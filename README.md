@@ -169,9 +169,11 @@ required flags in the installed `wsl --help`. Sources verified 2026-09-30:
   specifies 2.4.10 or higher for its modern Ubuntu distro format.
 
 The resulting command is `wsl --install --from-file <pinned-image> --name <name>
---location D:\wsl\<name> --no-launch`, followed by `wsl --terminate <name>` and
+--location D:\wsl\<name> --no-launch`, followed by `wsl --set-version <name> 2`,
+`wsl --terminate <name>` and
 `wsl --manage <name> --set-sparse true`. An existing name is reused only if it is
-already WSL 2 at the requested path; no distro is unregistered or moved.
+already WSL 2 at the requested path and has the matching image marker written by
+this script; no distro is unregistered or moved.
 
 Installer references: [chezmoi](https://www.chezmoi.io/),
 [mise](https://mise.jdx.dev/), [Claude native installation](https://code.claude.com/docs/en/setup),

@@ -23,7 +23,7 @@ docker run --name "$container" --rm \
     command -v sudo
     command -v git
     command -v curl
-    useradd --create-home --shell /bin/bash --groups sudo bootstrap-admin
+    useradd --create-home --shell /bin/bash bootstrap-admin
     printf "bootstrap-admin ALL=(ALL:ALL) NOPASSWD:ALL\n" > /etc/sudoers.d/90-ci-admin
     chmod 0440 /etc/sudoers.d/90-ci-admin
     install -d -o bootstrap-admin -g bootstrap-admin -m 0700 /home/bootstrap-admin/.config/gh
