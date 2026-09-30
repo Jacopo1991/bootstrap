@@ -155,14 +155,14 @@ foreach ($version in 2, 1) {
 }
 
 # Real compaction functions; only host interactions are mocked.
-foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'busy', 'became-busy', 'idle', 'diskpart-error') {
+foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 'busy', 'became-busy', 'idle', 'diskpart-error') {
     & {
         param($Scenario)
         $state = @{Events=[System.Collections.Generic.List[string]]::new(); Probe=0; Bytes=20GB; Attached=$false; Scenario=$Scenario}
         function Assert-BootstrapAdministrator {}
         function Get-WslDisks {
             if ($state.Scenario -eq 'missing') { return }
-            [pscustomobject]@{Name='Test'; WslVersion=$(if ($state.Scenario -eq 'wsl1') {1} else {2}); IsSparse=($state.Scenario -eq 'sparse'); Vhdx='C:\mock\ext4.vhdx'}
+            [pscustomobject]@{Name='Test'; WslVersion=$(if ($state.Scenario -eq 'wsl1') {1} else {2}); IsSparse=($state.Scenario -eq 'sparse'); Vhdx=$(if ($state.Scenario -eq 'non-ascii') {'C:\mock\'+[char]0x00e9+'\ext4.vhdx'} else {'C:\mock\ext4.vhdx'})}
         }
         function Test-Path { param($LiteralPath, $PathType) return $state.Scenario -ne 'file-missing' }
         function Get-Item { param($LiteralPath) [pscustomobject]@{Length=$state.Bytes} }
@@ -183,6 +183,8 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'busy', 'beca
         function diskpart.exe {
             $global:LASTEXITCODE=0
             Assert-Equal $args[0] '/s' 'diskpart scripted invocation'
+            $bytes = [IO.File]::ReadAllBytes($args[1])
+            Assert-Equal (@($bytes | Where-Object { $_ -gt 127 -or $_ -eq 0 }).Count) 0 'diskpart script is ASCII without BOM or UTF-16 NULs'
             $commands = [IO.File]::ReadAllText($args[1])
             Assert-Equal ($commands.StartsWith('select vdisk file="C:\mock\ext4.vhdx"')) $true 'diskpart selects only target file'
             if ($commands.Contains('compact vdisk')) {
@@ -203,6 +205,9 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'busy', 'beca
             Assert-Equal $state.Events.Count 0 'sparse refusal has no host actions'
         } elseif ($Scenario -eq 'file-missing') {
             Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*VHDX is missing*' 'missing file refused'
+        } elseif ($Scenario -eq 'non-ascii') {
+            Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*non-ASCII*' 'non-ASCII VHDX path refused'
+            Assert-Equal $state.Events.Count 0 'non-ASCII refusal has no WSL or diskpart actions'
         } elseif ($Scenario -eq 'diskpart-error') {
             Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*diskpart failed*' 'diskpart error propagated'
             Assert-Equal ($state.Events -join ',') 'probe,trim,probe,terminate,diskpart,detach-cleanup' 'failure detaches own disk'
@@ -293,4 +298,55 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'busy', 'beca
     Assert-Equal $running.UsedBytes 1GB 'running used bytes reported'
     Assert-Equal $running.CapBytes 790GB 'running cap bytes reported'
     Assert-Equal $legacy.UsedBytes $null 'WSL 1 usage remains empty'
+}
+
+# Exercise the owner-side PE probe without launching WSL or a Windows PE.
+foreach ($case in 'blocked', 'success', 'output', 'timeout', 'copy-error') {
+    & {
+        . "$PSScriptRoot/../windows/interop-probe.ps1"
+        $probeState = @{Case=$case; Paths=@{}; Removed=[System.Collections.Generic.List[string]]::new(); Killed=$false; Disposed=$false}
+        function Test-Path { param($LiteralPath) return $LiteralPath -eq '\\wsl.localhost\Test\var\tmp' -or $probeState.Paths.ContainsKey($LiteralPath) }
+        function Copy-Item {
+            param($LiteralPath, $Destination)
+            Assert-Equal $LiteralPath (Join-Path $env:SystemRoot 'System32\whoami.exe') 'probe copies the host whoami executable'
+            $probeState.Paths[$Destination]=$true
+            if ($probeState.Case -eq 'copy-error') { throw 'mock copy failed' }
+        }
+        function wsl.exe {
+            $command = $args -join ' '
+            if ($command -notmatch '^-d Test -u root chmod 755 -- /var/tmp/interop-probe-[a-f0-9]+\.exe$' -and
+                $command -notmatch '^-d Test -u agent test -f (/var/tmp/interop-probe-[a-f0-9]+\.exe) -a -x \1$') { throw ("Unexpected probe WSL call: " + $command) }
+            $global:LASTEXITCODE=0
+        }
+        function Start-Process {
+            param($FilePath, $ArgumentList, $WindowStyle, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError)
+            Assert-Equal "$FilePath/$WindowStyle/$PassThru" 'wsl.exe/Hidden/True' 'probe launches a hidden WSL process' | Out-Null
+            Assert-Equal ($ArgumentList -match '^-d Test -u agent -- bash -lc ') $true 'probe runs in the agent login shell' | Out-Null
+            [IO.File]::WriteAllText($RedirectStandardOutput, $(if ($probeState.Case -eq 'output') {'mock Windows output'} else {''}))
+            [IO.File]::WriteAllText($RedirectStandardError, 'mock blocked-launch diagnostic')
+            foreach ($path in $RedirectStandardOutput, $RedirectStandardError) { $probeState.Paths[$path]=$true }
+            $process = [pscustomobject]@{ExitCode=$(if ($probeState.Case -eq 'success') {0} else {1})}
+            $process | Add-Member ScriptMethod WaitForExit { param($Milliseconds) return $probeState.Case -ne 'timeout' }
+            $process | Add-Member ScriptMethod Kill { $probeState.Killed=$true }
+            $process | Add-Member ScriptMethod Dispose { $probeState.Disposed=$true }
+            return $process
+        }
+        function Remove-Item {
+            param($LiteralPath, [switch]$Force, $ErrorAction)
+            $probeState.Removed.Add($LiteralPath)
+            $probeState.Paths.Remove($LiteralPath) | Out-Null
+            if (-not $LiteralPath.StartsWith('\\wsl.localhost\')) { Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Force -ErrorAction SilentlyContinue }
+        }
+        switch ($case) {
+            blocked { Invoke-InteropProbe -Name Test }
+            success { Assert-Throws { Invoke-InteropProbe -Name Test } '*ran successfully*' 'successful Windows launch rejected' }
+            output { Assert-Throws { Invoke-InteropProbe -Name Test } '*produced stdout*' 'Windows output rejected even with nonzero exit' }
+            timeout { Assert-Throws { Invoke-InteropProbe -Name Test } '*Timed out*' 'timeout rejected as inconclusive' }
+            copy-error { Assert-Throws { Invoke-InteropProbe -Name Test } '*mock copy failed*' 'copy failure reported' }
+        }
+        Assert-Equal $probeState.Removed.Count 3 "$case removes executable and both output files"
+        Assert-Equal $probeState.Paths.Count 0 "$case leaves no probe files"
+        if ($case -ne 'copy-error') { Assert-Equal $probeState.Disposed $true "$case disposes the process" }
+        Assert-Equal $probeState.Killed ($case -eq 'timeout') "$case kills only a timed-out process"
+    }
 }

@@ -77,13 +77,32 @@ bash /opt/machine-bootstrap/current/checks/boundary.sh
 
 The distro check validates exact versions, takes content/mode/mtime snapshots
 of managed files and installed tools around another `chezmoi apply`, then requires
-an empty diff and clean `chezmoi verify`. The boundary check requires
+an empty diff and clean `chezmoi verify`. Installation pins umask to `022` for
+both generated chezmoi configuration and the initial apply, so the admin
+session's umask cannot change managed file modes. CI starts installation under
+umask `002` and requires the distro check to pass.
+
+The boundary check requires
 `sudo -n true` to fail, checks groups, and attempts to access the admin home and
 open `~admin/.config/gh/hosts.yml` without printing any file contents. It also
-rejects an accessible Docker socket when one exists. On WSL it fails for any
-drvfs/9p mount, a reachable `/mnt/c/Windows`, or enabled WSLInterop. Outside WSL
-it explicitly prints `SKIP: WSL-only checks (not WSL)`; that skip does not verify
-the live WSL boundary.
+rejects an accessible Docker socket when one exists. On WSL it fails for a
+Windows-drive mount, a reachable `/mnt/c/Windows`, `WSL_INTEROP` in the agent login
+environment, or an `/run/WSL/<pid>_interop` socket belonging to a process in
+the agent login's ancestry (including WSL's root-owned `/init`). The
+`WSLInterop` binfmt registration status is not authoritative: it can remain
+enabled while Windows PE execution is blocked. Outside WSL the check explicitly
+prints `SKIP: WSL-only checks (not WSL)`; that skip does not verify the live WSL
+boundary.
+
+From the Windows host, run the owner-side execution probe:
+
+```powershell
+.\windows\interop-probe.ps1 -Name AgentDev
+```
+
+It copies Windows `whoami.exe` to a unique path under the distro's `/var/tmp`,
+runs it as `agent`, and requires a nonzero exit with no stdout. It bounds the
+launch wait and removes the temporary executable even when the check fails.
 
 From PowerShell, with other work in this distro saved:
 

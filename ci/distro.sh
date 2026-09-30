@@ -36,10 +36,12 @@ docker run --name "$container" --rm \
       cd /repo
       export CHEZMOI_GIT_NAME="Bootstrap CI"
       export CHEZMOI_GIT_EMAIL="bootstrap-ci@example.invalid"
+      umask 002
       bash install.sh
       python3 ci/wsl-config.py
       bash install.sh
       python3 ci/wsl-config.py
+      umask 022
       cd /tmp
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/boundary.sh

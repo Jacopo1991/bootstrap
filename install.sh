@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ $EUID != 0 && $(id -un) != agent ]] || { echo 'Run as the non-root admin user.' >&2; exit 1; }
 [[ -z $(git -C "$ROOT" status --porcelain) ]] || {

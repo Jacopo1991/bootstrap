@@ -10,12 +10,14 @@ has_windows_drive_mount() {
   '
 }
 
-has_enabled_wsl_interop() {
-  local directory=${1:-/proc/sys/fs/binfmt_misc} entry
-  for entry in "$directory"/WSLInterop*; do
-    if [[ -r $entry ]] && grep -qx enabled "$entry"; then
-      return 0
-    fi
+# Binfmt registration can remain enabled even when Windows process launch is
+# blocked. Check only this agent login's environment and its own session socket.
+has_agent_session_interop() {
+  local interop_is_set=${1:-} socket_dir=${2:-/run/WSL} pid_list=${3-} pid
+  [[ -n $interop_is_set ]] && return 0
+  for pid in $pid_list; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    [[ -S "$socket_dir/${pid}_interop" ]] && return 0
   done
   return 1
 }
@@ -53,10 +55,17 @@ if grep -qiE 'microsoft|wsl' /proc/version; then
   if [[ -e /mnt/c/Windows ]]; then
     echo 'FAIL: /mnt/c/Windows is reachable.' >&2; exit 1;
   fi
-  if has_enabled_wsl_interop; then
-    echo 'FAIL: WSLInterop is enabled.' >&2; exit 1;
+  ancestor_pids=()
+  pid=$$
+  while [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/status ]]; do
+    ancestor_pids+=("$pid")
+    pid=$(awk '/^PPid:/ {print $2}' "/proc/$pid/status")
+    [[ $pid == 0 ]] && break
+  done
+  if has_agent_session_interop "${WSL_INTEROP+x}" /run/WSL "${ancestor_pids[*]}"; then
+    echo 'FAIL: Windows interop is available in the agent login/session.' >&2; exit 1;
   fi
-  echo 'PASS: Windows mounts, Windows directory access and WSLInterop denied.'
+  echo 'PASS: Windows mounts, Windows directory access and agent-session interop denied.'
 else
   echo 'SKIP: WSL-only checks (not WSL)'
 fi

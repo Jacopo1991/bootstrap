@@ -189,9 +189,10 @@ function Wait-WslVhdDetached {
 
 function Invoke-BootstrapDiskPart {
     param([string[]]$Commands)
+    if (($Commands -join "`n") -match '[^\x00-\x7F]') { throw 'DiskPart commands must contain only ASCII characters.' }
     $scriptFile = Join-Path $env:TEMP ('bootstrap-diskpart-' + [Guid]::NewGuid().ToString('N') + '.txt')
     try {
-        Set-Content -LiteralPath $scriptFile -Value ($Commands -join "`r`n") -Encoding unicode
+        Set-Content -LiteralPath $scriptFile -Value ($Commands -join "`r`n") -Encoding ascii
         $output = & diskpart.exe /s $scriptFile 2>&1
         $code = $LASTEXITCODE
         Write-Output $output
@@ -203,6 +204,7 @@ function Invoke-WslCompaction {
     param([string]$Name, [switch]$IfIdle)
     Assert-BootstrapAdministrator
     $disk = Get-CompactableWslDisk -Name $Name
+    if ($disk.Vhdx -match '[^\x00-\x7F]') { throw 'VHDX path contains non-ASCII characters; diskpart script requires an ASCII path.' }
     if ($IfIdle -and (Test-WslBusy -Name $Name)) { Write-Output "SKIP: $Name has non-system processes."; return }
     $before = (Get-Item -LiteralPath $disk.Vhdx).Length
     Write-Output "BEFORE: $Name FileBytes=$before"

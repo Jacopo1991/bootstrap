@@ -24,17 +24,29 @@ check_mount allow 'ordinary Linux mounts' $'/dev/sdc / ext4 rw 0 0\ntmpfs /mnt/c
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-if has_enabled_wsl_interop "$tmp"; then
-  echo 'FAIL: absent interop entries detected as enabled.' >&2; exit 1;
+mkdir "$tmp/WSL"
+if has_agent_session_interop '' "$tmp/WSL" '123 456'; then
+  echo 'FAIL: absent session socket detected.' >&2; exit 1;
 fi
-printf 'disabled\n' > "$tmp/WSLInterop"
-printf 'disabled\n' > "$tmp/WSLInterop-late"
-if has_enabled_wsl_interop "$tmp"; then
-  echo 'FAIL: disabled interop entries detected as enabled.' >&2; exit 1;
+touch "$tmp/WSL/123_interop"
+if has_agent_session_interop '' "$tmp/WSL" 123 1000; then
+  echo 'FAIL: regular file detected as session socket.' >&2; exit 1;
 fi
-printf 'enabled\ninterpreter /init\n' > "$tmp/WSLInterop-late"
-has_enabled_wsl_interop "$tmp" || { echo 'FAIL: enabled WSLInterop-late missed.' >&2; exit 1; }
-printf 'disabled\n' > "$tmp/WSLInterop-late"
-printf 'enabled\ninterpreter /init\n' > "$tmp/WSLInterop"
-has_enabled_wsl_interop "$tmp" || { echo 'FAIL: enabled WSLInterop missed.' >&2; exit 1; }
-echo 'PASS: absent, disabled, enabled and late interop entries'
+rm "$tmp/WSL/123_interop"
+if command -v socat >/dev/null; then
+  socat UNIX-LISTEN:"$tmp/WSL/123_interop",fork /dev/null >/dev/null 2>&1 &
+elif command -v nc >/dev/null; then
+  nc -lU "$tmp/WSL/123_interop" >/dev/null 2>&1 &
+else
+  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); time.sleep(5)' "$tmp/WSL/123_interop" &
+fi
+socket_pid=$!
+for _ in {1..50}; do [[ -S "$tmp/WSL/123_interop" ]] && break; sleep .02; done
+has_agent_session_interop '' "$tmp/WSL" '999 123 456' || { echo 'FAIL: root launcher ancestor socket missed.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1; }
+if has_agent_session_interop '' "$tmp/WSL" 456; then
+  echo 'FAIL: unrelated session socket flagged.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1;
+fi
+kill "$socket_pid" 2>/dev/null || true
+wait "$socket_pid" 2>/dev/null || true
+has_agent_session_interop x "$tmp/WSL" 456 || { echo 'FAIL: set WSL_INTEROP environment missed.' >&2; exit 1; }
+echo 'PASS: WSL_INTEROP environment, root ancestor socket and unrelated socket checks'
