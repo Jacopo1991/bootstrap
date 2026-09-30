@@ -293,10 +293,13 @@ Every unresolved component stays at its previous pin and is listed in the
 workflow summary and pull request body. The moving Claude installer and signing
 key rotations stay pinned until a version-bound official mapping can be checked.
 
-The workflow opens or updates a monthly pull request and never merges it. After
-publishing the branch, it explicitly dispatches the existing `gate.yml` workflow
-against that branch, then accepts only a new `workflow_dispatch` run whose
-workflow, branch and head SHA match the pull request exactly. The update job uses
+The workflow explicitly dispatches the existing `gate.yml` workflow against the
+candidate branch before publishing a pull request, and accepts only a new
+`workflow_dispatch` run whose workflow, branch and head SHA match exactly. A new
+pull request is created only after that gate passes. An existing same-branch
+review receives a clear failure report if preflight fails. The branch is checked
+before publication and the published PR head is checked against the gate-tested
+commit. It never merges a pull request. The update job uses
 the repository's built-in Actions token with contents, pull request and Actions
 write permission; it does not require a stored token. A repository administrator
 must enable **Allow GitHub Actions to create and approve pull requests**. Keep

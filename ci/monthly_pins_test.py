@@ -6,6 +6,8 @@ import datetime as dt
 import json
 from pathlib import Path
 import unittest
+from unittest import mock
+import tempfile
 
 import monthly_pins as pins
 
@@ -136,6 +138,109 @@ class ResolverTests(unittest.TestCase):
             dispatched,
             {101, 102, 103, 104, 105},
         ))
+
+
+    def test_open_pr_search_paginates_past_three_pages_and_fails_at_cap(self) -> None:
+        target = {"number": 77, "head": {"ref": "automation/monthly-pin-bump-2026-10",
+                  "user": {"login": "jacopo1991"}}}
+        pages = {1: [{}] * 100, 2: [{}] * 100, 3: [{}] * 100, 4: [target]}
+        requested = []
+        def fetch(page: int):
+            requested.append(page)
+            return pages[page]
+        self.assertIs(next(p for page in pins.monthly_pr_pages(fetch) for p in page
+                           if p.get("number") == 77), target)
+        self.assertEqual(requested, [1, 2, 3, 4])
+
+        def full_page(_page: int):
+            return [{}] * 100
+        with self.assertRaisesRegex(pins.ResolveError, "safety cap"):
+            list(pins.monthly_pr_pages(full_page, page_cap=2))
+
+    def test_failed_gate_never_creates_new_pr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.md"
+            report.write_text("Retained unresolved tools.\\n", encoding="utf-8")
+            api = mock.Mock(return_value={"object": {"sha": "candidate-sha"}})
+            with mock.patch.object(pins, "find_monthly_prs", return_value=[]), \
+                 mock.patch.object(pins, "dispatch_gate",
+                                   return_value=("https://example.invalid/gate/1", "failure")), \
+                 mock.patch.object(pins, "api_request", api):
+                with self.assertRaisesRegex(pins.ResolveError, "did not pass"):
+                    pins.publish_pr("owner/repo", "automation/monthly-pin-bump-2026-10",
+                                    "candidate-sha", str(report))
+            self.assertFalse(any(call.args[1] == "pulls" and call.args[2] == "POST"
+                                 for call in api.call_args_list))
+
+    def test_green_gate_publishes_only_the_exact_checked_head(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.md"
+            report.write_text("Resolved cohort.\\n", encoding="utf-8")
+            def api(_repo: str, path: str, method: str = "GET", payload=None):
+                if path == "git/ref/heads/automation/monthly-pin-bump-2026-10":
+                    return {"object": {"sha": "candidate-sha"}}
+                if path == "pulls" and method == "POST":
+                    self.assertIn("Existing required CI gate: [passed]", payload["body"])
+                    return {"number": 8, "html_url": "https://example.invalid/pull/8"}
+                if path == "pulls/8":
+                    return {"head": {"sha": "candidate-sha"}}
+                raise AssertionError((path, method))
+            with mock.patch.object(pins, "find_monthly_prs", return_value=[]), \
+                 mock.patch.object(pins, "dispatch_gate",
+                                   return_value=("https://example.invalid/gate/9", "success")), \
+                 mock.patch.object(pins, "api_request", side_effect=api):
+                result = pins.publish_pr("owner/repo", "automation/monthly-pin-bump-2026-10",
+                                         "candidate-sha", str(report))
+            self.assertIn("https://example.invalid/pull/8", result)
+            self.assertIn("https://example.invalid/gate/9", result)
+            self.assertIn("candidate-sha", result)
+
+    def test_python_312_selection_skips_release_candidate_only_folder(self) -> None:
+        root = '<a href="3.12.16/">3.12.16/</a><a href="3.12.15/">3.12.15/</a>'
+        dirs = {
+            "3.12.16": '<a href="Python-3.12.16rc2.tar.xz">rc</a>',
+            "3.12.15": '<a href="Python-3.12.15.tar.xz">final</a>',
+        }
+        self.assertEqual(pins.select_python_312_final(root, dirs.__getitem__), "3.12.15")
+        with self.assertRaises(pins.ResolveError):
+            pins.select_python_312_final(root, lambda _version: "<html></html>", candidate_cap=2)
+
+
+    def test_find_monthly_pr_searches_later_pages_and_does_not_infer_at_cap(self) -> None:
+        target = {"number": 88, "html_url": "https://example.invalid/pull/88",
+                  "head": {"ref": "automation/monthly-pin-bump-2026-10",
+                           "user": {"login": "owner"}}}
+        requested = []
+        def api(_repo: str, path: str, method: str = "GET", payload=None):
+            page = int(path.split("page=")[1])
+            requested.append(page)
+            return ([{}] * 100) if page < 5 else [target]
+        with mock.patch.object(pins, "api_request", side_effect=api):
+            self.assertIs(pins.find_monthly_pr("owner/repo"), target)
+        self.assertEqual(requested, [1, 2, 3, 4, 5])
+
+        def capped(_repo: str, _path: str, method: str = "GET", payload=None):
+            return [{}] * 100
+        with mock.patch.object(pins, "api_request", side_effect=capped):
+            with self.assertRaisesRegex(pins.ResolveError, "safety cap"):
+                pins.find_monthly_pr("owner/repo")
+
+
+    def test_publish_rechecks_for_a_different_monthly_pr_after_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.md"
+            report.write_text("Resolved cohort.\\n", encoding="utf-8")
+            other = {"number": 91, "head": {"ref": "automation/monthly-pin-bump-2026-09"}}
+            api = mock.Mock(return_value={"object": {"sha": "candidate-sha"}})
+            with mock.patch.object(pins, "find_monthly_prs", side_effect=[[], [other]]), \
+                 mock.patch.object(pins, "dispatch_gate",
+                                   return_value=("https://example.invalid/gate/1", "success")), \
+                 mock.patch.object(pins, "api_request", api):
+                with self.assertRaisesRegex(pins.ResolveError, "opened during gate"):
+                    pins.publish_pr("owner/repo", "automation/monthly-pin-bump-2026-10",
+                                    "candidate-sha", str(report))
+            self.assertFalse(any(call.args[1] == "pulls" and call.args[2] == "POST"
+                                 for call in api.call_args_list))
 
 
 if __name__ == "__main__":

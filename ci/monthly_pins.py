@@ -389,12 +389,25 @@ def latest_node_24() -> str:
     return version
 
 
+def select_python_312_final(listing: str, fetch_directory: Any, candidate_cap: int = 20) -> str:
+    versions = set(re.findall(r'href=["\'](3\.12\.\d+)/["\']', listing))
+    ordered = sorted(versions, key=lambda value: tuple(map(int, value.split("."))), reverse=True)
+    for version in ordered[:candidate_cap]:
+        directory = fetch_directory(version)
+        archive = re.compile(r'href=["\']Python-' + re.escape(version) + r'\.(?:tar\.xz|tgz|tar\.gz)["\']')
+        if archive.search(directory):
+            return version
+    raise ResolveError("no final Python 3.12 source archive found in bounded release candidates")
+
+
 def latest_python_312() -> str:
     listing = request_bytes("https://www.python.org/ftp/python/", limit=4 * 1024 * 1024).decode()
-    versions = set(re.findall(r'href=["\'](3\.12\.\d+)/["\']', listing))
-    if not versions:
-        raise ResolveError("Python 3.12 release listing unavailable")
-    return max(versions, key=lambda value: tuple(map(int, value.split("."))))
+    return select_python_312_final(
+        listing,
+        lambda version: request_bytes(
+            f"https://www.python.org/ftp/python/{version}/", limit=2 * 1024 * 1024
+        ).decode(),
+    )
 
 
 def npm_latest(name: str) -> str:
@@ -625,21 +638,35 @@ def api_request(repository: str, path: str, method: str = "GET",
         raise ResolveError("GitHub API returned invalid JSON") from None
 
 
-def find_monthly_pr(repository: str) -> dict[str, Any] | None:
+def monthly_pr_pages(fetch_page: Any, page_cap: int = 100):
+    for page in range(1, page_cap + 1):
+        pulls = fetch_page(page)
+        if not isinstance(pulls, list):
+            raise ResolveError("GitHub returned an invalid open pull request page")
+        yield pulls
+        if len(pulls) < 100:
+            return
+    raise ResolveError(f"open pull request pagination reached the {page_cap}-page safety cap")
+
+
+def find_monthly_prs(repository: str) -> list[dict[str, Any]]:
     owner = repository.split("/", 1)[0]
-    for page in range(1, 4):
-        pulls = api_request(
-            repository,
-            "pulls?" + urlencode({"state": "open", "base": "main", "per_page": 100, "page": page})
-        )
+    def fetch_page(page: int) -> Any:
+        query = urlencode({"state": "open", "base": "main", "per_page": 100, "page": page})
+        return api_request(repository, "pulls?" + query)
+    matches: list[dict[str, Any]] = []
+    for pulls in monthly_pr_pages(fetch_page):
         for pr in pulls:
             head = pr.get("head", {})
             if (head.get("ref", "").startswith(MONTHLY_BRANCH_PREFIX)
                     and head.get("user", {}).get("login", "").lower() == owner.lower()):
-                return pr
-        if len(pulls) < 100:
-            break
-    return None
+                matches.append(pr)
+    return matches
+
+
+def find_monthly_pr(repository: str) -> dict[str, Any] | None:
+    matches = find_monthly_prs(repository)
+    return matches[0] if matches else None
 
 
 def check_pending(repository: str, output_path: str | None) -> bool:
@@ -659,58 +686,78 @@ def check_pending(repository: str, output_path: str | None) -> bool:
 
 def publish_pr(repository: str, branch: str, head_sha: str, report_path: str) -> str:
     report = Path(report_path).read_text(encoding="utf-8")
-    pr_body = (
+    existing_prs = find_monthly_prs(repository)
+    if any(pr.get("head", {}).get("ref") != branch for pr in existing_prs):
+        raise ResolveError("a different monthly pin review is already open")
+    existing = next(iter(existing_prs), None)
+
+    def verify_branch_head() -> None:
+        ref = api_request(repository, "git/ref/heads/" + branch)
+        if ref.get("object", {}).get("sha") != head_sha:
+            raise ResolveError("branch head changed before or during PR publication")
+
+    base_body = (
         "Monthly exact pin refresh from official package and release metadata.\n\n"
         "The updater retains a component when it cannot resolve its complete safe cohort. "
         "Review retained components and candidate changes below.\n\n"
         + report
-        + "\nCI status: awaiting the existing gate.yml workflow dispatched for this exact head."
     )
-    existing = find_monthly_pr(repository)
-    if existing and existing["head"]["ref"] == branch:
-        pr = api_request(repository, f"pulls/{existing['number']}", "PATCH", {"body": pr_body})
+    try:
+        gate_url, conclusion = dispatch_gate(repository, branch, head_sha)
+    except ResolveError as exc:
+        if existing:
+            current = api_request(repository, f"pulls/{existing['number']}")
+            if current.get("head", {}).get("sha") != head_sha:
+                raise ResolveError("existing monthly PR head changed before reporting a gate failure") from None
+            failed_body = base_body + f"\n\nRequired gate failed or could not be verified for {head_sha}: {exc}"
+            api_request(repository, f"pulls/{existing['number']}", "PATCH", {"body": failed_body})
+            current = api_request(repository, f"pulls/{existing['number']}")
+            if current.get("head", {}).get("sha") != head_sha:
+                raise ResolveError("existing monthly PR head changed while reporting a gate failure") from None
+        raise
+    verify_branch_head()
+    latest_existing_prs = find_monthly_prs(repository)
+    if any(pr.get("head", {}).get("ref") != branch for pr in latest_existing_prs):
+        raise ResolveError("another monthly pin review opened during gate preflight")
+    existing = next(iter(latest_existing_prs), None)
+    status = "passed" if conclusion == "success" else conclusion
+    body = base_body + f"\n\nExisting required CI gate: [{status}]({gate_url}) for {head_sha}."
+    if conclusion != "success":
+        if existing:
+            current = api_request(repository, f"pulls/{existing['number']}")
+            if current.get("head", {}).get("sha") != head_sha:
+                raise ResolveError("existing monthly PR head changed before reporting its gate result")
+            api_request(repository, f"pulls/{existing['number']}", "PATCH", {"body": body})
+            current = api_request(repository, f"pulls/{existing['number']}")
+            if current.get("head", {}).get("sha") != head_sha:
+                raise ResolveError("existing monthly PR head changed while reporting its gate result")
+        raise ResolveError(f"required gate did not pass for {head_sha}: {gate_url}")
+
+    verify_branch_head()
+    if existing:
+        number = existing.get("number")
+        pr_url = existing.get("html_url", "")
+        current = api_request(repository, f"pulls/{number}")
+        if current.get("head", {}).get("sha") != head_sha:
+            raise ResolveError("existing monthly PR head changed before publication")
+        api_request(repository, f"pulls/{number}", "PATCH", {"body": body})
     else:
         pr = api_request(repository, "pulls", "POST", {
             "title": "chore: refresh monthly bootstrap pins",
-            "body": pr_body,
+            "body": body,
             "head": branch,
             "base": "main",
             "draft": False,
         })
-    number = pr.get("number")
+        number = pr.get("number")
+        pr_url = pr.get("html_url", "")
     if not number:
         raise ResolveError("GitHub did not return the monthly pin PR")
-    pr_url = pr.get("html_url", "")
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        current = api_request(repository, f"pulls/{number}")
-        if current.get("head", {}).get("sha") == head_sha:
-            break
-        time.sleep(5)
-    else:
-        raise ResolveError("monthly PR head did not match the generated commit")
-    try:
-        gate_url, conclusion = dispatch_gate(repository, branch, head_sha)
-    except ResolveError as exc:
-        api_request(repository, f"pulls/{number}", "PATCH", {
-            "body": pr_body + f"\n\nRequired gate could not be verified for {head_sha}: {exc}"
-        })
-        raise
     current = api_request(repository, f"pulls/{number}")
     if current.get("head", {}).get("sha") != head_sha:
-        raise ResolveError("monthly PR head changed while its required gate was running")
-    status = "passed" if conclusion == "success" else conclusion
-    body = (
-        "Monthly exact pin refresh from official package and release metadata.\n\n"
-        "The updater retains a component when it cannot resolve its complete safe cohort. "
-        "Review retained components and candidate changes below.\n\n"
-        + report
-        + f"\nExisting required CI gate: [{status}]({gate_url}) for {head_sha}."
-    )
-    api_request(repository, f"pulls/{number}", "PATCH", {"body": body})
-    if conclusion != "success":
-        raise ResolveError(f"required gate did not pass: {gate_url}")
-    result = f"Opened or updated [PR #{number}]({pr_url}); exact-head gate passed: [{gate_url}]({gate_url})."
+        raise ResolveError("monthly PR head did not match the gate-checked commit")
+    verify_branch_head()
+    result = f"Opened or updated [PR #{number}]({pr_url}); exact-head gate passed: [{gate_url}]({gate_url}) for {head_sha}."
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as stream:
