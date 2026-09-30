@@ -155,10 +155,10 @@ foreach ($version in 2, 1) {
 }
 
 # Real compaction functions; only host interactions are mocked.
-foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 'busy', 'became-busy', 'idle', 'diskpart-error') {
+foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 'other-idle', 'other-manual', 'list-error', 'malformed-list', 'busy', 'became-busy', 'idle', 'lock-timeout', 'diskpart-error') {
     & {
         param($Scenario)
-        $state = @{Events=[System.Collections.Generic.List[string]]::new(); Probe=0; Bytes=20GB; Attached=$false; Scenario=$Scenario}
+        $state = @{Events=[System.Collections.Generic.List[string]]::new(); Probe=0; Bytes=20GB; Attached=$false; Scenario=$Scenario; Waited=$false; Listed=$false}
         function Assert-BootstrapAdministrator {}
         function Get-WslDisks {
             if ($state.Scenario -eq 'missing') { return }
@@ -167,9 +167,22 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
         function Test-Path { param($LiteralPath, $PathType) return $state.Scenario -ne 'file-missing' }
         function Get-Item { param($LiteralPath) [pscustomobject]@{Length=$state.Bytes} }
         function Get-DiskImage { param($ImagePath) [pscustomobject]@{Attached=$state.Attached} }
+        function Wait-WslVhdDetached {
+            param($Vhdx)
+            if ($state.Scenario -eq 'lock-timeout') { throw 'Timed out waiting for exclusive read access.' }
+            $state.Waited=$true
+        }
         function Start-Sleep { param($Seconds) Assert-Equal $Seconds 15 'diskpart retry shutdown interval' | Out-Null }
         function wsl.exe {
             $global:LASTEXITCODE = 0
+            if (($args -join ' ') -eq '--list --verbose') {
+                $state.Listed=$true
+                if ($state.Scenario -eq 'list-error') { $global:LASTEXITCODE=1; return }
+                $listing = "  NAME STATE VERSION`n* Test Running 2`n  Sleeping Stopped 2"
+                if ($state.Scenario -eq 'malformed-list') { $listing += "`n  Other ???" }
+                if ($state.Scenario -in 'other-idle', 'other-manual') { $listing += "`n  Other Distro Running 2`n  Legacy Running 1" }
+                return ($listing.ToCharArray() -join [string][char]0)
+            }
             Assert-Equal $args[1] 'Test' 'only selected distro touched' | Out-Null
             if ($args[0] -eq '--terminate') { $state.Events.Add('terminate'); return }
             if ($args[5] -eq 'python3') {
@@ -182,6 +195,7 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
         }
         function diskpart.exe {
             $global:LASTEXITCODE=0
+            Assert-Equal $state.Waited $true 'exclusive-open wait precedes diskpart'
             Assert-Equal $args[0] '/s' 'diskpart scripted invocation'
             $bytes = [IO.File]::ReadAllBytes($args[1])
             Assert-Equal (@($bytes | Where-Object { $_ -gt 127 -or $_ -eq 0 }).Count) 0 'diskpart script is ASCII without BOM or UTF-16 NULs'
@@ -208,6 +222,21 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
         } elseif ($Scenario -eq 'non-ascii') {
             Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*non-ASCII*' 'non-ASCII VHDX path refused'
             Assert-Equal $state.Events.Count 0 'non-ASCII refusal has no WSL or diskpart actions'
+        } elseif ($Scenario -eq 'other-idle') {
+            Assert-Equal ((Invoke-WslCompaction -Name Test -IfIdle) -join '') 'SKIP: WSL VM held by Other Distro, Legacy' 'other running distros cause an idle skip'
+            Assert-Equal $state.Events.Count 0 'other-distro skip performs no trim, probe, terminate or diskpart'
+        } elseif ($Scenario -eq 'other-manual') {
+            Assert-Throws { Invoke-WslCompaction -Name Test } '*WSL VM held by Other Distro, Legacy*' 'manual compaction names other running distros'
+            Assert-Equal $state.Events.Count 0 'other-distro refusal performs no trim, terminate or diskpart'
+        } elseif ($Scenario -eq 'list-error') {
+            Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*wsl.exe failed*' 'failed distro listing blocks compaction'
+            Assert-Equal $state.Events.Count 0 'listing failure performs no trim or terminate'
+        } elseif ($Scenario -eq 'malformed-list') {
+            Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*Could not parse*' 'unrecognized distro listing blocks compaction'
+            Assert-Equal $state.Events.Count 0 'malformed listing performs no trim or terminate'
+        } elseif ($Scenario -eq 'lock-timeout') {
+            Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*Timed out*' 'exclusive-open timeout blocks diskpart'
+            Assert-Equal ($state.Events -join ',') 'probe,trim,probe,terminate' 'locked VHDX never reaches diskpart'
         } elseif ($Scenario -eq 'diskpart-error') {
             Assert-Throws { Invoke-WslCompaction -Name Test -IfIdle } '*diskpart failed*' 'diskpart error propagated'
             Assert-Equal ($state.Events -join ',') 'probe,trim,probe,terminate,diskpart,detach-cleanup' 'failure detaches own disk'
@@ -219,9 +248,29 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
     } $scenario
 }
 & {
-    function Get-DiskImage { param($ImagePath) [pscustomobject]@{Attached=$true} }
-    function Start-Sleep { param($Seconds) }
-    Assert-Throws { Wait-WslVhdDetached -Vhdx 'C:\mock\ext4.vhdx' -TimeoutSeconds 0 } '*Timed out*' 'attachment wait bounded'
+    $lockPath = Join-Path $env:TEMP ('bootstrap-lock-' + [Guid]::NewGuid().ToString('N') + '.vhdx')
+    [IO.File]::WriteAllBytes($lockPath, [byte[]]@(1,2,3))
+    $lockState = @{Held=$null; Sleeps=0; Release=$true}
+    function Start-Sleep {
+        param($Seconds)
+        $lockState.Sleeps++
+        if ($lockState.Release) { $lockState.Held.Dispose() }
+    }
+    function Get-DiskImage { throw 'DiskImage attachment state must not decide whether the VHDX is unlocked.' }
+    try {
+        $lockState.Held = [IO.File]::Open($lockPath, 'Open', 'Read', 'None')
+        Wait-WslVhdDetached -Vhdx $lockPath
+        Assert-Equal $lockState.Sleeps 1 'exclusive-open wait polls until the held file is released'
+        $lockState.Release=$false
+        # This succeeds only if the wait closed its successful exclusive open.
+        $lockState.Held = [IO.File]::Open($lockPath, 'Open', 'Read', 'None')
+        Assert-Throws { Wait-WslVhdDetached -Vhdx $lockPath -TimeoutSeconds 0 } '*Timed out*' 'locked-file wait is bounded'
+        $timeout = (Get-Command Wait-WslVhdDetached).ScriptBlock.Ast.Find({ param($node) $node -is [Management.Automation.Language.ParameterAst] -and $node.Name.VariablePath.UserPath -eq 'TimeoutSeconds' }, $true)
+        Assert-Equal $timeout.DefaultValue.Value 300 'exclusive-open wait defaults to the 300-second VM idle window'
+    } finally {
+        if ($null -ne $lockState.Held) { $lockState.Held.Dispose() }
+        Remove-Item -LiteralPath $lockPath -Force
+    }
 }
 
 & {
@@ -301,6 +350,22 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
 }
 
 # Exercise the owner-side PE probe without launching WSL or a Windows PE.
+& {
+    . "$PSScriptRoot/../checks/compact-check.ps1" -Name Test
+    $checkState = @{Calls=0}
+    function Assert-BootstrapAdministrator {}
+    function Get-CompactableWslDisk { param($Name) [pscustomobject]@{Vhdx='C:\mock\ext4.vhdx'} }
+    function Assert-WslCap { throw 'compact-check queried the target before refusing other running distros.' }
+    function wsl.exe {
+        if (($args -join ' ') -ne '--list --verbose') { throw 'compact-check started or wrote to a distro before refusing.' }
+        $checkState.Calls++
+        $global:LASTEXITCODE=0
+        "  NAME STATE VERSION`n* Test Running 2`n  Other Distro Running 2"
+    }
+    Assert-Throws { Invoke-WslCompactCheck -Name Test } '*other WSL distros are running: Other Distro*' 'compact-check refuses other running distros before writing'
+    Assert-Equal $checkState.Calls 1 'compact-check only lists distros on refusal'
+}
+
 foreach ($case in 'blocked', 'success', 'output', 'timeout', 'copy-error') {
     & {
         . "$PSScriptRoot/../windows/interop-probe.ps1"

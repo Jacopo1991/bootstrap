@@ -149,6 +149,31 @@ function Get-CompactableWslDisk {
     return $disks[0]
 }
 
+function Get-OtherRunningWslDistros {
+    param([Parameter(Mandatory)][string]$Name)
+    $lines = @(& wsl.exe --list --verbose 2>&1)
+    $code = $LASTEXITCODE
+    if ($code -ne 0) { throw "wsl.exe failed ($code): --list --verbose" }
+    $text = (($lines -join "`n").Replace([string][char]0, ''))
+    $hasHeader = $false
+    $running = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in ($text -split "`r?`n")) {
+        if ($line -match '^\s*NAME\s+STATE\s+VERSION\s*$') { $hasHeader = $true; continue }
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if (-not $hasHeader) { throw 'Could not parse output from wsl --list --verbose.' }
+        if ($line -notmatch '^\s*(?:\*\s*)?(.+?)\s+(Running|Stopped)\s+\d+\s*$') {
+            throw 'Could not parse a distro row from wsl --list --verbose.'
+        }
+        $distroName = $Matches[1].Trim()
+        $state = $Matches[2]
+        if ($state -eq 'Running' -and -not [string]::Equals($distroName, $Name, [StringComparison]::OrdinalIgnoreCase)) {
+            $running.Add($distroName)
+        }
+    }
+    if (-not $hasHeader) { throw 'Could not parse output from wsl --list --verbose.' }
+    return $running.ToArray()
+}
+
 function Test-WslBusy {
     param([string]$Name)
     # Unknown processes are busy. Only root/system-account OS daemons, WSL init,
@@ -178,13 +203,23 @@ print('BUSY' if busy else 'IDLE')
 }
 
 function Wait-WslVhdDetached {
-    param([string]$Vhdx, [int]$TimeoutSeconds=120)
+    param([string]$Vhdx, [int]$TimeoutSeconds=300)
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        if (-not (Get-DiskImage -ImagePath $Vhdx).Attached) { return }
+        $stream = $null
+        try {
+            $stream = [IO.File]::Open($Vhdx, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            return
+        } catch [IO.IOException] {
+            # Only sharing/lock violations mean another opener still owns the VHDX.
+            if (($_.Exception.HResult -band 0xFFFF) -notin 32, 33) { throw }
+        } finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+        }
+        if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Seconds 2
-    } while ((Get-Date) -lt $deadline)
-    throw "Timed out waiting for $Vhdx to detach. No compaction attempted."
+    } while ($true)
+    throw "Timed out waiting for exclusive read access to $Vhdx. No compaction attempted."
 }
 
 function Invoke-BootstrapDiskPart {
@@ -203,6 +238,12 @@ function Invoke-BootstrapDiskPart {
 function Invoke-WslCompaction {
     param([string]$Name, [switch]$IfIdle)
     Assert-BootstrapAdministrator
+    $otherRunning = @(Get-OtherRunningWslDistros -Name $Name)
+    if ($otherRunning.Count -gt 0) {
+        $names = $otherRunning -join ', '
+        if ($IfIdle) { Write-Output "SKIP: WSL VM held by $names"; return }
+        throw "WSL VM held by $names; cannot compact $Name."
+    }
     $disk = Get-CompactableWslDisk -Name $Name
     if ($disk.Vhdx -match '[^\x00-\x7F]') { throw 'VHDX path contains non-ASCII characters; diskpart script requires an ASCII path.' }
     if ($IfIdle -and (Test-WslBusy -Name $Name)) { Write-Output "SKIP: $Name has non-system processes."; return }
