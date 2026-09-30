@@ -10,6 +10,8 @@ Assert-Equal (ConvertTo-WindowsArgument 'a"b') '"a\"b"' 'embedded quote escaped'
 Assert-Equal (ConvertTo-WindowsArgument 'C:\ends with space\') '"C:\ends with space\\"' 'quoted trailing slash'
 
 $listing='  NAME           STATE      VERSION'+[Environment]::NewLine+'* Active         Running    2'+[Environment]::NewLine+'  Sleeping       Stopped    2'
+$resolved=Get-Command -Name Get-WslDisks -CommandType Function
+Assert-Equal $resolved.Name Get-WslDisks 'inventory imports shared WSL registry helper'
 $parsed=@(ConvertFrom-WslList $listing)
 Assert-Equal $parsed.Count 2 'WSL list parsed'
 Assert-Equal $parsed[1].State 'Stopped' 'stopped state parsed'
@@ -31,7 +33,7 @@ try {
  Assert-Equal $found.Distro.usedBytes 120 'newest matching cache chosen'
  $wrong=Get-LatestCachedDistro -Directory $fixture -Name Test -Vhdx 'C:\other\ext4.vhdx' -CurrentDate ([datetime]'2026-09-30')
  Assert-Equal $null $wrong 'cache identity includes VHDX path'
- Write-Record (Join-Path $probeDir '2026-10-01.json') -At '2026-10-01T12:00:00+02:00'
+ Write-Record (Join-Path $fixture '2026-10-01.json') -At '2026-10-01T12:00:00+02:00'
  $future=Get-LatestCachedDistro -Directory $fixture -Name Test -Vhdx 'C:\mock\ext4.vhdx' -CurrentDate ([datetime]'2026-09-30')
  Assert-Equal $future.Distro.usedBytes 120 'future cache excluded'
  $target=Join-Path $fixture 'atomic.json'
@@ -57,7 +59,7 @@ try {
  }
  & {
   $probeDir=Join-Path $fixture 'probe';[IO.Directory]::CreateDirectory($probeDir)|Out-Null
-  $state=@{Calls=[collections.generic.list[string]]::new();Running=$false;ProbeCalls=0}
+  $state=@{Calls=[collections.generic.list[string]]::new();Running=$false;Partial=$false;ProbeCalls=0}
   function Get-WslDisks {[pscustomobject]@{Name='Test';WslVersion=2;Vhdx='C:\mock\ext4.vhdx';FileBytes=900;BasePath='C:\mock'}}
   function Invoke-BoundedNative {param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
    $state.Calls.Add(($Arguments -join ' '))
@@ -65,7 +67,7 @@ try {
    if($Arguments[0] -eq '--version'){return [pscustomobject]@{Status='Success';Output='WSL version: 2.5.0';ExitCode=0}}
    [pscustomobject]@{Status='Failed';Output='sensitive-like diagnostic';ExitCode=1}
   }
-  function Invoke-WslInventoryProbe {param($Name);$state.ProbeCalls++;[pscustomobject]@{Status='Success';Usage=[pscustomobject]@{capBytes=1000;usedBytes=800};Largest=@([pscustomobject]@{path='/home/agent';bytes=50});Errors=@()}}
+  function Invoke-WslInventoryProbe {param($Name);$state.ProbeCalls++;[pscustomobject]@{Status=$(if($state.Partial){'Partial'}else{'Success'});Usage=[pscustomobject]@{capBytes=1000;usedBytes=800};Largest=@([pscustomobject]@{path='/home/agent';bytes=50});Errors=$(if($state.Partial){@('missing-var')}else{@()})}}
   function Get-PSDrive {param($Name,$PSProvider,$ErrorAction);[pscustomobject]@{Free=123}}
   function Test-Path {param($LiteralPath,$PathType);if($LiteralPath -like 'HKLM:*'){return $false};if($PathType){Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType -ErrorAction SilentlyContinue}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -ErrorAction SilentlyContinue}}
   function Get-ItemProperty {throw 'No registry value'}
@@ -79,7 +81,7 @@ try {
   function Write-CacheForProbe {
    $d=[pscustomobject]@{Name='Test';Vhdx='C:\mock\ext4.vhdx';usedBytes=700;capBytes=1000;largestDirectories=@();usageRecordedAtISO='2026-10-01T01:00:00+02:00'}
    $r=[pscustomobject]@{schemaVersion=1;createdAtISO='2026-10-01T01:00:00+02:00';distros=@($d)}
-   [IO.File]::WriteAllText((Join-Path $fixture '2026-10-01.json'),($r|ConvertTo-Json -Depth 6))
+   [IO.File]::WriteAllText((Join-Path $probeDir '2026-10-01.json'),($r|ConvertTo-Json -Depth 6))
   }
   Write-CacheForProbe
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T02:00:00')
@@ -91,6 +93,10 @@ try {
   Assert-Equal $state.ProbeCalls 1 'running distro gets one bounded probe'
   Assert-Equal $v.distros[0].UsageSource Live 'running usage source live'
   Assert-Equal $v.distros[0].largestDirectories.Count 1 'directory summary returned'
+  $state.Partial=$true;$v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T04:00:00')
+  Assert-Equal $v.distros[0].Status Partial 'partial directory scan is visible'
+  Assert-Equal $v.distros[0].UsedBytes 800 'partial scan preserves valid filesystem usage'
+  Assert-Equal $v.distros[0].DirectoryErrors[0] missing-var 'partial scan exposes fixed error code'
   Assert-Equal (($v|ConvertTo-Json -Depth 8).Contains('sensitive-like diagnostic')) $false 'native diagnostics never enter inventory'
  }
 } finally {Remove-Item -LiteralPath $fixture -Recurse -Force}

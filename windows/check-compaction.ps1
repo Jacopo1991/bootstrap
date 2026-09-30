@@ -34,7 +34,7 @@ function Invoke-WslCompactionCheck {
   $usage=[pscustomobject]@{CapBytes=[long]$Matches[1];UsedBytes=[long]$Matches[2]};$source='Live';$recordedAt=(Get-Date).ToString('o')
  }elseif($stateRecord -and $stateRecord.State -eq 'Stopped' -and $stateRecord.Version -eq 2 -and $disk.WslVersion -eq 2){
   $cached=Get-LatestCachedDistro -Directory $InventoryDirectory -Name $disk.Name -Vhdx $disk.Vhdx -CurrentDate (Get-Date)
-  if($cached){$usage=[pscustomobject]@{CapBytes=$cached.Distro.capBytes;UsedBytes=$cached.Distro.usedBytes};$source='Cache';$recordedAt=[string]$cached.Distro.usageRecordedAtISO}
+  if($cached){$capProperty=$cached.Distro.PSObject.Properties['capBytes'];$cachedCap=$null;if($null -ne $capProperty){$cachedCap=$capProperty.Value};$usage=[pscustomobject]@{CapBytes=$cachedCap;UsedBytes=$cached.Distro.usedBytes};$source='Cache';$recordedAt=[string]$cached.Distro.usageRecordedAtISO}
  }
  if($null -eq $usage){return}
  $used=[long]$usage.UsedBytes;$cap=if($null -ne $usage.CapBytes){[long]$usage.CapBytes}else{$null};$capText=if($null -eq $cap){'unknown'}else{[string]$cap}

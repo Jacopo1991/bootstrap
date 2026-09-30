@@ -1,5 +1,6 @@
 [CmdletBinding()]
 param([string]$OutputDirectory='C:\ProgramData\machine-bootstrap\inventory',[datetime]$Now=(Get-Date))
+. "$PSScriptRoot/common.ps1"
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 
@@ -64,6 +65,7 @@ print(json.dumps({"usage":usage,"largestDirectories":sizes[:10],"errors":sorted(
 
 function ConvertFrom-WslList {
  param([string]$Text)
+ $Text=$Text.Replace([string][char]0,'')
  $items=[collections.generic.list[object]]::new();$header=$false
  foreach($line in ($Text -split '\r?\n')){
   if($line -match '^\s*NAME\s+STATE\s+VERSION\s*$'){$header=$true;continue}
@@ -88,8 +90,11 @@ function Get-LatestCachedDistro {
   try{$recordAt=[datetimeoffset]::Parse([string]$r.createdAtISO)}catch{continue}
   if($recordAt.Date -ne $date.Date -or $recordAt.Date -lt $min -or $recordAt.Date -gt $CurrentDate.Date){continue}
   foreach($d in $r.distros){
-   if(-not [string]::Equals([string]$d.Name,$Name,'OrdinalIgnoreCase') -or -not [string]::Equals([string]$d.Vhdx,$Vhdx,'OrdinalIgnoreCase') -or $null -eq $d.usedBytes){continue}
-   try{$measuredAt=[datetimeoffset]::Parse([string]$d.usageRecordedAtISO)}catch{continue}
+   if($null -eq $d){continue}
+   $nameProperty=$d.PSObject.Properties['Name'];$pathProperty=$d.PSObject.Properties['Vhdx'];$usedProperty=$d.PSObject.Properties['usedBytes'];$measuredProperty=$d.PSObject.Properties['usageRecordedAtISO']
+   if($null -eq $nameProperty -or $null -eq $pathProperty -or $null -eq $usedProperty -or $null -eq $measuredProperty){continue}
+   if(-not [string]::Equals([string]$nameProperty.Value,$Name,'OrdinalIgnoreCase') -or -not [string]::Equals([string]$pathProperty.Value,$Vhdx,'OrdinalIgnoreCase') -or $null -eq $usedProperty.Value){continue}
+   try{$measuredAt=[datetimeoffset]::Parse([string]$measuredProperty.Value)}catch{continue}
    if($measuredAt.Date -lt $min -or $measuredAt.Date -gt $CurrentDate.Date){continue}
    $matches.Add([pscustomobject]@{At=$recordAt;Distro=$d})
   }
@@ -119,10 +124,10 @@ function Get-MachineInventoryValue {
   $e=[ordered]@{Name=[string]$disk.Name;State=$state;WslVersion=$ver;Vhdx=[string]$disk.Vhdx;FileBytes=$disk.FileBytes;UsedBytes=$null;CapBytes=$null;LargestDirectories=@();DirectoryErrors=@();Status='Unavailable';UsageSource='Unavailable';UsageRecordedAtISO=$null;CacheRecordDate=$null}
   if($state -eq 'Running' -and $ver -eq 2 -and $disk.WslVersion -eq 2){
    $p=Invoke-WslInventoryProbe $disk.Name;$e.Status=$p.Status;$e.DirectoryErrors=@($p.Errors)
-   if($p.Status -eq 'Success' -and $p.Usage){$e.UsedBytes=[long]$p.Usage.usedBytes;$e.CapBytes=[long]$p.Usage.capBytes;$e.LargestDirectories=@($p.Largest);if($p.Status -eq 'Success'){$e.Status='Success'}else{$e.Status='Partial'};$e.UsageSource='Live';$e.UsageRecordedAtISO=$CurrentTime.ToString('o')}
+   if(($p.Status -in @('Success','Partial')) -and $null -ne $p.Usage){$e.UsedBytes=[long]$p.Usage.usedBytes;$e.CapBytes=[long]$p.Usage.capBytes;$e.LargestDirectories=@($p.Largest);if($p.Status -eq 'Success'){$e.Status='Success'}else{$e.Status='Partial'};$e.UsageSource='Live';$e.UsageRecordedAtISO=$CurrentTime.ToString('o')}
   }elseif($state -eq 'Stopped' -and $ver -eq 2 -and $disk.WslVersion -eq 2){
    $c=Get-LatestCachedDistro $OutputDirectory $disk.Name $disk.Vhdx $CurrentTime
-   if($c){$e.UsedBytes=[long]$c.Distro.usedBytes;if($null -ne $c.Distro.capBytes){$e.CapBytes=[long]$c.Distro.capBytes};$e.LargestDirectories=@($c.Distro.largestDirectories);$ep=$c.Distro.PSObject.Properties['directoryErrors'];if($null -ne $ep){$e.DirectoryErrors=@($ep.Value)};$e.Status='Cached';$e.UsageSource='Cache';$e.UsageRecordedAtISO=[string]$c.Distro.usageRecordedAtISO;$e.CacheRecordDate=$c.At.ToString('o')}else{$e.Status='StoppedNoCache'}
+   if($c){$e.UsedBytes=[long]$c.Distro.usedBytes;$cp=$c.Distro.PSObject.Properties['capBytes'];if($null -ne $cp -and $null -ne $cp.Value){$e.CapBytes=[long]$cp.Value};$dp=$c.Distro.PSObject.Properties['largestDirectories'];if($null -ne $dp){$e.LargestDirectories=@($dp.Value)};$ep=$c.Distro.PSObject.Properties['directoryErrors'];if($null -ne $ep){$e.DirectoryErrors=@($ep.Value)};$e.Status='Cached';$e.UsageSource='Cache';$e.UsageRecordedAtISO=[string]$c.Distro.usageRecordedAtISO;$e.CacheRecordDate=$c.At.ToString('o')}else{$e.Status='StoppedNoCache'}
   }elseif($ver -ne 2 -or $disk.WslVersion -ne 2){$e.Status='UnsupportedWslVersion'}elseif($state -eq 'Unknown'){$e.Status='StateUnavailable'}
   $distros.Add([pscustomobject]$e)
  }
