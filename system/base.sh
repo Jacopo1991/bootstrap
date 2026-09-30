@@ -30,7 +30,7 @@ apt-get update
 apt_locked "$BOOTSTRAP_ROOT/system/apt-gh.lock"
 ln -sfn /usr/bin/fdfind /usr/local/bin/fd
 
-# Preserve unrelated distro settings while converging these three keys.
+# Preserve unrelated distro settings while converging these five keys.
 python3 - <<'PY'
 import configparser, pathlib
 path = pathlib.Path('/etc/wsl.conf')
@@ -39,7 +39,8 @@ config.optionxform = str
 if path.exists():
     config.read(path)
 for section, key, value in [('boot','systemd','true'), ('user','default','agent'),
-                            ('interop','appendWindowsPath','false')]:
+                            ('interop','appendWindowsPath','false'),
+                            ('automount','enabled','false'), ('interop','enabled','false')]:
     if not config.has_section(section):
         config.add_section(section)
     config.set(section, key, value)

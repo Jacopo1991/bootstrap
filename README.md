@@ -44,10 +44,27 @@ wsl --terminate AgentDev
 wsl -d AgentDev
 ```
 
-The default user is now `agent`, systemd is enabled, and Windows PATH import is
-disabled. The admin's Linux home has mode `0700` with its access/default ACLs
+The default user is now `agent`, systemd is enabled, and Windows drive automount,
+Windows binary interop and Windows PATH import are disabled. Terminating and
+restarting the distro is required for these settings to take effect, including
+when updating an existing installation. The admin's Linux home has mode `0700` with its access/default ACLs
 removed. Agent is locked for password login, absent from sudo/docker groups,
 and explicitly denied sudo. Agent login via `wsl -d AgentDev` still works.
+
+For a one-off task involving D:, open the admin explicitly with
+`wsl -d AgentDev -u youradmin`. Use a private mount namespace so the agent's
+sessions never receive the drive mount:
+
+```bash
+sudo unshare --mount --propagation private /bin/bash
+mkdir -p /mnt/d
+sudo mount -t drvfs D: /mnt/d
+# Perform the admin task here; do not start agent processes in this namespace.
+sudo umount /mnt/d
+exit
+```
+
+Unmount immediately after the task. Do not enable automount or interop for it.
 
 ### Design step 7 — verify the tools and user boundary
 
@@ -63,7 +80,10 @@ of managed files and installed tools around another `chezmoi apply`, then requir
 an empty diff and clean `chezmoi verify`. The boundary check requires
 `sudo -n true` to fail, checks groups, and attempts to access the admin home and
 open `~admin/.config/gh/hosts.yml` without printing any file contents. It also
-rejects an accessible Docker socket when one exists.
+rejects an accessible Docker socket when one exists. On WSL it fails for any
+drvfs/9p mount, a reachable `/mnt/c/Windows`, or enabled WSLInterop. Outside WSL
+it explicitly prints `SKIP: WSL-only checks (not WSL)`; that skip does not verify
+the live WSL boundary.
 
 From PowerShell, with other work in this distro saved:
 
@@ -186,7 +206,9 @@ Installer references: [chezmoi](https://www.chezmoi.io/),
 GitHub-hosted `ubuntu-24.04` runs pinned ShellCheck/Gitleaks. It imports the same
 checksum-pinned Ubuntu WSL filesystem into a disposable Docker container, creates
 an admin with an empty gh credential-file fixture, runs `install.sh` twice as
-that admin, then runs the distro and boundary checks as agent. This avoids the
+that admin, asserts all five `/etc/wsl.conf` keys after each install, then runs
+the distro and boundary checks as agent. The container explicitly skips the
+WSL-only runtime checks. This avoids the
 hosted runner's preinstalled PPAs and tools masking fresh-image failures. The
 single **gate** job runs with `always()` and fails if any required job failed,
 was cancelled or was skipped. CI cannot establish Windows sparse reclaim or
