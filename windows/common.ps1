@@ -40,12 +40,29 @@ public static class BootstrapDiskSize {
 '@
 }
 
+function ConvertTo-WslBasePath {
+    param([AllowNull()][AllowEmptyString()][string]$BasePath)
+    if ([string]::IsNullOrWhiteSpace($BasePath)) { return }
+    $path = [Environment]::ExpandEnvironmentVariables($BasePath)
+    if ($path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        $path = '\\' + $path.Substring(8)
+    } elseif ($path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        $path = $path.Substring(4)
+    }
+    return [IO.Path]::GetFullPath($path)
+}
+
 function Get-WslDisks {
     $registry = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
     if (-not (Test-Path -LiteralPath $registry)) { return }
     foreach ($key in Get-ChildItem -LiteralPath $registry) {
         $distro = Get-ItemProperty -LiteralPath $key.PSPath
-        $basePath = [Environment]::ExpandEnvironmentVariables($distro.BasePath)
+        $baseProperty = $distro.PSObject.Properties['BasePath']
+        $basePath = ConvertTo-WslBasePath -BasePath $(if ($null -ne $baseProperty) { $baseProperty.Value })
+        if ($null -eq $basePath) {
+            Write-Warning "Skipping WSL registry entry $($key.PSPath): missing BasePath."
+            continue
+        }
         $diskName = if ($distro.PSObject.Properties.Name -contains 'VhdFileName') {
             $distro.VhdFileName
         } else { 'ext4.vhdx' }

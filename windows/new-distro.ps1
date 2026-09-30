@@ -12,7 +12,6 @@ $marker = Join-Path $location '.bootstrap-image.sha256'
 $existing = @(Get-WslDisks | Where-Object Name -eq $Name)
 if ($existing.Count) {
     $existingPath = $existing[0].BasePath
-    if ($existingPath.StartsWith('\\?\')) { $existingPath = $existingPath.Substring(4) }
     if ([IO.Path]::GetFullPath($existingPath).TrimEnd('\') -ne $location -or $existing[0].WslVersion -ne 2) {
         throw "Existing distro $Name is not WSL 2 at $location; refusing to change it."
     }

@@ -28,9 +28,19 @@ jobs:
           persist-credentials: false
       - name: Fresh pinned Ubuntu image, bootstrap twice, distro and boundary checks
         run: bash ci/distro.sh
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Windows PowerShell 5.1 BasePath regression tests
+        shell: powershell
+        run: powershell.exe -NoProfile -File ci/windows-test.ps1
   gate:
     if: ${{ always() }}
-    needs: [lint, distro]
+    needs: [lint, distro, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -38,7 +48,9 @@ jobs:
         env:
           LINT: ${{ needs.lint.result }}
           DISTRO: ${{ needs.distro.result }}
+          WINDOWS: ${{ needs.windows.result }}
         run: |
-          printf 'lint=%s\ndistro=%s\n' "$LINT" "$DISTRO" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'lint=%s\ndistro=%s\nwindows=%s\n' "$LINT" "$DISTRO" "$WINDOWS" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$LINT" = success
           test "$DISTRO" = success
+          test "$WINDOWS" = success
