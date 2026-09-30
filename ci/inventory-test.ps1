@@ -105,8 +105,12 @@ try {
  . "$PSScriptRoot/../windows/check-compaction.ps1" -Name Test
  $log=Join-Path $env:TEMP ('bootstrap-compaction-cache-'+[guid]::NewGuid().ToString('N')+'.log')
  function Get-WslDisks {[pscustomobject]@{Name='Test';WslVersion=2;Vhdx='C:\mock\ext4.vhdx';FileBytes=850GB}}
- function Get-WslDistroState {param($Name);[pscustomobject]@{State='Stopped';Version=2}}
- function Invoke-Wsl {throw 'Stopped distro must never launch.'}
+ $calls=[collections.generic.list[string]]::new()
+ function Invoke-BoundedNative {param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
+  $calls.Add(($Arguments -join ' '))
+  if($Arguments[0] -eq '--list'){return [pscustomobject]@{Status='Success';Output=(' NAME STATE VERSION'+[Environment]::NewLine+'* Test Stopped 2');ExitCode=0}}
+  throw 'Stopped distro must never invoke a distro command.'
+ }
  function Get-LatestCachedDistro {param($Directory,$Name,$Vhdx,$CurrentDate);[pscustomobject]@{At=[datetimeoffset]::Now;Distro=[pscustomobject]@{usedBytes=800GB;capBytes=900GB;usageRecordedAtISO='2026-09-30T02:30:00+02:00'}}}
  try {
   Invoke-WslCompactionCheck -Name Test -LogPath $log -InventoryDirectory $fixture|Out-Null
@@ -114,6 +118,7 @@ try {
   Assert-True ($text.Contains('Source=Cache')) 'cache provenance in compaction log'
   Assert-True ($text.Contains('RecordedAt=2026-09-30T02:30:00+02:00')) 'cache timestamp in log'
   Assert-True ($text.Contains('COMPACTION RECOMMENDED:')) 'cached cap threshold applies while stopped'
+  Assert-Equal ($calls -join ',') '--list --verbose' 'stopped check only lists states and never invokes distro'
  } finally {Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue}
 }
 
@@ -144,13 +149,19 @@ try {
 }
 & {
  . "$PSScriptRoot/../windows/inventory.ps1"
+ $probeFailure=$false
  function Invoke-BoundedNative {param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
+  if($probeFailure){return [pscustomobject]@{Status='Success';Output='{"usage":null,"largestDirectories":[],"errors":["usage-unavailable"]}';ExitCode=0}}
   $dirs=@();for($i=1;$i -le 12;$i++){$dirs+=@{path="/home/u$i";bytes=$i}}
   [pscustomobject]@{Status='Success';Output=(@{usage=@{capBytes=1000;usedBytes=400};largestDirectories=$dirs;errors=@()}|ConvertTo-Json -Depth 5 -Compress);ExitCode=0}
  }
  $result=Invoke-WslInventoryProbe -Name Test
  Assert-Equal $result.Largest.Count 10 'probe keeps only ten largest directories'
  Assert-Equal $result.Largest[0].path '/home/u12' 'probe sorts largest directories first'
+ $probeFailure=$true;$result=Invoke-WslInventoryProbe -Name Test
+ Assert-Equal $result.Status Partial 'missing df data is a partial probe'
+ Assert-Equal $result.Usage $null 'missing df data does not fabricate usage'
+ Assert-Equal $result.Errors[0] usage-unavailable 'df failure has a fixed status code'
 }
 
 & {

@@ -32,13 +32,14 @@ function Invoke-BoundedNative {
 $script:InventoryPython=@'
 import json,os,pathlib,subprocess,time
 usage=None
+sizes=[];errors=[]
 try:
  r=subprocess.run(["df","-B1","--output=size,used","/"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=5,text=True)
  f=r.stdout.splitlines()[-1].split()
  if r.returncode==0 and len(f)>=2: usage={"capBytes":int(f[0]),"usedBytes":int(f[1])}
 except Exception: pass
+if usage is None: errors.append("usage-unavailable")
 deadline=time.monotonic()+54
-sizes=[];errors=[]
 for root in ("/home","/var"):
  try: children=list(pathlib.Path(root).iterdir())
  except FileNotFoundError: errors.append("missing-"+root[1:]);continue
@@ -82,7 +83,7 @@ function Get-ValidInventoryRecord {
 function Get-LatestCachedDistro {
  param([string]$Directory,[string]$Name,[string]$Vhdx,[datetime]$CurrentDate)
  if(-not(Test-Path -LiteralPath $Directory -PathType Container)){return}
- $min=$CurrentDate.Date.AddDays(-29);$matches=[collections.generic.list[object]]::new()
+ $min=$CurrentDate.Date.AddDays(-29);$cacheCandidates=[collections.generic.list[object]]::new()
  foreach($f in Get-ChildItem -LiteralPath $Directory -File){
   if($f.Name -notmatch '^\d{4}-\d{2}-\d{2}\.json$'){continue}
   try{$date=[datetime]::ParseExact($f.BaseName,'yyyy-MM-dd',[globalization.cultureinfo]::InvariantCulture)}catch{continue}
@@ -96,10 +97,10 @@ function Get-LatestCachedDistro {
    if(-not [string]::Equals([string]$nameProperty.Value,$Name,'OrdinalIgnoreCase') -or -not [string]::Equals([string]$pathProperty.Value,$Vhdx,'OrdinalIgnoreCase') -or $null -eq $usedProperty.Value){continue}
    try{$measuredAt=[datetimeoffset]::Parse([string]$measuredProperty.Value)}catch{continue}
    if($measuredAt.Date -lt $min -or $measuredAt.Date -gt $CurrentDate.Date){continue}
-   $matches.Add([pscustomobject]@{At=$recordAt;Distro=$d})
+   $cacheCandidates.Add([pscustomobject]@{At=$recordAt;Distro=$d})
   }
  }
- $matches|Sort-Object At -Descending|Select-Object -First 1
+ $cacheCandidates|Sort-Object At -Descending|Select-Object -First 1
 }
 function Invoke-WslInventoryProbe {
  param([string]$Name)
@@ -108,7 +109,7 @@ function Invoke-WslInventoryProbe {
  if($r.Status -ne 'Success'){return [pscustomobject]@{Status=$r.Status;Usage=$null;Largest=@();Errors=@()}}
  try{$d=$r.Output|ConvertFrom-Json;$u=$d.usage;if($u -and ($u.capBytes -lt 1 -or $u.usedBytes -lt 0)){throw 'bad'}
   $dirs=@($d.largestDirectories|?{$_.path -match '^/(home|var)/[^/]+$' -and $_.bytes -ge 0}|select -First 10)
-  [pscustomobject]@{Status=if(@($d.errors).Count -gt 0){'Partial'}else{'Success'};Usage=$u;Largest=$dirs;Errors=@($d.errors|Where-Object{$_ -in 'missing-home','missing-var','unreadable-home','unreadable-var','scan-error'})}
+  [pscustomobject]@{Status=if(@($d.errors).Count -gt 0){'Partial'}else{'Success'};Usage=$u;Largest=$dirs;Errors=@($d.errors|Where-Object{$_ -in 'missing-home','missing-var','unreadable-home','unreadable-var','scan-error','usage-unavailable'})}
  }catch{[pscustomobject]@{Status='InvalidProbeOutput';Usage=$null;Largest=@();Errors=@()}}
 }
 function Get-MachineInventoryValue {
