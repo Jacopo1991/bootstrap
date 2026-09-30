@@ -33,7 +33,11 @@ if ($existing.Count) {
     # Microsoft documents --from-file and --name for modern distros, and
     # --location / --no-launch in its Basic commands reference.
     Invoke-Wsl -WslArgs @('--install', '--from-file', $image, '--name', $Name, '--location', $location, '--no-launch')
-    Invoke-Wsl -WslArgs @('--set-version', $Name, '2')
+    $installed = @(Get-WslDisks | Where-Object Name -eq $Name)
+    if ($installed.Count -ne 1) { throw "Installed distro $Name could not be read back." }
+    if ($installed[0].WslVersion -ne 2) {
+        Invoke-Wsl -WslArgs @('--set-version', $Name, '2')
+    }
     Set-Content -LiteralPath $marker -Value $expected -Encoding ascii -NoNewline
 }
 Invoke-Wsl -WslArgs @('--terminate', $Name)
