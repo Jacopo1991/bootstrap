@@ -280,3 +280,26 @@ PowerShell 5.1 tests with WSL, diskpart and scheduling mocked, covering config
 merge/backup, creation/cap checks, refusal rules and idle skipping. It is required
 by the gate. CI cannot establish physical VHDX compaction or
 physical NVIDIA GPU behavior; run those host checks in steps 7 and 8.
+
+### Monthly pin review
+
+The monthly pin workflow runs on the first day of each month at 01:30 UTC. It
+resolves the Ubuntu snapshot and base apt locks together, and resolves each
+vendor apt lock against that vendor's own signed repository. It refreshes exact
+stable releases when the official release artifact can be identified and
+checksum-pinned, keeps Node on the 24 LTS line and Python on 3.12, and regenerates
+the full npm lock with lockfile version 2 before requiring `npm ci` to pass.
+Every unresolved component stays at its previous pin and is listed in the
+workflow summary and pull request body. The moving Claude installer and signing
+key rotations stay pinned until a version-bound official mapping can be checked.
+
+The workflow opens or updates a monthly pull request and never merges it. After
+publishing the branch, it explicitly dispatches the existing `gate.yml` workflow
+against that branch, then accepts only a new `workflow_dispatch` run whose
+workflow, branch and head SHA match the pull request exactly. The update job uses
+the repository's built-in Actions token with contents, pull request and Actions
+write permission; it does not require a stored token. A repository administrator
+must enable **Allow GitHub Actions to create and approve pull requests**. Keep
+the existing `gate` job required and allow the `workflow_dispatch` event under
+any Actions execution policy. A manual run defaults to a read-only candidate
+preview; select the non-preview option only when a pull request is intended.
