@@ -50,6 +50,7 @@ if has_agent_session_interop '' "$tmp/WSL" '999 789 2 1' "$tmp/proc"; then
   echo 'FAIL: /init executable socket flagged as session interop.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1;
 fi
 has_agent_session_interop '' "$tmp/WSL" '999 123 789 2 1' "$tmp/proc" || { echo 'FAIL: user-session ancestor socket missed.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1; }
+has_agent_session_interop '' "$tmp/WSL" '1 2 789 123' "$tmp/proc" || { echo 'FAIL: init ancestors stopped user-session socket detection.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1; }
 if has_agent_session_interop '' "$tmp/WSL" 456 "$tmp/proc"; then
   echo 'FAIL: unrelated session socket flagged.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1;
 fi
