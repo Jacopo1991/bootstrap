@@ -5,3 +5,4 @@ node_modules/
 *.wsl
 *.env
 !home/.chezmoitemplates/pins.env
+!checks/gpu-image.env

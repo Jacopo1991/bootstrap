@@ -181,8 +181,11 @@ Installer references: [chezmoi](https://www.chezmoi.io/),
 
 ## CI
 
-GitHub-hosted `ubuntu-24.04` runs pinned ShellCheck/Gitleaks and runs `install.sh`
-twice as its admin account, then the distro and boundary checks as agent. The
+GitHub-hosted `ubuntu-24.04` runs pinned ShellCheck/Gitleaks. It imports the same
+checksum-pinned Ubuntu WSL filesystem into a disposable Docker container, creates
+an admin with an empty gh credential-file fixture, runs `install.sh` twice as
+that admin, then runs the distro and boundary checks as agent. This avoids the
+hosted runner's preinstalled PPAs and tools masking fresh-image failures. The
 single **gate** job runs with `always()` and fails if any required job failed,
 was cancelled or was skipped. CI cannot establish Windows sparse reclaim or
 physical NVIDIA GPU behavior; run those host checks in steps 7 and 8.

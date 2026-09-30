@@ -7,5 +7,5 @@ useDefault = true
 description = "Public release and apt key checksums"
 condition = "AND"
 paths = ['''^home/\.chezmoitemplates/pins\.env$''']
-regexTarget = "line"
+regexTarget = "match"
 regexes = ['''^(SECRETSPEC|GH_KEY|DOCKER_KEY|NVIDIA_KEY)_SHA256='[a-f0-9]{64}'$''']

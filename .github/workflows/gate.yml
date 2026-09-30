@@ -26,18 +26,8 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Bootstrap twice as admin
-        env:
-          CHEZMOI_GIT_NAME: Bootstrap CI
-          CHEZMOI_GIT_EMAIL: bootstrap-ci@example.invalid
-        run: |
-          bash install.sh
-          bash install.sh
-      - name: Distro and boundary checks as agent
-        run: |
-          cd /tmp
-          sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh
-          sudo -H -u agent bash /opt/machine-bootstrap/current/checks/boundary.sh
+      - name: Fresh pinned Ubuntu image, bootstrap twice, distro and boundary checks
+        run: bash ci/distro.sh
   gate:
     if: ${{ always() }}
     needs: [lint, distro]
