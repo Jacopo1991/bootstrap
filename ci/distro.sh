@@ -13,7 +13,9 @@ cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT
+echo 'Downloading the pinned Ubuntu WSL filesystem (389 MB).'
 download_verified "$UBUNTU_IMAGE_URL" "$UBUNTU_IMAGE_SHA256" "$tmp/ubuntu.wsl"
+echo 'Ubuntu checksum verified; importing the fresh filesystem.'
 docker import "$tmp/ubuntu.wsl" "$image" >/dev/null
 docker run --name "$container" --rm \
   --mount "type=bind,src=$ROOT,dst=/repo,readonly" \

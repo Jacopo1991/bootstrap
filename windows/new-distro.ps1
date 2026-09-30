@@ -9,7 +9,8 @@ if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64
 $location = [IO.Path]::GetFullPath("D:\wsl\$Name")
 $existing = @(Get-WslDisks | Where-Object Name -eq $Name)
 if ($existing.Count) {
-    $existingPath = $existing[0].BasePath -replace '^\\\?\\', ''
+    $existingPath = $existing[0].BasePath
+    if ($existingPath.StartsWith('\\?\')) { $existingPath = $existingPath.Substring(4) }
     if ([IO.Path]::GetFullPath($existingPath).TrimEnd('\') -ne $location -or $existing[0].WslVersion -ne 2) {
         throw "Existing distro $Name is not WSL 2 at $location; refusing to change it."
     }

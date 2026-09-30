@@ -16,7 +16,8 @@ require_root() {
 
 download_verified() {
   local url=$1 checksum=$2 target=$3
-  curl --fail --silent --show-error --location --retry 3 "$url" -o "$target"
+  curl --fail --silent --show-error --location --retry 3 \
+    --connect-timeout 30 --max-time 900 --speed-time 60 --speed-limit 1024 "$url" -o "$target"
   printf '%s  %s\n' "$checksum" "$target" | sha256sum --check --status
 }
 
