@@ -145,7 +145,7 @@ function Get-MachineInventoryValue {
 function Write-AtomicInventoryJson {
  param([string]$Path,[string]$Json)
  $tmp=Join-Path (Split-Path -Parent $Path) ('.inventory-'+[guid]::NewGuid().ToString('N')+'.tmp')
- try{[IO.File]::WriteAllText($tmp,$Json,[text.UTF8Encoding]::new($false));if([IO.File]::Exists($Path)){[IO.File]::Replace($tmp,$Path,$null)}else{[IO.File]::Move($tmp,$Path)}}finally{if([IO.File]::Exists($tmp)){[IO.File]::Delete($tmp)}}
+ try{[IO.File]::WriteAllText($tmp,$Json,[text.UTF8Encoding]::new($false));if([IO.File]::Exists($Path)){[IO.File]::Replace($tmp,$Path,[System.Management.Automation.Language.NullString]::Value)}else{[IO.File]::Move($tmp,$Path)}}finally{if([IO.File]::Exists($tmp)){[IO.File]::Delete($tmp)}}
 }
 function Remove-ExpiredInventoryRecords {
  param([string]$Directory,[datetime]$CurrentDate)
