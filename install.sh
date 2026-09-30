@@ -29,6 +29,9 @@ revision=$(git -C "$ROOT" rev-parse HEAD)
 public_source="/opt/machine-bootstrap/revisions/$revision"
 sudo install -d -m 0755 "$public_source"
 git -C "$ROOT" archive HEAD | sudo tar -xf - -C "$public_source"
+# chezmoi init expects a Git source. Create fresh metadata without copying the
+# admin's repository config, credentials, templates or hooks.
+sudo git -C "$public_source" init --quiet --initial-branch=main --template=
 sudo chown -R root:root "$public_source"
 sudo chmod -R go-w "$public_source"
 sudo ln -sfn "$public_source" /opt/machine-bootstrap/current
