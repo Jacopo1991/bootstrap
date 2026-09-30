@@ -1,0 +1,6 @@
+# Managed by chezmoi for the dedicated agent user.
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib"
+export DISABLE_AUTOUPDATER=1
+case $- in
+  *i*) eval "$(mise activate bash)" ;;
+esac

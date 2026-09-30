@@ -1,0 +1,11 @@
+{{- $name := env "CHEZMOI_GIT_NAME" -}}
+{{- $email := env "CHEZMOI_GIT_EMAIL" -}}
+{{- if not $name -}}
+{{- $name = promptStringOnce . "gitName" "Git name" -}}
+{{- end -}}
+{{- if not $email -}}
+{{- $email = promptStringOnce . "gitEmail" "Git email" -}}
+{{- end -}}
+[data]
+gitName = {{ $name | quote }}
+gitEmail = {{ $email | quote }}

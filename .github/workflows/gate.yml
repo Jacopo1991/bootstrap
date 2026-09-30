@@ -1,0 +1,54 @@
+name: Bootstrap
+on:
+  push:
+    branches: [main, feat/public-wsl-bootstrap]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: bootstrap-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: bash ci/lint.sh
+  distro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Bootstrap twice as admin
+        env:
+          CHEZMOI_GIT_NAME: Bootstrap CI
+          CHEZMOI_GIT_EMAIL: bootstrap-ci@example.invalid
+        run: |
+          bash install.sh
+          bash install.sh
+      - name: Distro and boundary checks as agent
+        run: |
+          cd /tmp
+          sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh
+          sudo -H -u agent bash /opt/machine-bootstrap/current/checks/boundary.sh
+  gate:
+    if: ${{ always() }}
+    needs: [lint, distro]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report all required results
+        env:
+          LINT: ${{ needs.lint.result }}
+          DISTRO: ${{ needs.distro.result }}
+        run: |
+          printf 'lint=%s\ndistro=%s\n' "$LINT" "$DISTRO" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$LINT" = success
+          test "$DISTRO" = success

@@ -1,0 +1,7 @@
+work/
+outputs/
+node_modules/
+*.vhdx
+*.wsl
+*.env
+!home/.chezmoitemplates/pins.env

@@ -1,0 +1,4 @@
+nvidia-container-toolkit=1.20.1-1
+nvidia-container-toolkit-base=1.20.1-1
+libnvidia-container-tools=1.20.1-1
+libnvidia-container1=1.20.1-1

@@ -1,0 +1,9 @@
+{
+  "name": "public-agent-tools",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@openai/codex": "0.159.2",
+    "ccusage": "20.0.26"
+  }
+}
