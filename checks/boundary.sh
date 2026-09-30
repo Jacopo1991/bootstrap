@@ -13,10 +13,16 @@ has_windows_drive_mount() {
 # Binfmt registration can remain enabled even when Windows process launch is
 # blocked. Check only this agent login's environment and its own session socket.
 has_agent_session_interop() {
-  local interop_is_set=${1:-} socket_dir=${2:-/run/WSL} pid_list=${3-} pid
+  local interop_is_set=${1:-} socket_dir=${2:-/run/WSL} pid_list=${3-}
+  local proc_dir=${4:-/proc} pid exe
   [[ -n $interop_is_set ]] && return 0
   for pid in $pid_list; do
     [[ $pid =~ ^[0-9]+$ ]] || continue
+    # WSL init sockets persist even with interop disabled; they are not evidence
+    # of an enabled user session. Keep checking every non-init ancestor.
+    [[ $pid == 1 || $pid == 2 ]] && continue
+    exe=$(readlink -- "$proc_dir/$pid/exe" 2>/dev/null || true)
+    [[ $exe == /init ]] && continue
     [[ -S "$socket_dir/${pid}_interop" ]] && return 0
   done
   return 1
