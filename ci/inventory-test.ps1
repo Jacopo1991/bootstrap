@@ -59,22 +59,22 @@ try {
  }
  & {
   $probeDir=Join-Path $fixture 'probe';[IO.Directory]::CreateDirectory($probeDir)|Out-Null
-  $state=@{Calls=[collections.generic.list[string]]::new();Running=$false;Partial=$false;ProbeCalls=0}
+  $inventoryFixtureState=@{Calls=[collections.generic.list[string]]::new();Running=$false;Partial=$false;ProbeCalls=0}
   function Get-WslDisks {[pscustomobject]@{Name='Test';WslVersion=2;Vhdx='C:\mock\ext4.vhdx';FileBytes=900;BasePath='C:\mock'}}
   function Invoke-BoundedNative {param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
-   $state.Calls.Add(($Arguments -join ' '))
-   if($Arguments[0] -eq '--list'){$out=' NAME STATE VERSION'+[Environment]::NewLine+$(if($state.Running){'* Test Running 2'}else{'* Test Stopped 2'});return [pscustomobject]@{Status='Success';Output=$out;ExitCode=0}}
+   $inventoryFixtureState.Calls.Add(($Arguments -join ' '))
+   if($Arguments[0] -eq '--list'){$out=' NAME STATE VERSION'+[Environment]::NewLine+$(if($inventoryFixtureState.Running){'* Test Running 2'}else{'* Test Stopped 2'});return [pscustomobject]@{Status='Success';Output=$out;ExitCode=0}}
    if($Arguments[0] -eq '--version'){return [pscustomobject]@{Status='Success';Output='WSL version: 2.5.0';ExitCode=0}}
    [pscustomobject]@{Status='Failed';Output='sensitive-like diagnostic';ExitCode=1}
   }
-  function Invoke-WslInventoryProbe {param($Name);$state.ProbeCalls++;[pscustomobject]@{Status=$(if($state.Partial){'Partial'}else{'Success'});Usage=[pscustomobject]@{capBytes=1000;usedBytes=800};Largest=@([pscustomobject]@{path='/home/agent';bytes=50});Errors=$(if($state.Partial){@('missing-var')}else{@()})}}
+  function Invoke-WslInventoryProbe {param($Name);$inventoryFixtureState.ProbeCalls++;[pscustomobject]@{Status=$(if($inventoryFixtureState.Partial){'Partial'}else{'Success'});Usage=[pscustomobject]@{capBytes=1000;usedBytes=800};Largest=@([pscustomobject]@{path='/home/agent';bytes=50});Errors=$(if($inventoryFixtureState.Partial){@('missing-var')}else{@()})}}
   function Get-PSDrive {param($Name,$PSProvider,$ErrorAction);[pscustomobject]@{Free=123}}
   function Test-Path {param($LiteralPath,$PathType);if($LiteralPath -like 'HKLM:*'){return $false};if($PathType){Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType -ErrorAction SilentlyContinue}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -ErrorAction SilentlyContinue}}
   function Get-ItemProperty {throw 'No registry value'}
   function Get-ScheduledTask {param($TaskName,$ErrorAction);[pscustomobject]@{TaskName='MachineBootstrap-Inventory';State='Ready'}}
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01')
-  Assert-Equal $state.ProbeCalls 0 'stopped distro never probed'
-  Assert-Equal ($state.Calls -match '^-d') $false 'stopped state has no distro invocation'
+  Assert-Equal $inventoryFixtureState.ProbeCalls 0 'stopped distro never probed'
+  Assert-Equal ($inventoryFixtureState.Calls -match '^-d') $false 'stopped state has no distro invocation'
   Assert-Equal $v.distros[0].Status StoppedNoCache 'missing cache explicit'
   Assert-Equal $v.distros[0].UsedBytes $null 'no invented stopped usage'
   Assert-Equal $v.taskStates[0].Name MachineBootstrap-Inventory 'task metadata captured'
@@ -87,13 +87,13 @@ try {
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T02:00:00')
   Assert-Equal $v.distros[0].UsageSource Cache 'stopped usage source cache'
   Assert-Equal $v.distros[0].UsedBytes 700 'cached usage retained'
-  Assert-Equal $state.ProbeCalls 0 'cache never launches stopped distro'
-  $state.Running=$true
+  Assert-Equal $inventoryFixtureState.ProbeCalls 0 'cache never launches stopped distro'
+  $inventoryFixtureState.Running=$true
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T03:00:00')
-  Assert-Equal $state.ProbeCalls 1 'running distro gets one bounded probe'
+  Assert-Equal $inventoryFixtureState.ProbeCalls 1 'running distro gets one bounded probe'
   Assert-Equal $v.distros[0].UsageSource Live 'running usage source live'
   Assert-Equal $v.distros[0].largestDirectories.Count 1 'directory summary returned'
-  $state.Partial=$true;$v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T04:00:00')
+  $inventoryFixtureState.Partial=$true;$v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T04:00:00')
   Assert-Equal $v.distros[0].Status Partial 'partial directory scan is visible'
   Assert-Equal $v.distros[0].UsedBytes 800 'partial scan preserves valid filesystem usage'
   Assert-Equal $v.distros[0].DirectoryErrors[0] missing-var 'partial scan exposes fixed error code'
@@ -124,11 +124,11 @@ try {
 
 & {
  . "$PSScriptRoot/../windows/install-inventory-task.ps1"
- $state=@{Tasks=0;Copied=[collections.generic.list[string]]::new()}
+ $inventoryTaskFixtureState=@{Tasks=0;Copied=[collections.generic.list[string]]::new()}
  function Assert-BootstrapAdministrator {}
  function New-Item {param($ItemType,[switch]$Force,$Path)}
  function Set-Acl {param($LiteralPath,$AclObject);Assert-Equal $AclObject.AreAccessRulesProtected $true 'inventory task directory ACL protected'|Out-Null}
- function Copy-Item {param($LiteralPath,$Destination,[switch]$Force);$state.Copied.Add([IO.Path]::GetFileName($LiteralPath))}
+ function Copy-Item {param($LiteralPath,$Destination,[switch]$Force);$inventoryTaskFixtureState.Copied.Add([IO.Path]::GetFileName($LiteralPath))}
  function Register-ScheduledTask {param($TaskName,$Xml,[switch]$Force)
   Assert-Equal $TaskName MachineBootstrap-Inventory 'stable task identity'|Out-Null
   Assert-Equal ([bool]$Force) $true 'task registration converges'|Out-Null
@@ -139,13 +139,13 @@ try {
   Assert-Equal $doc.SelectSingleNode('//t:Principal/t:LogonType',$ns).InnerText S4U 'inventory task stores no password'|Out-Null
   Assert-Equal $doc.SelectSingleNode('//t:Principal/t:RunLevel',$ns).InnerText HighestAvailable 'inventory task elevated'|Out-Null
   Assert-Equal ($doc.SelectSingleNode('//t:Exec/t:Arguments',$ns).InnerText.Contains('-OutputDirectory')) $true 'task writes to inventory folder'|Out-Null
-  $state.Tasks++
+  $inventoryTaskFixtureState.Tasks++
  }
  function Get-ScheduledTask {param($TaskName);[pscustomobject]@{TaskName=$TaskName;State='Ready'}}
  Install-MachineInventoryTask
  Install-MachineInventoryTask
- Assert-Equal $state.Tasks 2 'repeat task install converges same task'
- Assert-Equal ($state.Copied -join ',') 'common.ps1,inventory.ps1,common.ps1,inventory.ps1' 'only fixed inventory scripts copied'
+ Assert-Equal $inventoryTaskFixtureState.Tasks 2 'repeat task install converges same task'
+ Assert-Equal ($inventoryTaskFixtureState.Copied -join ',') 'common.ps1,inventory.ps1,common.ps1,inventory.ps1' 'only fixed inventory scripts copied'
 }
 & {
  . "$PSScriptRoot/../windows/inventory.ps1"
