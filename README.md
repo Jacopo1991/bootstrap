@@ -129,7 +129,7 @@ model files; no model service or credentials are used.
 | Node/Python/uv global tools | `home/dot_config/mise/config.toml` |
 | Codex CLI and ccusage, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
 | Explicit apt package versions (held after install) | `system/apt-*.lock` |
-| Ubuntu dependency resolution | Signed Ubuntu snapshot `20260901T000000Z` |
+| Ubuntu dependency resolution | Signed Ubuntu snapshot `20260930T000000Z` |
 | apt signing key hashes | `home/.chezmoitemplates/pins.env` |
 | GPU Python packages and all dependencies with hashes | `checks/gpu-requirements.lock` |
 | GPU container image | `checks/gpu-image.env` |

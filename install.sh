@@ -2,6 +2,9 @@
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ $EUID != 0 && $(id -un) != agent ]] || { echo 'Run as the non-root admin user.' >&2; exit 1; }
+[[ -z $(git -C "$ROOT" status --porcelain) ]] || {
+  echo 'Commit bootstrap changes before running install.sh.' >&2; exit 1;
+}
 sudo -v
 bash_cmd=/bin/bash
 sudo "$bash_cmd" "$ROOT/system/base.sh"
@@ -22,9 +25,6 @@ if ! cmp -s "$tmp/mise/bin/mise" /usr/local/bin/mise; then
 fi
 
 # Publish only committed public files, never the admin's .git config or home.
-[[ -z $(git -C "$ROOT" status --porcelain) ]] || {
-  echo 'Commit bootstrap changes before running install.sh.' >&2; exit 1;
-}
 revision=$(git -C "$ROOT" rev-parse HEAD)
 public_source="/opt/machine-bootstrap/revisions/$revision"
 sudo install -d -m 0755 "$public_source"
