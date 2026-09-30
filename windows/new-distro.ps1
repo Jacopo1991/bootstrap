@@ -1,6 +1,7 @@
 # Minimum supported WSL 2.5.0; run from PowerShell on Windows, amd64.
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9_-]{0,47}$')][string]$Name)
+param([Parameter(Mandatory)][ValidatePattern('^[A-Za-z][A-Za-z0-9_-]{0,47}$')][string]$Name,
+      [ValidateRange(1, 65536)][int]$MaxSizeGB=800)
 . "$PSScriptRoot/common.ps1"
 Assert-WslVersion
 if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') {
@@ -32,6 +33,7 @@ if ($existing.Count) {
     }
     # Microsoft documents --from-file and --name for modern distros, and
     # --location / --no-launch in its Basic commands reference.
+    Set-WslVhdCap -MaxSizeGB $MaxSizeGB
     Invoke-Wsl -WslArgs @('--install', '--from-file', $image, '--name', $Name, '--location', $location, '--no-launch')
     $installed = @(Get-WslDisks | Where-Object Name -eq $Name)
     if ($installed.Count -ne 1) { throw "Installed distro $Name could not be read back." }
@@ -40,7 +42,8 @@ if ($existing.Count) {
     }
     Set-Content -LiteralPath $marker -Value $expected -Encoding ascii -NoNewline
 }
+Get-CompactableWslDisk -Name $Name | Out-Null
+$usage = Assert-WslCap -Name $Name -MaxSizeGB $MaxSizeGB
 Invoke-Wsl -WslArgs @('--terminate', $Name)
-Invoke-Wsl -WslArgs @('--manage', $Name, '--set-sparse', 'true')
-Write-Output "Installed $Name at $location; sparse mode enabled."
+Write-Output "Installed $Name at $location; filesystem cap read-back $($usage.CapBytes) bytes (limit ${MaxSizeGB}GB). Sparse mode is off."
 Write-Output "Next: wsl -d $Name (create the non-root admin user; do not name it agent)."

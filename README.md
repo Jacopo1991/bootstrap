@@ -13,7 +13,7 @@ must never enter this repository, command examples, logs or CI.
 From a Windows checkout of this repository in PowerShell:
 
 ```powershell
-.\windows\new-distro.ps1 -Name AgentDev
+.\windows\new-distro.ps1 -Name AgentDev -MaxSizeGB 800
 wsl -d AgentDev
 ```
 
@@ -89,17 +89,55 @@ From PowerShell, with other work in this distro saved:
 
 ```powershell
 .\windows\vhdx-size.ps1
-.\checks\sparse-check.ps1 -Name AgentDev
+.\checks\compact-check.ps1 -Name AgentDev -MaxSizeGB 800
+.\windows\install-compaction-task.ps1 -Name AgentDev
 ```
 
-The sparse check writes **5 GiB of real random data** into a unique temporary
-file inside the selected distro, deletes only that file, syncs and runs root
-`fstrim /`. It terminates only that distro and waits up to three minutes for at
-least 4 GiB of allocated Windows disk space to be reclaimed. A sparse VHDX's
-logical file length can remain constant; `AllocatedBytes` is the actual Windows
-storage used. Ensure at least 6 GiB is free inside Linux and sufficient free
-space on the Windows disk. Cleanup runs on failure too. WSL 1 distros have no
-VHDX and are printed with empty size fields by `vhdx-size.ps1`.
+Run the compaction check and task installer in **elevated Windows PowerShell as
+the Windows account that owns the distro**. Save all work in that distro first.
+The check verifies the filesystem cap, writes **5 GiB of real random data** into
+a unique temporary file, deletes only that file, syncs, and compacts. It requires
+the VHDX file length to shrink by at least 4 GiB. Ensure at least 6 GiB is free
+inside Linux and sufficient free space on the Windows disk. Cleanup runs on
+failure too. `vhdx-size.ps1` reports file/allocated bytes and Linux used/cap bytes;
+reading Linux usage starts a stopped WSL 2 distro. WSL 1 has empty size fields.
+
+### VHD cap and automatic compaction
+
+Sparse VHD mode is never enabled. The [WSL 2.5.6 release note](https://github.com/microsoft/WSL/releases/tag/2.5.6)
+puts sparse VHD support behind `--allow-unsafe`; WSL warns of potential data
+corruption. This setup uses a normal dynamic VHDX with an **800 GiB default cap**
+and explicit compaction instead.
+
+Before a fresh install, `new-distro.ps1` merges `[wsl2] defaultVhdSize=800GB` into
+`%USERPROFILE%\.wslconfig`, preserving other keys and comments. An existing file
+is backed up beside it before any change. Rerunning the same merge changes
+nothing. `-MaxSizeGB` selects another cap (GB here means 1024 cubed bytes).
+This global default affects future VHDs, not existing ones. If the WSL VM is
+already running, the change may not be active yet: save your other WSL work and
+stop it yourself before creation. The installer does not stop other distros;
+it reads `df -B1` as root and fails if the new filesystem exceeds the requested
+cap. It also refuses sparse VHDXs and an existing `sparseVhd=true` configuration.
+Keep `sparseVhd` off. Raising an existing cap later uses
+`wsl --manage AgentDev --resize 1000GB`; follow Microsoft's
+[disk-space guidance](https://learn.microsoft.com/en-us/windows/wsl/disk-space).
+
+Manual compaction: `.\windows\compact-distro.ps1 -Name AgentDev`.
+It refuses missing/WSL 1/sparse disks, runs root `fstrim /`, terminates only the
+named distro, waits up to 120 seconds for its VHDX to detach, and uses diskpart
+to attach read-only, compact, then detach. It logs file bytes before/after.
+It never shuts down all of WSL or operates on another distro.
+
+The task installer copies the compactor and common script into an admin-only
+`C:\ProgramData\machine-bootstrap` directory and converges one task per distro.
+It runs **Sunday at 03:30 local time**, under the distro owner's account with
+highest privileges (S4U, no stored password), using `-IfIdle` and logging to
+`C:\ProgramData\machine-bootstrap\compact.log`. The owner must be an administrator.
+Busy distros exit successfully without TRIM, termination or diskpart. The idle
+probe allows only recognized OS daemons owned by system accounts; any user
+process or unknown daemon blocks compaction. It checks again after TRIM, before
+termination. Schedule it for a quiet period; a concurrent new process can race
+the last idle check. No scheduled task is installed automatically during creation.
 
 This checks the requested Linux user boundary. The Windows account that owns WSL
 can still launch the distro as root; this is not a boundary against that owner.
@@ -183,15 +221,16 @@ required flags in the installed `wsl --help`. Sources verified 2026-09-30:
   documents `--from-file` and `--name`; modern distro support begins at 2.4.4.
 - Microsoft [Disk space](https://learn.microsoft.com/en-us/windows/wsl/disk-space)
   documents the supported `--manage` baseline as 2.5 and higher.
-- Microsoft [September 2023 WSL update](https://devblogs.microsoft.com/commandline/windows-subsystem-for-linux-september-2023-update/)
-  documents `wsl --manage <distro> --set-sparse <true/false>`.
+- Microsoft [WSL configuration](https://learn.microsoft.com/en-us/windows/wsl/wsl-config)
+  documents `defaultVhdSize` for new virtual disks.
+- Microsoft [compact vdisk](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/compact-vdisk)
+  requires a detached or read-only attached dynamic VHD.
 - Canonical [Install Ubuntu on WSL 2](https://ubuntu.com/wsl/docs/latest/howto/install-ubuntu-wsl2/)
   specifies 2.4.10 or higher for its modern Ubuntu distro format.
 
 The resulting command is `wsl --install --from-file <pinned-image> --name <name>
---location D:\wsl\<name> --no-launch`, followed by `wsl --set-version <name> 2`,
-`wsl --terminate <name>` and
-`wsl --manage <name> --set-sparse true`. An existing name is reused only if it is
+--location D:\wsl\<name> --no-launch`, followed by `wsl --set-version <name> 2`
+only when needed, a cap read-back and `wsl --terminate <name>`. An existing name is reused only if it is
 already WSL 2 at the requested path and has the matching image marker written by
 this script; no distro is unregistered or moved.
 
@@ -211,5 +250,8 @@ the distro and boundary checks as agent. The container explicitly skips the
 WSL-only runtime checks. This avoids the
 hosted runner's preinstalled PPAs and tools masking fresh-image failures. The
 single **gate** job runs with `always()` and fails if any required job failed,
-was cancelled or was skipped. CI cannot establish Windows sparse reclaim or
+was cancelled or was skipped. A `windows-latest` job explicitly runs Windows
+PowerShell 5.1 tests with WSL, diskpart and scheduling mocked, covering config
+merge/backup, creation/cap checks, refusal rules and idle skipping. It is required
+by the gate. CI cannot establish physical VHDX compaction or
 physical NVIDIA GPU behavior; run those host checks in steps 7 and 8.
