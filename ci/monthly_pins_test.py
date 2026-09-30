@@ -212,7 +212,7 @@ class ResolverTests(unittest.TestCase):
                            "user": {"login": "owner"}}}
         requested = []
         def api(_repo: str, path: str, method: str = "GET", payload=None):
-            page = int(path.split("page=")[1])
+            page = int(path.rsplit("page=", 1)[1])
             requested.append(page)
             return ([{}] * 100) if page < 5 else [target]
         with mock.patch.object(pins, "api_request", side_effect=api):

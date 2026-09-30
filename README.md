@@ -290,8 +290,8 @@ stable releases when the official release artifact can be identified and
 checksum-pinned, keeps Node on the 24 LTS line and Python on 3.12, and regenerates
 the full npm lock with lockfile version 2 before requiring `npm ci` to pass.
 Every unresolved component stays at its previous pin and is listed in the
-workflow summary and pull request body. The moving Claude installer and signing
-key rotations stay pinned until a version-bound official mapping can be checked.
+workflow summary and pull request body. Claude Code's moving installer/version pairing is not resolved by this updater and
+requires manual review; signing-key rotations remain pinned for manual review.
 
 The workflow explicitly dispatches the existing `gate.yml` workflow against the
 candidate branch before publishing a pull request, and accepts only a new

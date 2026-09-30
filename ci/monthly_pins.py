@@ -575,7 +575,7 @@ def update(root: Path, dry_run: bool) -> str:
             pass
 
     pins = parse_pins(staged_text(pins_path, staged))
-    notes.append("Retained Claude Code version and installer hash: the installer endpoint is moving and no stable version-to-artifact checksum mapping is available.")
+    notes.append("Retained Claude Code version and installer hash: this version pairing is not resolved by the updater; its moving installer requires manual review.")
     notes.append("Retained apt signing-key hashes; key rotation requires a separately reviewed official-key change.")
     update_mise_config(root, pins, staged)
 
