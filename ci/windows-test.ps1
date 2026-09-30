@@ -255,3 +255,42 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'busy', 'beca
     Install-WslCompactionTask -Name Test
     Assert-Equal $tasks.Count 1 'repeat installation retains one task'
 }
+
+& {
+    $reportState = @{Calls=[System.Collections.Generic.List[string]]::new(); Rows=[System.Collections.Generic.List[object]]::new()}
+    function wsl.exe {
+        $global:LASTEXITCODE=0
+        $reportState.Calls.Add(($args -join ' '))
+        if (($args -join ' ') -eq '--list --verbose') {
+            # WSL outputs UTF-16 with embedded NULs under Windows PowerShell 5.1.
+            $listing = "  NAME           STATE      VERSION`n  Sleeping       Stopped    2`n* Active         Running    2`n  Legacy         Running    1"
+            return ($listing.ToCharArray() -join [string][char]0)
+        }
+        if (($args -join ' ') -ne '-d Active -u root -- df -B1 --output=size,used /') { throw 'Reporter attempted to start a stopped or WSL 1 distro.' }
+        'Size Used'; '848256040960 1073741824'
+    }
+    function Test-Path { param($LiteralPath) return $LiteralPath -eq 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' }
+    function Get-ChildItem {
+        param($LiteralPath)
+        foreach ($name in 'Sleeping', 'Active', 'Legacy') { [pscustomobject]@{PSPath=$name} }
+    }
+    function Get-ItemProperty {
+        param($LiteralPath)
+        [pscustomobject]@{DistributionName=$LiteralPath; Version=$(if ($LiteralPath -eq 'Legacy') {1} else {2}); BasePath=('C:\mock\'+$LiteralPath)}
+    }
+    function Format-Table {
+        param([switch]$AutoSize, [Parameter(ValueFromPipeline)]$InputObject)
+        process { $reportState.Rows.Add($InputObject) }
+    }
+    & "$PSScriptRoot/../windows/vhdx-size.ps1"
+    Assert-Equal ($reportState.Calls -join ',') '--list --verbose,-d Active -u root -- df -B1 --output=size,used /' 'only running WSL 2 queried; stopped distro gets no -d call'
+    Assert-Equal $reportState.Rows.Count 3 'all registry distros remain in report'
+    $stopped = @($reportState.Rows | Where-Object Name -eq 'Sleeping')[0]
+    $running = @($reportState.Rows | Where-Object Name -eq 'Active')[0]
+    $legacy = @($reportState.Rows | Where-Object Name -eq 'Legacy')[0]
+    Assert-Equal $stopped.UsedBytes $null 'stopped used bytes empty'
+    Assert-Equal $stopped.CapBytes $null 'stopped cap bytes empty'
+    Assert-Equal $running.UsedBytes 1GB 'running used bytes reported'
+    Assert-Equal $running.CapBytes 790GB 'running cap bytes reported'
+    Assert-Equal $legacy.UsedBytes $null 'WSL 1 usage remains empty'
+}
