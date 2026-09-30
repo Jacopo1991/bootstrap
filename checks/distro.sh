@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "FAIL: distro check at line $LINENO" >&2' ERR
 [[ $(id -un) == agent ]] || { echo 'Run as agent.' >&2; exit 1; }
 ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=../home/.chezmoitemplates/pins.env
@@ -16,7 +17,7 @@ done
 [[ $(uv --version) == "uv $UV_VERSION"* ]]
 [[ $(claude --version) == "$CLAUDE_VERSION (Claude Code)" ]]
 [[ $(codex --version) == "codex-cli $CODEX_VERSION" ]]
-[[ $(ccusage --version) == "$CCUSAGE_VERSION" ]]
+[[ $(ccusage --version) == "ccusage $CCUSAGE_VERSION" ]]
 [[ $(bws --version) == "bws $BWS_VERSION" ]]
 [[ $(secretspec --version) == "secretspec $SECRETSPEC_VERSION" ]]
 for lock in "$ROOT/system/apt-base.lock" "$ROOT/system/apt-gh.lock"; do
