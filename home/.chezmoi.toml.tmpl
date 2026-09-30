@@ -6,6 +6,7 @@
 {{- if not $email -}}
 {{- $email = promptStringOnce . "gitEmail" "Git email" -}}
 {{- end -}}
+sourceDir = "/opt/machine-bootstrap/current"
 [data]
 gitName = {{ $name | quote }}
 gitEmail = {{ $email | quote }}
