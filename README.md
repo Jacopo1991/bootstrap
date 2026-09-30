@@ -121,7 +121,7 @@ inside Linux and sufficient free space on the Windows disk. Cleanup runs on
 failure too. `vhdx-size.ps1` reports file/allocated bytes and Linux used/cap bytes;
 reading Linux usage starts a stopped WSL 2 distro. WSL 1 has empty size fields.
 
-### VHD cap and automatic compaction
+### VHD cap and monthly compaction checks
 
 Sparse VHD mode is never enabled. The [WSL 2.5.6 release note](https://github.com/microsoft/WSL/releases/tag/2.5.6)
 puts sparse VHD support behind `--allow-unsafe`; WSL warns of potential data
@@ -142,21 +142,27 @@ Keep `sparseVhd` off. Raising an existing cap later uses
 [disk-space guidance](https://learn.microsoft.com/en-us/windows/wsl/disk-space).
 
 Manual compaction: `.\windows\compact-distro.ps1 -Name AgentDev`.
-It refuses missing/WSL 1/sparse disks, runs root `fstrim /`, terminates only the
-named distro, waits up to 120 seconds for its VHDX to detach, and uses diskpart
-to attach read-only, compact, then detach. It logs file bytes before/after.
-It never shuts down all of WSL or operates on another distro.
+It refuses missing/WSL 1/sparse disks and any other running WSL distro, runs root
+`fstrim /`, terminates only the named distro, waits up to 300 seconds for
+exclusive read access to its VHDX, and uses diskpart to attach read-only,
+compact, then detach. It logs file bytes before/after. It never shuts down all
+of WSL or operates on another distro.
 
-The task installer copies the compactor and common script into an admin-only
-`C:\ProgramData\machine-bootstrap` directory and converges one task per distro.
-It runs **Sunday at 03:30 local time**, under the distro owner's account with
-highest privileges (S4U, no stored password), using `-IfIdle` and logging to
-`C:\ProgramData\machine-bootstrap\compact.log`. The owner must be an administrator.
-Busy distros exit successfully without TRIM, termination or diskpart. The idle
-probe allows only recognized OS daemons owned by system accounts; any user
-process or unknown daemon blocks compaction. It checks again after TRIM, before
-termination. Schedule it for a quiet period; a concurrent new process can race
-the last idle check. No scheduled task is installed automatically during creation.
+The task installer copies the checker and common script into an admin-only
+`C:\ProgramData\machine-bootstrap` directory and converges one task per distro;
+rerunning it replaces the previous weekly task.
+It runs on the **first day of every month at 03:30 local time**, under the distro
+owner's account with highest privileges (S4U, no stored password), and appends
+to `C:\ProgramData\machine-bootstrap\compact.log`. The owner must be an
+administrator. This task only recommends compaction: it never trims, stops a
+distro, or calls diskpart. For the selected distro, it always logs the VHDX file
+size. It reads Linux used/cap bytes only when that WSL 2 distro is already
+running; stopped distros log only file size and receive no recommendation.
+It appends `COMPACTION RECOMMENDED: run windows\compact-distro.ps1 -Name <name>`
+when file size exceeds Linux used space by more than 50 GiB or exceeds 90% of the
+filesystem cap. The monthly trigger uses Task Scheduler's
+[ScheduleByMonth schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-daysofmonth-monthlyscheduletype-element).
+No scheduled task is installed automatically during creation.
 
 This checks the requested Linux user boundary. The Windows account that owns WSL
 can still launch the distro as root; this is not a boundary against that owner.

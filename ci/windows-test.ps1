@@ -275,39 +275,86 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
 
 & {
     . "$PSScriptRoot/../windows/install-compaction-task.ps1" -Name Test
-    $tasks = @{}
+    $tasks = @{'MachineBootstrap-Compact-Test'=[pscustomobject]@{TaskName='MachineBootstrap-Compact-Test'; State='Old weekly compactor'}}
+    $copied = [System.Collections.Generic.List[string]]::new()
     function Assert-BootstrapAdministrator {}
     function Get-CompactableWslDisk { param($Name) [pscustomobject]@{Name=$Name} }
     function New-Item { param($ItemType, [switch]$Force, $Path) }
     function Set-Acl { param($LiteralPath, $AclObject) Assert-Equal $AclObject.AreAccessRulesProtected $true 'task code ACL protected' }
-    function Copy-Item { param($LiteralPath, $Destination, [switch]$Force) }
-    function New-ScheduledTaskAction {
-        param($Execute, $Argument)
-        Assert-Equal ($Execute.EndsWith('\powershell.exe')) $true 'task uses Windows PowerShell'
-        Assert-Equal $Argument '-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\compact-distro.ps1" -Name "Test" -IfIdle -LogPath "C:\ProgramData\machine-bootstrap\compact.log"' 'task idle mode and stable logging'
-        [pscustomobject]@{Execute=$Execute; Arguments=$Argument}
-    }
-    function New-ScheduledTaskTrigger {
-        param([switch]$Weekly, $DaysOfWeek, $At)
-        Assert-Equal ([bool]$Weekly -and $DaysOfWeek -eq 'Sunday' -and $At -eq '03:30') $true 'weekly Sunday 0330 trigger'
-        [pscustomobject]@{At=$At}
-    }
-    function New-ScheduledTaskPrincipal {
-        param($UserId, $LogonType, $RunLevel)
-        Assert-Equal $UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) 'task runs as distro owner'
-        Assert-Equal "$LogonType/$RunLevel" 'S4U/Highest' 'highest privileges without stored password'
-        [pscustomobject]@{UserId=$UserId}
-    }
-    function New-ScheduledTaskSettingsSet { param($MultipleInstances, $ExecutionTimeLimit) [pscustomobject]@{MultipleInstances=$MultipleInstances} }
+    function Copy-Item { param($LiteralPath, $Destination, [switch]$Force) $copied.Add([IO.Path]::GetFileName($LiteralPath)) }
     function Register-ScheduledTask {
-        param($TaskName, $Action, $Trigger, $Principal, $Settings, [switch]$Force)
+        param($TaskName, $Xml, [switch]$Force)
         Assert-Equal ([bool]$Force) $true 'task registration converges'
+        $document = [xml]$Xml
+        $ns = [Xml.XmlNamespaceManager]::new($document.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        Assert-Equal $document.SelectSingleNode('//t:ScheduleByMonth/t:DaysOfMonth/t:Day', $ns).InnerText '1' 'monthly check runs on day 1'
+        Assert-Equal ($document.SelectSingleNode('//t:ScheduleByMonth/t:Months', $ns).ChildNodes.LocalName -join ',') 'January,February,March,April,May,June,July,August,September,October,November,December' 'monthly check covers all twelve months'
+        Assert-Equal ($document.SelectSingleNode('//t:CalendarTrigger/t:StartBoundary', $ns).InnerText -match 'T03:30:00$') $true 'monthly check runs at local 0330'
+        Assert-Equal ($document.SelectNodes('//t:ScheduleByWeek', $ns).Count) 0 'weekly compaction trigger removed'
+        Assert-Equal $document.SelectSingleNode('//t:Principal/t:UserId', $ns).InnerText ([Security.Principal.WindowsIdentity]::GetCurrent().Name) 'task runs as distro owner'
+        Assert-Equal $document.SelectSingleNode('//t:Principal/t:LogonType', $ns).InnerText 'S4U' 'task stores no password'
+        Assert-Equal $document.SelectSingleNode('//t:Principal/t:RunLevel', $ns).InnerText 'HighestAvailable' 'task has highest privileges'
+        Assert-Equal $document.SelectSingleNode('//t:Settings/t:MultipleInstancesPolicy', $ns).InnerText 'IgnoreNew' 'monthly checks do not overlap'
+        Assert-Equal ($document.SelectSingleNode('//t:Exec/t:Command', $ns).InnerText.EndsWith('\powershell.exe')) $true 'task uses Windows PowerShell'
+        Assert-Equal $document.SelectSingleNode('//t:Exec/t:Arguments', $ns).InnerText '-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\check-compaction.ps1" -Name "Test" -LogPath "C:\ProgramData\machine-bootstrap\compact.log"' 'task invokes only the passive check with stable logging'
         $tasks[$TaskName]=[pscustomobject]@{TaskName=$TaskName; State='Ready'}
     }
     function Get-ScheduledTask { param($TaskName) $tasks[$TaskName] }
     Install-WslCompactionTask -Name Test
     Install-WslCompactionTask -Name Test
     Assert-Equal $tasks.Count 1 'repeat installation retains one task'
+    Assert-Equal ($copied -join ',') 'common.ps1,check-compaction.ps1,common.ps1,check-compaction.ps1' 'task installs the checker instead of the compactor'
+}
+
+foreach ($case in @(
+    @{Name='stopped'; Running=$false; File=790GB; Used=0; Cap=800GB; Recommend=$false},
+    @{Name='small'; Running=$true; File=200GB; Used=180GB; Cap=800GB; Recommend=$false},
+    @{Name='gap'; Running=$true; File=200GB; Used=149GB; Cap=800GB; Recommend=$true},
+    @{Name='gap-boundary'; Running=$true; File=200GB; Used=150GB; Cap=800GB; Recommend=$false},
+    @{Name='cap'; Running=$true; File=721GB; Used=700GB; Cap=800GB; Recommend=$true},
+    @{Name='cap-boundary'; Running=$true; File=720GB; Used=700GB; Cap=800GB; Recommend=$false},
+    @{Name='both'; Running=$true; File=750GB; Used=650GB; Cap=800GB; Recommend=$true}
+)) {
+    & {
+        . "$PSScriptRoot/../windows/check-compaction.ps1" -Name Test
+        $checkState = @{Calls=[System.Collections.Generic.List[string]]::new()}
+        $log = Join-Path $env:TEMP ('bootstrap-monthly-' + [Guid]::NewGuid().ToString('N') + '.log')
+        [IO.File]::WriteAllText($log, "HISTORY`r`n")
+        function Assert-BootstrapAdministrator {}
+        function Get-WslDisks {
+            [pscustomobject]@{Name='Test'; WslVersion=2; Vhdx='C:\mock\ext4.vhdx'; FileBytes=$case.File; IsSparse=$false}
+            [pscustomobject]@{Name='Other'; WslVersion=2; Vhdx='C:\mock\other.vhdx'; FileBytes=790GB; IsSparse=$false}
+        }
+        function Get-CompactableWslDisk { param($Name) Get-WslDisks | Where-Object Name -eq $Name }
+        function Get-Item { param($LiteralPath) [pscustomobject]@{Length=$case.File} }
+        function wsl.exe {
+            $command = $args -join ' '
+            $checkState.Calls.Add($command)
+            $global:LASTEXITCODE=0
+            if ($command -eq '--list --verbose') {
+                $status = if ($case.Running) {'Running'} else {'Stopped'}
+                $listing = "  NAME STATE VERSION`n* Test $status 2`n  Other Running 2"
+                return ($listing.ToCharArray() -join [string][char]0)
+            }
+            if (-not $case.Running -or $command -ne '-d Test -u root -- df -B1 --output=size,used /') { throw 'Monthly check attempted to start a stopped distro, touch another distro, or compact.' }
+            'Size Used'; "$($case.Cap) $($case.Used)"
+        }
+        function Invoke-WslCompaction { throw 'Monthly check must never compact.' }
+        function Invoke-BootstrapDiskPart { throw 'Monthly check must never run DiskPart.' }
+        try {
+            Invoke-WslCompactionCheck -Name Test -LogPath $log | Out-Null
+            $lines = [IO.File]::ReadAllLines($log)
+            Assert-Equal $lines[0] 'HISTORY' "$($case.Name) preserves existing log entries"
+            Assert-Equal (($lines -join ' ') -match "FileBytes=$($case.File)(\D|$)") $true "$($case.Name) logs VHDX file bytes"
+            $recommendations = @($lines | Where-Object { $_ -like 'COMPACTION RECOMMENDED:*' })
+            Assert-Equal $recommendations.Count $(if ($case.Recommend) {1} else {0}) "$($case.Name) recommendation threshold"
+            if ($case.Recommend) { Assert-Equal $recommendations[0] 'COMPACTION RECOMMENDED: run windows\compact-distro.ps1 -Name Test' 'recommendation gives the manual command' }
+            $expected = if ($case.Running) {'--list --verbose,-d Test -u root -- df -B1 --output=size,used /'} else {'--list --verbose'}
+            Assert-Equal ($checkState.Calls -join ',') $expected "$($case.Name) only queries usage if already running"
+            if (-not $case.Running) { Assert-Equal (($lines -join ' ') -match '(UsedBytes|CapBytes)=') $false 'stopped check logs only file size' }
+        } finally { Remove-Item -LiteralPath $log -Force }
+    }
 }
 
 & {
