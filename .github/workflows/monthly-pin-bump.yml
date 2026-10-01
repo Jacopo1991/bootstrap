@@ -1,0 +1,83 @@
+name: Monthly pin update
+on:
+  schedule:
+    - cron: "30 1 1 * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Resolve and report candidates without creating a branch or pull request
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: monthly-pin-update
+  cancel-in-progress: false
+jobs:
+  preview:
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Resolve candidates without publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/monthly_pins.py update --dry-run
+  monthly:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Skip while an earlier monthly pin review remains open
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/monthly_pins.py check-pending --repository "$GITHUB_REPOSITORY" --output "$GITHUB_OUTPUT"
+      - name: Resolve pins and publish a review branch
+        if: steps.pending.outputs.pending != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/monthly-pin-report.md"
+          python3 ci/monthly_pins.py update --report "$report"
+          branch="automation/monthly-pin-bump-$(date -u +%Y-%m)"
+          if git diff --quiet; then
+            echo "No resolved pin changes; no pull request was created."
+            exit 0
+          fi
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            home/.chezmoitemplates/pins.env \
+            home/dot_config/mise/config.toml \
+            home/dot_local/share/bootstrap/npm/package.json \
+            home/dot_local/share/bootstrap/npm/package-lock.json \
+            system/apt-base.lock system/apt-gh.lock system/apt-docker.lock system/apt-nvidia.lock
+          git commit -m "chore: refresh monthly bootstrap pins"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            expected="$(git rev-parse "refs/remotes/origin/$branch")"
+            git push "--force-with-lease=refs/heads/$branch:$expected" origin "HEAD:refs/heads/$branch"
+          else
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+          head_sha="$(git rev-parse HEAD)"
+          python3 ci/monthly_pins.py publish \
+            --repository "$GITHUB_REPOSITORY" \
+            --branch "$branch" \
+            --head-sha "$head_sha" \
+            --report "$report"
