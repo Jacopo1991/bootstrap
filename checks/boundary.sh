@@ -43,10 +43,11 @@ check_vscode_ssh_boundary() {
       echo "FAIL: AgentDev SSH policy lacks required setting: $setting" >&2; return 1;
     }
   done
-  [[ $(grep -c '^listenaddress ' <<< "$effective") == 1 ]] &&
-    grep -Fxq 'listenaddress 127.0.0.1:2222' <<< "$effective" || {
-      echo 'FAIL: AgentDev SSH must have one IPv4 loopback listener on port 2222.' >&2; return 1;
-    }
+  if [[ $(grep -c '^listenaddress ' <<< "$effective") != 1 ]] ||
+    ! grep -Fxq 'listenaddress 127.0.0.1:2222' <<< "$effective"; then
+    echo 'FAIL: AgentDev SSH must have one IPv4 loopback listener on port 2222.' >&2
+    return 1
+  fi
   [[ -L /etc/systemd/system/ssh.socket && $(readlink /etc/systemd/system/ssh.socket) == /dev/null ]] || {
     echo 'FAIL: Ubuntu SSH socket activation is not masked.' >&2; return 1;
   }
