@@ -29,6 +29,41 @@ function Invoke-BoundedNative {
  finally{if($p){$p.Dispose()};foreach($f in $out,$err){if(Test-Path -LiteralPath $f){Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue}}}
 }
 
+$script:GhTokenExpiryPython=@'
+import datetime,json,os,re,subprocess
+def emit(status,expires_at=None):
+    print(json.dumps({"schemaVersion":1,"status":status,"expiresAtISO":expires_at},separators=(",",":")))
+try:
+    env=dict(os.environ)
+    env.pop("GH_DEBUG",None)
+    result=subprocess.run(["/usr/bin/gh","api","--hostname","github.com","--include","--silent","user"],cwd="/",env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=15,text=True)
+    if result.returncode!=0:
+        emit("UNAVAILABLE")
+    else:
+        values=[]
+        for line in result.stdout.splitlines():
+            match=re.match(r"(?i)^GitHub-Authentication-Token-Expiration:\s*(.*?)\s*$",line)
+            if match:
+                values.append(match.group(1))
+        if len(values)!=1:
+            emit("UNKNOWN" if not values else "UNAVAILABLE")
+        else:
+            value=values[0]
+            try:
+                parsed=datetime.datetime.strptime(value,"%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                try:
+                    parsed=datetime.datetime.fromisoformat(value.replace("Z","+00:00"))
+                    if parsed.tzinfo is None:
+                        raise ValueError("timezone required")
+                    parsed=parsed.astimezone(datetime.timezone.utc)
+                except Exception:
+                    emit("UNAVAILABLE")
+                    raise SystemExit(0)
+            emit("AVAILABLE",parsed.replace(microsecond=0).isoformat().replace("+00:00","Z"))
+except Exception:
+    emit("UNAVAILABLE")
+'@
 $script:InventoryPython=@'
 import json,os,pathlib,subprocess,time
 usage=None
@@ -220,6 +255,29 @@ function Invoke-WslAgentDrift {
  }catch{[pscustomobject]@{Status='UNAVAILABLE';Findings=@('invalid-drift-probe-output')}}
 }
 
+function Invoke-WslGhTokenExpiry {
+ param([string]$Name)
+ if(-not [string]::Equals($Name,'AgentDev','OrdinalIgnoreCase')){return [pscustomobject]@{Status='SKIP';ExpiresAtISO=$null}}
+ $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
+ $lr=Invoke-BoundedNative $wsl @('--list','--verbose') 10000
+ if($lr.Status -ne 'Success'){return [pscustomobject]@{Status='SKIP';ExpiresAtISO=$null}}
+ try{
+  $current=@(ConvertFrom-WslList $lr.Output|Where-Object{[string]::Equals($_.Name,'AgentDev','OrdinalIgnoreCase')})
+  if($current.Count -ne 1 -or $current[0].State -ne 'Running' -or $current[0].WslVersion -ne 2){return [pscustomobject]@{Status='SKIP';ExpiresAtISO=$null}}
+ }catch{return [pscustomobject]@{Status='SKIP';ExpiresAtISO=$null}}
+ $r=Invoke-BoundedNative $wsl @('-d','AgentDev','-u','agent','--','python3','-c',$script:GhTokenExpiryPython) 25000 4096
+ if($r.Status -ne 'Success'){return [pscustomobject]@{Status='UNAVAILABLE';ExpiresAtISO=$null}}
+ try{
+  $d=$r.Output|ConvertFrom-Json
+  if($d.schemaVersion -ne 1 -or $d.status -notin @('AVAILABLE','UNKNOWN','UNAVAILABLE')){throw 'invalid'}
+  if($d.status -ne 'AVAILABLE'){return [pscustomobject]@{Status=[string]$d.status;ExpiresAtISO=$null}}
+  $raw=[string]$d.expiresAtISO
+  $parsed=[datetimeoffset]::MinValue
+  if($raw -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$' -or -not [datetimeoffset]::TryParseExact($raw,'yyyy-MM-ddTHH:mm:ssZ',[globalization.cultureinfo]::InvariantCulture,[globalization.datetimestyles]::AssumeUniversal,[ref]$parsed)){throw 'invalid'}
+  [pscustomobject]@{Status='AVAILABLE';ExpiresAtISO=$parsed.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")}
+ }catch{[pscustomobject]@{Status='UNAVAILABLE';ExpiresAtISO=$null}}
+}
+
 function Get-MachineInventoryValue {
  param([string]$OutputDirectory,[datetime]$CurrentTime)
  $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
@@ -230,11 +288,20 @@ function Get-MachineInventoryValue {
  foreach($disk in @(Get-WslDisks)){
   $sr=@($live|?{[string]::Equals($_.Name,$disk.Name,'OrdinalIgnoreCase')}|select -First 1)
   $state=if($sr.Count){$sr[0].State}else{'Unknown'};$ver=if($sr.Count){[int]$sr[0].WslVersion}else{[int]$disk.WslVersion}
-  $e=[ordered]@{Name=[string]$disk.Name;State=$state;WslVersion=$ver;Vhdx=[string]$disk.Vhdx;FileBytes=$disk.FileBytes;UsedBytes=$null;CapBytes=$null;LargestDirectories=@();DirectoryErrors=@();Status='Unavailable';UsageSource='Unavailable';UsageRecordedAtISO=$null;CacheRecordDate=$null;AgentDriftStatus='UNAVAILABLE';AgentDriftFindings=@()}
+  $e=[ordered]@{Name=[string]$disk.Name;State=$state;WslVersion=$ver;Vhdx=[string]$disk.Vhdx;FileBytes=$disk.FileBytes;UsedBytes=$null;CapBytes=$null;LargestDirectories=@();DirectoryErrors=@();Status='Unavailable';UsageSource='Unavailable';UsageRecordedAtISO=$null;CacheRecordDate=$null;AgentDriftStatus='UNAVAILABLE';AgentDriftFindings=@();GhTokenExpiryStatus='SKIP';GhTokenExpiresAtISO=$null;GhTokenExpiryRecordedAtISO=$null;GhTokenExpiryWarning=$null}
   if($state -eq 'Running' -and $ver -eq 2 -and $disk.WslVersion -eq 2){
    $p=Invoke-WslInventoryProbe $disk.Name;$e.Status=$p.Status;$e.DirectoryErrors=@($p.Errors)
    if(($p.Status -in @('Success','Partial')) -and $null -ne $p.Usage){$e.UsedBytes=[long]$p.Usage.usedBytes;$e.CapBytes=[long]$p.Usage.capBytes;$e.LargestDirectories=@($p.Largest);if($p.Status -eq 'Success'){$e.Status='Success'}else{$e.Status='Partial'};$e.UsageSource='Live';$e.UsageRecordedAtISO=$CurrentTime.ToString('o')}
    $ad=Invoke-WslAgentDrift $disk.Name;$e.AgentDriftStatus=$ad.Status;$e.AgentDriftFindings=@($ad.Findings)
+   if([string]::Equals([string]$disk.Name,'AgentDev','OrdinalIgnoreCase')){
+    $expiry=Invoke-WslGhTokenExpiry $disk.Name;$e.GhTokenExpiryStatus=$expiry.Status
+    if($expiry.Status -ne 'SKIP'){$e.GhTokenExpiryRecordedAtISO=$CurrentTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')}
+    if($expiry.Status -eq 'AVAILABLE' -and $expiry.ExpiresAtISO){
+     $e.GhTokenExpiresAtISO=$expiry.ExpiresAtISO
+     $expiryAt=[datetimeoffset]::ParseExact($expiry.ExpiresAtISO,'yyyy-MM-ddTHH:mm:ssZ',[globalization.cultureinfo]::InvariantCulture,[globalization.datetimestyles]::AssumeUniversal)
+     if($expiryAt -le ([datetimeoffset]$CurrentTime.ToUniversalTime()).AddDays(14)){$e.GhTokenExpiryWarning='expires-within-14-days'}
+    }
+   }
   }elseif($state -eq 'Stopped' -and $ver -eq 2 -and $disk.WslVersion -eq 2){
    $e.AgentDriftStatus='SKIP';$e.AgentDriftFindings=@('distro-stopped')
    $c=Get-LatestCachedDistro $OutputDirectory $disk.Name $disk.Vhdx $CurrentTime
@@ -268,5 +335,8 @@ function Invoke-MachineInventory {
  $v=Get-MachineInventoryValue $OutputDirectory $At;$json=$v|ConvertTo-Json -Depth 8;$date=Join-Path $OutputDirectory ($At.ToString('yyyy-MM-dd')+'.json')
  Write-AtomicInventoryJson $date $json;Write-AtomicInventoryJson (Join-Path $OutputDirectory 'latest.json') $json
  Remove-ExpiredInventoryRecords $OutputDirectory $At;Write-Output ('Inventory recorded: '+$date)
+ foreach($d in @($v.distros|Where-Object{$_.GhTokenExpiryWarning -eq 'expires-within-14-days'})){
+  Write-Output ('WARNING: AgentDev gh token expires within 14 days: '+$d.GhTokenExpiresAtISO)
+ }
 }
 if($MyInvocation.InvocationName -ne '.') {Invoke-MachineInventory -OutputDirectory $OutputDirectory -At $Now}
