@@ -115,6 +115,8 @@ with tempfile.TemporaryDirectory() as temp:
     for target in (sibling, knowledge):
         for subcommand in ("log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"):
             extra = " --no-textconv" if subcommand in {"log", "show", "diff", "blame"} else ""
+            if subcommand in {"log", "show", "diff"}:
+                extra += " --no-ext-diff"
             command = f"git --no-pager --no-optional-locks -C {target} {subcommand}{extra}"
             assert policy.evaluate(event(command), roots) is None, command
         for subcommand in ("add", "commit", "push", "fetch", "checkout", "reset", "config"):
@@ -122,7 +124,7 @@ with tempfile.TemporaryDirectory() as temp:
             assert policy.evaluate(event(command), roots) is not None, command
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
-    assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv"), roots) is None
+    assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
     for command in (
         f"git -C {outsider} status", f"git -C {link} status",
         "git -C nested -C ../../sibling add file",
@@ -153,13 +155,20 @@ with tempfile.TemporaryDirectory() as temp:
         "git status > '$OUT'", "git status > ~/result",
         f"gh issue list &> {outsider}/result",
         "git status &> '$OUT'", "git status &>> ~/result",
+        "git --no-pager --no-optional-locks -C ../sibling grep -nf/etc/file needle",
+        "git --no-pager --no-optional-locks -C ../sibling grep -nOcat needle",
+        "git --no-pager --no-optional-locks -C ../sibling ls-files -zX/etc/file",
+        "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv -wS/tmp/revisions file",
+        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --ext-diff",
+        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --textconv",
+        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv",
         "git --no-pager --no-optional-locks -C ../sibling grep -f/etc/file needle",
         "git --no-pager --no-optional-locks -C ../sibling grep -foutside-link needle",
         "git --no-pager --no-optional-locks -C ../sibling ls-files -X/etc/file",
         "git --no-pager --no-optional-locks -C ../sibling ls-files --exclude-from=outside-link",
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --contents=outside-link file",
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --ignore-revs-file=outside-link file",
-        "git --no-pager --no-optional-locks -C ../sibling show --no-textconv outside-link",
+        "git --no-pager --no-optional-locks -C ../sibling show --no-textconv --no-ext-diff outside-link",
         "git --no-pager --no-optional-locks -C ../sibling log -p",
         "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
         "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",
@@ -167,7 +176,7 @@ with tempfile.TemporaryDirectory() as temp:
         f"git -C --no-pager -C --no-optional-locks -C {sibling} status",
         "git --no-pager -C ../sibling status",
         "git --no-pager --no-optional-locks -C ../sibling diff",
-        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --out=/tmp/no-write",
+        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --out=/tmp/no-write",
         "git --no-pager --no-optional-locks -C ../sibling grep -Ocat needle",
         "git --no-pager --no-optional-locks -C ../sibling grep --open-files-in-pager=cat needle",
         "git --no-pager --no-optional-locks -C ../sibling grep --open=cat needle",

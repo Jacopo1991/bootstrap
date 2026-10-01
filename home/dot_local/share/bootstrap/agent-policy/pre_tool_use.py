@@ -200,6 +200,11 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
             return "Cross-repository reads require --no-pager and --no-optional-locks."
         if subcommand in {"log", "show", "diff", "blame"} and "--no-textconv" not in arguments:
             return "Cross-repository log/show/diff/blame require --no-textconv."
+        if subcommand in {"log", "show", "diff"} and "--no-ext-diff" not in arguments:
+            return "Cross-repository log/show/diff require --no-ext-diff."
+        if any(arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
+               and not arg[1:].isdigit() for arg in arguments):
+            return "Spell cross-repository short options separately; aggregation is blocked."
         forbidden = ("--ext-diff", "--textconv", "--no-index", "--open-files-in-pager")
         external_files = {
             "grep": ("--file",),

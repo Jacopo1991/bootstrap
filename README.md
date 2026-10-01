@@ -433,7 +433,9 @@ blame against repositories under `/home/agent/dev_workspace` and
 `/home/agent/cortex`. Other Git subcommands remain limited to the current repo.
 Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
 so no pager runs and status cannot refresh another repository's index. Add
-`--no-textconv` to cross-repository log, show, diff and blame. Current-repository
+`--no-textconv` to cross-repository log, show, diff and blame, and
+`--no-ext-diff` to log, show and diff. Spell short options separately; aggregated
+short flags and external input-file options are refused. Current-repository
 Git commands retain ordinary use; global/file configuration writes, new
 repository/worktree creation, output-file primitives and local filesystem
 remotes require separate setup and are blocked. Push, fetch and pull require
