@@ -148,21 +148,55 @@ exclusive read access to its VHDX, and uses diskpart to attach read-only,
 compact, then detach. It logs file bytes before/after. It never shuts down all
 of WSL or operates on another distro.
 
-The task installer copies the checker and common script into an admin-only
-`C:\ProgramData\machine-bootstrap` directory and converges one task per distro;
-rerunning it replaces the previous weekly task.
-It runs on the **first day of every month at 03:30 local time**, under the distro
-owner's account with highest privileges (S4U, no stored password), and appends
-to `C:\ProgramData\machine-bootstrap\compact.log`. The owner must be an
-administrator. This task only recommends compaction: it never trims, stops a
-distro, or calls diskpart. For the selected distro, it always logs the VHDX file
-size. It reads Linux used/cap bytes only when that WSL 2 distro is already
-running; stopped distros log only file size and receive no recommendation.
-It appends `COMPACTION RECOMMENDED: run windows\compact-distro.ps1 -Name <name>`
-when file size exceeds Linux used space by more than 50 GiB or exceeds 90% of the
-filesystem cap. The monthly trigger uses Task Scheduler's
-[ScheduleByMonth schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-daysofmonth-monthlyscheduletype-element).
-No scheduled task is installed automatically during creation.
+The compaction task installer copies the checker, common script, and inventory
+cache helper into an admin-only `C:\ProgramData\machine-bootstrap` directory
+and converges one task per distro. It runs on the first day of every month at
+03:30 local time as the distro owner's account with highest privileges (S4U, no
+stored password), and appends to `C:\ProgramData\machine-bootstrap\compact.log`.
+The owner must be an administrator. The task only recommends compaction: it
+never trims, stops a distro, or calls diskpart. For a running WSL 2 distro, the
+check reads live Linux used/cap bytes. For a stopped WSL 2 distro, it uses the
+newest matching inventory record from the current date and previous 29 dates, matched
+by distro name and VHDX path. It reports the source timestamp and applies the
+same thresholds when cached values are available. Without a usable cache it
+logs the VHDX file size and makes no recommendation. It recommends
+`windows\compact-distro.ps1 -Name <name>` when the VHDX exceeds Linux used
+space by more than 50 GiB or exceeds 90% of the recorded filesystem cap. No
+scheduled task is installed automatically during creation.
+
+### Nightly Windows inventory
+
+From elevated Windows PowerShell as the account that owns WSL, register one
+idempotent nightly task:
+
+```powershell
+.\windows\install-inventory-task.ps1
+```
+
+It runs every day at 02:30 local time under that account with highest privileges
+using S4U, so Task Scheduler stores no password. The fixed scripts are copied
+to the protected `C:\ProgramData\machine-bootstrap` directory. Run the
+inventory manually with `.\windows\inventory.ps1` or read the latest local
+record at `C:\ProgramData\machine-bootstrap\inventory\latest.json`.
+
+Each run writes a UTF-8 JSON record named `yyyy-MM-dd.json` and updates
+`latest.json` atomically. It retains dated files from today through 29 days earlier, even when some
+calendar dates have no record. It deletes only older root-level files whose
+names exactly match that date format. The versioned record contains WSL distro names, states, versions,
+VHDX paths and file sizes; C: and D: free bytes; WSL and NVIDIA driver versions;
+pending-reboot flags; MachineBootstrap task names and states; and filesystem
+usage plus the ten largest direct subdirectories under `/home` and `/var`
+for each running WSL 2 distro. Directory values are allocated bytes and paths;
+the scan does not read file contents. A stopped distro is never started. Its
+new record carries the newest matching cached usage, cap, and directory summary
+when available, with the source date and timestamp visible in the JSON.
+
+Each running distro probe has a 60-second wall limit. Native-command stderr is
+discarded and failures use fixed status values; command diagnostics, environment
+values, and file contents are not written to inventory. The inventory stays on
+the Windows machine under the protected ProgramData directory. These values
+describe the host at collection time and do not certify that a stopped distro's
+cached measurements are current beyond the retained record window.
 
 This checks the requested Linux user boundary. The Windows account that owns WSL
 can still launch the distro as root; this is not a boundary against that owner.
