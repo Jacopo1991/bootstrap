@@ -112,6 +112,114 @@ function Invoke-WslInventoryProbe {
   [pscustomobject]@{Status=if(@($d.errors).Count -gt 0){'Partial'}else{'Success'};Usage=$u;Largest=$dirs;Errors=@($d.errors|Where-Object{$_ -in 'missing-home','missing-var','unreadable-home','unreadable-var','scan-error','usage-unavailable'})}
  }catch{[pscustomobject]@{Status='InvalidProbeOutput';Usage=$null;Largest=@();Errors=@()}}
 }
+function Get-SafeTaskName {
+ param([string]$Name)
+ $safe=$Name -replace '[^A-Za-z0-9_. -]','_'
+ if($safe.Length -gt 96){$safe=$safe.Substring(0,96)}
+ $safe
+}
+function Get-TaskWorkingRoot {
+ param([string]$Path)
+ if([string]::IsNullOrWhiteSpace($Path)){return 'unset'}
+ $p=$Path.TrimEnd('\')
+ if($p -match '(?i)^C:\\ProgramData\\machine-bootstrap(?:\\|$)'){return 'machine-maintenance'}
+ if($p -match '(?i)^C:\\backups\\[^\\]+(?:\\|$)'){return 'owner-backup'}
+ if($p -match '(?i)^C:\\Users\\[^\\]+\\Documents\\Codex(?:\\|$)'){return 'documents-codex'}
+ if($p -match '(?i)^D:\\wsl\\[^\\]+(?:\\|$)'){return 'wsl-storage'}
+ 'outside-approved-root'
+}
+function Test-ApprovedAgentTaskAction {
+ param($Task)
+ $actions=@($Task.Actions)
+ if($actions.Count -ne 1){return $false}
+ $action=$actions[0]
+ $executeProperty=$action.PSObject.Properties['Execute'];$argumentsProperty=$action.PSObject.Properties['Arguments'];$workingProperty=$action.PSObject.Properties['WorkingDirectory']
+ if($null -eq $executeProperty -or $null -eq $argumentsProperty -or $null -eq $workingProperty){return $false}
+ $exe=[IO.Path]::GetFileName([string]$executeProperty.Value)
+ $args=[string]$argumentsProperty.Value
+ $wd=[string]$workingProperty.Value
+ if(-not [string]::Equals($exe,'wsl.exe','OrdinalIgnoreCase') -or -not [string]::IsNullOrWhiteSpace($wd)){return $false}
+ if($args -notmatch '^-d\s+AgentDev\s+-u\s+agent\s+--\s+/home/agent/dev_workspace/[A-Za-z0-9._/-]+$'){return $false}
+ $args -notmatch '(^|/)\.\.(/|$)'
+}
+function Test-ExpectedMaintenanceTask {
+ param($Task)
+ $nameProperty=$Task.PSObject.Properties['TaskName'];$pathProperty=$Task.PSObject.Properties['TaskPath'];$actionsProperty=$Task.PSObject.Properties['Actions']
+ if($null -eq $nameProperty -or $null -eq $pathProperty -or $null -eq $actionsProperty){return $false}
+ $name=[string]$nameProperty.Value;$taskPath=[string]$pathProperty.Value
+ if(-not [string]::Equals($taskPath,'\','OrdinalIgnoreCase')){return $false}
+ $actions=@($actionsProperty.Value);if($actions.Count -ne 1){return $false}
+ $action=$actions[0]
+ $executeProperty=$action.PSObject.Properties['Execute'];$argumentsProperty=$action.PSObject.Properties['Arguments'];$workingProperty=$action.PSObject.Properties['WorkingDirectory']
+ if($null -eq $executeProperty -or $null -eq $argumentsProperty -or $null -eq $workingProperty){return $false}
+ $expectedPowerShell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+ if(-not [string]::Equals([string]$executeProperty.Value,$expectedPowerShell,'OrdinalIgnoreCase')){return $false}
+ if(-not [string]::Equals([string]$workingProperty.Value,'C:\ProgramData\machine-bootstrap','OrdinalIgnoreCase')){return $false}
+ if([string]::Equals($name,'MachineBootstrap-Inventory','OrdinalIgnoreCase')){
+  $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"'
+  return [string]::Equals([string]$argumentsProperty.Value,$expected,'OrdinalIgnoreCase')
+ }
+ if($name -match '^MachineBootstrap-Compact-([A-Za-z][A-Za-z0-9_-]{0,47})$'){
+  $compactName=$Matches[1]
+  $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\check-compaction.ps1" -Name "'+$compactName+'" -LogPath "C:\ProgramData\machine-bootstrap\compact.log"'
+  return [string]::Equals([string]$argumentsProperty.Value,$expected,'OrdinalIgnoreCase')
+ }
+ $false
+}
+function Get-ScheduledTaskReview {
+ $projectTasks=[collections.generic.list[object]]::new()
+ $ownerTasks=[collections.generic.list[object]]::new()
+ $hasUnknownTaskPath=$false
+ try{$all=@(Get-ScheduledTask -ErrorAction Stop)}catch{return [pscustomobject]@{Status='UNAVAILABLE';Tasks=@();OwnerOnlyMaintenance=@()}}
+ foreach($task in $all){
+  $nameProperty=$task.PSObject.Properties['TaskName'];$pathProperty=$task.PSObject.Properties['TaskPath'];$stateProperty=$task.PSObject.Properties['State'];$actionsProperty=$task.PSObject.Properties['Actions']
+  if($null -eq $nameProperty -or $null -eq $pathProperty){$hasUnknownTaskPath=$true}
+  $name=if($null -ne $nameProperty){[string]$nameProperty.Value}else{''}
+  $safe=if($name){Get-SafeTaskName $name}else{'unknown-task'}
+  if(Test-ExpectedMaintenanceTask $task){
+   $ownerTasks.Add([pscustomobject]@{Name=$safe;State=if($null -ne $stateProperty){[string]$stateProperty.Value}else{'Unknown'};Scope='owner-only-maintenance'})
+   continue
+  }
+  $taskPath=if($null -ne $pathProperty){[string]$pathProperty.Value}else{''}
+  if($pathProperty -and $taskPath -like '\Microsoft\Windows\*'){continue}
+  $actions=@()
+  if($null -ne $actionsProperty){$actions=@($actionsProperty.Value)}
+  $shape='other'
+  if($actions.Count -eq 1){
+   $executeProperty=$actions[0].PSObject.Properties['Execute'];$exe=if($null -ne $executeProperty){[IO.Path]::GetFileName([string]$executeProperty.Value)}else{''}
+   if([string]::Equals($exe,'wsl.exe','OrdinalIgnoreCase')){
+    if(Test-ApprovedAgentTaskAction ([pscustomobject]@{Actions=$actions} )){$shape='wsl-agent-approved-repo-job'}else{$shape='wsl-agent-invalid-shape'}
+   }elseif([string]::Equals($exe,'powershell.exe','OrdinalIgnoreCase') -or [string]::Equals($exe,'pwsh.exe','OrdinalIgnoreCase') -or [string]::Equals($exe,'cmd.exe','OrdinalIgnoreCase')){$shape='windows-host-action'}
+  }
+  $working='unset'
+  if($actions.Count -eq 1){$working=Get-TaskWorkingRoot ([string]$actions[0].WorkingDirectory)}
+  $findings=@()
+  if($shape -ne 'wsl-agent-approved-repo-job'){$findings+='unapproved-project-task'}
+  if($working -in @('documents-codex','outside-approved-root','wsl-storage')){$findings+='working-directory-outside-agent-code-root'}
+  if($name -like 'MachineBootstrap-*'){$findings+='machine-maintenance-task-identity-or-action-mismatch'}
+  if($null -eq $pathProperty -or $null -eq $nameProperty){$findings+='scheduled-task-metadata-unavailable'}
+  $projectTasks.Add([pscustomobject]@{Name=$safe;State=if($null -ne $stateProperty){[string]$stateProperty.Value}else{'Unknown'};ActionShape=$shape;WorkingRoot=$working;Findings=@($findings|Select-Object -Unique)})
+ }
+ $status=if($hasUnknownTaskPath){'UNAVAILABLE'}elseif($projectTasks.Count){if(@($projectTasks|Where-Object{$_.Findings.Count -gt 0}).Count){'DRIFT'}else{'CLEAN'}}else{'SKIP'}
+ [pscustomobject]@{Status=$status;Tasks=$projectTasks.ToArray();OwnerOnlyMaintenance=$ownerTasks.ToArray()}
+}
+function Invoke-WslAgentDrift {
+ param([string]$Name)
+ $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
+ $r=Invoke-BoundedNative $wsl @('-d',$Name,'-u','agent','--','python3','/opt/machine-bootstrap/current/checks/agent-drift.py') 30000 32768
+ if($r.Status -ne 'Success'){return [pscustomobject]@{Status='UNAVAILABLE';Findings=@('drift-probe-unavailable')}}
+ try{
+  $d=$r.Output|ConvertFrom-Json
+  if($d.schemaVersion -ne 1 -or $d.status -notin @('CLEAN','DRIFT') -or $null -eq $d.findings){throw 'invalid'}
+  $codes=@()
+  foreach($finding in @($d.findings)){
+   if([string]$finding -match '^[A-Za-z0-9:@._-]+$'){$codes+=([string]$finding)}
+  }
+  if($d.status -eq 'DRIFT' -and -not $codes.Count){throw 'invalid'}
+  [pscustomobject]@{Status=[string]$d.status;Findings=@($codes|Select-Object -First 100)}
+ }catch{[pscustomobject]@{Status='UNAVAILABLE';Findings=@('invalid-drift-probe-output')}}
+}
+
 function Get-MachineInventoryValue {
  param([string]$OutputDirectory,[datetime]$CurrentTime)
  $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
@@ -122,14 +230,16 @@ function Get-MachineInventoryValue {
  foreach($disk in @(Get-WslDisks)){
   $sr=@($live|?{[string]::Equals($_.Name,$disk.Name,'OrdinalIgnoreCase')}|select -First 1)
   $state=if($sr.Count){$sr[0].State}else{'Unknown'};$ver=if($sr.Count){[int]$sr[0].WslVersion}else{[int]$disk.WslVersion}
-  $e=[ordered]@{Name=[string]$disk.Name;State=$state;WslVersion=$ver;Vhdx=[string]$disk.Vhdx;FileBytes=$disk.FileBytes;UsedBytes=$null;CapBytes=$null;LargestDirectories=@();DirectoryErrors=@();Status='Unavailable';UsageSource='Unavailable';UsageRecordedAtISO=$null;CacheRecordDate=$null}
+  $e=[ordered]@{Name=[string]$disk.Name;State=$state;WslVersion=$ver;Vhdx=[string]$disk.Vhdx;FileBytes=$disk.FileBytes;UsedBytes=$null;CapBytes=$null;LargestDirectories=@();DirectoryErrors=@();Status='Unavailable';UsageSource='Unavailable';UsageRecordedAtISO=$null;CacheRecordDate=$null;AgentDriftStatus='UNAVAILABLE';AgentDriftFindings=@()}
   if($state -eq 'Running' -and $ver -eq 2 -and $disk.WslVersion -eq 2){
    $p=Invoke-WslInventoryProbe $disk.Name;$e.Status=$p.Status;$e.DirectoryErrors=@($p.Errors)
    if(($p.Status -in @('Success','Partial')) -and $null -ne $p.Usage){$e.UsedBytes=[long]$p.Usage.usedBytes;$e.CapBytes=[long]$p.Usage.capBytes;$e.LargestDirectories=@($p.Largest);if($p.Status -eq 'Success'){$e.Status='Success'}else{$e.Status='Partial'};$e.UsageSource='Live';$e.UsageRecordedAtISO=$CurrentTime.ToString('o')}
+   $ad=Invoke-WslAgentDrift $disk.Name;$e.AgentDriftStatus=$ad.Status;$e.AgentDriftFindings=@($ad.Findings)
   }elseif($state -eq 'Stopped' -and $ver -eq 2 -and $disk.WslVersion -eq 2){
+   $e.AgentDriftStatus='SKIP';$e.AgentDriftFindings=@('distro-stopped')
    $c=Get-LatestCachedDistro $OutputDirectory $disk.Name $disk.Vhdx $CurrentTime
    if($c){$e.UsedBytes=[long]$c.Distro.usedBytes;$cp=$c.Distro.PSObject.Properties['capBytes'];if($null -ne $cp -and $null -ne $cp.Value){$e.CapBytes=[long]$cp.Value};$dp=$c.Distro.PSObject.Properties['largestDirectories'];if($null -ne $dp){$e.LargestDirectories=@($dp.Value)};$ep=$c.Distro.PSObject.Properties['directoryErrors'];if($null -ne $ep){$e.DirectoryErrors=@($ep.Value)};$e.Status='Cached';$e.UsageSource='Cache';$e.UsageRecordedAtISO=[string]$c.Distro.usageRecordedAtISO;$e.CacheRecordDate=$c.At.ToString('o')}else{$e.Status='StoppedNoCache'}
-  }elseif($ver -ne 2 -or $disk.WslVersion -ne 2){$e.Status='UnsupportedWslVersion'}elseif($state -eq 'Unknown'){$e.Status='StateUnavailable'}
+  }elseif($ver -ne 2 -or $disk.WslVersion -ne 2){$e.Status='UnsupportedWslVersion';$e.AgentDriftStatus='SKIP';$e.AgentDriftFindings=@('unsupported-wsl-version')}elseif($state -eq 'Unknown'){$e.Status='StateUnavailable';$e.AgentDriftStatus='UNAVAILABLE';$e.AgentDriftFindings=@('distro-state-unavailable')}
   $distros.Add([pscustomobject]$e)
  }
  $drives=[ordered]@{}
@@ -139,8 +249,8 @@ function Get-MachineInventoryValue {
  if($nr.Status -eq 'Success'){$nv=@($nr.Output -split '\r?\n'|%{$_.Trim()}|?{$_ -match '^\d{1,4}\.\d{1,4}(?:\.\d{1,4})?$'}|select -Unique)}
  $reboot=[ordered]@{ComponentBasedServicing=(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending');WindowsUpdate=(Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired');PendingFileRenameOperations=$false}
  try{$reboot.PendingFileRenameOperations=$null -ne (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction Stop).PendingFileRenameOperations}catch{}
- $tasks=@();try{$tasks=@(Get-ScheduledTask -TaskName 'MachineBootstrap-*' -ErrorAction Stop|%{[pscustomobject]@{Name=[string]$_.TaskName;State=[string]$_.State}}|sort Name)}catch{}
- [pscustomobject]@{schemaVersion=1;createdAtISO=$CurrentTime.ToString('o');wslVersion=$wv;wslStatus=$ws;nvidiaDriverVersions=$nv;nvidiaStatus=$nr.Status;drives=$drives;pendingReboot=$reboot;taskStates=$tasks;distros=$distros.ToArray()}
+ $taskReview=Get-ScheduledTaskReview;$tasks=@($taskReview.OwnerOnlyMaintenance|Sort-Object Name)
+ [pscustomobject]@{schemaVersion=2;createdAtISO=$CurrentTime.ToString('o');wslVersion=$wv;wslStatus=$ws;nvidiaDriverVersions=$nv;nvidiaStatus=$nr.Status;drives=$drives;pendingReboot=$reboot;taskStates=$tasks;scheduledTaskReviewStatus=$taskReview.Status;scheduledProjectTasks=@($taskReview.Tasks);ownerOnlyMaintenanceTasks=$tasks;distros=$distros.ToArray()}
 }
 function Write-AtomicInventoryJson {
  param([string]$Path,[string]$Json)

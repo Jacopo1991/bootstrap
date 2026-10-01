@@ -1,0 +1,59 @@
+{
+  "permissions": {
+    "defaultMode": "default",
+    "deny": [
+      "Bash(git merge *)",
+      "Bash(gh pr merge *)",
+      "Bash(powershell *)",
+      "Bash(powershell.exe *)",
+      "Bash(pwsh *)",
+      "Bash(pwsh.exe *)",
+      "Bash(cmd.exe *)",
+      "Bash(wsl.exe *)",
+      "Bash(wslconfig.exe *)",
+      "Bash(/mnt/c/Windows/**)",
+      "Bash(/mnt/c/Windows/System32/cmd.exe *)",
+      "Bash(/mnt/c/Windows/System32/wsl.exe *)",
+      "Bash(/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe *)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.netrc)",
+      "Read(~/.npmrc)",
+      "Read(~/.claude.json)",
+      "Read(~/.codex/auth.json)",
+      "Read(//etc/shadow)",
+      "Read(//etc/sudoers)",
+      "Read(//etc/sudoers.d/**)",
+      "Read(//mnt/c/**)",
+      "Read(//mnt/d/**)",
+      "Edit(//mnt/c/**)",
+      "Edit(//mnt/d/**)",
+      "Edit(//etc/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "allowUnsandboxedCommands": false,
+    "failIfUnavailable": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.local/share/bootstrap/agent-policy/pre_tool_use.py",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
