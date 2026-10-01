@@ -111,14 +111,15 @@ with tempfile.TemporaryDirectory() as temp:
         return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(current)}
     for target in (sibling, knowledge):
         for subcommand in ("log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"):
-            command = f"git -C {target} {subcommand}"
+            extra = " --no-textconv" if subcommand in {"show", "diff", "blame"} else ""
+            command = f"git --no-pager --no-optional-locks -C {target} {subcommand}{extra}"
             assert policy.evaluate(event(command), roots) is None, command
         for subcommand in ("add", "commit", "push", "fetch", "checkout", "reset", "config"):
             command = f"git -C {target} {subcommand}"
             assert policy.evaluate(event(command), roots) is not None, command
-    assert policy.evaluate(event("git -C ../sibling status"), roots) is None
-    assert policy.evaluate(event("git -C.. -Csibling status"), roots) is None
-    assert policy.evaluate(event("git --no-pager -C ../sibling log"), roots) is None
+    assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
+    assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
+    assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log"), roots) is None
     for command in (
         f"git -C {outsider} status", f"git -C {link} status",
         "git -C nested -C ../../sibling add file",
@@ -134,9 +135,30 @@ with tempfile.TemporaryDirectory() as temp:
         "git -C ../sibling grep needle ../../outside",
         "git -C ../sibling status > ../sibling/result",
         "git merge branch", "gh pr merge 1",
+        "gh --repo owner/repo pr merge 1", "gh pr --repo owner/repo merge 1",
+        "gh -Rowner/repo pr merge 1", "gh --hostname github.com pr merge 1",
+        "git config --global review.fixture value",
+        "git config --glob review.fixture value",
+        "git config --file ../sibling/.git/config review.fixture value",
+        "git config -f../sibling/.git/config review.fixture value",
+        "git clone . ../created", "git worktree add ../created",
+        "git bundle create /tmp/out HEAD", "git format-patch -o /tmp/out HEAD",
+        "git diff --out=/tmp/out", "git checkout ../sibling/file",
+        "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
+        "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",
+        "git -C ../sibling status",
+        "git --no-pager -C ../sibling status",
+        "git --no-pager --no-optional-locks -C ../sibling diff",
+        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --out=/tmp/no-write",
+        "git --no-pager --no-optional-locks -C ../sibling grep -Ocat needle",
+        "git --no-pager --no-optional-locks -C ../sibling grep --open-files-in-pager=cat needle",
+        "git --no-pager --no-optional-locks -C ../sibling grep --open=cat needle",
+        "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv -S/tmp/revisions file",
+        "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --contents=/tmp/file file",
     ):
         assert policy.evaluate(event(command), roots) is not None, command
-    for command in ("git add file", "git push origin branch", "git -C . add file"):
+    for command in ("git add file", "git push origin branch", "git -C . add file", "git config --local review.fixture value",
+                    "gh --repo owner/repo pr create", "gh pr --repo owner/repo create"):
         assert policy.evaluate(event(command), roots) is None, command
     assert policy.permission_reason(event("git push origin branch"), roots) is None
     assert policy.permission_reason(event("gh issue list"), roots) is None

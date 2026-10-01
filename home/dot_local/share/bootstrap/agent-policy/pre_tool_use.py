@@ -25,6 +25,12 @@ COMMAND_WRAPPERS = {"env", "command", "exec", "nohup", "timeout", "nice", "setsi
                     "stdbuf", "xargs", "busybox"}
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+CURRENT_REPO_GIT = READ_ONLY_GIT | {
+    "add", "commit", "push", "fetch", "pull", "checkout", "switch", "reset",
+    "restore", "clean", "rm", "mv", "branch", "tag", "remote", "stash",
+    "rebase", "cherry-pick", "revert", "config", "rev-list", "ls-remote", "describe",
+}
+SHELL_EXPANSION = re.compile(r"[$~*?\[\]{}]")
 
 
 
@@ -106,6 +112,8 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str]] | Non
         else:
             return target, token, tokens[index + 1:]
         # Git resolves each relative -C against the preceding effective directory.
+        if SHELL_EXPANSION.search(value):
+            return None
         if value:
             target = (target / value).resolve()
         index += 1
@@ -126,22 +134,70 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
         return "Build agents never merge."
+    if subcommand not in CURRENT_REPO_GIT:
+        return "Git topology changes and unsupported write primitives require separate setup."
+    # Reject abbreviated as well as full long options. Git accepts unique prefixes.
+    def option_matches(argument: str, option: str) -> bool:
+        key = argument.split("=", 1)[0]
+        return key.startswith("--") and len(key) > 2 and option.startswith(key)
+
+    if any(option_matches(arg, "--output") for arg in arguments):
+        return "Git output-file options are blocked; redirect only inside the current repository."
+    if subcommand == "config":
+        if any(arg.startswith("-f") or any(option_matches(arg, option) for option in
+               ("--global", "--system", "--file", "--worktree", "--scope"))
+               for arg in arguments):
+            return "Git config may change only the current repository's local configuration."
     if cross_repo:
-        # Nominally read-only Git commands can write via --output or invoke
-        # repository-configured programs through diff/textconv/pager options.
-        forbidden = {"--output", "--ext-diff", "--textconv", "--no-index"}
-        if any(arg.split("=", 1)[0] in forbidden for arg in arguments):
-            return "Side-effecting read-only Git options are blocked across repositories."
-        # Path operands may not escape the inspected repository through symlinks,
-        # absolute paths or ../. Options and revision expressions are not paths.
-        for arg in arguments:
-            if arg.startswith("-"):
-                continue
-            if (arg.startswith(("/", "../", "./")) or "/" in arg) and not inside(arg, str(target), target_root):
-                return "Git read path is outside the inspected repository."
+        selectors = tokens[1:len(tokens) - len(arguments) - 1]
+        if not {"--no-pager", "--no-optional-locks"}.issubset(selectors):
+            return "Cross-repository reads require --no-pager and --no-optional-locks."
+        if subcommand in {"show", "diff", "blame"} and "--no-textconv" not in arguments:
+            return "Cross-repository show/diff/blame require --no-textconv."
+        forbidden = ("--ext-diff", "--textconv", "--no-index", "--open-files-in-pager")
+        if any(any(option_matches(arg, option) for option in forbidden)
+               or arg.startswith("-O") or (subcommand == "blame" and arg.startswith("-S"))
+               for arg in arguments):
+            return "Side-effecting or external-file read options are blocked across repositories."
+    # Check filesystem operands, including attached option values, in the effective
+    # repository. Remote URLs are reviewed by the native prompt; local remote
+    # destinations are forbidden so a push cannot write a sibling repository.
+    for arg in arguments:
+        if SHELL_EXPANSION.search(arg) and (cross_repo or subcommand not in READ_ONLY_GIT):
+            return "Expanded Git operands are blocked; use literal repository paths."
+        value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else arg
+        if value.startswith("file://"):
+            return "Local filesystem Git remotes are blocked."
+        if "://" in value or re.match(r"^[^/]+@[^:]+:", value):
+            continue
+        if value.startswith(("/", "../", "./")) or (cross_repo and "/" in value):
+            if not inside(value, str(target), target_root):
+                return "Git path is outside the inspected repository."
+        if subcommand in {"push", "fetch", "pull", "remote"} and value.startswith(("/", "../", "./")):
+            return "Use a named or network Git remote, not a filesystem destination."
     if subcommand == "commit":
         return secret_scan(root)
     return None
+
+
+def gh_merges(tokens: list[str]) -> bool:
+    """Find the pr/merge command through inherited repository/hostname options."""
+    words: list[str] = []
+    index = 1
+    while index < len(tokens) and len(words) < 2:
+        token = tokens[index]
+        if token in {"-R", "--repo", "--hostname"}:
+            index += 2
+            continue
+        if token.startswith(("--repo=", "--hostname=")) or (token.startswith("-R") and len(token) > 2):
+            index += 1
+            continue
+        if SHELL_EXPANSION.search(token):
+            return True  # Dynamic command selection cannot establish never-merge.
+        if not token.startswith("-"):
+            words.append(token)
+        index += 1
+    return words == ["pr", "merge"]
 
 
 def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str | None:
@@ -220,7 +276,7 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
         return "Shell writes outside the current repository are blocked."
     if executable == "git":
         return git_policy(tokens, cwd, root, approved_roots)
-    if executable == "gh" and tokens[1:3] == ["pr", "merge"]:
+    if executable == "gh" and gh_merges(tokens):
         return "Build agents never merge."
     return None
 

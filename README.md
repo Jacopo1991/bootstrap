@@ -431,6 +431,12 @@ persistent allow prefixes as a substitute for the exact repository operation.
 The shared policy permits log, show, diff, status, rev-parse, ls-files, grep and
 blame against repositories under `/home/agent/dev_workspace` and
 `/home/agent/cortex`. Other Git subcommands remain limited to the current repo.
+Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
+so no pager runs and status cannot refresh another repository's index. Add
+`--no-textconv` to cross-repository show, diff and blame. Current-repository
+Git commands retain ordinary use; global/file configuration writes, new
+repository/worktree creation, output-file primitives and local filesystem
+remotes require separate setup and are blocked.
 Repeated and attached `-C` selectors resolve sequentially; symlink escapes,
 config/git-dir/work-tree overrides and side-effecting cross-repo read options
 are refused. The existing host-command, file-write and staged-secret checks
