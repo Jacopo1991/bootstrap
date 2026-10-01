@@ -39,8 +39,12 @@ docker run --name "$container" --rm \
       umask 002
       bash install.sh
       python3 ci/wsl-config.py
+      sudo -H -u agent python3 /repo/ci/git-credentials-test.py /home/agent/.gitconfig
+      sudo -H -u agent chezmoi verify
       bash install.sh
       python3 ci/wsl-config.py
+      sudo -H -u agent python3 /repo/ci/git-credentials-test.py /home/agent/.gitconfig
+      sudo -H -u agent chezmoi verify
       umask 022
       sudo bash /repo/ci/vscode-ssh-test.sh
       cd /tmp

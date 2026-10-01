@@ -37,6 +37,12 @@ The checkout must be clean and committed. Rerun `bash install.sh` as admin to
 converge the same revision again. There is no authentication, automatic upgrade
 or GPU/Docker installation in this entrypoint.
 
+The agent's managed Git config declares the same GitHub and Gist credential
+helper as `gh auth setup-git`: an empty helper reset followed by
+`!/usr/bin/gh auth git-credential` for each host. Reapplying the bootstrap
+preserves these helper settings and keeps `chezmoi verify` clean. This stores
+only helper configuration; it does not authenticate an account or touch tokens.
+
 Exit Linux, terminate **only this distro**, then launch it again:
 
 ```powershell
