@@ -42,7 +42,7 @@ finish()
 if not blocks:
     raise SystemExit("GPU lock contains no exact requirement blocks")
 
-torch_names = {"torch", "torchvision", "torchaudio"}
+torch_names = {"torch", "torchvision", "torchaudio", "triton"}
 torch_blocks = []
 pypi_blocks = []
 seen = set()
