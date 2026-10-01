@@ -108,5 +108,5 @@ if grep -qiE 'microsoft|wsl' /proc/version; then
 else
   echo 'SKIP: WSL-only checks (not WSL)'
 fi
-if [[ -e /etc/ssh/sshd_config.agentdev ]]; then check_vscode_ssh_boundary; fi
+check_vscode_ssh_boundary
 echo 'PASS: sudo denied, groups restricted, admin home/gh credentials inaccessible.'
