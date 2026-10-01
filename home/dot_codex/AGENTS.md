@@ -17,3 +17,12 @@ These rules apply to every project in the agent user's home.
 - Do not perform Windows-host actions or access Windows-mounted host files. Do not invoke PowerShell, pwsh, cmd.exe, wsl.exe, or Windows executables through another path or wrapper. Do not install or remove software or change host, distro, service, scheduler, or operating-system settings.
 - Do not bypass approval prompts, sandbox limits, or permission settings. Ask the user before an action that requires broader access.
 - If a request is blocked by missing authority, unavailable access, or a failed required check, stop and report the specific blocker. Do not claim completion without read-back evidence.
+
+## Approved workspace roots
+
+- Code workspaces belong under `/home/agent/dev_workspace/<repo>`; Cortex knowledge repositories belong under the sibling root `/home/agent/cortex/<repo>`. Never nest Cortex knowledge inside a code repository.
+- Runtime data belongs under `/home/agent/project-data/<project>` and is never a Git repository. Backups belong only in the Windows owner's `C:\\backups\\<project>` and are owner-managed; the agent must not access or write there.
+- CustomerHarness and Typo3/DKM are founder-approved local-only projects under `/home/agent/dev_workspace/<project>`; do not add GitHub remotes, publish them, or copy their private contents into this repository.
+- Do not work from or write to `Documents\\Codex`, arbitrary Windows paths, or any other project root. Do not start stopped WSL distros to inspect them.
+- Scheduled project jobs remain deferred. Do not create workflow hooks, inbox dispatch, scheduled PM jobs, or new scheduler entries. Existing machine inventory and compaction tasks are owner-managed maintenance.
+- Shared skills, MCP servers, and plugins start empty. Candidate inventory entries are for founder review; do not install or link candidates. Optional Superpowers installation is outside the toolkit sync and pilot-critical path.

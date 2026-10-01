@@ -1,6 +1,9 @@
-approval_policy = "on-request"
+approval_policy = "untrusted"
 approvals_reviewer = "user"
 sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]
 network_access = false
+
+[features]
+hooks = true
