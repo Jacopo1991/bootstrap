@@ -182,7 +182,8 @@ function Get-ScheduledTaskReview {
   }
   $taskPath=if($null -ne $pathProperty){[string]$pathProperty.Value}else{''}
   if($pathProperty -and $taskPath -like '\Microsoft\Windows\*'){continue}
-  $actions=if($null -ne $actionsProperty){@($actionsProperty.Value)}else{@()}
+  $actions=@()
+  if($null -ne $actionsProperty){$actions=@($actionsProperty.Value)}
   $shape='other'
   if($actions.Count -eq 1){
    $executeProperty=$actions[0].PSObject.Properties['Execute'];$exe=if($null -ne $executeProperty){[IO.Path]::GetFileName([string]$executeProperty.Value)}else{''}
