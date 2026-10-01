@@ -42,6 +42,7 @@ docker run --name "$container" --rm \
       bash install.sh
       python3 ci/wsl-config.py
       umask 022
+      sudo bash /repo/ci/vscode-ssh-test.sh
       cd /tmp
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/boundary.sh

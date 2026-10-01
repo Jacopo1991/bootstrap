@@ -28,6 +28,46 @@ has_agent_session_interop() {
   return 1
 }
 
+has_ssh_conditional_or_include() {
+  grep -Eiq '^[[:space:]]*(Match|Include)([[:space:]]|=)' "$1"
+}
+
+check_vscode_ssh_boundary() {
+  local config=/etc/ssh/sshd_config.agentdev effective listeners
+  [[ -r $config ]] || { echo 'FAIL: AgentDev SSH policy is missing.' >&2; return 1; }
+  if has_ssh_conditional_or_include "$config"; then
+    echo 'FAIL: AgentDev SSH policy may not use Match or Include directives.' >&2; return 1
+  fi
+  effective=$(/usr/sbin/sshd -G -f "$config" 2>/dev/null) || {
+    echo 'FAIL: AgentDev SSH policy cannot be evaluated.' >&2; return 1;
+  }
+  for setting in \
+    'port 2222' 'passwordauthentication no' 'kbdinteractiveauthentication no' \
+    'authenticationmethods publickey' 'permitrootlogin no' 'allowusers agent' \
+    'allowtcpforwarding local' 'permitopen 127.0.0.1:*' 'gatewayports no' \
+    'allowstreamlocalforwarding no' 'x11forwarding no' 'allowagentforwarding no'; do
+    grep -Fxq -- "$setting" <<< "$effective" || {
+      echo "FAIL: AgentDev SSH policy lacks required setting: $setting" >&2; return 1;
+    }
+  done
+  if [[ $(grep -c '^listenaddress ' <<< "$effective") != 1 ]] ||
+    ! grep -Fxq 'listenaddress 127.0.0.1:2222' <<< "$effective"; then
+    echo 'FAIL: AgentDev SSH must have one IPv4 loopback listener on port 2222.' >&2
+    return 1
+  fi
+  [[ -L /etc/systemd/system/ssh.socket && $(readlink /etc/systemd/system/ssh.socket) == /dev/null ]] || {
+    echo 'FAIL: Ubuntu SSH socket activation is not masked.' >&2; return 1;
+  }
+  [[ -L /etc/systemd/system/multi-user.target.wants/ssh.service ]] || {
+    echo 'FAIL: AgentDev SSH service is not enabled.' >&2; return 1;
+  }
+  listeners=$(ss -H -ltn | awk '$1 == "LISTEN" && $4 ~ /:2222$/ { print $4 }')
+  [[ $listeners == 127.0.0.1:2222 ]] || {
+    echo 'FAIL: AgentDev SSH is not listening only on 127.0.0.1:2222.' >&2; return 1;
+  }
+  echo 'PASS: AgentDev SSH policy, service activation and loopback listener enforced.'
+}
+
 # Unit tests source the same predicates without running account checks.
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
   return 0
@@ -75,4 +115,5 @@ if grep -qiE 'microsoft|wsl' /proc/version; then
 else
   echo 'SKIP: WSL-only checks (not WSL)'
 fi
+check_vscode_ssh_boundary
 echo 'PASS: sudo denied, groups restricted, admin home/gh credentials inaccessible.'
