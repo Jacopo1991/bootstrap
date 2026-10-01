@@ -15,7 +15,7 @@ function Install-WslCompactionTask {
         $acl.AddAccessRule($rule)
     }
     Set-Acl -LiteralPath $directory -AclObject $acl
-    foreach ($file in 'common.ps1', 'check-compaction.ps1') {
+    foreach ($file in 'common.ps1', 'check-compaction.ps1', 'inventory.ps1') {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination (Join-Path $directory $file) -Force
     }
 

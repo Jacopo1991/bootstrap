@@ -304,7 +304,7 @@ foreach ($scenario in 'missing', 'wsl1', 'sparse', 'file-missing', 'non-ascii', 
     Install-WslCompactionTask -Name Test
     Install-WslCompactionTask -Name Test
     Assert-Equal $tasks.Count 1 'repeat installation retains one task'
-    Assert-Equal ($copied -join ',') 'common.ps1,check-compaction.ps1,common.ps1,check-compaction.ps1' 'task installs the checker instead of the compactor'
+    Assert-Equal ($copied -join ',') 'common.ps1,check-compaction.ps1,inventory.ps1,common.ps1,check-compaction.ps1,inventory.ps1' 'task installs the checker and inventory cache helper'
 }
 
 foreach ($case in @(
@@ -339,6 +339,12 @@ foreach ($case in @(
             }
             if (-not $case.Running -or $command -ne '-d Test -u root -- df -B1 --output=size,used /') { throw 'Monthly check attempted to start a stopped distro, touch another distro, or compact.' }
             'Size Used'; "$($case.Cap) $($case.Used)"
+        }
+        function Invoke-BoundedNative {
+            param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
+            $output = @(& wsl.exe @Arguments)
+            $code = $LASTEXITCODE
+            [pscustomobject]@{Status=$(if ($code -eq 0) {'Success'} else {'Failed'}); Output=($output -join [Environment]::NewLine); ExitCode=$code}
         }
         function Invoke-WslCompaction { throw 'Monthly check must never compact.' }
         function Invoke-BootstrapDiskPart { throw 'Monthly check must never run DiskPart.' }
@@ -462,3 +468,6 @@ foreach ($case in 'blocked', 'success', 'output', 'timeout', 'copy-error') {
         Assert-Equal $probeState.Killed ($case -eq 'timeout') "$case kills only a timed-out process"
     }
 }
+
+
+& "$PSScriptRoot/inventory-test.ps1"
