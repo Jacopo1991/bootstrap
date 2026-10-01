@@ -31,6 +31,14 @@ cleanup() {
   rm -rf "$test_dir"
 }
 trap cleanup EXIT
+if ! sudo -H -u agent /usr/sbin/sshd -T -f "$config" \
+  -C user=agent,addr=127.0.0.1,host=localhost \
+  >"$test_dir/agent-effective" 2>"$test_dir/agent-sshd.err"; then
+  diagnostic=$(head -n 1 "$test_dir/agent-sshd.err" |
+    sed -E 's@/etc/ssh/ssh_host_[[:alnum:]_-]+@<host-key-file>@g')
+  printf 'Agent sshd -T diagnostic: %s\n' "${diagnostic:-no stderr}"
+  exit 1
+fi
 ssh-keygen -q -t ed25519 -N '' -f "$test_dir/key" -C ci-vscode-ssh
 cat "$test_dir/key.pub" | python3 system/authorize-agent-key.py
 first=$(sha256sum /home/agent/.ssh/authorized_keys | cut -d' ' -f1)
