@@ -122,6 +122,39 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[s
     return None
 
 
+def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> str | None:
+    """Require an explicit remote whose effective URLs stay on GitHub."""
+    forbidden = ("--repo", "--receive-pack", "--upload-pack", "--exec", "--multiple")
+    if any(arg.startswith("-") and any(option.startswith(arg.split("=", 1)[0])
+           for option in forbidden) for arg in arguments):
+        return "Custom Git remote routing is blocked."
+    if subcommand == "fetch" and "--all" in arguments:
+        return "Fetch one explicit remote at a time."
+    remote = next((arg for arg in arguments if not arg.startswith("-")), None)
+    if not remote:
+        return "Git network commands require an explicit GitHub remote."
+    def github_url(value: str) -> bool:
+        return value.startswith(("https://github.com/", "git@github.com:", "ssh://git@github.com/"))
+    if github_url(remote):
+        # Resolve configured insteadOf rewrites too, using Git's own URL expansion.
+        command = ["git", "ls-remote", "--get-url", remote]
+    else:
+        command = ["git", "remote", "get-url"]
+        if subcommand == "push":
+            command.append("--push")
+        command.extend(["--all", remote])
+    try:
+        result = subprocess.run(command, cwd=target, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, check=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return "Git remote cannot be resolved safely; use a configured GitHub remote."
+    urls = result.stdout.splitlines()
+    if not urls or any(not github_url(url) for url in urls):
+        return "Local filesystem and non-GitHub remote destinations are blocked."
+    return None
+
+
 def git_policy(tokens: list[str], cwd: str, root: Path,
                approved_roots: tuple[Path, ...] | None) -> str | None:
     parsed = git_target(tokens, cwd)
@@ -153,8 +186,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if cross_repo:
         if not {"--no-pager", "--no-optional-locks"}.issubset(selectors):
             return "Cross-repository reads require --no-pager and --no-optional-locks."
-        if subcommand in {"show", "diff", "blame"} and "--no-textconv" not in arguments:
-            return "Cross-repository show/diff/blame require --no-textconv."
+        if subcommand in {"log", "show", "diff", "blame"} and "--no-textconv" not in arguments:
+            return "Cross-repository log/show/diff/blame require --no-textconv."
         forbidden = ("--ext-diff", "--textconv", "--no-index", "--open-files-in-pager")
         if any(any(option_matches(arg, option) for option in forbidden)
                or arg.startswith("-O") or (subcommand == "blame" and arg.startswith("-S"))
@@ -176,6 +209,10 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
                 return "Git path is outside the inspected repository."
         if subcommand in {"push", "fetch", "pull", "remote"} and value.startswith(("/", "../", "./")):
             return "Use a named or network Git remote, not a filesystem destination."
+    if subcommand in {"push", "fetch", "pull"}:
+        reason = git_network_remote(arguments, target, subcommand)
+        if reason:
+            return reason
     if subcommand == "commit":
         return secret_scan(root)
     return None
@@ -258,7 +295,8 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     if names & (HOST_NAMES | HOST_OPS):
         return "Host, Windows, and operating-system commands are blocked."
     for i, token in enumerate(tokens):
-        if token in {">", ">>", ">|"} and (i + 1 >= len(tokens) or not inside(tokens[i + 1], cwd, root)):
+        if token in {">", ">>", ">|"} and (i + 1 >= len(tokens) or SHELL_EXPANSION.search(tokens[i + 1])
+                or not inside(tokens[i + 1], cwd, root)):
             return "Shell output outside the current repository is blocked."
     args = [t for t in tokens[1:] if not t.startswith("-")]
     targets = []

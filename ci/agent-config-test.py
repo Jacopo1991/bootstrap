@@ -103,6 +103,8 @@ with tempfile.TemporaryDirectory() as temp:
     for repo in (current, sibling, knowledge, outsider):
         repo.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "remote", "add", "origin",
+                        "https://github.com/Jacopo1991/ci-fixture.git"], cwd=repo, check=True)
     link = code_base / "escape-link"
     link.symlink_to(outsider, target_is_directory=True)
     nested = current / "nested"
@@ -111,7 +113,7 @@ with tempfile.TemporaryDirectory() as temp:
         return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(current)}
     for target in (sibling, knowledge):
         for subcommand in ("log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"):
-            extra = " --no-textconv" if subcommand in {"show", "diff", "blame"} else ""
+            extra = " --no-textconv" if subcommand in {"log", "show", "diff", "blame"} else ""
             command = f"git --no-pager --no-optional-locks -C {target} {subcommand}{extra}"
             assert policy.evaluate(event(command), roots) is None, command
         for subcommand in ("add", "commit", "push", "fetch", "checkout", "reset", "config"):
@@ -119,7 +121,7 @@ with tempfile.TemporaryDirectory() as temp:
             assert policy.evaluate(event(command), roots) is not None, command
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
-    assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log"), roots) is None
+    assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv"), roots) is None
     for command in (
         f"git -C {outsider} status", f"git -C {link} status",
         "git -C nested -C ../../sibling add file",
@@ -144,6 +146,10 @@ with tempfile.TemporaryDirectory() as temp:
         "git clone . ../created", "git worktree add ../created",
         "git bundle create /tmp/out HEAD", "git format-patch -o /tmp/out HEAD",
         "git diff --out=/tmp/out", "git checkout ../sibling/file",
+        "git push sibling.git HEAD", "git push child/../../sibling HEAD",
+        "git push", "git fetch --all",
+        "git status > '$OUT'", "git status > ~/result",
+        "git --no-pager --no-optional-locks -C ../sibling log -p",
         "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
         "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",
         "git -C ../sibling status",
@@ -161,6 +167,21 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("git add file", "git push origin branch", "git -C . add file", "git config --local review.fixture value",
                     "gh --repo owner/repo pr create", "gh pr --repo owner/repo create"):
         assert policy.evaluate(event(command), roots) is None, command
+    subprocess.run(["git", "remote", "add", "local-target", str(sibling)], cwd=current, check=True)
+    subprocess.run(["git", "remote", "add", "local-file", "file://" + str(sibling)], cwd=current, check=True)
+    for command in ("git push local-target HEAD", "git push local-file HEAD",
+                    "git fetch local-target", "git pull local-target",
+                    "git push https://example.invalid/repo HEAD"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    # Also check an existing named remote redirected through pushurl/insteadOf.
+    subprocess.run(["git", "config", "remote.origin.pushurl", str(sibling)], cwd=current, check=True)
+    assert policy.evaluate(event("git push origin HEAD"), roots) is not None
+    subprocess.run(["git", "config", "--unset", "remote.origin.pushurl"], cwd=current, check=True)
+    subprocess.run(["git", "config", "url." + str(sibling) + ".insteadOf",
+                    "https://github.com/Jacopo1991/ci-fixture.git"], cwd=current, check=True)
+    assert policy.evaluate(event("git push origin HEAD"), roots) is not None
+    assert policy.evaluate(event("git push https://github.com/Jacopo1991/ci-fixture.git HEAD"), roots) is not None
+    subprocess.run(["git", "config", "--unset-all", "url." + str(sibling) + ".insteadOf"], cwd=current, check=True)
     assert policy.permission_reason(event("git push origin branch"), roots) is None
     assert policy.permission_reason(event("gh issue list"), roots) is None
     assert policy.permission_reason(event("/usr/bin/gh pr create"), roots) is None
