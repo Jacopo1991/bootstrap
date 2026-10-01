@@ -1,0 +1,19 @@
+
+AddressFamily inet
+Port 2222
+ListenAddress 127.0.0.1
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+PermitRootLogin no
+AllowUsers agent
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:*
+GatewayPorts no
+AllowStreamLocalForwarding no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTunnel no
+PermitUserRC no
+UsePAM yes

@@ -289,6 +289,14 @@ discarded. MachineBootstrap inventory and compaction tasks remain the
 owner-managed maintenance exception. Project workflow hooks, inbox dispatch,
 and scheduled PM automation stay deferred until design step 14.
 
+### VS Code Remote-SSH for AgentDev
+
+The bootstrap installs OpenSSH Server and enables the systemd service for the non-sudo agent account. Its dedicated policy listens only on 127.0.0.1:2222, accepts Ed25519 public-key authentication, and permits local TCP forwarding to 127.0.0.1 for VS Code Remote-SSH. Password and keyboard interactive login, root login, remote TCP forwarding, agent forwarding, X11, and stream-local forwarding are disabled. Ubuntu socket activation is masked to prevent an extra wildcard listener. Windows mounts and WSL interop remain disabled for the agent session.
+
+Run windows/setup-vscode-ssh.ps1 from a normal Windows PowerShell window as the WSL owner. It creates the key pair in %USERPROFILE%/.ssh only when both files are absent, streams only the public key to the distro as root, and adds or updates only the Host agentdev stanza in the owner's SSH config. It preserves existing keys and fails closed if the pair is incomplete, mismatched, or protected by a passphrase. Linux stores the key under /home/agent/.ssh/authorized_keys, owned by agent with mode 0600; the .ssh directory uses mode 0700.
+
+Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choose Remote-SSH: Connect to Host, then select agentdev. The first connection installs VS Code Server in the AgentDev Linux home. Open Linux projects under /home/agent/dev_workspace/<repo>. The extension host runs inside WSL without requiring Windows mounts or interop in the agent session.
+
 ## Pins and repeatability
 
 | Component | Pin location |

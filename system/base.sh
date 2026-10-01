@@ -48,3 +48,6 @@ with path.open('w') as f:
     config.write(f, space_around_delimiters=False)
 path.chmod(0o644)
 PY
+
+# Install and enable the isolated VS Code Remote-SSH endpoint.
+bash "$BOOTSTRAP_ROOT/system/ssh.sh"
