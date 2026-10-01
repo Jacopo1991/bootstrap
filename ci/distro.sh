@@ -46,6 +46,7 @@ docker run --name "$container" --rm \
       sudo -H -u agent python3 /repo/ci/git-credentials-test.py /home/agent/.gitconfig
       sudo -H -u agent chezmoi verify
       umask 022
+      sudo -H -u agent python3 /repo/ci/git-gh-approval-test.py
       sudo bash /repo/ci/vscode-ssh-test.sh
       cd /tmp
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh

@@ -17,13 +17,25 @@ assert codex["sandbox_mode"] == "workspace-write"
 assert codex["sandbox_workspace_write"]["network_access"] is False
 assert codex["features"]["hooks"] is True
 codex_hooks = json.loads((ROOT / "home/dot_codex/hooks.json").read_text(encoding="utf-8"))
-assert set(codex_hooks["hooks"]) == {"PreToolUse"}
+assert set(codex_hooks["hooks"]) == {"PreToolUse", "PermissionRequest"}
+assert codex_hooks["hooks"]["PermissionRequest"][0]["matcher"] == "^Bash$"
 assert {x["matcher"] for x in codex_hooks["hooks"]["PreToolUse"]} == {"^Bash$", "^(apply_patch|Edit|Write)$"}
 
 claude = json.loads((ROOT / "home/dot_claude/settings.json").read_text(encoding="utf-8"))
 assert claude["permissions"]["defaultMode"] == "default"
 assert "allow" not in claude["permissions"]
-assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False, "failIfUnavailable": True}
+assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
+    "failIfUnavailable": True, "excludedCommands": ["git", "gh"],
+    "autoAllowBashIfSandboxed": False}
+assert set(claude["permissions"]["ask"]) == {"Bash(git *)", "Bash(gh *)",
+    "Bash(/usr/bin/git *)", "Bash(/usr/bin/gh *)"}
+assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
+assert "Bash(git merge *)" in claude["permissions"]["deny"]
+assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
+assert "network" not in claude["sandbox"]
+rules = (ROOT / "home/dot_codex/rules/default.rules").read_text(encoding="utf-8")
+assert rules.count('decision = "prompt"') == 4
+assert 'decision = "allow"' not in rules
 assert "PreToolUse" in claude["hooks"]
 assert not claude.get("mcpServers") and not claude.get("plugins")
 
@@ -75,6 +87,90 @@ with tempfile.TemporaryDirectory() as temp:
     (root / "synthetic.txt").write_text(synthetic + "\n", encoding="utf-8")
     subprocess.run(["git", "add", "synthetic.txt"], cwd=root, check=True)
     assert policy.secret_scan(root) is not None, "synthetic staged token must block commit"
+
+
+# Two approved root families, three real repositories, and a sibling root that
+# merely shares a string prefix. All fixtures are hosted and contain no auth.
+with tempfile.TemporaryDirectory() as temp:
+    base = Path(temp)
+    code_base = base / "dev_workspace"
+    knowledge_base = base / "cortex"
+    roots = (code_base, knowledge_base)
+    current = code_base / "current"
+    sibling = code_base / "sibling"
+    knowledge = knowledge_base / "project"
+    outsider = base / "dev_workspace-escape" / "repo"
+    for repo in (current, sibling, knowledge, outsider):
+        repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    link = code_base / "escape-link"
+    link.symlink_to(outsider, target_is_directory=True)
+    nested = current / "nested"
+    nested.mkdir()
+    def event(command):
+        return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(current)}
+    for target in (sibling, knowledge):
+        for subcommand in ("log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"):
+            command = f"git -C {target} {subcommand}"
+            assert policy.evaluate(event(command), roots) is None, command
+        for subcommand in ("add", "commit", "push", "fetch", "checkout", "reset", "config"):
+            command = f"git -C {target} {subcommand}"
+            assert policy.evaluate(event(command), roots) is not None, command
+    assert policy.evaluate(event("git -C ../sibling status"), roots) is None
+    assert policy.evaluate(event("git -C.. -Csibling status"), roots) is None
+    assert policy.evaluate(event("git --no-pager -C ../sibling log"), roots) is None
+    for command in (
+        f"git -C {outsider} status", f"git -C {link} status",
+        "git -C nested -C ../../sibling add file",
+        "git -C ../sibling --work-tree=. status",
+        "git --git-dir=../sibling/.git status",
+        "git -c alias.status=add -C ../sibling status",
+        "git --config-env=alias.status=FOO status",
+        "git -C ../sibling diff --output=/tmp/no-write",
+        "git -C ../sibling log --output /tmp/no-write",
+        "git -C ../sibling diff --ext-diff",
+        "git -C ../sibling diff --textconv",
+        "git -C ../sibling diff --no-index /tmp/a /tmp/b",
+        "git -C ../sibling grep needle ../../outside",
+        "git -C ../sibling status > ../sibling/result",
+        "git merge branch", "gh pr merge 1",
+    ):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in ("git add file", "git push origin branch", "git -C . add file"):
+        assert policy.evaluate(event(command), roots) is None, command
+    assert policy.permission_reason(event("git push origin branch"), roots) is None
+    assert policy.permission_reason(event("gh issue list"), roots) is None
+    assert policy.permission_reason(event("/usr/bin/gh pr create"), roots) is None
+    for command in ("curl https://github.com", "wget https://github.com",
+                    "python3 script.py", "env gh issue list", "gh issue list && curl example.com"):
+        assert policy.permission_reason(event(command), roots) is not None, command
+    # Exercise hook output shape, not just evaluate(): allowed network requests
+    # produce no permission grant; denied escalations use PermissionRequest JSON.
+    previous_root_for = policy.root_for
+    policy.root_for = lambda cwd, approved_roots=None: previous_root_for(cwd, roots)
+    try:
+        import contextlib
+        import io
+        import sys
+        for command, blocked in (("gh issue list", False), ("curl https://github.com", True)):
+            payload = event(command) | {"hook_event_name": "PermissionRequest"}
+            previous_stdin = sys.stdin
+            output = io.StringIO()
+            try:
+                sys.stdin = io.StringIO(json.dumps(payload))
+                with contextlib.redirect_stdout(output):
+                    assert policy.main() == 0
+            finally:
+                sys.stdin = previous_stdin
+            if blocked:
+                response = json.loads(output.getvalue())
+                assert response["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+                assert response["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+            else:
+                assert output.getvalue() == "", "normal native user approval must remain"
+    finally:
+        policy.root_for = previous_root_for
+print("PASS: cross-repository Git reads, current-repository writes and git/gh-only approvals")
 
 for path in ("home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md"):
     rules = (ROOT / path).read_text(encoding="utf-8").lower()

@@ -408,3 +408,39 @@ must enable **Allow GitHub Actions to create and approve pull requests**. Keep
 the existing `gate` job required and allow the `workflow_dispatch` event under
 any Actions execution policy. A manual run defaults to a read-only candidate
 preview; select the non-preview option only when a pull request is intended.
+
+
+### Repository commands and approved network access
+
+Claude Code keeps its sandbox enabled, its general unsandboxed retry disabled,
+regular permission prompts, the existing deny list and PreToolUse hook. Only
+`git` and `gh` are listed in `sandbox.excludedCommands`; explicit ask rules retain
+prompts for these tools. This is the documented exception even with
+`allowUnsandboxedCommands: false`; no general domain/network allow is added.
+The native GitHub CLI may use its existing credential store; agents must never
+read or print credential files or values.
+
+Codex keeps `workspace-write`, `network_access = false`, `on-request` and the
+user approval reviewer. Prompt-only execution rules cover git/gh. Its
+PermissionRequest hook denies other Bash escalations and returns no grant for
+git/gh, so the native user prompt still decides the exact request. This also
+denies non-git/gh shell escalations for filesystem access; ordinary commands
+inside the sandbox continue through PreToolUse. Never approve broad shell or
+persistent allow prefixes as a substitute for the exact repository operation.
+
+The shared policy permits log, show, diff, status, rev-parse, ls-files, grep and
+blame against repositories under `/home/agent/dev_workspace` and
+`/home/agent/cortex`. Other Git subcommands remain limited to the current repo.
+Repeated and attached `-C` selectors resolve sequentially; symlink escapes,
+config/git-dir/work-tree overrides and side-effecting cross-repo read options
+are refused. The existing host-command, file-write and staged-secret checks
+remain in force. This hook is a command guard, not an OS boundary against
+arbitrary programs or a replacement for reviewing the exact approval.
+
+Sources checked 2026-10-01: [Claude sandbox modes and exclusions](https://code.claude.com/docs/en/sandboxing#the-unsandboxed-retry-escape-hatch),
+[Codex approvals](https://learn.chatgpt.com/docs/agent-approvals-security),
+[Codex execution rules](https://learn.chatgpt.com/docs/agent-configuration/rules),
+and [Codex PermissionRequest](https://learn.chatgpt.com/docs/hooks#permissionrequest).
+Pinned Codex `0.159.2` exposes the same PermissionRequest event and deny output;
+CI checks the managed hook and uses the installed CLI's execution-policy checker.
+No authentication, GitHub write or owner-host check is run by these tests.

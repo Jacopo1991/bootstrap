@@ -24,6 +24,8 @@ WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
 COMMAND_WRAPPERS = {"env", "command", "exec", "nohup", "timeout", "nice", "setsid",
                     "stdbuf", "xargs", "busybox"}
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+
 
 
 def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
@@ -80,6 +82,65 @@ def secret_scan(root: Path) -> str | None:
         return "Secret scan failed; commit blocked."
     if result.returncode != 0:
         return "Staged changes failed secret scanning; commit blocked."
+    return None
+
+
+def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str]] | None:
+    """Resolve repeated -C options without permitting config/worktree overrides."""
+    target = Path(cwd).resolve()
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-C":
+            index += 1
+            if index >= len(tokens):
+                return None
+            value = tokens[index]
+        elif token.startswith("-C") and len(token) > 2:
+            value = token[2:]
+        elif token in {"--no-pager", "--literal-pathspecs", "--no-optional-locks"}:
+            index += 1
+            continue
+        elif token.startswith("-"):
+            return None
+        else:
+            return target, token, tokens[index + 1:]
+        # Git resolves each relative -C against the preceding effective directory.
+        if value:
+            target = (target / value).resolve()
+        index += 1
+    return None
+
+
+def git_policy(tokens: list[str], cwd: str, root: Path,
+               approved_roots: tuple[Path, ...] | None) -> str | None:
+    parsed = git_target(tokens, cwd)
+    if parsed is None:
+        return "Unsupported Git selector or global option; use plain git with -C or --no-pager."
+    target, subcommand, arguments = parsed
+    target_root = root_for(str(target), approved_roots)
+    if str(target_root) == "/__bootstrap_outside_approved_roots__":
+        return "Git target is outside approved code and knowledge roots."
+    cross_repo = target_root != root
+    if cross_repo and subcommand not in READ_ONLY_GIT:
+        return "Git writes outside the current repository are blocked."
+    if subcommand == "merge":
+        return "Build agents never merge."
+    if cross_repo:
+        # Nominally read-only Git commands can write via --output or invoke
+        # repository-configured programs through diff/textconv/pager options.
+        forbidden = {"--output", "--ext-diff", "--textconv", "--no-index"}
+        if any(arg.split("=", 1)[0] in forbidden for arg in arguments):
+            return "Side-effecting read-only Git options are blocked across repositories."
+        # Path operands may not escape the inspected repository through symlinks,
+        # absolute paths or ../. Options and revision expressions are not paths.
+        for arg in arguments:
+            if arg.startswith("-"):
+                continue
+            if (arg.startswith(("/", "../", "./")) or "/" in arg) and not inside(arg, str(target), target_root):
+                return "Git read path is outside the inspected repository."
+    if subcommand == "commit":
+        return secret_scan(root)
     return None
 
 
@@ -158,11 +219,28 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     if any(not inside(t, cwd, root) for t in targets):
         return "Shell writes outside the current repository are blocked."
     if executable == "git":
-        if any(tokens[i] == "-C" and i + 1 < len(tokens) and not inside(tokens[i + 1], cwd, root)
-               for i in range(len(tokens))):
-            return "Git operations outside the current repository are blocked."
-        if "commit" in tokens[1:]:
-            return secret_scan(root)
+        return git_policy(tokens, cwd, root, approved_roots)
+    if executable == "gh" and tokens[1:3] == ["pr", "merge"]:
+        return "Build agents never merge."
+    return None
+
+
+def permission_reason(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str | None:
+    """Codex: only plain git/gh commands may reach an unsandboxed approval."""
+    reason = evaluate(event, approved_roots)
+    if reason:
+        return reason
+    data = event.get("tool_input", {})
+    command = data.get("command")
+    if event.get("tool_name") != "Bash" or not isinstance(command, str):
+        return "Only Git and GitHub CLI shell requests may leave the sandbox."
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return "Unrecognized approval command; blocked by policy."
+    if not tokens or tokens[0] not in {"git", "gh", "/usr/bin/git", "/usr/bin/gh"}:
+        return "Only Git and GitHub CLI may request network or sandbox escalation."
+    # No allow response: native user approval remains mandatory.
     return None
 
 
@@ -174,9 +252,13 @@ def main() -> int:
     except (json.JSONDecodeError, ValueError):
         print(json.dumps(deny("Hook input invalid; blocked by policy."), separators=(",", ":")))
         return 0
-    reason = evaluate(event)
+    permission_request = event.get("hook_event_name") == "PermissionRequest"
+    reason = permission_reason(event) if permission_request else evaluate(event)
     if reason:
-        print(json.dumps(deny(reason), separators=(",", ":")))
+        response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "deny", "message": reason}}}
+                    if permission_request else deny(reason))
+        print(json.dumps(response, separators=(",", ":")))
     return 0
 
 
