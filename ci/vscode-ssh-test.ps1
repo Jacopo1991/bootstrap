@@ -70,12 +70,12 @@ try {
     $merged = [IO.File]::ReadAllText($configPath)
     Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 3) 'new Ed25519 key generated and public half checked'
     Assert-True ($global:bootstrapVscodeSshTestWslCalls -eq 1 -and $global:bootstrapVscodeSshTestReceivedKey -eq $global:bootstrapVscodeSshTestPublicFixture -and $global:bootstrapVscodeSshTestWslInvocation -match 'wsl\.exe -d AgentDev -u root -- python3 \$linuxKeyHelper') 'only public key streamed to the root key helper in AgentDev'
-    Assert-True (([regex]::Matches($merged, '(?m)^Host agentdev$')).Count -eq 1) 'managed Host stanza is unique'
+    Assert-True (([regex]::Matches($merged, '(?m)^Host agentdev\r?$')).Count -eq 1) 'managed Host stanza is unique'
     Assert-True ($merged.Contains('HostName 127.0.0.1') -and $merged.Contains('Port 2222') -and $merged.Contains('User agent')) 'connection target is fixed to AgentDev'
     Assert-True ($merged.Contains('IdentityFile ~/.ssh/agentdev_ed25519')) 'OpenSSH home-relative owner key path is configured'
     $effectiveSsh = & ssh.exe -G -F $configPath agentdev 2>$null
     $effectiveText = $effectiveSsh -join [Environment]::NewLine
-    Assert-True ($LASTEXITCODE -eq 0 -and $effectiveText -match '(?m)^hostname 127\.0\.0\.1$' -and $effectiveText -match '(?m)^port 2222$' -and $effectiveText -match '(?m)^user agent$' -and $effectiveText -match '(?m)^identityfile .*[\\/]agentdev_ed25519$') 'Windows OpenSSH parses the managed host without connecting'
+    Assert-True ($LASTEXITCODE -eq 0 -and $effectiveText -match '(?m)^hostname 127\.0\.0\.1\r?$' -and $effectiveText -match '(?m)^port 2222\r?$' -and $effectiveText -match '(?m)^user agent\r?$' -and $effectiveText -match '(?m)^identityfile .*[\\/]agentdev_ed25519\r?$') 'Windows OpenSSH parses the managed host without connecting'
     Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
     $firstConfig = $merged
     & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
