@@ -15,6 +15,27 @@ Assert-Equal $resolved.Name Get-WslDisks 'inventory imports shared WSL registry 
 $parsed=@(ConvertFrom-WslList $listing)
 Assert-Equal $parsed.Count 2 'WSL list parsed'
 Assert-Equal $parsed[1].State 'Stopped' 'stopped state parsed'
+$validRepoTask=[pscustomobject]@{Actions=@([pscustomobject]@{Execute='C:\Windows\System32\wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/sample/repo-job';WorkingDirectory=''})}
+Assert-True (Test-ApprovedAgentTaskAction $validRepoTask) 'approved absolute WSL repo-job launcher shape'
+$badRepoTask=[pscustomobject]@{Actions=@([pscustomobject]@{Execute='C:\Windows\System32\wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/../outside/job';WorkingDirectory=''})}
+Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project task traversal rejected'
+& {
+ $synthetic='fixture-argument-must-not-be-serialized'
+ function Get-ScheduledTask {param($ErrorAction)
+  @(
+   [pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='powershell.exe';Arguments=$synthetic;WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
+   [pscustomobject]@{TaskName='Custom-Outside';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='powershell.exe';Arguments=$synthetic;WorkingDirectory='C:\Users\tester\Documents\Codex\repo'})},
+   [pscustomobject]@{TaskName='AgentRepoJob-Approved';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/sample/repo-job';WorkingDirectory=''})}
+  )
+ }
+ $review=Get-ScheduledTaskReview
+ Assert-Equal $review.Status 'DRIFT' 'outside-root custom task reported as drift'
+ Assert-Equal $review.OwnerOnlyMaintenance[0].Scope 'owner-only-maintenance' 'machine inventory labeled owner-only maintenance'
+ Assert-Equal $review.Tasks[0].WorkingRoot 'documents-codex' 'Documents Codex working directory classified'
+ Assert-Equal $review.Tasks[1].ActionShape 'wsl-agent-approved-repo-job' 'approved WSL job shape recorded'
+ $serialized=$review|ConvertTo-Json -Depth 8
+ Assert-Equal $serialized.Contains($synthetic) $false 'scheduled task arguments never serialized'
+}
 Assert-Equal (@(ConvertFrom-WslList ($listing.ToCharArray() -join [string][char]0)).Count) 2 'NUL-separated WSL list parsed'
 $fixture=Join-Path $env:TEMP ('bootstrap-inventory-tests-'+[guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($fixture)|Out-Null
@@ -59,7 +80,7 @@ try {
  }
  & {
   $probeDir=Join-Path $fixture 'probe';[IO.Directory]::CreateDirectory($probeDir)|Out-Null
-  $inventoryFixtureState=@{Calls=[collections.generic.list[string]]::new();Running=$false;Partial=$false;ProbeCalls=0}
+  $inventoryFixtureState=@{Calls=[collections.generic.list[string]]::new();Running=$false;Partial=$false;ProbeCalls=0;AgentDriftCalls=0}
   function Get-WslDisks {[pscustomobject]@{Name='Test';WslVersion=2;Vhdx='C:\mock\ext4.vhdx';FileBytes=900;BasePath='C:\mock'}}
   function Invoke-BoundedNative {param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
    $inventoryFixtureState.Calls.Add(($Arguments -join ' '))
@@ -68,12 +89,15 @@ try {
    [pscustomobject]@{Status='Failed';Output='sensitive-like diagnostic';ExitCode=1}
   }
   function Invoke-WslInventoryProbe {param($Name);$inventoryFixtureState.ProbeCalls++;[pscustomobject]@{Status=$(if($inventoryFixtureState.Partial){'Partial'}else{'Success'});Usage=[pscustomobject]@{capBytes=1000;usedBytes=800};Largest=@([pscustomobject]@{path='/home/agent';bytes=50});Errors=$(if($inventoryFixtureState.Partial){@('missing-var')}else{@()})}}
+  function Invoke-WslAgentDrift {param($Name);$inventoryFixtureState.AgentDriftCalls++;[pscustomobject]@{Status='DRIFT';Findings=@('global-cli-outside-bootstrap:foreign')}}
   function Get-PSDrive {param($Name,$PSProvider,$ErrorAction);[pscustomobject]@{Free=123}}
   function Test-Path {param($LiteralPath,$PathType);if($LiteralPath -like 'HKLM:*'){return $false};if($PathType){Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType -ErrorAction SilentlyContinue}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -ErrorAction SilentlyContinue}}
   function Get-ItemProperty {throw 'No registry value'}
   function Get-ScheduledTask {param($TaskName,$ErrorAction);[pscustomobject]@{TaskName='MachineBootstrap-Inventory';State='Ready'}}
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01')
   Assert-Equal $inventoryFixtureState.ProbeCalls 0 'stopped distro never probed'
+  Assert-Equal $inventoryFixtureState.AgentDriftCalls 0 'stopped distro never queried for drift'
+  Assert-Equal $v.distros[0].AgentDriftStatus 'SKIP' 'stopped distro drift status is SKIP'
   Assert-Equal ($inventoryFixtureState.Calls -match '^-d') $false 'stopped state has no distro invocation'
   Assert-Equal $v.distros[0].Status StoppedNoCache 'missing cache explicit'
   Assert-Equal $v.distros[0].UsedBytes $null 'no invented stopped usage'
@@ -91,6 +115,9 @@ try {
   $inventoryFixtureState.Running=$true
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T03:00:00')
   Assert-Equal $inventoryFixtureState.ProbeCalls 1 'running distro gets one bounded probe'
+  Assert-Equal $inventoryFixtureState.AgentDriftCalls 1 'running distro gets one drift query'
+  Assert-Equal $v.distros[0].AgentDriftStatus 'DRIFT' 'running distro drift status is read back'
+  Assert-Equal $v.distros[0].AgentDriftFindings[0] 'global-cli-outside-bootstrap:foreign' 'running distro reports fixed drift code'
   Assert-Equal $v.distros[0].UsageSource Live 'running usage source live'
   Assert-Equal $v.distros[0].largestDirectories.Count 1 'directory summary returned'
   $inventoryFixtureState.Partial=$true;$v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01T04:00:00')

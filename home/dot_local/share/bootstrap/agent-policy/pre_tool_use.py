@@ -18,7 +18,7 @@ HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
             "adduser", "usermod", "passwd", "visudo"}
 WINDOWS = re.compile(r"(?i)(?:[A-Z]:[\\/]|/mnt/[a-z](?:/|$)|\\\\[^\\]+\\|"
                      r"(?<![A-Za-z0-9_])(?:powershell(?:\.exe)?|pwsh(?:\.exe)?|"
-                     r"cmd\.exe|wsl(?:\.exe)?|diskpart(?:\.exe)?|schtasks\.exe)(?![A-Za-z0-9_])")
+                     r"cmd\.exe|wsl(?:\.exe)?|diskpart(?:\.exe)?|schtasks\.exe)(?![A-Za-z0-9_]))")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
 

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Hosted tests for native settings and policy-hook negative controls."""
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 assert (ROOT / ".chezmoiroot").read_text(encoding="utf-8").strip() == "home"
 codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="utf-8"))
-assert codex["approval_policy"] == "untrusted"
+assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
 assert codex["sandbox_mode"] == "workspace-write"
 assert codex["sandbox_workspace_write"]["network_access"] is False
@@ -48,6 +50,19 @@ with tempfile.TemporaryDirectory() as temp:
                             "cwd": str(root)}, approved) is not None
     assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "env sudo true"},
                             "cwd": str(root)}, approved) is not None
+
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "CI Fixture"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "ci-fixture@example.invalid"], cwd=root, check=True)
+    (root / "safe.txt").write_text("safe fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "safe.txt"], cwd=root, check=True)
+    assert policy.secret_scan(root) is None, "safe staged diff should pass"
+    synthetic = "ghp_" + hashlib.sha256(b"bootstrap hook canary").hexdigest()[:36]
+    (root / "synthetic.txt").write_text(synthetic + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "synthetic.txt"], cwd=root, check=True)
+    assert policy.secret_scan(root) is not None, "synthetic staged token must block commit"
 
 for path in ("home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md"):
     rules = (ROOT / path).read_text(encoding="utf-8").lower()

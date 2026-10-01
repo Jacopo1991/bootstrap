@@ -240,8 +240,9 @@ model files; no model service or credentials are used.
 ### Design step 10 — minimal agent configuration and drift report
 
 The existing chezmoi apply manages Codex and Claude Code's global instructions,
-native permissions, and one shared pre-tool policy hook. Codex uses the
-`untrusted` approval policy with `workspace-write` and sandbox networking off.
+native permissions, and one shared pre-tool policy hook. Codex uses the supported `on-request` approval policy, routes approvals to
+the user, and sets `workspace-write` with sandbox networking off. The retired
+`untrusted` policy is not valid in the pinned Codex version.
 Claude Code keeps its normal ask-before-running mode and uses the native Linux
 sandbox with unsandboxed retries disabled and startup failing if the sandbox is
 unavailable. The base image pins the sandbox's `bubblewrap` and `socat`
@@ -280,8 +281,8 @@ new task or scheduler is installed. It queries only distros already running and
 records a stopped distro as `SKIP` without starting it. For running distros,
 the drift check reports dirty `chezmoi verify`/`chezmoi diff`, unexpected
 globally installed agent CLIs, skills, MCP servers or plugins, and task/job
-configuration outside the approved roots. A missing approved path or
-unconfigured task-root setting is reported as `UNCONFIGURED`, never clean.
+configuration outside the approved roots. Any custom task whose launcher or working directory does not match the
+approved roots is reported as drift, never clean.
 Windows task output contains sanitized task names and fixed action/working-root
 classifications only; raw arguments, command lines and secret values are
 discarded. MachineBootstrap inventory and compaction tasks remain the

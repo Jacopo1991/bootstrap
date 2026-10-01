@@ -9,11 +9,13 @@ download_verified "$SHELLCHECK_URL" "$SHELLCHECK_SHA256" "$tmp/shellcheck.tar.xz
 tar -xJf "$tmp/shellcheck.tar.xz" -C "$tmp"
 download_verified "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
 tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+export PATH="$tmp:$PATH"
 python3 "$ROOT/ci/gitleaks-canary.py" "$tmp/gitleaks"
 cd "$ROOT"
 bash ci/boundary-test.sh
 python3 ci/monthly_pins_test.py
 python3 ci/agent-config-test.py
+python3 ci/agent-drift-test.py
 mapfile -t scripts < <(find . -name '*.sh' -type f -not -path './.git/*')
 "$tmp/shellcheck-v0.11.0/shellcheck" --external-sources --source-path=SCRIPTDIR "${scripts[@]}"
 # Render the actual chezmoi script too; shared pin constants are intentionally

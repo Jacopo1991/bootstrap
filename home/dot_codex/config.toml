@@ -1,4 +1,4 @@
-approval_policy = "untrusted"
+approval_policy = "on-request"
 approvals_reviewer = "user"
 sandbox_mode = "workspace-write"
 
