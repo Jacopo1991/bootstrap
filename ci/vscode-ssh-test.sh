@@ -108,6 +108,13 @@ ss -H -ltn | awk '$1 == "LISTEN" && $4 ~ /:2222$/ { found++; if ($4 != "127.0.0.
 
 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -i "$test_dir/key" -p 2222 agent@127.0.0.1 'test "$(id -un)" = agent' >/dev/null 2>&1
+# The Windows ProxyCommand's WSL suffix needs nc on a fresh bootstrap.
+# Exercise that same agent-side byte relay using the existing ephemeral CI key.
+sudo -H -u agent sh -c 'command -v nc >/dev/null'
+ssh -o BatchMode=yes -o 'ProxyCommand=nc 127.0.0.1 2222' \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -i "$test_dir/key" agent@127.0.0.1 'test "$(id -un)" = agent' >/dev/null 2>&1
+echo 'PASS: fresh-distro nc relay reaches the key-only agent SSH service.'
 if ssh -o BatchMode=yes -o PubkeyAuthentication=no -o PreferredAuthentications=password \
   -o NumberOfPasswordPrompts=0 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -i "$test_dir/key" -p 2222 agent@127.0.0.1 true >/dev/null 2>&1; then
