@@ -21,7 +21,11 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 Check-Valid-Until: no
 EOF
 apt-get update
+# Seed the custom daemon policy and mask Ubuntu socket activation before the
+# OpenSSH package maintainer scripts can start a default listener.
+bash "$BOOTSTRAP_ROOT/system/ssh.sh" prepare
 apt_locked "$BOOTSTRAP_ROOT/system/apt-base.lock"
+bash "$BOOTSTRAP_ROOT/system/ssh.sh" activate
 apt_key githubcli "$GH_KEY_URL" "$GH_KEY_SHA256" binary
 cat > /etc/apt/sources.list.d/bootstrap-gh.list <<'EOF'
 deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main

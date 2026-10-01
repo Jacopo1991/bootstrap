@@ -41,7 +41,8 @@ if cat "$test_dir/key.pub" | python3 system/authorize-agent-key.py >/dev/null 2>
 fi
 [[ ! -e "$test_dir/authorized_keys" ]]
 rm /home/agent/.ssh
-mkdir -m 0700 -o agent -g agent /home/agent/.ssh
+mkdir -m 0700 /home/agent/.ssh
+chown agent:agent /home/agent/.ssh
 ln -s "$test_dir/sentinel" /home/agent/.ssh/authorized_keys
 if cat "$test_dir/key.pub" | python3 system/authorize-agent-key.py >/dev/null 2>&1; then
   echo 'Symlinked authorized_keys was accepted.' >&2; exit 1
@@ -99,11 +100,14 @@ ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no 
   -o UserKnownHostsFile=/dev/null -i "$test_dir/key" -p 2222 \
   -L "127.0.0.1:22481:127.0.0.1:$target_port" agent@127.0.0.1 >/dev/null 2>&1 &
 tunnel_pid=$!
+forwarded=0
 for _ in {1..50}; do
   if python3 -c 'import socket; s=socket.socket(); s.settimeout(.2); s.connect(("127.0.0.1",22481)); print(s.recv(64).decode()); s.close()' 2>/dev/null | grep -qx vscode-loopback-ok; then
+    forwarded=1
     break
   fi
   sleep 0.05
 done
+[[ $forwarded == 1 ]] || { echo 'Loopback TCP forwarding failed.' >&2; exit 1; }
 wait "$server_pid"
 echo 'PASS: key-only agent login, root/password denial and VS Code loopback forwarding.'
