@@ -31,7 +31,7 @@ has_agent_session_interop() {
 check_vscode_ssh_boundary() {
   local config=/etc/ssh/sshd_config.agentdev effective listeners
   [[ -r $config ]] || { echo 'FAIL: AgentDev SSH policy is missing.' >&2; return 1; }
-  effective=$(sshd -T -f "$config" -C user=agent,addr=127.0.0.1,host=localhost 2>/dev/null) || {
+  effective=$(/usr/sbin/sshd -T -f "$config" -C user=agent,addr=127.0.0.1,host=localhost 2>/dev/null) || {
     echo 'FAIL: AgentDev SSH policy cannot be evaluated.' >&2; return 1;
   }
   for setting in \
