@@ -85,6 +85,26 @@ def configured_plugin_names(home: Path) -> set[str]:
     return names
 
 
+def version_matches(expected: str, actual: str) -> bool:
+    tokens = re.findall(r"(?<![A-Za-z0-9])\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?(?![A-Za-z0-9])", actual)
+    return expected in tokens
+
+
+def unexpected_global_npm_packages(output: str) -> list[str]:
+    value = json.loads(output)
+    dependencies = value.get("dependencies")
+    if not isinstance(dependencies, dict):
+        raise ValueError("npm global inventory is not a dependency map")
+    return sorted(set(dependencies) - {"npm", "corepack"})
+
+
+def installed_uv_tools(directory: Path) -> list[str]:
+    if not directory.is_dir():
+        return []
+    return sorted(entry.name for entry in directory.iterdir()
+                  if entry.is_dir() and not entry.name.startswith("."))
+
+
 def scan(root: Path, home: Path) -> list[str]:
     findings: set[str] = set()
     rc, _ = run_quiet(["chezmoi", "verify"])
@@ -110,7 +130,7 @@ def scan(root: Path, home: Path) -> list[str]:
         if not resolved or Path(resolved).parent.resolve() != (home / ".local" / "bin").resolve():
             findings.add("cli-path-drift:" + name)
         rc, actual = run_quiet(args)
-        if rc or expected not in actual:
+        if rc or not version_matches(expected, actual):
             findings.add("cli-version-drift:" + name)
 
     try:
@@ -127,6 +147,27 @@ def scan(root: Path, home: Path) -> list[str]:
                         for item in compare_sets(actual_mise, expected_mise))
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         findings.add("mise-lock-unavailable")
+
+    npm_rc, npm_output = run_quiet(["npm", "list", "-g", "--depth=0", "--json"])
+    try:
+        npm_extras = unexpected_global_npm_packages(npm_output)
+    except (json.JSONDecodeError, ValueError):
+        findings.add("npm-global-inventory-unavailable")
+    else:
+        if npm_rc:
+            findings.add("npm-global-inventory-unavailable")
+        findings.update("npm-global-outside-bootstrap:" + name for name in npm_extras)
+
+    uv_dir_rc, uv_dir_output = run_quiet(["uv", "tool", "dir"])
+    if uv_dir_rc or not uv_dir_output.strip():
+        findings.add("uv-tool-inventory-unavailable")
+    else:
+        try:
+            uv_names = installed_uv_tools(Path(uv_dir_output.strip().splitlines()[0]))
+        except OSError:
+            findings.add("uv-tool-inventory-unavailable")
+        else:
+            findings.update("uv-tool-outside-bootstrap:" + name for name in uv_names)
 
     extras = unexpected_global_binaries(home)
     findings.update("global-cli-outside-bootstrap:" + name for name in extras)

@@ -280,7 +280,7 @@ The existing nightly Windows inventory task is reused for drift collection; no
 new task or scheduler is installed. It queries only distros already running and
 records a stopped distro as `SKIP` without starting it. For running distros,
 the drift check reports dirty `chezmoi verify`/`chezmoi diff`, unexpected
-globally installed agent CLIs, skills, MCP servers or plugins, and task/job
+globally installed agent CLIs, npm packages, uv tools, skills, MCP servers or plugins, and task/job
 configuration outside the approved roots. Any custom task whose launcher or working directory does not match the
 approved roots is reported as drift, never clean.
 Windows task output contains sanitized task names and fixed action/working-root
