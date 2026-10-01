@@ -2,6 +2,14 @@
 set -euo pipefail
 
 config=/etc/ssh/sshd_config.agentdev
+override=/etc/systemd/system/ssh.service.d/agentdev.conf
+for setting in \
+  "ExecStart=/usr/sbin/sshd -D -f $config" \
+  "ExecStartPre=/usr/sbin/sshd -t -f $config"; do
+  grep -Fxq -- "$setting" "$override"
+done
+test -L /etc/systemd/system/ssh.socket
+test "$(readlink /etc/systemd/system/ssh.socket)" = /dev/null
 /usr/sbin/sshd -t -f "$config"
 effective=$(/usr/sbin/sshd -T -f "$config" -C user=agent,addr=127.0.0.1,host=localhost)
 for setting in \
