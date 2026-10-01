@@ -61,6 +61,7 @@ try {
         '    ServerAliveInterval 30',
         'Host agentdev',
         '    HostName old.example',
+        '    ProxyCommand old-proxy.exe',
         'Host archive other',
         '    User archived',
         ''
@@ -76,18 +77,54 @@ try {
     $priorErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $effectiveSsh = & ssh.exe -T -G -F $configPath agentdev 2>$null
+        $effectiveSsh = @(& ssh.exe -T -G -F $configPath agentdev 2>$null)
         $sshExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $priorErrorActionPreference
     }
     $effectiveText = $effectiveSsh -join [Environment]::NewLine
     Assert-True ($sshExitCode -eq 0 -and $effectiveText -match '(?m)^hostname 127\.0\.0\.1\r?$' -and $effectiveText -match '(?m)^port 2222\r?$' -and $effectiveText -match '(?m)^user agent\r?$' -and $effectiveText -match '(?m)^identityfile .*[\\/]agentdev_ed25519\r?$') 'Windows OpenSSH parses the managed host without connecting'
+    $expectedProxy = 'C:\Windows\System32\wsl.exe -d AgentDev -u agent -- nc 127.0.0.1 2222'
+    Assert-True ($effectiveText -match ('(?im)^proxycommand ' + [regex]::Escape($expectedProxy) + '\r?$')) 'Windows OpenSSH selects the AgentDev wake-and-relay command without executing it'
+    Assert-True (-not $merged.Contains('old-proxy.exe') -and ([regex]::Matches($merged, '(?im)^\s*ProxyCommand\s+')).Count -eq 1) 'existing managed proxy is replaced once'
     Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
     $firstConfig = $merged
     & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
     Assert-True ([IO.File]::ReadAllText($configPath) -ceq $firstConfig) 'SSH config merge is idempotent'
     Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 5 -and $global:bootstrapVscodeSshTestWslCalls -eq 2) 'existing matching key pair is reused'
+
+    # Exercise real script/StrictMode behavior for the zero- and one-line cases.
+    # All key generation and WSL calls remain inert fixtures on the CI runner.
+    foreach ($configCase in 'missing', 'empty', 'one-line') {
+        if ([IO.File]::Exists($configPath)) { [IO.File]::Delete($configPath) }
+        if ($configCase -eq 'empty') { [IO.File]::WriteAllText($configPath, '') }
+        if ($configCase -eq 'one-line') { [IO.File]::WriteAllText($configPath, '# one-line config without final newline') }
+        & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
+        $firstResult = [IO.File]::ReadAllText($configPath)
+        Assert-True (([regex]::Matches($firstResult, '(?m)^Host agentdev\r?$')).Count -eq 1) "$configCase config has one managed Host block under StrictMode"
+        $priorErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $parsed = @(& ssh.exe -T -G -F $configPath agentdev 2>$null)
+            $parseExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+        }
+        $parsedText = $parsed -join [Environment]::NewLine
+        Assert-True ($parseExitCode -eq 0 -and $parsedText -match '(?m)^hostname 127\.0\.0\.1\r?$' -and $parsedText -match '(?m)^port 2222\r?$' -and $parsedText -match '(?m)^user agent\r?$' -and $parsedText -match '(?m)^identitiesonly yes\r?$' -and $parsedText -match '(?m)^identityfile .*[\\/]agentdev_ed25519\r?$') "$configCase config retains all existing connection directives"
+        Assert-True ($parsedText -match ('(?im)^proxycommand ' + [regex]::Escape($expectedProxy) + '\r?$')) "$configCase config selects the wake-and-relay proxy"
+        if ($configCase -eq 'one-line') {
+            Assert-True ($firstResult.StartsWith('# one-line config without final newline' + [Environment]::NewLine)) 'one-line input is retained as a complete line'
+        }
+        $firstBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($configPath))
+        & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
+        Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($configPath)) -ceq $firstBytes) "$configCase config is byte-identical on repeat setup"
+        Assert-True (([regex]::Matches([IO.File]::ReadAllText($configPath), '(?im)^\s*ProxyCommand\s+')).Count -eq 1) "$configCase repeat has one proxy directive"
+    }
+
+    [IO.File]::WriteAllText($configPath, "ProxyCommand inherited-proxy.exe`r`nHost *`r`n    ServerAliveInterval 30`r`n")
+    Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*global SSH config sets ProxyCommand*' 'global proxy cannot silently override AgentDev relay'
+    Assert-True ([IO.File]::ReadAllText($configPath).StartsWith('ProxyCommand inherited-proxy.exe')) 'global proxy conflict preserves config'
 
     $brokenProfile = Join-Path $testRoot 'broken'
     $brokenSsh = Join-Path $brokenProfile '.ssh'

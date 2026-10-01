@@ -82,7 +82,7 @@ if ([IO.File]::Exists($configPath)) {
 }
 $lineEnding = [Environment]::NewLine
 $hadFinalNewline = $original.EndsWith([char]10) -or $original.EndsWith([char]13)
-$lines = if ($original.Length) { [regex]::Split($original, '\r\n|\n|\r') } else { @() }
+$lines = @(if ($original.Length) { [regex]::Split($original, '\r\n|\n|\r') })
 $kept = New-Object 'System.Collections.Generic.List[string]'
 $index = 0
 while ($index -lt $lines.Length) {
@@ -100,7 +100,7 @@ while ($kept.Count -gt 0 -and $kept[$kept.Count - 1] -eq '') { $kept.RemoveAt($k
 # wildcard and Match entries so first-value-wins settings remain effective.
 $insertAt = 0
 while ($insertAt -lt $kept.Count -and $kept[$insertAt] -notmatch '^\s*(?:Host|Match)\s+') { $insertAt++ }
-$globalConflicts = @('HostName', 'Port', 'User', 'IdentityFile', 'IdentitiesOnly')
+$globalConflicts = @('HostName', 'Port', 'User', 'IdentityFile', 'IdentitiesOnly', 'ProxyCommand')
 for ($i = 0; $i -lt $insertAt; $i++) {
     foreach ($directive in $globalConflicts) {
         if ($kept[$i] -match ('^\s*' + $directive + '\s+')) {
@@ -114,7 +114,8 @@ $block = @(
     '    Port 2222',
     '    User agent',
     '    IdentityFile ~/.ssh/agentdev_ed25519',
-    '    IdentitiesOnly yes'
+    '    IdentitiesOnly yes',
+    '    ProxyCommand C:\Windows\System32\wsl.exe -d AgentDev -u agent -- nc 127.0.0.1 2222'
 )
 for ($i = $block.Length - 1; $i -ge 0; $i--) { $kept.Insert($insertAt, $block[$i]) }
 $result = $kept -join $lineEnding
