@@ -54,7 +54,7 @@ if (-not $privateExists) {
 # and returns its public half for pair comparison; PowerShell never reads the
 # private-key contents.
 $publicText = [IO.File]::ReadAllText($publicKeyPath)
-if ($publicText -notmatch '^(ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: agentdev)?)\r?\n?$') {
+if ($publicText -notmatch '^(ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: [^\r\n]*)?)\r?\n?$') {
     throw 'The AgentDev public key is not one valid Ed25519 line.'
 }
 $publicKey = $Matches[1]
