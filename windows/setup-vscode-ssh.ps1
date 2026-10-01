@@ -113,7 +113,7 @@ $block = @(
     '    HostName 127.0.0.1',
     '    Port 2222',
     '    User agent',
-    '    IdentityFile %USERPROFILE%/.ssh/agentdev_ed25519',
+    '    IdentityFile ~/.ssh/agentdev_ed25519',
     '    IdentitiesOnly yes'
 )
 for ($i = $block.Length - 1; $i -ge 0; $i--) { $kept.Insert($insertAt, $block[$i]) }
