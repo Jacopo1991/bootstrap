@@ -9,7 +9,7 @@ import re
 import stat
 import sys
 
-KEY = re.compile(r"ssh-ed25519[ \t]+[A-Za-z0-9+/]+={0,3}(?:[ \t]+[^ \t\r\n]+)?\Z")
+KEY = re.compile(r"ssh-ed25519[ \t]+[A-Za-z0-9+/]+={0,3}(?:[ \t]+[^\r\n]+)?\Z")
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 
