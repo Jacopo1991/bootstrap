@@ -100,10 +100,10 @@ while ($kept.Count -gt 0 -and $kept[$kept.Count - 1] -eq '') { $kept.RemoveAt($k
 # wildcard and Match entries so first-value-wins settings remain effective.
 $insertAt = 0
 while ($insertAt -lt $kept.Count -and $kept[$insertAt] -notmatch '^\s*(?:Host|Match)\s+') { $insertAt++ }
-$globalConflicts = @('HostName', 'Port', 'User', 'IdentityFile', 'IdentitiesOnly', 'ProxyCommand')
+$globalConflicts = @('HostName', 'Port', 'User', 'IdentityFile', 'IdentitiesOnly', 'ProxyCommand', 'ProxyJump')
 for ($i = 0; $i -lt $insertAt; $i++) {
     foreach ($directive in $globalConflicts) {
-        if ($kept[$i] -match ('^\s*' + $directive + '\s+')) {
+        if ($kept[$i] -match ('^\s*' + $directive + '(?:\s+|\s*=)')) {
             throw "The global SSH config sets $directive; move that setting into host stanzas before running this script."
         }
     }

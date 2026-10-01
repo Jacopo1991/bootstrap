@@ -122,9 +122,22 @@ try {
         Assert-True (([regex]::Matches([IO.File]::ReadAllText($configPath), '(?im)^\s*ProxyCommand\s+')).Count -eq 1) "$configCase repeat has one proxy directive"
     }
 
-    [IO.File]::WriteAllText($configPath, "ProxyCommand inherited-proxy.exe`r`nHost *`r`n    ServerAliveInterval 30`r`n")
-    Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*global SSH config sets ProxyCommand*' 'global proxy cannot silently override AgentDev relay'
-    Assert-True ([IO.File]::ReadAllText($configPath).StartsWith('ProxyCommand inherited-proxy.exe')) 'global proxy conflict preserves config'
+    foreach ($globalSetting in 'ProxyCommand inherited-proxy.exe', 'ProxyCommand=inherited-proxy.exe', 'ProxyJump bastion', 'ProxyJump=bastion') {
+        [IO.File]::WriteAllText($configPath, $globalSetting + [Environment]::NewLine + 'Host *' + [Environment]::NewLine + '    ServerAliveInterval 30' + [Environment]::NewLine)
+        $beforeConflict = [Convert]::ToBase64String([IO.File]::ReadAllBytes($configPath))
+        $priorErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $conflicting = @(& ssh.exe -T -G -F $configPath agentdev 2>$null)
+            $conflictingExitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $priorErrorActionPreference
+        }
+        $conflictingText = $conflicting -join [Environment]::NewLine
+        Assert-True ($conflictingExitCode -eq 0 -and ($conflictingText -match '(?m)^proxycommand inherited-proxy\.exe\r?$' -or $conflictingText -match '(?m)^proxyjump bastion\r?$')) "$globalSetting is a real OpenSSH global conflict"
+        Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*global SSH config sets Proxy*' "$globalSetting cannot silently override AgentDev relay"
+        Assert-True ([Convert]::ToBase64String([IO.File]::ReadAllBytes($configPath)) -ceq $beforeConflict) "$globalSetting conflict preserves config bytes"
+    }
 
     $brokenProfile = Join-Path $testRoot 'broken'
     $brokenSsh = Join-Path $brokenProfile '.ssh'
