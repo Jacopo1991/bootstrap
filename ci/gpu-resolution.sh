@@ -44,5 +44,5 @@ docker run --rm \
   --mount "type=bind,src=$tmp/uv/uv,dst=/usr/local/bin/uv,readonly" \
   "$GPU_IMAGE" \
   bash -ec 'test "$(uname -m)" = x86_64
-    env -u UV_NO_CONFIG XDG_CONFIG_HOME=/tmp/uv-config UV_INDEX=https://127.0.0.1:9/simple UV_FIND_LINKS=/tmp/missing-find-links UV_NO_BUILD=1 UV_NO_CACHE=1 uv venv --python /usr/local/bin/python /tmp/gpu-venv
+    env UV_NO_CONFIG=1 XDG_CONFIG_HOME=/tmp/uv-config UV_INDEX=https://127.0.0.1:9/simple UV_FIND_LINKS=/tmp/missing-find-links UV_NO_BUILD=1 UV_NO_CACHE=1 uv venv --python /usr/local/bin/python /tmp/gpu-venv
     env -u UV_NO_CONFIG XDG_CONFIG_HOME=/tmp/uv-config UV_INDEX=https://127.0.0.1:9/simple UV_FIND_LINKS=/tmp/missing-find-links UV_NO_BUILD=1 UV_NO_CACHE=1 bash /checks/gpu.sh --install-only /tmp/gpu-venv/bin/python /checks/gpu-requirements.lock'
