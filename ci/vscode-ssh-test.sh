@@ -57,6 +57,12 @@ if cat "$test_dir/key.pub" | python3 system/authorize-agent-key.py >/dev/null 2>
 fi
 [[ ! -s "$test_dir/sentinel" ]]
 rm /home/agent/.ssh/authorized_keys
+printf '%s\n' 'root-managed data' > /home/agent/.ssh/authorized_keys
+if cat "$test_dir/key.pub" | python3 system/authorize-agent-key.py >/dev/null 2>&1; then
+  echo 'Root-owned authorized_keys was accepted.' >&2; exit 1
+fi
+[[ $(cat /home/agent/.ssh/authorized_keys) == 'root-managed data' ]]
+rm /home/agent/.ssh/authorized_keys
 printf '%s\n' 'ssh-rsa AAAA malicious' | python3 system/authorize-agent-key.py >/dev/null 2>&1 && {
   echo 'Wrong key type was accepted.' >&2; exit 1;
 }
