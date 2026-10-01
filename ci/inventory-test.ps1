@@ -6,8 +6,8 @@ function Assert-Equal {param($Actual,$Expected,[string]$Label);if($Actual -cne $
 function Assert-True {param([bool]$Value,[string]$Label);if(-not $Value){throw "FAIL: $Label"};Write-Output "PASS: $Label"}
 Assert-Equal (ConvertTo-WindowsArgument 'plain') 'plain' 'plain argument'
 Assert-Equal (ConvertTo-WindowsArgument 'name with spaces') '"name with spaces"' 'spaces quoted'
-Assert-Equal (ConvertTo-WindowsArgument 'a"b') '"a"b"' 'embedded quote escaped'
-Assert-Equal (ConvertTo-WindowsArgument 'C:\ends with space\') '"C:\ends with space\"' 'quoted trailing slash'
+Assert-Equal (ConvertTo-WindowsArgument 'a"b') '"a\"b"' 'embedded quote escaped'
+Assert-Equal (ConvertTo-WindowsArgument 'C:\ends with space\') '"C:\ends with space\\"' 'quoted trailing slash'
 
 $listing='  NAME           STATE      VERSION'+[Environment]::NewLine+'* Active         Running    2'+[Environment]::NewLine+'  Sleeping       Stopped    2'
 $resolved=Get-Command -Name Get-WslDisks -CommandType Function

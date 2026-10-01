@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Hosted tests for read-only installed-set drift detection."""
 import json
+import os
+import shutil
 from pathlib import Path
 import tempfile
 import importlib.util
