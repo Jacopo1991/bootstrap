@@ -59,6 +59,7 @@ printf '%s\n%s\n' "$(cat "$test_dir/key.pub")" 'ssh-ed25519 AAAA second-line' |
 cat "$test_dir/key.pub" | python3 system/authorize-agent-key.py
 [[ $(stat -c '%U:%G:%a' /home/agent/.ssh/authorized_keys) == agent:agent:600 ]]
 
+install -d -m 0755 /run/sshd
 /usr/sbin/sshd -f "$config"
 for _ in {1..50}; do
   ss -H -ltn | awk '$1 == "LISTEN" && $4 == "127.0.0.1:2222" { found=1 } END { exit !found }' && break
