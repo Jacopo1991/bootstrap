@@ -301,6 +301,8 @@ The bootstrap installs OpenSSH Server and enables the systemd service for the no
 
 Run windows/setup-vscode-ssh.ps1 from a normal Windows PowerShell window as the WSL owner. It creates the key pair in %USERPROFILE%/.ssh only when both files are absent, streams only the public key to the distro as root, and adds or updates only the Host agentdev stanza in the owner's SSH config. It preserves existing keys and fails closed if the pair is incomplete, mismatched, or protected by a passphrase. Linux stores the key under /home/agent/.ssh/authorized_keys, owned by agent with mode 0600; the .ssh directory uses mode 0700.
 
+The managed Host block uses `ProxyCommand C:\Windows\System32\wsl.exe -d AgentDev -u agent -- nc 127.0.0.1 2222`. Connecting starts a stopped AgentDev and keeps the WSL relay running for the SSH session, as reported by the owner during host setup. Existing connection directives stay in place; a conflicting global ProxyCommand or ProxyJump must be moved into another host stanza first.
+
 Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choose Remote-SSH: Connect to Host, then select agentdev. The first connection installs VS Code Server in the AgentDev Linux home. Open Linux projects under /home/agent/dev_workspace/<repo>. The extension host runs inside WSL without requiring Windows mounts or interop in the agent session.
 
 ## Pins and repeatability
