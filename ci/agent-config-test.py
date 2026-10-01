@@ -48,8 +48,20 @@ with tempfile.TemporaryDirectory() as temp:
                             "cwd": str(root)}, approved) is None
     assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "python3 -c 'print(1)'"},
                             "cwd": str(root)}, approved) is not None
+    assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "env python3 -c 'print(1)'"},
+                            "cwd": str(root)}, approved) is not None
+    assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "env bash -c 'true'"},
+                            "cwd": str(root)}, approved) is not None
+    assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "FOO=bar python3 -c 'print(1)'"},
+                            "cwd": str(root)}, approved) is not None
+    assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "command python3 -c 'print(1)'"},
+                            "cwd": str(root)}, approved) is not None
+    assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "busybox sh -c 'true'"},
+                            "cwd": str(root)}, approved) is not None
     assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "env sudo true"},
                             "cwd": str(root)}, approved) is not None
+    assert policy.evaluate({"tool_name": "Bash", "tool_input": {"command": "printf safe"},
+                            "cwd": str(root)}, approved) is None
 
 with tempfile.TemporaryDirectory() as temp:
     root = Path(temp)

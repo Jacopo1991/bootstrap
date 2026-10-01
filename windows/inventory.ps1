@@ -133,12 +133,38 @@ function Test-ApprovedAgentTaskAction {
  $actions=@($Task.Actions)
  if($actions.Count -ne 1){return $false}
  $action=$actions[0]
- $exe=[IO.Path]::GetFileName([string]$action.Execute)
- $args=[string]$action.Arguments
- $wd=[string]$action.WorkingDirectory
+ $executeProperty=$action.PSObject.Properties['Execute'];$argumentsProperty=$action.PSObject.Properties['Arguments'];$workingProperty=$action.PSObject.Properties['WorkingDirectory']
+ if($null -eq $executeProperty -or $null -eq $argumentsProperty -or $null -eq $workingProperty){return $false}
+ $exe=[IO.Path]::GetFileName([string]$executeProperty.Value)
+ $args=[string]$argumentsProperty.Value
+ $wd=[string]$workingProperty.Value
  if(-not [string]::Equals($exe,'wsl.exe','OrdinalIgnoreCase') -or -not [string]::IsNullOrWhiteSpace($wd)){return $false}
  if($args -notmatch '^-d\s+AgentDev\s+-u\s+agent\s+--\s+/home/agent/dev_workspace/[A-Za-z0-9._/-]+$'){return $false}
  $args -notmatch '(^|/)\.\.(/|$)'
+}
+function Test-ExpectedMaintenanceTask {
+ param($Task)
+ $nameProperty=$Task.PSObject.Properties['TaskName'];$pathProperty=$Task.PSObject.Properties['TaskPath'];$actionsProperty=$Task.PSObject.Properties['Actions']
+ if($null -eq $nameProperty -or $null -eq $pathProperty -or $null -eq $actionsProperty){return $false}
+ $name=[string]$nameProperty.Value;$taskPath=[string]$pathProperty.Value
+ if(-not [string]::Equals($taskPath,'\','OrdinalIgnoreCase')){return $false}
+ $actions=@($actionsProperty.Value);if($actions.Count -ne 1){return $false}
+ $action=$actions[0]
+ $executeProperty=$action.PSObject.Properties['Execute'];$argumentsProperty=$action.PSObject.Properties['Arguments'];$workingProperty=$action.PSObject.Properties['WorkingDirectory']
+ if($null -eq $executeProperty -or $null -eq $argumentsProperty -or $null -eq $workingProperty){return $false}
+ $expectedPowerShell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+ if(-not [string]::Equals([string]$executeProperty.Value,$expectedPowerShell,'OrdinalIgnoreCase')){return $false}
+ if(-not [string]::Equals([string]$workingProperty.Value,'C:\ProgramData\machine-bootstrap','OrdinalIgnoreCase')){return $false}
+ if([string]::Equals($name,'MachineBootstrap-Inventory','OrdinalIgnoreCase')){
+  $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"'
+  return [string]::Equals([string]$argumentsProperty.Value,$expected,'OrdinalIgnoreCase')
+ }
+ if($name -match '^MachineBootstrap-Compact-([A-Za-z][A-Za-z0-9_-]{0,47})$'){
+  $compactName=$Matches[1]
+  $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\check-compaction.ps1" -Name "'+$compactName+'" -LogPath "C:\ProgramData\machine-bootstrap\compact.log"'
+  return [string]::Equals([string]$argumentsProperty.Value,$expected,'OrdinalIgnoreCase')
+ }
+ $false
 }
 function Get-ScheduledTaskReview {
  $projectTasks=[collections.generic.list[object]]::new()
@@ -146,20 +172,22 @@ function Get-ScheduledTaskReview {
  $hasUnknownTaskPath=$false
  try{$all=@(Get-ScheduledTask -ErrorAction Stop)}catch{return [pscustomobject]@{Status='UNAVAILABLE';Tasks=@();OwnerOnlyMaintenance=@()}}
  foreach($task in $all){
-  $nameProperty=$task.PSObject.Properties['TaskName'];$name=if($null -ne $nameProperty){[string]$nameProperty.Value}else{''}
-  $safe=Get-SafeTaskName $name
-  if($name -like 'MachineBootstrap-*'){
-   $stateProperty=$task.PSObject.Properties['State'];$ownerTasks.Add([pscustomobject]@{Name=$safe;State=if($null -ne $stateProperty){[string]$stateProperty.Value}else{'Unknown'};Scope='owner-only-maintenance'})
+  $nameProperty=$task.PSObject.Properties['TaskName'];$pathProperty=$task.PSObject.Properties['TaskPath'];$stateProperty=$task.PSObject.Properties['State'];$actionsProperty=$task.PSObject.Properties['Actions']
+  if($null -eq $nameProperty -or $null -eq $pathProperty){$hasUnknownTaskPath=$true}
+  $name=if($null -ne $nameProperty){[string]$nameProperty.Value}else{''}
+  $safe=if($name){Get-SafeTaskName $name}else{'unknown-task'}
+  if(Test-ExpectedMaintenanceTask $task){
+   $ownerTasks.Add([pscustomobject]@{Name=$safe;State=if($null -ne $stateProperty){[string]$stateProperty.Value}else{'Unknown'};Scope='owner-only-maintenance'})
    continue
   }
-  $pathProperty=$task.PSObject.Properties['TaskPath']
-  if($null -eq $pathProperty){$hasUnknownTaskPath=$true;$taskPath=''}else{$taskPath=[string]$pathProperty.Value}
-  if($taskPath -like '\Microsoft\Windows\*'){continue}
-  $actions=@($task.Actions);$shape='other'
+  $taskPath=if($null -ne $pathProperty){[string]$pathProperty.Value}else{''}
+  if($pathProperty -and $taskPath -like '\Microsoft\Windows\*'){continue}
+  $actions=if($null -ne $actionsProperty){@($actionsProperty.Value)}else{@()}
+  $shape='other'
   if($actions.Count -eq 1){
-   $exe=[IO.Path]::GetFileName([string]$actions[0].Execute)
+   $executeProperty=$actions[0].PSObject.Properties['Execute'];$exe=if($null -ne $executeProperty){[IO.Path]::GetFileName([string]$executeProperty.Value)}else{''}
    if([string]::Equals($exe,'wsl.exe','OrdinalIgnoreCase')){
-    if(Test-ApprovedAgentTaskAction $task){$shape='wsl-agent-approved-repo-job'}else{$shape='wsl-agent-invalid-shape'}
+    if(Test-ApprovedAgentTaskAction ([pscustomobject]@{Actions=$actions} )){$shape='wsl-agent-approved-repo-job'}else{$shape='wsl-agent-invalid-shape'}
    }elseif([string]::Equals($exe,'powershell.exe','OrdinalIgnoreCase') -or [string]::Equals($exe,'pwsh.exe','OrdinalIgnoreCase') -or [string]::Equals($exe,'cmd.exe','OrdinalIgnoreCase')){$shape='windows-host-action'}
   }
   $working='unset'
@@ -167,7 +195,9 @@ function Get-ScheduledTaskReview {
   $findings=@()
   if($shape -ne 'wsl-agent-approved-repo-job'){$findings+='unapproved-project-task'}
   if($working -in @('documents-codex','outside-approved-root','wsl-storage')){$findings+='working-directory-outside-agent-code-root'}
-  $projectTasks.Add([pscustomobject]@{Name=$safe;State=[string]$task.State;ActionShape=$shape;WorkingRoot=$working;Findings=@($findings|Select-Object -Unique)})
+  if($name -like 'MachineBootstrap-*'){$findings+='machine-maintenance-task-identity-or-action-mismatch'}
+  if($null -eq $pathProperty -or $null -eq $nameProperty){$findings+='scheduled-task-metadata-unavailable'}
+  $projectTasks.Add([pscustomobject]@{Name=$safe;State=if($null -ne $stateProperty){[string]$stateProperty.Value}else{'Unknown'};ActionShape=$shape;WorkingRoot=$working;Findings=@($findings|Select-Object -Unique)})
  }
  $status=if($hasUnknownTaskPath){'UNAVAILABLE'}elseif($projectTasks.Count){if(@($projectTasks|Where-Object{$_.Findings.Count -gt 0}).Count){'DRIFT'}else{'CLEAN'}}else{'SKIP'}
  [pscustomobject]@{Status=$status;Tasks=$projectTasks.ToArray();OwnerOnlyMaintenance=$ownerTasks.ToArray()}

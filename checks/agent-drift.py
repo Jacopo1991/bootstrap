@@ -22,6 +22,7 @@ VERSION_COMMANDS = {
     "bws": ["bws", "--version"],
     "secretspec": ["secretspec", "--version"],
     "gitleaks": ["gitleaks", "version"],
+    "ccusage": ["ccusage", "--version"],
 }
 
 
@@ -29,11 +30,27 @@ def compare_sets(expected: set[str], actual: set[str]) -> list[str]:
     return sorted(actual - expected)
 
 
-def run_quiet(args: list[str], timeout: int = 10) -> tuple[int, str]:
+def approved_runtime_path(home: Path) -> str:
+    paths = (
+        home / ".local" / "bin",
+        home / ".local" / "share" / "mise" / "shims",
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("/bin"),
+        Path("/usr/lib/wsl/lib"),
+    )
+    return os.pathsep.join(dict.fromkeys(str(path) for path in paths))
+
+
+def run_quiet(args: list[str], timeout: int = 10, home: Path | None = None) -> tuple[int, str]:
+    home = home or Path.home()
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["PATH"] = approved_runtime_path(home)
     try:
         result = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, timeout=timeout,
-                                check=False)
+                                check=False, cwd=home, env=env)
         return result.returncode, result.stdout
     except (OSError, subprocess.SubprocessError):
         return 127, ""
@@ -107,10 +124,10 @@ def installed_uv_tools(directory: Path) -> list[str]:
 
 def scan(root: Path, home: Path) -> list[str]:
     findings: set[str] = set()
-    rc, _ = run_quiet(["chezmoi", "verify"])
+    rc, _ = run_quiet(["chezmoi", "verify"], home=home)
     if rc:
         findings.add("chezmoi-verify-failed")
-    rc, diff = run_quiet(["chezmoi", "diff"])
+    rc, diff = run_quiet(["chezmoi", "diff"], home=home)
     if rc or diff.strip():
         findings.add("chezmoi-diff-nonempty")
 
@@ -126,10 +143,10 @@ def scan(root: Path, home: Path) -> list[str]:
         if not expected:
             findings.add("pin-unavailable:" + name)
             continue
-        resolved = shutil.which(name)
+        resolved = shutil.which(name, path=approved_runtime_path(home))
         if not resolved or Path(resolved).parent.resolve() != (home / ".local" / "bin").resolve():
             findings.add("cli-path-drift:" + name)
-        rc, actual = run_quiet(args)
+        rc, actual = run_quiet(args, home=home)
         if rc or not version_matches(expected, actual):
             findings.add("cli-version-drift:" + name)
 
@@ -148,7 +165,7 @@ def scan(root: Path, home: Path) -> list[str]:
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         findings.add("mise-lock-unavailable")
 
-    npm_rc, npm_output = run_quiet(["npm", "list", "-g", "--depth=0", "--json"])
+    npm_rc, npm_output = run_quiet(["npm", "list", "-g", "--depth=0", "--json"], home=home)
     try:
         npm_extras = unexpected_global_npm_packages(npm_output)
     except (json.JSONDecodeError, ValueError):
@@ -158,7 +175,7 @@ def scan(root: Path, home: Path) -> list[str]:
             findings.add("npm-global-inventory-unavailable")
         findings.update("npm-global-outside-bootstrap:" + name for name in npm_extras)
 
-    uv_dir_rc, uv_dir_output = run_quiet(["uv", "tool", "dir"])
+    uv_dir_rc, uv_dir_output = run_quiet(["uv", "tool", "dir"], home=home)
     if uv_dir_rc or not uv_dir_output.strip():
         findings.add("uv-tool-inventory-unavailable")
     else:

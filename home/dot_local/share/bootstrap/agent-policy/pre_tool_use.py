@@ -21,6 +21,9 @@ WINDOWS = re.compile(r"(?i)(?:[A-Z]:[\\/]|/mnt/[a-z](?:/|$)|\\\\[^\\]+\\|"
                      r"cmd\.exe|wsl(?:\.exe)?|diskpart(?:\.exe)?|schtasks\.exe)(?![A-Za-z0-9_]))")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
+COMMAND_WRAPPERS = {"env", "command", "exec", "nohup", "timeout", "nice", "setsid",
+                    "stdbuf", "xargs", "busybox"}
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 
 
 def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
@@ -127,13 +130,15 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     if not tokens:
         return None
     executable = Path(tokens[0]).name.lower()
-    names = {Path(t).name.lower() for t in tokens}
-    if names & (HOST_NAMES | HOST_OPS):
-        return "Host, Windows, and operating-system commands are blocked."
+    if executable in COMMAND_WRAPPERS or ENV_ASSIGNMENT.fullmatch(tokens[0]):
+        return "Shell command wrappers and environment-prefixed commands are blocked."
     if executable in {"bash", "sh", "dash", "python", "python3", "node", "ruby", "perl"} and any(
         t in {"-c", "-e", "--eval"} for t in tokens[1:]
     ):
         return "Inline shell and interpreter programs are blocked."
+    names = {Path(t).name.lower() for t in tokens}
+    if names & (HOST_NAMES | HOST_OPS):
+        return "Host, Windows, and operating-system commands are blocked."
     for i, token in enumerate(tokens):
         if token in {">", ">>", ">|"} and (i + 1 >= len(tokens) or not inside(tokens[i + 1], cwd, root)):
             return "Shell output outside the current repository is blocked."

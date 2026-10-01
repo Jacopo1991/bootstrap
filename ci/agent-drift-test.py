@@ -14,6 +14,9 @@ expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage"}
 assert drift.compare_sets(expected, expected) == []
 assert drift.version_matches("0.159.2", "codex-cli 0.159.2")
 assert not drift.version_matches("0.159.2", "codex-cli 0.159.20")
+assert drift.VERSION_COMMANDS["ccusage"] == ["ccusage", "--version"]
+assert drift.version_matches("20.0.26", "ccusage 20.0.26")
+assert not drift.version_matches("20.0.26", "ccusage 20.0.260")
 npm_fixture = json.dumps({"dependencies": {
     "npm": {"version": "10.9.0"},
     "corepack": {"version": "0.34.0"},
@@ -29,6 +32,20 @@ with tempfile.TemporaryDirectory() as temp:
     assert drift.unexpected_global_binaries(home) == []
     (bin_dir / "foreign-agent-cli").touch()
     assert drift.unexpected_global_binaries(home) == ["foreign-agent-cli"]
+    shim_dir = home / ".local" / "share" / "mise" / "shims"
+    shim_dir.mkdir(parents=True)
+    for directory, name, marker in (
+        (bin_dir, "ccusage", "managed-ccusage"),
+        (shim_dir, "npm", "managed-npm"),
+        (shim_dir, "uv", "managed-uv"),
+    ):
+        executable = directory / name
+        executable.write_text("#!/bin/sh\nprintf '%s\\n' '" + marker + "'\n", encoding="utf-8")
+        executable.chmod(0o755)
+        assert drift.approved_runtime_path(home).split(os.pathsep)[0] == str(bin_dir)
+        assert Path(shutil.which(name, path=drift.approved_runtime_path(home))).parent == directory
+        rc, output = drift.run_quiet([name, "--version"], home=home)
+        assert rc == 0 and output.strip() == marker, (name, rc, output)
     tool_root = home / ".local" / "share" / "uv" / "tools"
     tool_root.mkdir(parents=True)
     (tool_root / "foreign-uv-tool").mkdir()

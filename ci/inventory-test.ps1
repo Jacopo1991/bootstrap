@@ -6,8 +6,8 @@ function Assert-Equal {param($Actual,$Expected,[string]$Label);if($Actual -cne $
 function Assert-True {param([bool]$Value,[string]$Label);if(-not $Value){throw "FAIL: $Label"};Write-Output "PASS: $Label"}
 Assert-Equal (ConvertTo-WindowsArgument 'plain') 'plain' 'plain argument'
 Assert-Equal (ConvertTo-WindowsArgument 'name with spaces') '"name with spaces"' 'spaces quoted'
-Assert-Equal (ConvertTo-WindowsArgument 'a"b') '"a\"b"' 'embedded quote escaped'
-Assert-Equal (ConvertTo-WindowsArgument 'C:\ends with space\') '"C:\ends with space\\"' 'quoted trailing slash'
+Assert-Equal (ConvertTo-WindowsArgument 'a"b') '"a"b"' 'embedded quote escaped'
+Assert-Equal (ConvertTo-WindowsArgument 'C:\ends with space\') '"C:\ends with space\"' 'quoted trailing slash'
 
 $listing='  NAME           STATE      VERSION'+[Environment]::NewLine+'* Active         Running    2'+[Environment]::NewLine+'  Sleeping       Stopped    2'
 $resolved=Get-Command -Name Get-WslDisks -CommandType Function
@@ -21,20 +21,37 @@ $badRepoTask=[pscustomobject]@{Actions=@([pscustomobject]@{Execute='C:\Windows\S
 Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project task traversal rejected'
 & {
  $synthetic='fixture-argument-must-not-be-serialized'
+ $powershell='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
  function Get-ScheduledTask {param($ErrorAction)
   @(
-   [pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='powershell.exe';Arguments=$synthetic;WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
+   [pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
+   [pscustomobject]@{TaskName='MachineBootstrap-Compact-Test';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\check-compaction.ps1" -Name "Test" -LogPath "C:\ProgramData\machine-bootstrap\compact.log"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
+   [pscustomobject]@{TaskName='MachineBootstrap-Evil';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments=$synthetic;WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
    [pscustomobject]@{TaskName='Custom-Outside';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='powershell.exe';Arguments=$synthetic;WorkingDirectory='C:\Users\tester\Documents\Codex\repo'})},
    [pscustomobject]@{TaskName='AgentRepoJob-Approved';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/sample/repo-job';WorkingDirectory=''})}
   )
  }
  $review=Get-ScheduledTaskReview
  Assert-Equal $review.Status 'DRIFT' 'outside-root custom task reported as drift'
- Assert-Equal $review.OwnerOnlyMaintenance[0].Scope 'owner-only-maintenance' 'machine inventory labeled owner-only maintenance'
- Assert-Equal $review.Tasks[0].WorkingRoot 'documents-codex' 'Documents Codex working directory classified'
- Assert-Equal $review.Tasks[1].ActionShape 'wsl-agent-approved-repo-job' 'approved WSL job shape recorded'
+ Assert-Equal $review.OwnerOnlyMaintenance.Count 2 'only two declared maintenance tasks are exempt'
+ Assert-Equal $review.OwnerOnlyMaintenance[0].Name MachineBootstrap-Inventory 'expected inventory task identity retained'
+ Assert-Equal $review.OwnerOnlyMaintenance[1].Name MachineBootstrap-Compact-Test 'expected compaction task identity retained'
+ Assert-Equal $review.Tasks[0].Name MachineBootstrap-Evil 'spoofed maintenance task remains visible'
+ Assert-True ($review.Tasks[0].Findings -contains 'machine-maintenance-task-identity-or-action-mismatch') 'spoofed maintenance identity flagged'
+ Assert-Equal $review.Tasks[1].WorkingRoot 'documents-codex' 'Documents Codex working directory classified'
+ Assert-Equal $review.Tasks[2].ActionShape 'wsl-agent-approved-repo-job' 'approved WSL job shape recorded'
  $serialized=$review|ConvertTo-Json -Depth 8
  Assert-Equal $serialized.Contains($synthetic) $false 'scheduled task arguments never serialized'
+}
+& {
+ $powershell='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+ function Get-ScheduledTask {param($ErrorAction)
+  [pscustomobject]@{TaskName='MachineBootstrap-Inventory';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})}
+ }
+ $review=Get-ScheduledTaskReview
+ Assert-Equal $review.Status 'UNAVAILABLE' 'missing task path is never reported clean'
+ Assert-Equal $review.OwnerOnlyMaintenance.Count 0 'missing task path prevents maintenance exemption'
+ Assert-True ($review.Tasks[0].Findings -contains 'scheduled-task-metadata-unavailable') 'missing task metadata is visible'
 }
 Assert-Equal (@(ConvertFrom-WslList ($listing.ToCharArray() -join [string][char]0)).Count) 2 'NUL-separated WSL list parsed'
 $fixture=Join-Path $env:TEMP ('bootstrap-inventory-tests-'+[guid]::NewGuid().ToString('N'))
@@ -93,7 +110,7 @@ try {
   function Get-PSDrive {param($Name,$PSProvider,$ErrorAction);[pscustomobject]@{Free=123}}
   function Test-Path {param($LiteralPath,$PathType);if($LiteralPath -like 'HKLM:*'){return $false};if($PathType){Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType -ErrorAction SilentlyContinue}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -ErrorAction SilentlyContinue}}
   function Get-ItemProperty {throw 'No registry value'}
-  function Get-ScheduledTask {param($TaskName,$ErrorAction);[pscustomobject]@{TaskName='MachineBootstrap-Inventory';State='Ready'}}
+  function Get-ScheduledTask {param($TaskName,$ErrorAction);[pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})}}
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01')
   Assert-Equal $inventoryFixtureState.ProbeCalls 0 'stopped distro never probed'
   Assert-Equal $inventoryFixtureState.AgentDriftCalls 0 'stopped distro never queried for drift'
