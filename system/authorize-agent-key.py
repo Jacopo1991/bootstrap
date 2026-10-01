@@ -35,16 +35,18 @@ def main() -> int:
             raise ValueError("unsafe agent home")
         try:
             os.mkdir(".ssh", 0o700, dir_fd=home_fd)
+            created_ssh_directory = True
         except FileExistsError:
-            pass
+            created_ssh_directory = False
         ssh_fd = os.open(".ssh", DIRECTORY, dir_fd=home_fd)
         try:
             ssh_stat = os.fstat(ssh_fd)
             if not stat.S_ISDIR(ssh_stat.st_mode):
                 raise ValueError("unsafe SSH directory")
-            if ssh_stat.st_uid not in (0, account.pw_uid):
+            if created_ssh_directory:
+                os.fchown(ssh_fd, account.pw_uid, account.pw_gid)
+            elif ssh_stat.st_uid != account.pw_uid:
                 raise ValueError("unexpected SSH directory owner")
-            os.fchown(ssh_fd, account.pw_uid, account.pw_gid)
             os.fchmod(ssh_fd, 0o700)
             try:
                 key_fd = os.open("authorized_keys", FILE | os.O_EXCL, 0o600, dir_fd=ssh_fd)
