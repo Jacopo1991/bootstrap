@@ -220,3 +220,88 @@ try {
   Assert-Equal ([IO.File]::ReadAllBytes($date)[0] -eq 123) $true 'dated output has no BOM'
  } finally {Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue}
 }
+
+
+& {
+ Assert-True ($script:GhTokenExpiryPython.Contains('--include')) 'gh expiry probe requests response headers'
+ Assert-True ($script:GhTokenExpiryPython.Contains('--silent')) 'gh expiry probe suppresses response body'
+ Assert-True ($script:GhTokenExpiryPython.Contains('stdout=subprocess.PIPE')) 'raw headers are captured inside the AgentDev process'
+ Assert-True ($script:GhTokenExpiryPython.Contains('stderr=subprocess.DEVNULL')) 'gh diagnostics are discarded inside AgentDev'
+ Assert-True ($script:GhTokenExpiryPython.Contains('GitHub-Authentication-Token-Expiration')) 'only the documented expiry header is parsed'
+ Assert-Equal ($script:GhTokenExpiryPython.Contains('print(result.stdout)')) $false 'Python probe never prints raw headers'
+ Assert-Equal ($script:GhTokenExpiryPython.Contains('gh auth token')) $false 'Python probe never requests token contents'
+}
+foreach($case in @(
+ @{Name='exactly-fourteen-days';AgentState='Running';ProbeStatus='Success';Expires='2026-10-15T00:00:00Z';ExpectedStatus='AVAILABLE';ExpectedWarning='expires-within-14-days';ExpectedCalls=1},
+ @{Name='more-than-fourteen-days';AgentState='Running';ProbeStatus='Success';Expires='2026-10-16T00:00:00Z';ExpectedStatus='AVAILABLE';ExpectedWarning=$null;ExpectedCalls=1},
+ @{Name='already-expired';AgentState='Running';ProbeStatus='Success';Expires='2026-09-30T23:59:59Z';ExpectedStatus='AVAILABLE';ExpectedWarning='expires-within-14-days';ExpectedCalls=1},
+ @{Name='missing-header';AgentState='Running';ProbeStatus='Success';Expires=$null;ExpectedStatus='UNKNOWN';ExpectedWarning=$null;ExpectedCalls=1},
+ @{Name='invalid-date';AgentState='Running';ProbeStatus='Success';Expires='not-a-date';ExpectedStatus='UNAVAILABLE';ExpectedWarning=$null;ExpectedCalls=1},
+ @{Name='probe-timeout';AgentState='Running';ProbeStatus='Timeout';Expires=$null;ExpectedStatus='UNAVAILABLE';ExpectedWarning=$null;ExpectedCalls=1},
+ @{Name='stopped-agentdev';AgentState='Stopped';ProbeStatus='Success';Expires='2026-10-02T00:00:00Z';ExpectedStatus='SKIP';ExpectedWarning=$null;ExpectedCalls=0},
+ @{Name='unknown-agentdev';AgentState='Unknown';ProbeStatus='Success';Expires='2026-10-02T00:00:00Z';ExpectedStatus='SKIP';ExpectedWarning=$null;ExpectedCalls=0},
+ @{Name='stops-before-gh-query';AgentState='Running';FreshAgentState='Stopped';ProbeStatus='Success';Expires='2026-10-02T00:00:00Z';ExpectedStatus='SKIP';ExpectedWarning=$null;ExpectedCalls=0}
+)) {
+ & {
+  $inventoryExpiryState=@{Case=$case;GhCalls=[collections.generic.list[string]]::new();ProbeCalls=0;DriftCalls=0;ListCalls=0}
+  function Get-WslDisks {
+   @(
+    [pscustomobject]@{Name='AgentDev';WslVersion=2;Vhdx='C:\mock\agentdev.vhdx';FileBytes=900;BasePath='C:\mock'},
+    [pscustomobject]@{Name='Other';WslVersion=2;Vhdx='C:\mock\other.vhdx';FileBytes=800;BasePath='C:\mock'},
+    [pscustomobject]@{Name='Sleeping';WslVersion=2;Vhdx='C:\mock\sleeping.vhdx';FileBytes=700;BasePath='C:\mock'}
+   )
+  }
+  function Invoke-BoundedNative {
+   param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
+   if($Arguments[0] -eq '--list'){
+    $inventoryExpiryState.ListCalls++
+    $lines=@(' NAME STATE VERSION')
+    $agentState=$case.AgentState
+    if($inventoryExpiryState.ListCalls -gt 1 -and $case.ContainsKey('FreshAgentState') -and $case['FreshAgentState']){$agentState=$case['FreshAgentState']}
+    if($agentState -ne 'Unknown'){$lines+=('* AgentDev '+$agentState+' 2')}
+    $lines+='  Other Running 2';$lines+='  Sleeping Stopped 2'
+    return [pscustomobject]@{Status='Success';Output=($lines -join [Environment]::NewLine);ExitCode=0}
+   }
+   if($Arguments[0] -eq '--version'){return [pscustomobject]@{Status='Success';Output='WSL version: 2.5.0';ExitCode=0}}
+   if($Arguments -contains '-c'){
+    $inventoryExpiryState.GhCalls.Add(($Arguments -join ' '))
+    if($case.ProbeStatus -eq 'Timeout'){return [pscustomobject]@{Status='Timeout';Output=$null;ExitCode=$null}}
+    $status=if($null -eq $case.Expires){'UNKNOWN'}else{'AVAILABLE'}
+    $payload=[ordered]@{schemaVersion=1;status=$status;expiresAtISO=$case.Expires;secretMarker='gho-never-serialize';diagnostic='raw gh output must not be copied'}
+    return [pscustomobject]@{Status='Success';Output=($payload|ConvertTo-Json -Compress);ExitCode=0}
+   }
+   [pscustomobject]@{Status='Failed';Output='discarded diagnostic';ExitCode=1}
+  }
+  function Invoke-WslInventoryProbe {param($Name);$inventoryExpiryState.ProbeCalls++;[pscustomobject]@{Status='Success';Usage=[pscustomobject]@{capBytes=1000;usedBytes=500};Largest=@();Errors=@()}}
+  function Invoke-WslAgentDrift {param($Name);$inventoryExpiryState.DriftCalls++;[pscustomobject]@{Status='CLEAN';Findings=@()}}
+  function Get-LatestCachedDistro {param($Directory,$Name,$Vhdx,$CurrentDate);$null}
+  function Get-PSDrive {param($Name,$PSProvider,$ErrorAction);[pscustomobject]@{Free=123}}
+  function Test-Path {param($LiteralPath,$PathType);if($LiteralPath -like 'HKLM:*'){return $false};$false}
+  function Get-ItemProperty {throw 'No registry value'}
+  function Get-ScheduledTask {param($TaskName,$ErrorAction);@()}
+  $now=[datetime]::SpecifyKind([datetime]'2026-10-01T00:00:00',[DateTimeKind]::Utc)
+  $v=Get-MachineInventoryValue -OutputDirectory $env:TEMP -CurrentTime $now
+  $agent=@($v.distros|Where-Object{$_.Name -eq 'AgentDev'})[0]
+  Assert-Equal $inventoryExpiryState.GhCalls.Count $case.ExpectedCalls "$($case.Name) AgentDev-only query gate"
+  Assert-Equal $agent.GhTokenExpiryStatus $case.ExpectedStatus "$($case.Name) status"
+  Assert-Equal $agent.GhTokenExpiryWarning $case.ExpectedWarning "$($case.Name) warning threshold"
+  if($case.ExpectedCalls -eq 1){Assert-True ([bool]$agent.GhTokenExpiryRecordedAtISO) "$($case.Name) records query time"}else{Assert-Equal $agent.GhTokenExpiryRecordedAtISO $null "$($case.Name) skipped query has no recorded time"}
+  if($case.ExpectedStatus -eq 'AVAILABLE' -and $case.Name -ne 'invalid-date'){
+   Assert-Equal $agent.GhTokenExpiresAtISO $case.Expires "$($case.Name) safe expiry date recorded"
+  }else{Assert-Equal $agent.GhTokenExpiresAtISO $null "$($case.Name) has no untrusted expiry date"}
+  $other=@($v.distros|Where-Object{$_.Name -eq 'Other'})[0]
+  Assert-Equal $other.GhTokenExpiryStatus 'SKIP' "$($case.Name) other distro never receives token metadata"
+  $serialized=$v|ConvertTo-Json -Depth 8
+  Assert-Equal $serialized.Contains('gho-never-serialize') $false "$($case.Name) extra token-like field is discarded"
+  Assert-Equal $serialized.Contains('raw gh output') $false "$($case.Name) raw diagnostic field is discarded"
+ }
+}
+& {
+ $dir=Join-Path $env:TEMP ('bootstrap-gh-expiry-warning-'+[guid]::NewGuid().ToString('N'))
+ function Get-MachineInventoryValue {param($OutputDirectory,$CurrentTime);[pscustomobject]@{schemaVersion=2;createdAtISO=$CurrentTime.ToString('o');distros=@([pscustomobject]@{Name='AgentDev';GhTokenExpiryStatus='AVAILABLE';GhTokenExpiresAtISO='2026-10-14T23:59:59Z';GhTokenExpiryWarning='expires-within-14-days'})}}
+ try {
+  $lines=@(Invoke-MachineInventory -OutputDirectory $dir -At ([datetime]'2026-10-01T00:00:00Z'))
+  Assert-Equal (@($lines|Where-Object{$_ -like 'WARNING: AgentDev gh token expires within 14 days:*'}).Count) 1 'inventory emits a fixed warning line'
+  Assert-Equal (($lines -join [Environment]::NewLine).Contains('gho-')) $false 'warning line contains no credential value'
+ } finally {Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue}
+}
