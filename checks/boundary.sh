@@ -29,7 +29,7 @@ has_agent_session_interop() {
 }
 
 has_ssh_conditional_or_include() {
-  grep -Eiq '^[[:space:]]*(Match|Include)[[:space:]]' "$1"
+  grep -Eiq '^[[:space:]]*(Match|Include)([[:space:]]|=)' "$1"
 }
 
 check_vscode_ssh_boundary() {
