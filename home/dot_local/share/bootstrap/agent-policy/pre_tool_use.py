@@ -91,9 +91,10 @@ def secret_scan(root: Path) -> str | None:
     return None
 
 
-def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str]] | None:
+def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[str]] | None:
     """Resolve repeated -C options without permitting config/worktree overrides."""
     target = Path(cwd).resolve()
+    selectors: set[str] = set()
     index = 1
     while index < len(tokens):
         token = tokens[index]
@@ -105,12 +106,13 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str]] | Non
         elif token.startswith("-C") and len(token) > 2:
             value = token[2:]
         elif token in {"--no-pager", "--literal-pathspecs", "--no-optional-locks"}:
+            selectors.add(token)
             index += 1
             continue
         elif token.startswith("-"):
             return None
         else:
-            return target, token, tokens[index + 1:]
+            return target, token, tokens[index + 1:], selectors
         # Git resolves each relative -C against the preceding effective directory.
         if SHELL_EXPANSION.search(value):
             return None
@@ -125,7 +127,7 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     parsed = git_target(tokens, cwd)
     if parsed is None:
         return "Unsupported Git selector or global option; use plain git with -C or --no-pager."
-    target, subcommand, arguments = parsed
+    target, subcommand, arguments, selectors = parsed
     target_root = root_for(str(target), approved_roots)
     if str(target_root) == "/__bootstrap_outside_approved_roots__":
         return "Git target is outside approved code and knowledge roots."
@@ -149,7 +151,6 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
                for arg in arguments):
             return "Git config may change only the current repository's local configuration."
     if cross_repo:
-        selectors = tokens[1:len(tokens) - len(arguments) - 1]
         if not {"--no-pager", "--no-optional-locks"}.issubset(selectors):
             return "Cross-repository reads require --no-pager and --no-optional-locks."
         if subcommand in {"show", "diff", "blame"} and "--no-textconv" not in arguments:

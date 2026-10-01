@@ -147,6 +147,7 @@ with tempfile.TemporaryDirectory() as temp:
         "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
         "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",
         "git -C ../sibling status",
+        f"git -C --no-pager -C --no-optional-locks -C {sibling} status",
         "git --no-pager -C ../sibling status",
         "git --no-pager --no-optional-locks -C ../sibling diff",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --out=/tmp/no-write",
