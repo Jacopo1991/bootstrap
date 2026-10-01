@@ -124,25 +124,37 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[s
 
 def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> str | None:
     """Require an explicit remote whose effective URLs stay on GitHub."""
-    forbidden = ("--repo", "--receive-pack", "--upload-pack", "--exec", "--multiple")
-    if any(arg.startswith("-") and any(option.startswith(arg.split("=", 1)[0])
-           for option in forbidden) for arg in arguments):
-        return "Custom Git remote routing is blocked."
-    if subcommand == "fetch" and "--all" in arguments:
-        return "Fetch one explicit remote at a time."
-    remote = next((arg for arg in arguments if not arg.startswith("-")), None)
-    if not remote:
-        return "Git network commands require an explicit GitHub remote."
+    flags = {
+        "push": {"-u", "--set-upstream", "-f", "--force", "--force-with-lease",
+                 "--atomic", "--tags", "--all", "-d", "--delete", "--prune",
+                 "-n", "--dry-run", "--porcelain", "-v", "--verbose", "-q", "--quiet"},
+        "fetch": {"-p", "--prune", "-t", "--tags", "--no-tags", "-f", "--force",
+                  "-n", "--dry-run", "-v", "--verbose", "-q", "--quiet"},
+        "pull": {"--rebase", "--no-rebase", "--ff-only", "--ff", "--no-ff",
+                 "--autostash", "--no-autostash", "-v", "--verbose", "-q", "--quiet"},
+    }
+    attached_values = {"--force-with-lease"} if subcommand == "push" else {
+        "--depth", "--filter", "--shallow-since", "--shallow-exclude",
+    }
+    operands: list[str] = []
+    for argument in arguments:
+        if not argument.startswith("-"):
+            operands.append(argument)
+        elif argument not in flags[subcommand]:
+            key, separator, value = argument.partition("=")
+            if key not in attached_values or not separator or not value:
+                return "Unsupported remote option; use ordinary flags or supported --key=value options."
+    if not operands:
+        return "Git network commands require an explicit named GitHub remote."
+    remote = operands[0]
+    # Named remotes let Git expand both insteadOf and pushInsteadOf itself.
+    # A direct URL cannot be resolved as a push URL without synthetic config.
+    command = ["git", "remote", "get-url"]
+    if subcommand == "push":
+        command.append("--push")
+    command.extend(["--all", remote])
     def github_url(value: str) -> bool:
         return value.startswith(("https://github.com/", "git@github.com:", "ssh://git@github.com/"))
-    if github_url(remote):
-        # Resolve configured insteadOf rewrites too, using Git's own URL expansion.
-        command = ["git", "ls-remote", "--get-url", remote]
-    else:
-        command = ["git", "remote", "get-url"]
-        if subcommand == "push":
-            command.append("--push")
-        command.extend(["--all", remote])
     try:
         result = subprocess.run(command, cwd=target, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

@@ -147,6 +147,7 @@ with tempfile.TemporaryDirectory() as temp:
         "git bundle create /tmp/out HEAD", "git format-patch -o /tmp/out HEAD",
         "git diff --out=/tmp/out", "git checkout ../sibling/file",
         "git push sibling.git HEAD", "git push child/../../sibling HEAD",
+        "git push -o origin local-target HEAD", "git push --push-option origin local-target HEAD",
         "git push", "git fetch --all",
         "git status > '$OUT'", "git status > ~/result",
         "git --no-pager --no-optional-locks -C ../sibling log -p",
@@ -164,7 +165,8 @@ with tempfile.TemporaryDirectory() as temp:
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --contents=/tmp/file file",
     ):
         assert policy.evaluate(event(command), roots) is not None, command
-    for command in ("git add file", "git push origin branch", "git -C . add file", "git config --local review.fixture value",
+    for command in ("git add file", "git push origin branch", "git push -u origin branch", "git fetch --depth=1 origin",
+                    "git -C . add file", "git config --local review.fixture value",
                     "gh --repo owner/repo pr create", "gh pr --repo owner/repo create"):
         assert policy.evaluate(event(command), roots) is None, command
     subprocess.run(["git", "remote", "add", "local-target", str(sibling)], cwd=current, check=True)
@@ -182,6 +184,11 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git push origin HEAD"), roots) is not None
     assert policy.evaluate(event("git push https://github.com/Jacopo1991/ci-fixture.git HEAD"), roots) is not None
     subprocess.run(["git", "config", "--unset-all", "url." + str(sibling) + ".insteadOf"], cwd=current, check=True)
+    subprocess.run(["git", "config", "url." + str(sibling) + ".pushInsteadOf",
+                    "https://github.com/Jacopo1991/ci-fixture.git"], cwd=current, check=True)
+    assert policy.evaluate(event("git push origin HEAD"), roots) is not None
+    assert policy.evaluate(event("git push https://github.com/Jacopo1991/ci-fixture.git HEAD"), roots) is not None
+    subprocess.run(["git", "config", "--unset-all", "url." + str(sibling) + ".pushInsteadOf"], cwd=current, check=True)
     assert policy.permission_reason(event("git push origin branch"), roots) is None
     assert policy.permission_reason(event("gh issue list"), roots) is None
     assert policy.permission_reason(event("/usr/bin/gh pr create"), roots) is None

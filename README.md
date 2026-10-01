@@ -437,8 +437,12 @@ so no pager runs and status cannot refresh another repository's index. Add
 Git commands retain ordinary use; global/file configuration writes, new
 repository/worktree creation, output-file primitives and local filesystem
 remotes require separate setup and are blocked. Push, fetch and pull require
-one explicit remote; its effective URLs (including pushurl/insteadOf rewrites)
+one explicit named remote; its effective URLs (including pushurl, insteadOf
+and pushInsteadOf rewrites)
 must be GitHub HTTPS or SSH. No remote connection is made by the policy check.
+Common flags such as `git push -u origin <branch>` work. Supported fetch/pull
+value options use `--key=value`; custom transport/push options, direct URL
+operands and unspecified remotes are refused rather than guessed.
 Repeated and attached `-C` selectors resolve sequentially; symlink escapes,
 config/git-dir/work-tree overrides and side-effecting cross-repo read options
 are refused. The existing host-command, file-write and staged-secret checks
