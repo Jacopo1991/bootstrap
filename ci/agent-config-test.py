@@ -109,6 +109,7 @@ with tempfile.TemporaryDirectory() as temp:
     link.symlink_to(outsider, target_is_directory=True)
     nested = current / "nested"
     nested.mkdir()
+    (sibling / "outside-link").symlink_to(outsider / "file")
     def event(command):
         return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(current)}
     for target in (sibling, knowledge):
@@ -150,6 +151,15 @@ with tempfile.TemporaryDirectory() as temp:
         "git push -o origin local-target HEAD", "git push --push-option origin local-target HEAD",
         "git push", "git fetch --all",
         "git status > '$OUT'", "git status > ~/result",
+        f"gh issue list &> {outsider}/result",
+        "git status &> '$OUT'", "git status &>> ~/result",
+        "git --no-pager --no-optional-locks -C ../sibling grep -f/etc/file needle",
+        "git --no-pager --no-optional-locks -C ../sibling grep -foutside-link needle",
+        "git --no-pager --no-optional-locks -C ../sibling ls-files -X/etc/file",
+        "git --no-pager --no-optional-locks -C ../sibling ls-files --exclude-from=outside-link",
+        "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --contents=outside-link file",
+        "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --ignore-revs-file=outside-link file",
+        "git --no-pager --no-optional-locks -C ../sibling show --no-textconv outside-link",
         "git --no-pager --no-optional-locks -C ../sibling log -p",
         "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
         "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",

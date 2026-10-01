@@ -201,6 +201,16 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if subcommand in {"log", "show", "diff", "blame"} and "--no-textconv" not in arguments:
             return "Cross-repository log/show/diff/blame require --no-textconv."
         forbidden = ("--ext-diff", "--textconv", "--no-index", "--open-files-in-pager")
+        external_files = {
+            "grep": ("--file",),
+            "ls-files": ("--exclude-from",),
+            "blame": ("--contents", "--ignore-revs-file"),
+        }.get(subcommand, ())
+        if any(any(option_matches(arg, option) for option in external_files)
+               or (subcommand == "grep" and arg.startswith("-f"))
+               or (subcommand == "ls-files" and arg.startswith("-X"))
+               for arg in arguments):
+            return "External input-file options are blocked across repositories."
         if any(any(option_matches(arg, option) for option in forbidden)
                or arg.startswith("-O") or (subcommand == "blame" and arg.startswith("-S"))
                for arg in arguments):
@@ -216,7 +226,7 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
             return "Local filesystem Git remotes are blocked."
         if "://" in value or re.match(r"^[^/]+@[^:]+:", value):
             continue
-        if value.startswith(("/", "../", "./")) or (cross_repo and "/" in value):
+        if cross_repo or value.startswith(("/", "../", "./")):
             if not inside(value, str(target), target_root):
                 return "Git path is outside the inspected repository."
         if subcommand in {"push", "fetch", "pull", "remote"} and value.startswith(("/", "../", "./")):
@@ -307,7 +317,7 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     if names & (HOST_NAMES | HOST_OPS):
         return "Host, Windows, and operating-system commands are blocked."
     for i, token in enumerate(tokens):
-        if token in {">", ">>", ">|"} and (i + 1 >= len(tokens) or SHELL_EXPANSION.search(tokens[i + 1])
+        if token in {">", ">>", ">|", "&>", "&>>"} and (i + 1 >= len(tokens) or SHELL_EXPANSION.search(tokens[i + 1])
                 or not inside(tokens[i + 1], cwd, root)):
             return "Shell output outside the current repository is blocked."
     args = [t for t in tokens[1:] if not t.startswith("-")]
