@@ -24,6 +24,7 @@ stage_policy() {
 }
 
 activate_policy() {
+  install -d -o root -g root -m 0755 /run/sshd
   ssh-keygen -A
   /usr/sbin/sshd -t -f /etc/ssh/sshd_config.agentdev
   if [[ -d /run/systemd/system ]]; then
