@@ -28,7 +28,7 @@ def main() -> int:
     if account.pw_uid == 0 or account.pw_dir != "/home/agent":
         raise ValueError("unexpected agent account")
     parent_fd = os.open("/home", DIRECTORY)
-    home_fd = os.open("agent", DIRECTORY, dir_fd=parent_fd)
+    home_fd = os.open("agent", DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
         home_stat = os.fstat(home_fd)
         if not stat.S_ISDIR(home_stat.st_mode) or home_stat.st_uid != account.pw_uid:
@@ -42,14 +42,24 @@ def main() -> int:
             ssh_stat = os.fstat(ssh_fd)
             if not stat.S_ISDIR(ssh_stat.st_mode):
                 raise ValueError("unsafe SSH directory")
+            if ssh_stat.st_uid not in (0, account.pw_uid):
+                raise ValueError("unexpected SSH directory owner")
             os.fchown(ssh_fd, account.pw_uid, account.pw_gid)
             os.fchmod(ssh_fd, 0o700)
-            key_fd = os.open("authorized_keys", FILE, 0o600, dir_fd=ssh_fd)
+            try:
+                key_fd = os.open("authorized_keys", FILE | os.O_EXCL, 0o600, dir_fd=ssh_fd)
+                created_key_file = True
+            except FileExistsError:
+                key_fd = os.open("authorized_keys", FILE, dir_fd=ssh_fd)
+                created_key_file = False
             try:
                 key_stat = os.fstat(key_fd)
                 if not stat.S_ISREG(key_stat.st_mode) or key_stat.st_nlink != 1:
                     raise ValueError("unsafe authorized_keys file")
-                os.fchown(key_fd, account.pw_uid, account.pw_gid)
+                if created_key_file:
+                    os.fchown(key_fd, account.pw_uid, account.pw_gid)
+                elif key_stat.st_uid != account.pw_uid:
+                    raise ValueError("unexpected authorized_keys owner")
                 os.fchmod(key_fd, 0o600)
                 fcntl.flock(key_fd, fcntl.LOCK_EX)
                 os.lseek(key_fd, 0, os.SEEK_SET)
