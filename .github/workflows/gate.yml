@@ -38,9 +38,18 @@ jobs:
       - name: Windows PowerShell 5.1 BasePath regression tests
         shell: powershell
         run: powershell.exe -NoProfile -File ci/windows-test.ps1
+  gpu-resolution:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Resolve host and pinned-container GPU requirements without a GPU
+        run: bash ci/gpu-resolution.sh
   gate:
     if: ${{ always() }}
-    needs: [lint, distro, windows]
+    needs: [lint, distro, windows, gpu-resolution]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -49,8 +58,10 @@ jobs:
           LINT: ${{ needs.lint.result }}
           DISTRO: ${{ needs.distro.result }}
           WINDOWS: ${{ needs.windows.result }}
+          GPU_RESOLUTION: ${{ needs.gpu-resolution.result }}
         run: |
-          printf 'lint=%s\ndistro=%s\nwindows=%s\n' "$LINT" "$DISTRO" "$WINDOWS" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'lint=%s\ndistro=%s\nwindows=%s\ngpu-resolution=%s\n' "$LINT" "$DISTRO" "$WINDOWS" "$GPU_RESOLUTION" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$LINT" = success
           test "$DISTRO" = success
           test "$WINDOWS" = success
+          test "$GPU_RESOLUTION" = success
