@@ -32,9 +32,9 @@ cleanup() {
 }
 trap cleanup EXIT
 if ! sudo -H -u agent /usr/sbin/sshd -T -f "$config" \
-  -C user=agent,addr=127.0.0.1,host=localhost \
-  >"$test_dir/agent-effective" 2>"$test_dir/agent-sshd.err"; then
-  diagnostic=$(head -n 1 "$test_dir/agent-sshd.err" |
+  -C user=agent,addr=127.0.0.1,host=localhost 2>&1 |
+  tee "$test_dir/agent-sshd-output" >/dev/null; then
+  diagnostic=$(head -n 1 "$test_dir/agent-sshd-output" |
     sed -E 's@/etc/ssh/ssh_host_[[:alnum:]_-]+@<host-key-file>@g')
   printf 'Agent sshd -T diagnostic: %s\n' "${diagnostic:-no stderr}"
   exit 1
