@@ -8,7 +8,7 @@ gpu_requirements() (
   [[ -x $python && -f $lock ]]
   cd /
   export UV_NO_CONFIG=1
-  unset UV_INDEX_URL UV_EXTRA_INDEX_URL UV_INDEX_STRATEGY UV_DEFAULT_INDEX
+  unset UV_INDEX UV_INDEX_URL UV_EXTRA_INDEX_URL UV_INDEX_STRATEGY UV_DEFAULT_INDEX UV_FIND_LINKS
 
   local tmp
   tmp=$(mktemp -d)
