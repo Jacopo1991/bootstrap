@@ -7,7 +7,7 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$ROOT/home/.chezmoitemplates/pins.env"
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib"
 export DISABLE_AUTOUPDATER=1
-for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage bws secretspec; do
+for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage bws secretspec bwrap socat gitleaks; do
   command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
 done
 [[ $(chezmoi --version) == "chezmoi version v$CHEZMOI_VERSION"* ]]
@@ -20,6 +20,9 @@ done
 [[ $(ccusage --version) == "ccusage $CCUSAGE_VERSION" ]]
 [[ $(bws --version) == "bws $BWS_VERSION" ]]
 [[ $(secretspec --version) == "secretspec $SECRETSPEC_VERSION" ]]
+gitleaks_expected=${GITLEAKS_URL##*/download/v}
+gitleaks_expected=${gitleaks_expected%%/*}
+[[ $(gitleaks version) == *"$gitleaks_expected"* ]]
 for lock in "$ROOT/system/apt-base.lock" "$ROOT/system/apt-gh.lock"; do
   while IFS='=' read -r package version; do
     [[ $(dpkg-query -W -f='${Version}' "$package") == "$version" ]] || {

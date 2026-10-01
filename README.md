@@ -51,7 +51,7 @@ when updating an existing installation. The admin's Linux home has mode `0700` w
 removed. Agent is locked for password login, absent from sudo/docker groups,
 and explicitly denied sudo. Agent login via `wsl -d AgentDev` still works.
 
-For a one-off task involving D:, open the admin explicitly with
+The agent user's configured hooks and sandbox never grant access to the Windows host or mounted Windows drives. For a one-off task involving D:, open the admin explicitly with
 `wsl -d AgentDev -u youradmin`. Use a private mount namespace so the agent's
 sessions never receive the drive mount:
 
@@ -75,7 +75,7 @@ bash /opt/machine-bootstrap/current/checks/distro.sh
 bash /opt/machine-bootstrap/current/checks/boundary.sh
 ```
 
-The distro check validates exact versions, takes content/mode/mtime snapshots
+The distro check validates exact versions (including `bubblewrap`, `socat`, and Gitleaks), takes content/mode/mtime snapshots
 of managed files and installed tools around another `chezmoi apply`, then requires
 an empty diff and clean `chezmoi verify`. Installation pins umask to `022` for
 both generated chezmoi configuration and the initial apply, so the admin
@@ -237,6 +237,57 @@ is disabled. The exact same assertions and hash-locked Python dependencies run
 in the digest-pinned Python container. These checks download public wheels and
 model files; no model service or credentials are used.
 
+### Design step 10 — minimal agent configuration and drift report
+
+The existing chezmoi apply manages Codex and Claude Code's global instructions,
+native permissions, and one shared pre-tool policy hook. Codex uses the
+`untrusted` approval policy with `workspace-write` and sandbox networking off.
+Claude Code keeps its normal ask-before-running mode and uses the native Linux
+sandbox with unsandboxed retries disabled and startup failing if the sandbox is
+unavailable. The base image pins the sandbox's `bubblewrap` and `socat`
+dependencies. Claude's optional seccomp add-on is not installed; Windows interop
+and drive automount remain disabled by the distro baseline.
+
+The policy hook blocks Windows/host commands, file-tool writes outside the
+current repository, shell writes outside that repository, and commits whose
+staged diff cannot pass the pinned Gitleaks scan. The Codex hook is user-managed:
+after first apply or any hook change, inspect and trust the exact hook definition
+with Codex's `/hooks` command before relying on it. Codex skips an untrusted
+hook. Do not use a hook-trust bypass. Hooks are additional guardrails; the
+Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
+
+Approved code roots are `/home/agent/dev_workspace/<repo>`; Cortex knowledge
+repositories belong in sibling paths under `/home/agent/cortex/<repo>`, never
+inside code repositories. Runtime data belongs under
+`/home/agent/project-data/<project>` and is never a Git repository.
+`CustomerHarness` and `Typo3/DKM` are founder-approved local-only code
+projects: keep them under the code root without a GitHub remote or publishing
+their contents. Backups under `C:\backups\<project>` are Windows-owner copies;
+the agent cannot access them. Other code clones under `Documents\Codex` or
+outside the approved roots are drift.
+
+Shared skills, MCP servers, plugins, and role-scoped availability start empty.
+Candidate names are listed in this pull request for founder review; nothing from
+the private toolkit inventory is installed or linked. The optional Superpowers
+marketplace is outside toolkit sync and the pilot-critical path. Add shared
+components only after a demonstrated need, progressing through CI, hooks and
+permissions, role-scoped availability, self-triggering skills, then task
+pointers. No automatic removal is performed; restore and security recovery
+remain available.
+
+The existing nightly Windows inventory task is reused for drift collection; no
+new task or scheduler is installed. It queries only distros already running and
+records a stopped distro as `SKIP` without starting it. For running distros,
+the drift check reports dirty `chezmoi verify`/`chezmoi diff`, unexpected
+globally installed agent CLIs, skills, MCP servers or plugins, and task/job
+configuration outside the approved roots. A missing approved path or
+unconfigured task-root setting is reported as `UNCONFIGURED`, never clean.
+Windows task output contains sanitized task names and fixed action/working-root
+classifications only; raw arguments, command lines and secret values are
+discarded. MachineBootstrap inventory and compaction tasks remain the
+owner-managed maintenance exception. Project workflow hooks, inbox dispatch,
+and scheduled PM automation stay deferred until design step 14.
+
 ## Pins and repeatability
 
 | Component | Pin location |
@@ -251,7 +302,7 @@ model files; no model service or credentials are used.
 | GPU Python packages and all dependencies with hashes | `checks/gpu-requirements.lock` |
 | GPU container image | `checks/gpu-image.env` |
 | Public test model | Revision in `checks/gpu-smoke.py` |
-| ShellCheck, Gitleaks and release SHA-256 | `home/.chezmoitemplates/pins.env` |
+| ShellCheck, agent/CI Gitleaks and release SHA-256 | `home/.chezmoitemplates/pins.env` |
 | GitHub Actions checkout | Full commit SHA in the workflow |
 
 Claude Code uses the official native installer with an exact release argument
@@ -305,7 +356,7 @@ GitHub-hosted `ubuntu-24.04` runs pinned ShellCheck/Gitleaks. It imports the sam
 checksum-pinned Ubuntu WSL filesystem into a disposable Docker container, creates
 an admin with an empty gh credential-file fixture, runs `install.sh` twice as
 that admin, asserts all five `/etc/wsl.conf` keys after each install, then runs
-the distro and boundary checks as agent. The container explicitly skips the
+the distro and boundary checks as agent. Hosted lint also tests blocking controls in the agent hook and exercises a synthetic, never-reusable secret-scanner canary without storing or logging its value. The container explicitly skips the
 WSL-only runtime checks. This avoids the
 hosted runner's preinstalled PPAs and tools masking fresh-image failures. The
 single **gate** job runs with `always()` and fails if any required job failed,

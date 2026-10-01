@@ -9,6 +9,7 @@ download_verified "$SHELLCHECK_URL" "$SHELLCHECK_SHA256" "$tmp/shellcheck.tar.xz
 tar -xJf "$tmp/shellcheck.tar.xz" -C "$tmp"
 download_verified "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
 tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+python3 "$ROOT/ci/gitleaks-canary.py" "$tmp/gitleaks"
 cd "$ROOT"
 bash ci/boundary-test.sh
 python3 ci/monthly_pins_test.py

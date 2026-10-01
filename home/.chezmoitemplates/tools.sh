@@ -10,6 +10,12 @@ download() {
   printf '%s  %s\n' "$2" "$3" | sha256sum --check --status
 }
 mkdir -p "$HOME/.local/bin"
+download "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
+tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+cmp -s "$tmp/gitleaks" "$HOME/.local/bin/gitleaks" || install -m 0755 "$tmp/gitleaks" "$HOME/.local/bin/gitleaks"
+gitleaks_expected=${GITLEAKS_URL##*/download/v}
+gitleaks_expected=${gitleaks_expected%%/*}
+[[ $("$HOME/.local/bin/gitleaks" version) == *"$gitleaks_expected"* ]]
 if [[ ! -x $HOME/.local/bin/claude ]] || [[ $("$HOME/.local/bin/claude" --version) != "$CLAUDE_VERSION (Claude Code)" ]]; then
   download "$CLAUDE_INSTALLER_URL" "$CLAUDE_INSTALLER_SHA256" "$tmp/claude-install.sh"
   bash "$tmp/claude-install.sh" "$CLAUDE_VERSION"
