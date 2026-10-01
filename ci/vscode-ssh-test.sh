@@ -21,10 +21,12 @@ if has_ssh_conditional_or_include "$guard_fixture"; then
   echo 'Commented Match directive was treated as active.' >&2; exit 1
 fi
 for directive in Match Include; do
-  printf '%s all\nPort 2222\n' "$directive" > "$guard_fixture"
-  if ! has_ssh_conditional_or_include "$guard_fixture"; then
-    echo "Active $directive directive was not rejected." >&2; exit 1
-  fi
+  for separator in ' ' '='; do
+    printf '%s%sall\nPort 2222\n' "$directive" "$separator" > "$guard_fixture"
+    if ! has_ssh_conditional_or_include "$guard_fixture"; then
+      echo "Active $directive directive with separator $separator was not rejected." >&2; exit 1
+    fi
+  done
 done
 rm -f "$guard_fixture"
 effective=$(/usr/sbin/sshd -T -f "$config" -C user=agent,addr=127.0.0.1,host=localhost)
