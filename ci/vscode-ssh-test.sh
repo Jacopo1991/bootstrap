@@ -2,6 +2,7 @@
 set -euo pipefail
 
 config=/etc/ssh/sshd_config.agentdev
+source checks/boundary.sh
 override=/etc/systemd/system/ssh.service.d/agentdev.conf
 for setting in \
   "ExecStart=/usr/sbin/sshd -D -f $config" \
@@ -11,6 +12,21 @@ done
 test -L /etc/systemd/system/ssh.socket
 test "$(readlink /etc/systemd/system/ssh.socket)" = /dev/null
 /usr/sbin/sshd -t -f "$config"
+if has_ssh_conditional_or_include "$config"; then
+  echo 'Dedicated SSH policy unexpectedly contains Match/Include.' >&2; exit 1
+fi
+guard_fixture=$(mktemp)
+printf '# Match all\nPort 2222\n' > "$guard_fixture"
+if has_ssh_conditional_or_include "$guard_fixture"; then
+  echo 'Commented Match directive was treated as active.' >&2; exit 1
+fi
+for directive in Match Include; do
+  printf '%s all\nPort 2222\n' "$directive" > "$guard_fixture"
+  if ! has_ssh_conditional_or_include "$guard_fixture"; then
+    echo "Active $directive directive was not rejected." >&2; exit 1
+  fi
+done
+rm -f "$guard_fixture"
 effective=$(/usr/sbin/sshd -T -f "$config" -C user=agent,addr=127.0.0.1,host=localhost)
 for setting in \
   'port 2222' 'passwordauthentication no' 'kbdinteractiveauthentication no' \
@@ -31,12 +47,11 @@ cleanup() {
   rm -rf "$test_dir"
 }
 trap cleanup EXIT
-if ! sudo -H -u agent /usr/sbin/sshd -T -f "$config" \
-  -C user=agent,addr=127.0.0.1,host=localhost 2>&1 |
+if ! sudo -H -u agent /usr/sbin/sshd -G -f "$config" 2>&1 |
   tee "$test_dir/agent-sshd-output" >/dev/null; then
   diagnostic=$(head -n 1 "$test_dir/agent-sshd-output" |
     sed -E 's@/etc/ssh/ssh_host_[[:alnum:]_-]+@<host-key-file>@g')
-  printf 'Agent sshd -T diagnostic: %s\n' "${diagnostic:-no stderr}"
+  printf 'Agent sshd -G diagnostic: %s\n' "${diagnostic:-no stderr}"
   exit 1
 fi
 ssh-keygen -q -t ed25519 -N '' -f "$test_dir/key" -C ci-vscode-ssh
