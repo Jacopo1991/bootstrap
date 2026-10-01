@@ -74,7 +74,85 @@ try {
     Assert-True ($global:bootstrapVscodeSshTestWslCalls -eq 1 -and $global:bootstrapVscodeSshTestReceivedKey -eq $global:bootstrapVscodeSshTestPublicFixture) 'only public key streamed to AgentDev'
     Assert-True (([regex]::Matches($merged, '(?m)^Host agentdev$')).Count -eq 1) 'managed Host stanza is unique'
     Assert-True ($merged.Contains('HostName 127.0.0.1') -and $merged.Contains('Port 2222') -and $merged.Contains('User agent')) 'connection target is fixed to AgentDev'
-    Assert-True ($merged.Contains('IdentityFile %USERPROFILE%/.ssh/agentdev_ed25519')) 'Windows owner key path is configured'
+    Assert-True ($merged.Contains('IdentityFile ~/.ssh/agentdev_ed25519')) 'OpenSSH home-relative owner key path is configured'
+    $effectiveSsh = & ssh.exe -G -F $configPath agentdev 2>$null
+    Assert-True ($LASTEXITCODE -eq 0 -and (($effectiveSsh -join "`n") -match '(?m)^hostname 127\.0\.0\.1
+    Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
+    $firstConfig = $merged
+    & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
+    Assert-True ([IO.File]::ReadAllText($configPath) -ceq $firstConfig) 'SSH config merge is idempotent'
+    Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 5 -and $global:bootstrapVscodeSshTestWslCalls -eq 2) 'existing matching key pair is reused'
+
+    $brokenProfile = Join-Path $testRoot 'broken'
+    $brokenSsh = Join-Path $brokenProfile '.ssh'
+    [IO.Directory]::CreateDirectory($brokenSsh) | Out-Null
+    $env:USERPROFILE = $brokenProfile
+    $brokenPrivate = Join-Path $brokenSsh 'agentdev_ed25519'
+    [IO.File]::WriteAllText($brokenPrivate, 'synthetic placeholder')
+    Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*key pair is incomplete*' 'partial key pair fails closed'
+    Assert-True ([IO.File]::Exists($brokenPrivate)) 'partial key file is preserved'
+} finally {
+    $env:USERPROFILE = $oldProfile
+    Remove-Item -LiteralPath $testRoot -Recurse -Force
+}
+) -and (($effectiveSsh -join "`n") -match '(?m)^port 2222
+    Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
+    $firstConfig = $merged
+    & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
+    Assert-True ([IO.File]::ReadAllText($configPath) -ceq $firstConfig) 'SSH config merge is idempotent'
+    Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 5 -and $global:bootstrapVscodeSshTestWslCalls -eq 2) 'existing matching key pair is reused'
+
+    $brokenProfile = Join-Path $testRoot 'broken'
+    $brokenSsh = Join-Path $brokenProfile '.ssh'
+    [IO.Directory]::CreateDirectory($brokenSsh) | Out-Null
+    $env:USERPROFILE = $brokenProfile
+    $brokenPrivate = Join-Path $brokenSsh 'agentdev_ed25519'
+    [IO.File]::WriteAllText($brokenPrivate, 'synthetic placeholder')
+    Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*key pair is incomplete*' 'partial key pair fails closed'
+    Assert-True ([IO.File]::Exists($brokenPrivate)) 'partial key file is preserved'
+} finally {
+    $env:USERPROFILE = $oldProfile
+    Remove-Item -LiteralPath $testRoot -Recurse -Force
+}
+) -and (($effectiveSsh -join "`n") -match '(?m)^user agent
+    Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
+    $firstConfig = $merged
+    & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
+    Assert-True ([IO.File]::ReadAllText($configPath) -ceq $firstConfig) 'SSH config merge is idempotent'
+    Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 5 -and $global:bootstrapVscodeSshTestWslCalls -eq 2) 'existing matching key pair is reused'
+
+    $brokenProfile = Join-Path $testRoot 'broken'
+    $brokenSsh = Join-Path $brokenProfile '.ssh'
+    [IO.Directory]::CreateDirectory($brokenSsh) | Out-Null
+    $env:USERPROFILE = $brokenProfile
+    $brokenPrivate = Join-Path $brokenSsh 'agentdev_ed25519'
+    [IO.File]::WriteAllText($brokenPrivate, 'synthetic placeholder')
+    Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*key pair is incomplete*' 'partial key pair fails closed'
+    Assert-True ([IO.File]::Exists($brokenPrivate)) 'partial key file is preserved'
+} finally {
+    $env:USERPROFILE = $oldProfile
+    Remove-Item -LiteralPath $testRoot -Recurse -Force
+}
+) -and (($effectiveSsh -join "`n") -match '(?m)^identityfile .*/agentdev_ed25519
+    Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
+    $firstConfig = $merged
+    & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
+    Assert-True ([IO.File]::ReadAllText($configPath) -ceq $firstConfig) 'SSH config merge is idempotent'
+    Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 5 -and $global:bootstrapVscodeSshTestWslCalls -eq 2) 'existing matching key pair is reused'
+
+    $brokenProfile = Join-Path $testRoot 'broken'
+    $brokenSsh = Join-Path $brokenProfile '.ssh'
+    [IO.Directory]::CreateDirectory($brokenSsh) | Out-Null
+    $env:USERPROFILE = $brokenProfile
+    $brokenPrivate = Join-Path $brokenSsh 'agentdev_ed25519'
+    [IO.File]::WriteAllText($brokenPrivate, 'synthetic placeholder')
+    Assert-Throws { & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner } '*key pair is incomplete*' 'partial key pair fails closed'
+    Assert-True ([IO.File]::Exists($brokenPrivate)) 'partial key file is preserved'
+} finally {
+    $env:USERPROFILE = $oldProfile
+    Remove-Item -LiteralPath $testRoot -Recurse -Force
+}
+)) 'Windows OpenSSH parses the managed host without connecting'
     Assert-True ($merged.Contains('Host github.com') -and $merged.Contains('Host archive other') -and $merged.Contains('ServerAliveInterval 30')) 'unrelated SSH entries are preserved'
     $firstConfig = $merged
     & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
