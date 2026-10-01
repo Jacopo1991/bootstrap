@@ -29,5 +29,8 @@ CHEZMOI_GIT_NAME='Bootstrap CI' CHEZMOI_GIT_EMAIL='bootstrap-ci@example.invalid'
 "$tmp/chezmoi" --source "$ROOT" --destination "$tmp/home" --config "$tmp/chezmoi.toml" \
   execute-template < home/run_onchange_after_10-tools.sh.tmpl > "$tmp/tools.sh"
 "$tmp/shellcheck-v0.11.0/shellcheck" --exclude=SC2034 "$tmp/tools.sh"
+"$tmp/chezmoi" --source "$ROOT" --destination "$tmp/home" --config "$tmp/chezmoi.toml" \
+  execute-template < home/dot_gitconfig.tmpl > "$tmp/gitconfig"
+python3 ci/git-credentials-test.py "$tmp/gitconfig"
 "$tmp/gitleaks" git --redact --no-banner .
 "$tmp/gitleaks" dir --redact --no-banner .
