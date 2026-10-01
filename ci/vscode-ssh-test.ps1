@@ -26,6 +26,7 @@ $global:bootstrapVscodeSshTestPublicFixture = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5A
 $global:bootstrapVscodeSshTestKeygenCalls = 0
 $global:bootstrapVscodeSshTestWslCalls = 0
 $global:bootstrapVscodeSshTestReceivedKey = $null
+$global:bootstrapVscodeSshTestWslInvocation = $null
 $env:USERPROFILE = $profile
 $runner = {
     param([string[]]$Arguments)
@@ -44,9 +45,7 @@ function wsl.exe {
     process {
         $global:bootstrapVscodeSshTestWslCalls++
         $global:bootstrapVscodeSshTestReceivedKey = [string]$_
-        if (($args -join ' ') -ne '-d AgentDev -u root -- python3 /opt/machine-bootstrap/current/system/authorize-agent-key.py') {
-            throw 'Unexpected WSL invocation.'
-        }
+        $global:bootstrapVscodeSshTestWslInvocation = $MyInvocation.Line
         $global:LASTEXITCODE = 0
     }
 }
@@ -70,7 +69,7 @@ try {
     & "$PSScriptRoot/../windows/setup-vscode-ssh.ps1" -KeygenRunner $runner
     $merged = [IO.File]::ReadAllText($configPath)
     Assert-True ($global:bootstrapVscodeSshTestKeygenCalls -eq 3) 'new Ed25519 key generated and public half checked'
-    Assert-True ($global:bootstrapVscodeSshTestWslCalls -eq 1 -and $global:bootstrapVscodeSshTestReceivedKey -eq $global:bootstrapVscodeSshTestPublicFixture) 'only public key streamed to AgentDev'
+    Assert-True ($global:bootstrapVscodeSshTestWslCalls -eq 1 -and $global:bootstrapVscodeSshTestReceivedKey -eq $global:bootstrapVscodeSshTestPublicFixture -and $global:bootstrapVscodeSshTestWslInvocation -match 'wsl\.exe -d AgentDev -u root -- python3 \$linuxKeyHelper') 'only public key streamed to the root key helper in AgentDev'
     Assert-True (([regex]::Matches($merged, '(?m)^Host agentdev$')).Count -eq 1) 'managed Host stanza is unique'
     Assert-True ($merged.Contains('HostName 127.0.0.1') -and $merged.Contains('Port 2222') -and $merged.Contains('User agent')) 'connection target is fixed to AgentDev'
     Assert-True ($merged.Contains('IdentityFile ~/.ssh/agentdev_ed25519')) 'OpenSSH home-relative owner key path is configured'
