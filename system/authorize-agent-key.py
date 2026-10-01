@@ -18,7 +18,10 @@ def main() -> int:
     line = sys.stdin.buffer.readline(16385)
     if not line.endswith(b"\n") or sys.stdin.buffer.read(1):
         raise ValueError("invalid public key input")
-    key = line[:-1].decode("ascii")
+    payload = line[:-1]
+    if payload.endswith(b"\r"):
+        payload = payload[:-1]
+    key = payload.decode("ascii")
     if not KEY.fullmatch(key):
         raise ValueError("invalid public key")
     account = pwd.getpwnam("agent")
