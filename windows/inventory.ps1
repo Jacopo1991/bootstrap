@@ -143,15 +143,18 @@ function Test-ApprovedAgentTaskAction {
 function Get-ScheduledTaskReview {
  $projectTasks=[collections.generic.list[object]]::new()
  $ownerTasks=[collections.generic.list[object]]::new()
+ $hasUnknownTaskPath=$false
  try{$all=@(Get-ScheduledTask -ErrorAction Stop)}catch{return [pscustomobject]@{Status='UNAVAILABLE';Tasks=@();OwnerOnlyMaintenance=@()}}
  foreach($task in $all){
-  $name=[string]$task.TaskName;$taskPath=[string]$task.TaskPath
-  if($taskPath -like '\Microsoft\Windows\*'){continue}
+  $nameProperty=$task.PSObject.Properties['TaskName'];$name=if($null -ne $nameProperty){[string]$nameProperty.Value}else{''}
   $safe=Get-SafeTaskName $name
   if($name -like 'MachineBootstrap-*'){
-   $ownerTasks.Add([pscustomobject]@{Name=$safe;State=[string]$task.State;Scope='owner-only-maintenance'})
+   $stateProperty=$task.PSObject.Properties['State'];$ownerTasks.Add([pscustomobject]@{Name=$safe;State=if($null -ne $stateProperty){[string]$stateProperty.Value}else{'Unknown'};Scope='owner-only-maintenance'})
    continue
   }
+  $pathProperty=$task.PSObject.Properties['TaskPath']
+  if($null -eq $pathProperty){$hasUnknownTaskPath=$true;$taskPath=''}else{$taskPath=[string]$pathProperty.Value}
+  if($taskPath -like '\Microsoft\Windows\*'){continue}
   $actions=@($task.Actions);$shape='other'
   if($actions.Count -eq 1){
    $exe=[IO.Path]::GetFileName([string]$actions[0].Execute)
@@ -166,7 +169,7 @@ function Get-ScheduledTaskReview {
   if($working -in @('documents-codex','outside-approved-root','wsl-storage')){$findings+='working-directory-outside-agent-code-root'}
   $projectTasks.Add([pscustomobject]@{Name=$safe;State=[string]$task.State;ActionShape=$shape;WorkingRoot=$working;Findings=@($findings|Select-Object -Unique)})
  }
- $status=if($projectTasks.Count){if(@($projectTasks|Where-Object{$_.Findings.Count -gt 0}).Count){'DRIFT'}else{'CLEAN'}}else{'SKIP'}
+ $status=if($hasUnknownTaskPath){'UNAVAILABLE'}elseif($projectTasks.Count){if(@($projectTasks|Where-Object{$_.Findings.Count -gt 0}).Count){'DRIFT'}else{'CLEAN'}}else{'SKIP'}
  [pscustomobject]@{Status=$status;Tasks=$projectTasks.ToArray();OwnerOnlyMaintenance=$ownerTasks.ToArray()}
 }
 function Invoke-WslAgentDrift {
