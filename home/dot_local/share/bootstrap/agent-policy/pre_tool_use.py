@@ -312,6 +312,20 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
 
     if any(option_matches(arg, "--output") for arg in arguments):
         return "Git output-file options are blocked; redirect only inside the current repository."
+    if subcommand == "clean":
+        return "Agent Git cleanup is blocked because it can remove nested repository metadata."
+    if subcommand in {"add", "mv", "rm", "checkout", "restore", "reset"}:
+        metadata = git_metadata(target_root)
+        if metadata is None:
+            return "Cannot identify protected Git metadata; Git file operation blocked."
+        if any(arg.startswith("--pathspec-from-file") for arg in arguments):
+            return "Indirect Git pathspec files are blocked; use explicit file paths."
+        operands = [arg for arg in arguments if not arg.startswith("-")]
+        if any(protected_git_path(arg, str(target), metadata) for arg in operands):
+            return "Git file operands cannot modify or stage protected repository metadata."
+        if subcommand in {"mv", "rm", "restore"} and any(
+                (target / arg).is_dir() for arg in operands):
+            return "Git directory mutations are blocked; use explicit non-metadata file paths."
     if subcommand == "config" and not git_config_read_only(arguments):
         return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
     if cross_repo:

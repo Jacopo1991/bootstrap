@@ -301,6 +301,16 @@ with tempfile.TemporaryDirectory() as temp:
                     "mv safe.txt nested-control/config"):
         assert policy.evaluate(event(command), roots) is not None, command
 
+    for command in ("git mv -f safe.txt nested-control/config",
+                    "git rm -f nested-control/config", "git restore nested-control/config",
+                    "git checkout -- nested-control/config", "git add nested-control/config",
+                    "git clean -ffdx nested-control", "git clean -ffdx .", "git clean -fd",
+                    "git mv nested-owner-repo renamed-owner-repo",
+                    "git mv safe.txt .git/hooks/pre-commit",
+                    "git add --pathspec-from-file=paths.txt"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    assert policy.evaluate(event("git mv safe.txt ordinary.txt"), roots) is None
+
     # A real local add/commit completes after passing the hook; GitHub push is
     # permission-tested against its named HTTPS remote, with no authentication
     # or network push from CI.

@@ -458,7 +458,10 @@ file writers use the same protection for lexical/resolved `.git` paths,
 symlink aliases, and Git's reported worktree/common metadata directories.
 Target-ancestor checks also protect existing nested repositories' separately
 named Git directories (HEAD/objects/refs or HEAD/commondir), without scanning
-the repository tree.
+the repository tree. Git file-write/staging operands use the same metadata
+protection. Indirect pathspec files, directory move/remove/restore and agent
+Git cleanup are refused; cleanup could otherwise delete nested metadata without
+naming it. Explicit ordinary-file operations and add/commit/push remain usable.
 Ambiguous transfer options, directory transfers and directory mutations are
 refused to prevent indirect metadata writes. Plain file copies remain usable.
 Git `-c`/`--config-env`, environment-prefixed commands, inherited/per-tool
