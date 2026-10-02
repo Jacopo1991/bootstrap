@@ -419,9 +419,11 @@ def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
 
 
 def plain_branch_name(value: str) -> bool:
-    """Conservative literal ref syntax; no revision operators or shell expansion."""
-    return bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._/-]*", value)
-                and ".." not in value and "//" not in value
+    """Literal branch-ref syntax without revision operators or control characters."""
+    return bool(value and value != "@" and not value.startswith("-")
+                and not any(ord(char) <= 32 or ord(char) == 127 or char in "~^:?*[\\"
+                            for char in value)
+                and ".." not in value and "@{" not in value and "//" not in value
                 and not value.endswith((".", "/"))
                 and all(not part.startswith(".") and not part.endswith(".lock")
                         for part in value.split("/")))
@@ -430,10 +432,12 @@ def plain_branch_name(value: str) -> bool:
 def git_switch_creation(arguments: list[str]) -> bool:
     """Only -c/--create <name> [plain object ID or origin/<branch>]."""
     if (len(arguments) not in {2, 3} or arguments[0] not in {"-c", "--create"}
-            or not plain_branch_name(arguments[1])):
+            or arguments[1].startswith("-")):
         return False
     if len(arguments) == 2:
-        return True
+        return True  # Preserve the pre-existing no-start-point creation grammar.
+    if not plain_branch_name(arguments[1]):
+        return False
     start = arguments[2]
     return bool(re.fullmatch(r"(?:[0-9a-fA-F]{4,40}|[0-9a-fA-F]{64})", start)
                 or start.startswith("origin/") and plain_branch_name(start[7:]))

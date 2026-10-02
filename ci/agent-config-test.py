@@ -481,6 +481,10 @@ with tempfile.TemporaryDirectory() as temp:
             return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
         for executable in ("git", "/usr/bin/git"):
             for create in ("-c", "--create"):
+                for suffix in ("feature+fix", "feature+fix origin/topic+fix"):
+                    command = executable + " switch " + create + " " + suffix
+                    assert policy.evaluate(switch_event(command), roots) is None, command
+                    assert policy.permission_reason(switch_event(command), roots) is None, command
                 for start in ("", " origin/main", " origin/topic/nested",
                               " abcd", " a1b2c3d", " " + "a1" * 20, " " + "A1" * 20,
                               " " + "ab" * 32):
@@ -589,8 +593,8 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run(["git", "update-ref", "refs/remotes/origin/start-fixture", first], cwd=current, check=True)
     for index, (create, start, expected) in enumerate((
             ("-c", first, first), ("--create", second, second),
-            ("-c", first[:7], first), ("--create", "origin/start-fixture", first))):
-        name = "ci-start-fixture-" + str(index)
+            ("-c", first[:7], first), ("--create", "origin/start-fixture", first), ("-c", first, first))):
+        name = "ci-start-fixture-" + str(index) + ("+fix" if index == 4 else "")
         command = "git switch " + create + " " + name + " " + start
         assert policy.evaluate(event(command), roots) is None, command
         assert policy.permission_reason(event(command), roots) is None, command
