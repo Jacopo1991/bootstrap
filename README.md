@@ -249,8 +249,8 @@ The existing chezmoi apply manages Codex and Claude Code's global instructions,
 native permissions, and one shared pre-tool policy hook. Codex uses the supported `on-request` approval policy, routes approvals to
 the user, and sets `workspace-write` with sandbox networking off. The retired
 `untrusted` policy is not valid in the pinned Codex version.
-Claude Code keeps its normal ask-before-running mode and uses the native Linux
-sandbox with unsandboxed retries disabled and startup failing if the sandbox is
+Claude Code uses the founder-approved `acceptEdits` mode, allows routine
+Git/gh commands, and uses the native Linux sandbox with unsandboxed retries disabled and startup failing if the sandbox is
 unavailable. The base image pins the sandbox's `bubblewrap` and `socat`
 dependencies. Claude's optional seccomp add-on is not installed; Windows interop
 and drive automount remain disabled by the distro baseline.
@@ -412,21 +412,40 @@ preview; select the non-preview option only when a pull request is intended.
 
 ### Repository commands and approved network access
 
-Claude Code keeps its sandbox enabled, its general unsandboxed retry disabled,
-regular permission prompts, the existing deny list and PreToolUse hook. Only
-`git` and `gh` are listed in `sandbox.excludedCommands`; explicit ask rules retain
-prompts for these tools. This is the documented exception even with
-`allowUnsandboxedCommands: false`; no general domain/network allow is added.
-The native GitHub CLI may use its existing credential store; agents must never
-read or print credential files or values.
+Founder decision 2026-10-02: Claude Code uses `acceptEdits`, with explicit
+allow rules for `git *`, `gh *`, `/usr/bin/git *` and `/usr/bin/gh *`, and no
+Git/gh ask rules. The existing deny list and PreToolUse hook remain active.
+The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
+Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
+and `/usr/bin/gh *`: bare names alone only match argument-less calls.
+No general domain/network allow is added. The native GitHub CLI may use its
+existing credential store; agents must never read or print credential files.
+
+Force pushes (including lease variants, short flags, force refspecs and flags
+after the remote/branch), remote branch deletion (delete flags, empty-source
+refspecs, mirror/prune), `gh repo delete/edit`, `gh api` DELETE requests,
+`gh release delete`, `gh secret` and `gh ruleset` are denied. Native Claude
+rules cover common spellings, and the shared hook inspects parsed arguments,
+including inherited repository selectors and attached API method values.
+The previous never-merge, workspace, Git metadata/configuration and secret
+checks remain in force.
 
 Codex keeps `workspace-write`, `network_access = false`, `on-request` and the
-user approval reviewer. Prompt-only execution rules cover git/gh. Its
-PermissionRequest hook denies other Bash escalations and returns no grant for
-git/gh, so the native user prompt still decides the exact request. This also
-denies non-git/gh shell escalations for filesystem access; ordinary commands
-inside the sandbox continue through PreToolUse. Never approve broad shell or
-persistent allow prefixes as a substitute for the exact repository operation.
+user approval reviewer. Four native allow prefixes permit routine Git/gh to
+run outside the sandbox without a prompt. Explicit forbidden prefixes and
+the shared hook block the forbidden operations above. Native prompt rules
+cover `git reset/rebase/cherry-pick/revert` and `git stash pop/drop/clear`.
+These approval-required forms must use a plain command without global
+selectors; the hook refuses selector variants that would otherwise miss a
+literal prefix rule. This is a bounded list of destructive primitives, not
+a general classifier for every possible Git operation. The PermissionRequest
+hook denies other shell escalations and never grants approval itself.
+
+Current-repository `git switch <branch>`, `git switch -c <branch>` and
+`git checkout -b <branch>` remain allowed. Switch's branch-creation `-c`
+is distinct from Git's global configuration override; global `git -c`,
+attached configuration overrides and creation in another repository stay
+blocked.
 
 The shared policy permits log, show, diff, status, rev-parse, ls-files, grep and
 blame against repositories under `/home/agent/dev_workspace` and
@@ -474,7 +493,7 @@ own index/refs; agents cannot edit the control files directly.
 This hook is a command guard, not an OS boundary against
 arbitrary programs or a replacement for reviewing the exact approval.
 
-Sources checked 2026-10-01: [Claude sandbox modes and exclusions](https://code.claude.com/docs/en/sandboxing#the-unsandboxed-retry-escape-hatch),
+Sources checked 2026-10-02: [Claude sandbox modes and exclusions](https://code.claude.com/docs/en/sandboxing#the-unsandboxed-retry-escape-hatch),
 [Codex approvals](https://learn.chatgpt.com/docs/agent-approvals-security),
 [Codex execution rules](https://learn.chatgpt.com/docs/agent-configuration/rules),
 and [Codex PermissionRequest](https://learn.chatgpt.com/docs/hooks#permissionrequest).

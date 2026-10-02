@@ -238,6 +238,25 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[s
     return None
 
 
+def forbidden_push(arguments: list[str]) -> bool:
+    """Inspect every argv position; native prefix rules cannot do that."""
+    for argument in arguments:
+        key = argument.split("=", 1)[0]
+        if (key.startswith("--force") or key.startswith("--delete")
+                or key in {"--mirror", "--prune"} or argument.startswith(("+", ":"))
+                or argument.startswith("-") and not argument.startswith("--")
+                and any(letter in argument[1:] for letter in ("f", "d"))):
+            return True
+    return False
+
+
+def git_needs_approval(subcommand: str, arguments: list[str]) -> bool:
+    """Bounded destructive local primitives with matching native prompt rules."""
+    return (subcommand in {"reset", "rebase", "cherry-pick", "revert"}
+            or subcommand == "stash" and bool(arguments)
+            and arguments[0] in {"pop", "drop", "clear"})
+
+
 def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> str | None:
     """Require an explicit remote whose effective URLs stay on GitHub."""
     flags = {
@@ -285,8 +304,7 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
 
 def git_policy(tokens: list[str], cwd: str, root: Path,
                approved_roots: tuple[Path, ...] | None) -> str | None:
-    if any(token == "-c" or token.startswith("-c") and len(token) > 2
-           or token.startswith("--config-env")
+    if any(token.startswith("--config-env")
            or "=" in token and (token.split("=", 1)[0].startswith("GIT_CONFIG")
                                or token.split("=", 1)[0] in GIT_OVERRIDE_ENV)
            for token in tokens[1:]):
@@ -295,6 +313,18 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if parsed is None:
         return "Unsupported Git selector or global option; use plain git with -C or --no-pager."
     target, subcommand, arguments, selectors = parsed
+    # -c before the subcommand is a configuration override (git_target rejects
+    # it). Only switch's exact -c <new-branch> form is branch creation, not config.
+    config_options = [index for index, argument in enumerate(arguments)
+                      if argument == "-c" or argument.startswith("-c") and len(argument) > 2]
+    if config_options and not (subcommand == "switch" and config_options == [0]
+                               and len(arguments) == 2 and arguments[0] == "-c"
+                               and not arguments[1].startswith("-")):
+        return "Git configuration overrides are blocked; use switch -c <branch> for creation."
+    if subcommand == "push" and forbidden_push(arguments):
+        return "Force pushes and remote branch deletion are blocked by founder policy."
+    if git_needs_approval(subcommand, arguments) and tokens[1] != subcommand:
+        return "Use a plain Git destructive command without global selectors so native approval applies."
     target_root = root_for(str(target), approved_roots)
     if str(target_root) == "/__bootstrap_outside_approved_roots__":
         return "Git target is outside approved code and knowledge roots."
@@ -395,24 +425,44 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     return None
 
 
-def gh_merges(tokens: list[str]) -> bool:
-    """Find the pr/merge command through inherited repository/hostname options."""
-    words: list[str] = []
+def gh_policy(tokens: list[str]) -> str | None:
+    """Find protected operations through inherited repository/hostname options."""
+    arguments: list[str] = []
     index = 1
-    while index < len(tokens) and len(words) < 2:
+    while index < len(tokens):
         token = tokens[index]
         if token in {"-R", "--repo", "--hostname"}:
+            if index + 1 >= len(tokens):
+                return "Incomplete GitHub CLI selector is blocked."
             index += 2
             continue
         if token.startswith(("--repo=", "--hostname=")) or (token.startswith("-R") and len(token) > 2):
             index += 1
             continue
-        if SHELL_EXPANSION.search(token):
-            return True  # Dynamic command selection cannot establish never-merge.
-        if not token.startswith("-"):
-            words.append(token)
+        arguments.append(token)
         index += 1
-    return words == ["pr", "merge"]
+    words = [token for token in arguments if not token.startswith("-")]
+    if any(SHELL_EXPANSION.search(token) for token in words[:2]):
+        return "Dynamic GitHub CLI command selection is blocked."
+    if words[:2] == ["pr", "merge"]:
+        return "Build agents never merge."
+    if (words[:2] in (["repo", "delete"], ["repo", "edit"], ["release", "delete"])
+            or words[:1] in (["secret"], ["ruleset"])):
+        return "GitHub repository administration, deletion, secrets and rulesets are blocked."
+    if words[:1] == ["api"]:
+        for index, argument in enumerate(arguments):
+            method = None
+            if argument in {"-X", "--method"}:
+                if index + 1 >= len(arguments):
+                    return "Incomplete GitHub API method is blocked."
+                method = arguments[index + 1]
+            elif argument.startswith("--method="):
+                method = argument.split("=", 1)[1]
+            elif argument.startswith("-X") and len(argument) > 2:
+                method = argument[2:].removeprefix("=")
+            if method is not None and method.upper() == "DELETE":
+                return "GitHub API DELETE requests are blocked."
+    return None
 
 
 def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str | None:
@@ -512,8 +562,8 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
         return "Shell writes outside the current repository or into Git metadata are blocked."
     if executable == "git":
         return git_policy(tokens, cwd, root, approved_roots)
-    if executable == "gh" and gh_merges(tokens):
-        return "Build agents never merge."
+    if executable == "gh":
+        return gh_policy(tokens)
     return None
 
 
@@ -532,7 +582,8 @@ def permission_reason(event: dict, approved_roots: tuple[Path, ...] | None = Non
         return "Unrecognized approval command; blocked by policy."
     if not tokens or tokens[0] not in {"git", "gh", "/usr/bin/git", "/usr/bin/gh"}:
         return "Only Git and GitHub CLI may request network or sandbox escalation."
-    # No allow response: native user approval remains mandatory.
+    # No hook grant: native allow rules cover routine Git/gh; destructive prompt
+    # rules still require the user's approval. Forbidden operations fail above.
     return None
 
 
