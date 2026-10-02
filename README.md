@@ -442,7 +442,14 @@ a general classifier for every possible Git operation. The PermissionRequest
 hook denies other shell escalations and never grants approval itself.
 
 Current-repository `git switch <branch>`, `git switch -c <branch>` and
-`git checkout -b <branch>` remain allowed. Switch's branch-creation `-c`
+`git checkout -b <branch>` remain allowed. Branch creation also permits
+`git switch -c <name> <start-point>` and `git switch --create <name> <start-point>`
+in the current repository. A start point must be a plain hexadecimal object ID
+(4–40 characters, or a full 64-character SHA-256 ID) or literal `origin/<branch>`;
+Git still verifies that it resolves to a commit. No extra switch options,
+force-create, attached/abbreviated creation flags, revision expressions, other
+remote refs or configuration overrides are permitted by this exception.
+The no-start-point `--create <name>` spelling is also supported. Switch's branch-creation `-c`
 is distinct from Git's global configuration override; global `git -c`,
 attached configuration overrides and creation in another repository stay
 blocked.

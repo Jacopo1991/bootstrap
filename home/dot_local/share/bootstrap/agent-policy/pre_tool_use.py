@@ -418,6 +418,31 @@ def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
     return git_network_remote(["origin"], target, "fetch")
 
 
+def plain_branch_name(value: str) -> bool:
+    """Literal branch-ref syntax without revision operators or control characters."""
+    return bool(value and value != "@" and not value.startswith(("-", "/"))
+                and not any(ord(char) <= 32 or ord(char) == 127 or char in "~^:?*[\\"
+                            for char in value)
+                and ".." not in value and "@{" not in value and "//" not in value
+                and not value.endswith((".", "/"))
+                and all(not part.startswith(".") and not part.endswith(".lock")
+                        for part in value.split("/")))
+
+
+def git_switch_creation(arguments: list[str]) -> bool:
+    """Only -c/--create <name> [plain object ID or origin/<branch>]."""
+    if (len(arguments) not in {2, 3} or arguments[0] not in {"-c", "--create"}
+            or arguments[1].startswith("-")):
+        return False
+    if len(arguments) == 2:
+        return True  # Preserve the pre-existing no-start-point creation grammar.
+    if not plain_branch_name(arguments[1]):
+        return False
+    start = arguments[2]
+    return bool(re.fullmatch(r"(?:[0-9a-fA-F]{4,40}|[0-9a-fA-F]{64})", start)
+                or start.startswith("origin/") and plain_branch_name(start[7:]))
+
+
 def git_policy(tokens: list[str], cwd: str, root: Path,
                approved_roots: tuple[Path, ...] | None) -> str | None:
     if any(token.startswith("--config-env")
@@ -429,14 +454,15 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if parsed is None:
         return "Unsupported Git selector or global option; use plain git with -C or --no-pager."
     target, subcommand, arguments, selectors = parsed
-    # -c before the subcommand is a configuration override (git_target rejects
-    # it). Only switch's exact -c <new-branch> form is branch creation, not config.
+    # Global -c remains blocked by git_target. Switch has a distinct, bounded
+    # creation grammar; an optional start point never becomes another option.
+    switch_creation = subcommand == "switch" and git_switch_creation(arguments)
     config_options = [index for index, argument in enumerate(arguments)
                       if argument == "-c" or argument.startswith("-c") and len(argument) > 2]
-    if config_options and not (subcommand == "switch" and config_options == [0]
-                               and len(arguments) == 2 and arguments[0] == "-c"
-                               and not arguments[1].startswith("-")):
-        return "Git configuration overrides are blocked; use switch -c <branch> for creation."
+    if config_options and not switch_creation:
+        return "Git configuration overrides or unsupported switch creation arguments are blocked."
+    if subcommand == "switch" and any(arg.startswith("-") for arg in arguments) and not switch_creation:
+        return "Switch creation permits only -c/--create <name> [commit SHA or origin/<branch>]."
     if subcommand == "push" and forbidden_push(arguments):
         return "Force pushes and remote branch deletion are blocked by founder policy."
     if git_needs_approval(subcommand, arguments) and tokens[1] != subcommand:
