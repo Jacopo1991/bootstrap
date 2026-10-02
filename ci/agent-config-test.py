@@ -230,6 +230,22 @@ with tempfile.TemporaryDirectory() as temp:
         assert policy.sibling_fetch_has_submodules(target), "stored submodule metadata must deny"
         stored.rmdir()
         assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is None
+        # Keep the embedded child while all files/gitlinks/stored metadata are
+        # absent: retained URL or activation config can make a new tree recurse.
+        for key, value in (("submodule.unsafe-child.url", "https://example.invalid/submodule"),
+                           ("submodule.unsafe-child.active", "true"),
+                           ("submodule.active", "unsafe-child"),
+                           ("submodule.recurse", "true")):
+            subprocess.run(["git", "config", key, value], cwd=target, check=True)
+            for suffix in ("fetch", "fetch origin"):
+                assert policy.evaluate(event(f"git -C {target} {suffix}"), roots) is not None
+            subprocess.run(["git", "config", "--unset", key], cwd=target, check=True)
+        included = target / "owner-submodule-config"
+        included.write_text("[submodule]\n\tactive = unsafe-child\n", encoding="utf-8")
+        subprocess.run(["git", "config", "include.path", str(included)], cwd=target, check=True)
+        assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is not None
+        subprocess.run(["git", "config", "--unset", "include.path"], cwd=target, check=True)
+        assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is None
     from unittest.mock import patch
     with patch.object(policy, "git_metadata", return_value=None):
         assert policy.sibling_fetch_has_submodules(sibling), "metadata failure must deny"

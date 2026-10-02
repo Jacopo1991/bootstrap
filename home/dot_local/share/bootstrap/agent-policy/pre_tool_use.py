@@ -263,6 +263,15 @@ def sibling_fetch_has_submodules(root: Path) -> bool:
     if metadata is None:
         return True
     try:
+        # Retained/inherited activation or URL config can reactivate an embedded
+        # child when a freshly fetched tree reintroduces its gitlink. Inspect
+        # effective configuration without collecting or printing its values.
+        configured = subprocess.run(
+            ["git", "config", "--get-regexp", "^submodule[.]"], cwd=root,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=3)
+        if configured.returncode != 1:
+            return True
         modules_file = root / ".gitmodules"
         if (modules_file.exists() or modules_file.is_symlink()
                 or any((directory / "modules").exists() for directory in metadata)):
