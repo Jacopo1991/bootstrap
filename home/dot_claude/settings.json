@@ -49,7 +49,11 @@
     "failIfUnavailable": true,
     "excludedCommands": [
       "git",
-      "gh"
+      "gh",
+      "git *",
+      "gh *",
+      "/usr/bin/git *",
+      "/usr/bin/gh *"
     ],
     "autoAllowBashIfSandboxed": false
   },

@@ -25,7 +25,9 @@ claude = json.loads((ROOT / "home/dot_claude/settings.json").read_text(encoding=
 assert claude["permissions"]["defaultMode"] == "default"
 assert "allow" not in claude["permissions"]
 assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
-    "failIfUnavailable": True, "excludedCommands": ["git", "gh"],
+    # Bare names match only argument-less calls; keep the exact approved patterns.
+    "failIfUnavailable": True,
+    "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False}
 assert set(claude["permissions"]["ask"]) == {"Bash(git *)", "Bash(gh *)",
     "Bash(/usr/bin/git *)", "Bash(/usr/bin/gh *)"}
