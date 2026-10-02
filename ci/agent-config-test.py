@@ -185,9 +185,119 @@ with tempfile.TemporaryDirectory() as temp:
     ):
         assert policy.evaluate(event(command), roots) is not None, command
     for command in ("git add file", "git push origin branch", "git push -u origin branch", "git fetch --depth=1 origin",
-                    "git -C . add file", "git config --local review.fixture value",
+                    "git -C . add file", "git config --local --get remote.origin.url",
+                    "git config --get remote.origin.url", "git config --list",
                     "gh --repo owner/repo pr create", "gh pr --repo owner/repo create"):
         assert policy.evaluate(event(command), roots) is None, command
+    # Owner/CI provisions identity and remote configuration. Agent calls cannot
+    # modify configuration, even for apparently harmless local keys.
+    for key in ("core.hooksPath", "core.fsmonitor", "core.sshCommand",
+                "alias.x", "filter.x.clean", "filter.x.smudge", "filter.x.process",
+                "diff.x.command", "review.fixture"):
+        for option in ("", "--local ", "--add ", "--replace-all "):
+            command = f"git config {option}{key} fixture-command"
+            assert policy.evaluate(event(command), roots) is not None, command
+    for command in ("git config --unset core.hooksPath", "git config --edit",
+                    "git config --remove-section core", "git config core.hooksPath",
+                    "git config --get core.hooksPath fixture-command",
+                    "git config --list --add core.hooksPath fixture-command",
+                    "git -c core.hooksPath=fixture status",
+                    "git -ccore.fsmonitor=fixture status",
+                    "git --config-env=core.sshCommand=FIXTURE status",
+                    "git status --config-env=core.sshCommand=FIXTURE",
+                    "FOO=fixture git status", "FOO=fixture gh issue list",
+                    "GIT_CONFIG_COUNT=0 git status", "GIT_CONFIG_PARAMETERS=fixture git status",
+                    "GIT_DIR=.git git status", "GIT_EXEC_PATH=. git status",
+                    "env GIT_DIR=.git git status", "env FOO=fixture gh issue list"):
+        assert policy.evaluate(event(command), roots) is not None, command
+
+    import unittest.mock
+    for name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+                 "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                 "GIT_CONFIG", "GIT_DIR", "GIT_EXEC_PATH", "GIT_SSH_COMMAND"):
+        # Refuse overrides before any helper Git subprocess runs.
+        with unittest.mock.patch.dict(policy.os.environ, {name: "fixture"}), \
+             unittest.mock.patch.object(policy.subprocess, "run",
+                                        side_effect=AssertionError("Git must not run with overrides")):
+            assert policy.evaluate(event("git status"), roots) is not None, name
+        for location in ("event", "input"):
+            payload = event("git status")
+            (payload if location == "event" else payload["tool_input"])["env"] = {name: "fixture"}
+            with unittest.mock.patch.object(policy.subprocess, "run",
+                                            side_effect=AssertionError("Git must not run with overrides")):
+                assert policy.evaluate(payload, roots) is not None, (name, location)
+
+    # Metadata is protected through native edit/patch tools, shell outputs,
+    # file transfers, symlink aliases, and resolved directory-copy destinations.
+    (current / "metadata-alias").symlink_to(current / ".git", target_is_directory=True)
+    (current / "pre-commit").write_text("fixture\n", encoding="utf-8")
+    (current / "safe.txt").write_text("safe fixture\n", encoding="utf-8")
+    (current / "docs").mkdir()
+    (current / "docs/pre-commit").symlink_to(current / ".git/hooks/pre-commit")
+    for filename in (".git/config", ".git/hooks/pre-commit", "metadata-alias/hooks/pre-commit",
+                     str(current / ".git/hooks/pre-commit"), ".git",
+                     "docs/pre-commit", ".git/../safe.txt"):
+        for tool in ("Write", "Edit", "MultiEdit"):
+            payload = {"tool_name": tool, "tool_input": {"file_path": filename}, "cwd": str(current)}
+            assert policy.evaluate(payload, roots) is not None, (tool, filename)
+        payload = {"tool_name": "apply_patch",
+                   "tool_input": {"patch": f"*** Begin Patch\n*** Add File: {filename}\n+fixture\n*** End Patch"},
+                   "cwd": str(current)}
+        assert policy.evaluate(payload, roots) is not None, filename
+    payload = {"tool_name": "apply_patch",
+               "tool_input": {"patch": "*** Begin Patch\n*** Update File: safe.txt\n*** Move to: .git/hooks/pre-commit\n@@\n-fixture\n+fixture\n*** End Patch"},
+               "cwd": str(current)}
+    assert policy.evaluate(payload, roots) is not None, "patch rename into metadata"
+    for command in (
+        "printf fixture > .git/hooks/pre-commit", "printf fixture >> .git/config",
+        "printf fixture &> .git/config", "printf fixture &>> metadata-alias/config",
+        "printf fixture >| .git/config", "printf fixture >& .git/config", "cat <> .git/config",
+        "cp safe.txt .git/hooks/pre-commit", "mv safe.txt .git/config",
+        "tee .git/hooks/pre-commit", "tee -a metadata-alias/config",
+        "cp -t .git/hooks pre-commit", "cp -t.git/hooks pre-commit",
+        "cp --target-directory=.git/hooks pre-commit",
+        "mv -t .git/hooks pre-commit", "cp pre-commit docs",
+        "cp .git/config safe.txt", "mv .git/config safe.txt",
+        "touch .git/config", "install -m 755 safe.txt .git/hooks/pre-commit",
+        "ln .git/config alias-config", "ln -s .git metadata-copy",
+        "dd of=.git/hooks/pre-commit", "sed -i s/a/b/ .git/config safe.txt",
+        "rm -r .", "chmod -R 755 .", "cp -r . docs", "mv docs renamed-docs",
+    ):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for tool in ("Write", "Edit"):
+        payload = {"tool_name": tool, "tool_input": {"file_path": "safe.txt"}, "cwd": str(current)}
+        assert policy.evaluate(payload, roots) is None, tool
+    for command in ("cp safe.txt copied.txt", "mv copied.txt moved.txt",
+                    "tee safe.txt", "printf fixture > safe.txt", "cp -t docs safe.txt"):
+        assert policy.evaluate(event(command), roots) is None, command
+
+    # Git can store metadata under a name other than .git; discover that path
+    # instead of relying only on path components (same protection as worktrees).
+    separate = code_base / "separate"
+    separate.mkdir()
+    control = separate / "git-control"
+    subprocess.run(["git", "init", "-q", "--separate-git-dir=" + str(control), str(separate)], check=True)
+    for filename in (".git", "git-control/config", "git-control/hooks/pre-commit"):
+        payload = {"tool_name": "Write", "tool_input": {"file_path": filename}, "cwd": str(separate)}
+        assert policy.evaluate(payload, roots) is not None, filename
+    payload = {"tool_name": "Write", "tool_input": {"file_path": "ordinary.txt"}, "cwd": str(separate)}
+    assert policy.evaluate(payload, roots) is None
+    with unittest.mock.patch.object(policy, "git_metadata", return_value=None):
+        assert policy.evaluate(payload, roots) is not None, "metadata discovery must fail closed"
+
+    # A real local add/commit completes after passing the hook; GitHub push is
+    # permission-tested against its named HTTPS remote, with no authentication
+    # or network push from CI.
+    subprocess.run(["git", "config", "user.name", "CI Fixture"], cwd=current, check=True)
+    subprocess.run(["git", "config", "user.email", "ci-fixture@example.invalid"], cwd=current, check=True)
+    assert policy.evaluate(event("git add safe.txt"), roots) is None
+    subprocess.run(["git", "add", "safe.txt"], cwd=current, check=True)
+    assert policy.evaluate(event("git commit -m 'CI safe workflow'"), roots) is None
+    subprocess.run(["git", "commit", "-q", "-m", "CI safe workflow"], cwd=current, check=True)
+    assert policy.evaluate(event("git push -u origin HEAD"), roots) is None
+    assert policy.permission_reason(event("git push -u origin HEAD"), roots) is None
+    print("PASS: agent config/metadata/override attempts denied; real add/commit and GitHub push approval permitted")
+
     subprocess.run(["git", "remote", "add", "local-target", str(sibling)], cwd=current, check=True)
     subprocess.run(["git", "remote", "add", "local-file", "file://" + str(sibling)], cwd=current, check=True)
     for command in ("git push local-target HEAD", "git push local-file HEAD",
@@ -222,7 +332,13 @@ with tempfile.TemporaryDirectory() as temp:
         import contextlib
         import io
         import sys
-        for command, blocked in (("gh issue list", False), ("curl https://github.com", True)):
+        for command, blocked in (("gh issue list", False), ("curl https://github.com", True),
+                                 ("git config core.hooksPath fixture-command", True),
+                                 ("git config core.fsmonitor fixture-command", True),
+                                 ("git config core.sshCommand fixture-command", True),
+                                 ("git config alias.x fixture-command", True),
+                                 ("git config filter.x.clean fixture-command", True),
+                                 ("printf fixture > .git/hooks/pre-commit", True)):
             payload = event(command) | {"hook_event_name": "PermissionRequest"}
             previous_stdin = sys.stdin
             output = io.StringIO()

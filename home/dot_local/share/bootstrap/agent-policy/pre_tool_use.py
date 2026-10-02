@@ -31,6 +31,111 @@ CURRENT_REPO_GIT = READ_ONLY_GIT | {
     "rebase", "cherry-pick", "revert", "config", "rev-list", "ls-remote", "describe",
 }
 SHELL_EXPANSION = re.compile(r"[$~*?\[\]{}]")
+GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                    "GIT_EXEC_PATH", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EXTERNAL_DIFF"}
+
+
+def git_environment_override(event: dict, data: dict) -> bool:
+    """Do not let inherited or per-tool environment change Git's control plane."""
+    environments = [os.environ]
+    for source in (event, data):
+        for key in ("env", "environment"):
+            if key in source:
+                if not isinstance(source[key], dict):
+                    return True
+                environments.append(source[key])
+    return any(name.startswith("GIT_CONFIG") or name in GIT_OVERRIDE_ENV
+               for environment in environments for name in environment)
+
+
+def protected_git_path(path_text: str, cwd: str, metadata: tuple[Path, ...]) -> bool:
+    """Protect .git itself, descendants, symlink aliases and worktree Git dirs."""
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = Path(cwd) / path
+    try:
+        resolved = path.resolve()
+        return (".git" in path.parts or ".git" in resolved.parts
+                or any(resolved == directory or directory in resolved.parents
+                       for directory in metadata))
+    except (OSError, ValueError):
+        return True
+
+
+def git_metadata(root: Path) -> tuple[Path, ...] | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+            cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
+        paths = tuple(Path(line).resolve() for line in result.stdout.splitlines())
+        return paths if len(paths) == 2 and all(path.is_absolute() for path in paths) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def writable(path_text: str, cwd: str, root: Path, metadata: tuple[Path, ...] | None) -> bool:
+    return (metadata is not None and inside(path_text, cwd, root)
+            and not protected_git_path(path_text, cwd, metadata))
+
+
+def transfer_paths(tokens: list[str], executable: str, cwd: str) -> tuple[list[str], list[str]] | None:
+    """Parse file transfers; refuse directory copies and ambiguous option forms."""
+    flags = {"-f", "-i", "-n", "-v", "-p", "-T", "-D", "--force", "--interactive",
+             "--no-clobber", "--verbose", "--no-target-directory", "--preserve-timestamps",
+             "--remove-destination"}
+    operands: list[str] = []
+    target_directory: str | None = None
+    index = 1
+    options = True
+    while index < len(tokens):
+        token = tokens[index]
+        if options and token == "--":
+            options = False
+        elif options and token in {"-t", "--target-directory"}:
+            index += 1
+            if index >= len(tokens) or target_directory is not None:
+                return None
+            target_directory = tokens[index]
+        elif options and (token.startswith("--target-directory=") or token.startswith("-t") and len(token) > 2):
+            if target_directory is not None:
+                return None
+            target_directory = token.split("=", 1)[1] if token.startswith("--") else token[2:]
+        elif options and executable == "install" and token in {"-m", "--mode"}:
+            index += 1
+            if index >= len(tokens):
+                return None
+        elif options and executable == "install" and (token.startswith("--mode=") or token.startswith("-m") and len(token) > 2):
+            pass
+        elif options and token.startswith("-"):
+            if token not in flags:
+                return None
+        else:
+            operands.append(token)
+        index += 1
+    if target_directory is None and len(operands) < 2 or target_directory is not None and not operands:
+        return None
+    sources = operands if target_directory is not None else operands[:-1]
+    destination = target_directory if target_directory is not None else operands[-1]
+    try:
+        if any((Path(cwd) / source).is_dir() for source in sources):
+            return None  # Recursive/whole-directory transfers can hide nested .git writes.
+        dest_path = Path(cwd) / destination
+        targets = [str(dest_path / Path(source).name) for source in sources] if dest_path.is_dir() else [destination]
+    except OSError:
+        return None
+    # mv deletes its source too; cp/install inspect sources for protected metadata.
+    return sources + [destination], targets + (sources if executable == "mv" else [])
+
+
+def git_config_read_only(arguments: list[str]) -> bool:
+    modifiers = {"--local", "--show-origin", "--show-scope"}
+    operation = [argument for argument in arguments if argument not in modifiers]
+    return (operation in (["--list"], ["-l"])
+            or len(operation) == 2 and operation[0] == "--get"
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z0-9-]+)+", operation[1]) is not None)
+
 
 
 
@@ -169,6 +274,12 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
 
 def git_policy(tokens: list[str], cwd: str, root: Path,
                approved_roots: tuple[Path, ...] | None) -> str | None:
+    if any(token == "-c" or token.startswith("-c") and len(token) > 2
+           or token.startswith("--config-env")
+           or "=" in token and (token.split("=", 1)[0].startswith("GIT_CONFIG")
+                               or token.split("=", 1)[0] in GIT_OVERRIDE_ENV)
+           for token in tokens[1:]):
+        return "Git configuration and execution overrides are blocked."
     parsed = git_target(tokens, cwd)
     if parsed is None:
         return "Unsupported Git selector or global option; use plain git with -C or --no-pager."
@@ -190,11 +301,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
 
     if any(option_matches(arg, "--output") for arg in arguments):
         return "Git output-file options are blocked; redirect only inside the current repository."
-    if subcommand == "config":
-        if any(arg.startswith("-f") or any(option_matches(arg, option) for option in
-               ("--global", "--system", "--file", "--worktree", "--scope"))
-               for arg in arguments):
-            return "Git config may change only the current repository's local configuration."
+    if subcommand == "config" and not git_config_read_only(arguments):
+        return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
     if cross_repo:
         if not {"--no-pager", "--no-optional-locks"}.issubset(selectors):
             return "Cross-repository reads require --no-pager and --no-optional-locks."
@@ -270,6 +378,8 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     data = event.get("tool_input")
     if not isinstance(data, dict):
         return "Unrecognized tool input; blocked by policy."
+    if git_environment_override(event, data):
+        return "Git configuration and execution environment overrides are blocked."
     cwd = str(event.get("cwd") or os.getcwd())
     root = root_for(cwd, approved_roots)
     if str(root) == "/__bootstrap_outside_approved_roots__":
@@ -279,17 +389,19 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     if tool in {"Write", "Edit", "MultiEdit"}:
         paths = [data.get(k) for k in ("file_path", "path", "filename")
                  if isinstance(data.get(k), str)]
-        if not paths or any(not inside(p, cwd, root) for p in paths):
-            return "File writes outside the current approved repository are blocked."
+        metadata = git_metadata(root)
+        if not paths or any(not writable(p, cwd, root, metadata) for p in paths):
+            return "File writes outside the current repository or into Git metadata are blocked."
         return None
     if tool == "apply_patch":
         patch = data.get("patch", data.get("command", ""))
         if not isinstance(patch, str):
             return "Patch input is unrecognized; blocked by policy."
-        paths = re.findall(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$",
+        paths = re.findall(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$",
                            patch, re.MULTILINE)
-        if not paths or any(not inside(p, cwd, root) for p in paths):
-            return "Patch writes outside the current approved repository are blocked."
+        metadata = git_metadata(root)
+        if not paths or any(not writable(p, cwd, root, metadata) for p in paths):
+            return "Patch writes outside the current repository or into Git metadata are blocked."
         return None
     if tool != "Bash":
         return None
@@ -321,25 +433,41 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     names = {Path(t).name.lower() for t in tokens}
     if names & (HOST_NAMES | HOST_OPS):
         return "Host, Windows, and operating-system commands are blocked."
+    output_operators = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+    metadata = git_metadata(root) if executable in WRITERS | {"sed"} or any(
+        token in output_operators for token in tokens) else None
     for i, token in enumerate(tokens):
-        if token in {">", ">>", ">|", "&>", "&>>"} and (i + 1 >= len(tokens) or SHELL_EXPANSION.search(tokens[i + 1])
-                or not inside(tokens[i + 1], cwd, root)):
-            return "Shell output outside the current repository is blocked."
+        if token in output_operators and (i + 1 >= len(tokens) or SHELL_EXPANSION.search(tokens[i + 1])
+                or not writable(tokens[i + 1], cwd, root, metadata)):
+            return "Shell output outside the current repository or into Git metadata is blocked."
     args = [t for t in tokens[1:] if not t.startswith("-")]
-    targets = []
-    if executable in WRITERS:
-        if executable in {"cp", "mv", "install"}:
-            targets = args[-1:]
-        elif executable == "dd":
+    targets: list[str] = []
+    inspected: list[str] = []
+    if executable in {"cp", "mv", "install"}:
+        transfer = transfer_paths(tokens, executable, cwd)
+        if transfer is None:
+            return "Ambiguous options and whole-directory file transfers are blocked."
+        inspected, targets = transfer
+    elif executable in WRITERS:
+        if executable == "dd":
             targets = [t.split("=", 1)[1] for t in tokens[1:] if t.startswith("of=")]
         elif executable == "truncate":
             targets = args[-1:]
         else:
             targets = args
-    if executable == "sed" and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
+        inspected = args + [t.split("=", 1)[1] for t in tokens[1:] if t.startswith("--") and "=" in t]
+        if executable in {"rm", "chmod", "chown"} and any(
+                SHELL_EXPANSION.search(t) or (Path(cwd) / t).is_dir() for t in targets):
+            return "Directory mutation commands are blocked; use explicit file paths."
+    if executable == "sed" and any(t == "-i" or t.startswith("-i") or t.startswith("--in-place")
+                                  for t in tokens[1:]):
         targets = args[-1:]
-    if any(not inside(t, cwd, root) for t in targets):
-        return "Shell writes outside the current repository are blocked."
+        inspected = args
+    if any(SHELL_EXPANSION.search(t) or metadata is None or protected_git_path(t, cwd, metadata)
+           for t in inspected):
+        return "Direct shell writes to Git metadata or expanded file operands are blocked."
+    if any(SHELL_EXPANSION.search(t) or not writable(t, cwd, root, metadata) for t in targets):
+        return "Shell writes outside the current repository or into Git metadata are blocked."
     if executable == "git":
         return git_policy(tokens, cwd, root, approved_roots)
     if executable == "gh" and gh_merges(tokens):

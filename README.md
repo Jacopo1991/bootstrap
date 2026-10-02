@@ -436,7 +436,11 @@ so no pager runs and status cannot refresh another repository's index. Add
 `--no-textconv` to cross-repository log, show, diff and blame, and
 `--no-ext-diff` to log, show and diff. Spell short options separately; aggregated
 short flags and external input-file options are refused. Current-repository
-Git commands retain ordinary use; global/file configuration writes, new
+Git commands retain ordinary add/commit/push use. All agent `git config`
+writes are blocked, including local configuration and hook/fsmonitor/SSH/
+alias/filter/diff keys; only explicit `--get` and `--list`/`-l` reads are
+permitted. Owner-provisioned identity/remotes remain in place. A future key
+exception needs an exact-name decision in a later PR. New
 repository/worktree creation, output-file primitives and local filesystem
 remotes require separate setup and are blocked. Push, fetch and pull require
 one explicit named remote; its effective URLs (including pushurl, insteadOf
@@ -448,7 +452,17 @@ operands and unspecified remotes are refused rather than guessed.
 Repeated and attached `-C` selectors resolve sequentially; symlink escapes,
 config/git-dir/work-tree overrides and side-effecting cross-repo read options
 are refused. The existing host-command, file-write and staged-secret checks
-remain in force. This hook is a command guard, not an OS boundary against
+remain in force. Native Edit/Write/MultiEdit and patches, including patch
+renames, refuse direct Git metadata writes. Shell redirection and recognised
+file writers use the same protection for lexical/resolved `.git` paths,
+symlink aliases, and Git's reported worktree/common metadata directories.
+Ambiguous transfer options, directory transfers and directory mutations are
+refused to prevent indirect metadata writes. Plain file copies remain usable.
+Git `-c`/`--config-env`, environment-prefixed commands, inherited/per-tool
+`GIT_CONFIG*`, `GIT_DIR`, `GIT_EXEC_PATH` and related execution overrides are
+refused before helper Git calls. Normal Git commands may still update their
+own index/refs; agents cannot edit the control files directly.
+This hook is a command guard, not an OS boundary against
 arbitrary programs or a replacement for reviewing the exact approval.
 
 Sources checked 2026-10-01: [Claude sandbox modes and exclusions](https://code.claude.com/docs/en/sandboxing#the-unsandboxed-retry-escape-hatch),
