@@ -22,13 +22,14 @@ def check(command, expected):
 for executable in ("git", "/usr/bin/git"):
     for arguments in (["status", "--short"], ["push", "-u", "origin", "ci-fixture"],
                       ["fetch", "origin"], ["add", "safe.txt"], ["commit", "-m", "fixture"],
+                      ["merge", "origin/main"], ["merge", "--no-edit", "origin/main"],
                       ["stash", "list"], ["switch", "task-fixture"], ["switch", "-c", "task-fixture"]):
         check([executable, *arguments], "allow")
     for arguments in (["reset", "--hard"], ["rebase", "--abort"],
                       ["cherry-pick", "--abort"], ["revert", "--abort"],
                       ["stash", "pop"], ["stash", "drop"], ["stash", "clear"]):
         check([executable, *arguments], "prompt")
-    for arguments in (["merge", "fixture"], ["push", "--force", "origin", "HEAD"],
+    for arguments in (["push", "--force", "origin", "HEAD"],
                       ["push", "--force-with-lease", "origin", "HEAD"],
                       ["push", "-f", "origin", "HEAD"], ["push", "--delete", "origin", "task"]):
         check([executable, *arguments], "forbidden")

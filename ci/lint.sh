@@ -16,6 +16,7 @@ bash ci/boundary-test.sh
 bash -n system/ssh.sh system/authorize-agent-key.sh ci/vscode-ssh-test.sh
 python3 ci/monthly_pins_test.py
 python3 ci/agent-config-test.py
+python3 ci/git-default-merge-test.py
 python3 ci/agent-drift-test.py
 mapfile -t scripts < <(find . -name '*.sh' -type f -not -path './.git/*')
 "$tmp/shellcheck-v0.11.0/shellcheck" --external-sources --source-path=SCRIPTDIR "${scripts[@]}"

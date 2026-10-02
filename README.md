@@ -460,7 +460,13 @@ metadata are excluded: plain fetch can recurse into unchecked child remotes.
 Inspection failures also deny this exception.
 Bare fetch resolves the branch-configured remote (falling back to origin)
 and verifies its effective GitHub URL. Pull, merge, checkout, switch and other
-Git writes remain limited to the current repo; build agents never merge.
+Git writes remain limited to the current repo. Build agents never merge pull requests.
+The only local merge exception is `git merge [--no-edit] origin/<default branch>`
+inside the current repo on an attached non-default branch, with one effective
+GitHub origin URL and a resolvable symbolic `origin/HEAD`. Unknown/default/detached
+branches, other refs and every other merge option are denied by the shared hook.
+The locally recorded origin default must be established by authorized setup;
+the hook never contacts a remote to discover it.
 Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
 so no pager runs and status cannot refresh another repository's index. Add
 `--no-textconv` to cross-repository log, show, diff and blame, and

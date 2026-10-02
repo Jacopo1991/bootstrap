@@ -2,7 +2,6 @@
   "permissions": {
     "defaultMode": "acceptEdits",
     "deny": [
-      "Bash(git merge *)",
       "Bash(gh pr merge *)",
       "Bash(powershell *)",
       "Bash(powershell.exe *)",
