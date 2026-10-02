@@ -454,6 +454,9 @@ blame against repositories under `/home/agent/dev_workspace` and
 approved root, updating refs/objects/FETCH_HEAD without changing the working
 tree. Sibling fetch does not need the read-only pager/lock selectors below;
 extra fetch options, refspecs, URLs and remote groups remain blocked there.
+Sibling repositories with submodule configuration, gitlinks or stored submodule
+metadata are excluded: plain fetch can recurse into unchecked child remotes.
+Inspection failures also deny this exception.
 Bare fetch resolves the branch-configured remote (falling back to origin)
 and verifies its effective GitHub URL. Pull, merge, checkout, switch and other
 Git writes remain limited to the current repo; build agents never merge.

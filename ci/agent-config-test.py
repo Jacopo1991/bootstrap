@@ -193,6 +193,47 @@ with tempfile.TemporaryDirectory() as temp:
         assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is not None
         subprocess.run(["git", "config", "--unset-all", "url." + str(current) + ".insteadOf"],
                        cwd=target, check=True)
+    # Populated submodules can recurse to an unchecked child URL. Deny both
+    # forms, including missing .gitmodules and stale index/worktree cases.
+    for target in (sibling, knowledge):
+        for repo in (target, target / "unsafe-child"):
+            if repo != target:
+                subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "config", "user.name", "CI Fixture"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "ci-fixture@example.invalid"],
+                           cwd=repo, check=True)
+        child = target / "unsafe-child"
+        subprocess.run(["git", "remote", "add", "origin", "https://example.invalid/submodule"],
+                       cwd=child, check=True)
+        (child / "safe.txt").write_text("submodule fixture\n", encoding="utf-8")
+        subprocess.run(["git", "add", "safe.txt"], cwd=child, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "submodule fixture"], cwd=child, check=True)
+        oid = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=child, text=True).strip()
+        (target / "a-before.txt").write_text("ordinary fixture\n", encoding="utf-8")
+        (target / ".gitmodules").write_text(
+            '[submodule "unsafe-child"]\n\tpath = unsafe-child\n'
+            '\turl = https://example.invalid/submodule\n', encoding="utf-8")
+        subprocess.run(["git", "add", "a-before.txt", ".gitmodules"], cwd=target, check=True)
+        subprocess.run(["git", "update-index", "--add", "--cacheinfo",
+                        "160000," + oid + ",unsafe-child"], cwd=target, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "parent gitlink fixture"], cwd=target, check=True)
+        for suffix in ("fetch", "fetch origin"):
+            assert policy.evaluate(event(f"git -C {target} {suffix}"), roots) is not None
+        (target / ".gitmodules").unlink()
+        assert policy.sibling_fetch_has_submodules(target), "indexed gitlink must deny without file"
+        subprocess.run(["git", "update-index", "--force-remove", "unsafe-child"], cwd=target, check=True)
+        assert policy.sibling_fetch_has_submodules(target), "committed gitlink must deny without index"
+        subprocess.run(["git", "update-index", "--force-remove", ".gitmodules"], cwd=target, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "remove parent gitlinks"], cwd=target, check=True)
+        stored = target / ".git" / "modules"
+        stored.mkdir()
+        assert policy.sibling_fetch_has_submodules(target), "stored submodule metadata must deny"
+        stored.rmdir()
+        assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is None
+    from unittest.mock import patch
+    with patch.object(policy, "git_metadata", return_value=None):
+        assert policy.sibling_fetch_has_submodules(sibling), "metadata failure must deny"
+    print("PASS: sibling fetch excludes populated/indexed/committed/stored submodules in both roots")
     print("PASS: sibling fetch/default remote allowed in both roots; checkout/pull/merge/switch and unsafe fetches denied")
 
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None

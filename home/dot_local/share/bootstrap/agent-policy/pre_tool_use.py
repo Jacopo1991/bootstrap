@@ -257,6 +257,36 @@ def git_needs_approval(subcommand: str, arguments: list[str]) -> bool:
             and arguments[0] in {"pop", "drop", "clear"})
 
 
+def sibling_fetch_has_submodules(root: Path) -> bool:
+    """Fail closed: plain fetch can recurse into unchecked submodule remotes."""
+    metadata = git_metadata(root)
+    if metadata is None:
+        return True
+    try:
+        modules_file = root / ".gitmodules"
+        if (modules_file.exists() or modules_file.is_symlink()
+                or any((directory / "modules").exists() for directory in metadata)):
+            return True
+        index = subprocess.run(["git", "ls-files", "--stage", "-z"], cwd=root,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
+        if any(record.startswith("160000 ") for record in index.stdout.split(chr(0))):
+            return True
+        head = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+                              cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, timeout=3)
+        if head.returncode == 1:
+            return False  # An unborn repository has no committed gitlinks.
+        if head.returncode != 0:
+            return True
+        tree = subprocess.run(["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
+        return any(record.startswith("160000 ") for record in tree.stdout.split(chr(0)))
+    except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+        return True
+
+
 def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> str | None:
     """Require an explicit remote whose effective URLs stay on GitHub."""
     flags = {
@@ -370,6 +400,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     sibling_fetch = cross_repo and subcommand == "fetch"
     if sibling_fetch and arguments not in ([], ["origin"]):
         return "Sibling fetch permits only fetch or fetch origin; options/refspecs are blocked."
+    if sibling_fetch and sibling_fetch_has_submodules(target_root):
+        return "Sibling fetch with submodules is blocked to avoid unchecked recursive destinations."
     if cross_repo and subcommand not in READ_ONLY_GIT and not sibling_fetch:
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
