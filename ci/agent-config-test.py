@@ -22,20 +22,44 @@ assert codex_hooks["hooks"]["PermissionRequest"][0]["matcher"] == "^Bash$"
 assert {x["matcher"] for x in codex_hooks["hooks"]["PreToolUse"]} == {"^Bash$", "^(apply_patch|Edit|Write)$"}
 
 claude = json.loads((ROOT / "home/dot_claude/settings.json").read_text(encoding="utf-8"))
-assert claude["permissions"]["defaultMode"] == "default"
-assert "allow" not in claude["permissions"]
+assert claude["permissions"]["defaultMode"] == "acceptEdits"
+assert "ask" not in claude["permissions"]
+assert claude["permissions"]["allow"] == ["Bash(git *)", "Bash(gh *)",
+    "Bash(/usr/bin/git *)", "Bash(/usr/bin/gh *)"]
 assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
-    "failIfUnavailable": True, "excludedCommands": ["git", "gh"],
+    # Bare names match only argument-less calls; keep the exact approved patterns.
+    "failIfUnavailable": True,
+    "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False}
-assert set(claude["permissions"]["ask"]) == {"Bash(git *)", "Bash(gh *)",
-    "Bash(/usr/bin/git *)", "Bash(/usr/bin/gh *)"}
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
 assert "Bash(git merge *)" in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
 assert "network" not in claude["sandbox"]
+# Documented Bash glob patterns cover destructive flags before and after
+# ordinary remote/branch operands. Selector/quote variants are hook-tested below.
+from fnmatch import fnmatchcase
+def claude_denies(command):
+    return any(fnmatchcase(command, entry[5:-1])
+               for entry in claude["permissions"]["deny"] if entry.startswith("Bash("))
+for executable in ("git", "/usr/bin/git"):
+    for tail in ("push --force origin HEAD", "push origin HEAD --force-with-lease",
+                 "push origin HEAD -f", "push origin -fextra",
+                 "push --delete origin branch", "push origin branch --delete",
+                 "push origin :branch"):
+        assert claude_denies(executable + " " + tail), tail
+for executable in ("gh", "/usr/bin/gh"):
+    for tail in ("repo delete fixture", "repo edit fixture", "release delete fixture",
+                 "secret list", "ruleset list", "api -X DELETE repos/fixture",
+                 "api repos/fixture -X DELETE", "api -XDELETE repos/fixture",
+                 "api repos/fixture --method DELETE", "api repos/fixture --method=DELETE"):
+        assert claude_denies(executable + " " + tail), tail
+for command in ("git push -u origin HEAD", "gh issue list", "gh pr create",
+                "/usr/bin/git push origin HEAD", "/usr/bin/gh api repos/fixture"):
+    assert not claude_denies(command), command
 rules = (ROOT / "home/dot_codex/rules/default.rules").read_text(encoding="utf-8")
+assert rules.count('decision = "allow"') == 4
 assert rules.count('decision = "prompt"') == 4
-assert 'decision = "allow"' not in rules
+assert rules.count('decision = "forbidden"') == 14
 assert "PreToolUse" in claude["hooks"]
 assert not claude.get("mcpServers") and not claude.get("plugins")
 
@@ -329,6 +353,61 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git add --chmod=+x safe.txt"), roots) is None
     assert policy.evaluate(event("git add --chmod=-x safe.txt"), roots) is None
 
+    # A real current-repository branch switch/creation must pass the guard.
+    # Keep global/attached configuration override variants denied.
+    for executable in ("git", "/usr/bin/git"):
+        for tail in ("switch task-fixture", "switch -c task-fixture", "checkout -b task-fixture"):
+            assert policy.evaluate(event(executable + " " + tail), roots) is None, tail
+        for tail in ("-c core.hooksPath=fixture switch task-fixture",
+                     "-ccore.hooksPath=fixture switch -c task-fixture",
+                     "switch --config-env=core.hooksPath=FIXTURE task-fixture",
+                     "switch -c task-fixture -c extra",
+                     "switch -ccore.hooksPath=fixture"):
+            assert policy.evaluate(event(executable + " " + tail), roots) is not None, tail
+    for target in (sibling, knowledge):
+        assert policy.evaluate(event(f"git -C {target} switch task-fixture"), roots) is not None
+        assert policy.evaluate(event(f"git -C {target} switch -c task-fixture"), roots) is not None
+
+    # Founder decision: ordinary Git/gh has native allow rules; forbidden
+    # operations are denied independently of flag position or inherited selectors.
+    for executable in ("git", "/usr/bin/git"):
+        for tail in ("push --force origin HEAD", "push origin HEAD --force",
+                     "push origin HEAD --force-with-lease=refs/heads/task:fixture",
+                     "push origin HEAD --force-if-includes", "push origin HEAD -f",
+                     "push origin HEAD -fextra", "push origin HEAD -uf",
+                     "push --delete origin task", "push origin task --delete",
+                     "push origin task -d", "push origin :task",
+                     "push origin +HEAD:task", "push --mirror origin", "push origin --prune",
+                     "-C . push origin HEAD --force", "-C . push origin :task"):
+            command = executable + " " + tail
+            assert policy.evaluate(event(command), roots) is not None, command
+            assert policy.permission_reason(event(command), roots) is not None, command
+        for tail in ("reset --hard", "rebase --abort", "cherry-pick --abort", "revert --abort",
+                     "stash pop", "stash drop", "stash clear"):
+            # Native literal prefixes request approval; hook must not grant it.
+            command = executable + " " + tail
+            assert policy.evaluate(event(command), roots) is None, command
+            assert policy.permission_reason(event(command), roots) is None, command
+            for prefix in ("-C . ", "--no-pager "):
+                assert policy.evaluate(event(executable + " " + prefix + tail), roots) is not None
+        for tail in ("push -u origin HEAD", "status --short", "stash list"):
+            assert policy.evaluate(event(executable + " " + tail), roots) is None, tail
+    for executable in ("gh", "/usr/bin/gh"):
+        for tail in ("repo delete fixture", "repo edit fixture", "release delete fixture",
+                     "secret list", "ruleset list", "-R owner/repo repo delete",
+                     "repo --repo owner/repo edit", "--hostname github.com release delete fixture",
+                     "--repo=owner/repo secret list", "-Rowner/repo ruleset list",
+                     "api -X DELETE repos/fixture", "api repos/fixture -X DELETE",
+                     "api -XDELETE repos/fixture", "api repos/fixture -X=DELETE",
+                     "api --method DELETE repos/fixture", "api repos/fixture --method=DELETE",
+                     "-R owner/repo api repos/fixture --method=delete"):
+            command = executable + " " + tail
+            assert policy.evaluate(event(command), roots) is not None, command
+            assert policy.permission_reason(event(command), roots) is not None, command
+        for tail in ("issue list", "pr create", "auth status", "repo view", "release list",
+                     "api repos/fixture", "api repos/fixture --method GET"):
+            assert policy.evaluate(event(executable + " " + tail), roots) is None, tail
+
     # A real local add/commit completes after passing the hook; GitHub push is
     # permission-tested against its named HTTPS remote, with no authentication
     # or network push from CI.
@@ -338,6 +417,11 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run(["git", "add", "safe.txt"], cwd=current, check=True)
     assert policy.evaluate(event("git commit -m 'CI safe workflow'"), roots) is None
     subprocess.run(["git", "commit", "-q", "-m", "CI safe workflow"], cwd=current, check=True)
+    assert policy.evaluate(event("git switch -c ci-switch-fixture"), roots) is None
+    subprocess.run(["git", "switch", "-q", "-c", "ci-switch-fixture"], cwd=current, check=True)
+    subprocess.run(["git", "branch", "ci-existing-fixture"], cwd=current, check=True)
+    assert policy.evaluate(event("git switch ci-existing-fixture"), roots) is None
+    subprocess.run(["git", "switch", "-q", "ci-existing-fixture"], cwd=current, check=True)
     assert policy.evaluate(event("git push -u origin HEAD"), roots) is None
     assert policy.permission_reason(event("git push -u origin HEAD"), roots) is None
     print("PASS: agent config/metadata/override attempts denied; real add/commit and GitHub push approval permitted")
@@ -397,10 +481,10 @@ with tempfile.TemporaryDirectory() as temp:
                 assert response["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
                 assert response["hookSpecificOutput"]["decision"]["behavior"] == "deny"
             else:
-                assert output.getvalue() == "", "normal native user approval must remain"
+                assert output.getvalue() == "", "hook must defer to native allow/prompt rules"
     finally:
         policy.root_for = previous_root_for
-print("PASS: cross-repository Git reads, current-repository writes and git/gh-only approvals")
+print("PASS: founder-approved routine Git/gh, destructive denies and canonical native approval controls")
 
 for path in ("home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md"):
     rules = (ROOT / path).read_text(encoding="utf-8").lower()
