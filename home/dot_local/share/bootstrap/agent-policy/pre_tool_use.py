@@ -379,6 +379,36 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
     return None
 
 
+
+def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
+    """Only merge the locally recorded GitHub origin default into a task branch."""
+    try:
+        def read_git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], cwd=target, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, check=True, timeout=3).stdout.strip()
+        current = read_git("symbolic-ref", "--quiet", "HEAD")
+        default = read_git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        prefix = "refs/remotes/origin/"
+        if (not current.startswith("refs/heads/") or not default.startswith(prefix)
+                or default == prefix + "HEAD"):
+            return "Cannot identify the current and origin default branch safely."
+        name = default[len(prefix):]
+        if current == "refs/heads/" + name:
+            return "Merging into the default branch is blocked; update only a task branch."
+        wanted = "origin/" + name
+        if arguments not in ([wanted], ["--no-edit", wanted]):
+            return "Only git merge [--no-edit] origin/<default branch> is allowed."
+        read_git("rev-parse", "--verify", default + "^{commit}")
+        urls = read_git("remote", "get-url", "--all", "origin").splitlines()
+        if len(urls) != 1:
+            return "Origin must have one unambiguous GitHub URL."
+    except (OSError, subprocess.SubprocessError):
+        return "Cannot verify merge metadata; origin/HEAD and its commit must exist."
+    return git_network_remote(["origin"], target, "fetch")
+
+
 def git_policy(tokens: list[str], cwd: str, root: Path,
                approved_roots: tuple[Path, ...] | None) -> str | None:
     if any(token.startswith("--config-env")
@@ -414,7 +444,7 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if cross_repo and subcommand not in READ_ONLY_GIT and not sibling_fetch:
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
-        return "Build agents never merge."
+        return git_default_branch_merge(arguments, target)
     if subcommand not in CURRENT_REPO_GIT:
         return "Git topology changes and unsupported write primitives require separate setup."
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.

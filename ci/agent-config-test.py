@@ -32,7 +32,7 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False}
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
-assert "Bash(git merge *)" in claude["permissions"]["deny"]
+assert "Bash(git merge *)" not in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
 assert "network" not in claude["sandbox"]
 # Documented Bash glob patterns cover destructive flags before and after
@@ -59,7 +59,7 @@ for command in ("git push -u origin HEAD", "gh issue list", "gh pr create",
 rules = (ROOT / "home/dot_codex/rules/default.rules").read_text(encoding="utf-8")
 assert rules.count('decision = "allow"') == 4
 assert rules.count('decision = "prompt"') == 4
-assert rules.count('decision = "forbidden"') == 14
+assert rules.count('decision = "forbidden"') == 12
 assert "PreToolUse" in claude["hooks"]
 assert not claude.get("mcpServers") and not claude.get("plugins")
 
