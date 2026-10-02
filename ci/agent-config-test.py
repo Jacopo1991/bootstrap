@@ -309,6 +309,9 @@ with tempfile.TemporaryDirectory() as temp:
                     "git rm -f -- ':(literal)nested-control/config'",
                     "git add -- ':nested-control/config'", "git add .",
                     "git add -A", "git add -u", "git add",
+                    "git add -A --chmod +x", "git add -A --ch +x",
+                    "git add --chmod +x safe.txt", "git add --ch=+x safe.txt",
+                    "git add -A --chmod=+x", "git add --chmod=-x",
                     "git add --pathspec-from=paths.txt",
                     "git mv -f -- safe.txt -control/config",
                     "git add -- -control/config",
@@ -323,6 +326,8 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git mv safe.txt ordinary.txt"), roots) is None
     assert policy.evaluate(event("git mv -- safe.txt -ordinary.txt"), roots) is None
     assert policy.evaluate(event("git --literal-pathspecs add safe.txt"), roots) is None
+    assert policy.evaluate(event("git add --chmod=+x safe.txt"), roots) is None
+    assert policy.evaluate(event("git add --chmod=-x safe.txt"), roots) is None
 
     # A real local add/commit completes after passing the hook; GitHub push is
     # permission-tested against its named HTTPS remote, with no authentication

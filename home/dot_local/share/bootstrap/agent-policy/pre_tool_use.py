@@ -325,6 +325,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         for argument in arguments:
             if argument == "--" and not literal_paths:
                 literal_paths = True
+            elif (subcommand == "add" and not literal_paths
+                  and option_matches(argument, "--chmod")):
+                # Git consumes a separate chmod value as an option argument,
+                # not a filename. Accept only exact attached values so they
+                # cannot satisfy the explicit-file staging requirement.
+                if argument not in {"--chmod=+x", "--chmod=-x"}:
+                    return "Git add chmod requires an exact --chmod=+x/--chmod=-x option."
             elif literal_paths or not argument.startswith("-"):
                 operands.append(argument)
         if any(argument.startswith(":") for argument in operands):
