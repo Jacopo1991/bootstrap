@@ -35,12 +35,23 @@
       "Edit(//mnt/c/**)",
       "Edit(//mnt/d/**)",
       "Edit(//etc/**)"
+    ],
+    "ask": [
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(/usr/bin/git *)",
+      "Bash(/usr/bin/gh *)"
     ]
   },
   "sandbox": {
     "enabled": true,
     "allowUnsandboxedCommands": false,
-    "failIfUnavailable": true
+    "failIfUnavailable": true,
+    "excludedCommands": [
+      "git",
+      "gh"
+    ],
+    "autoAllowBashIfSandboxed": false
   },
   "hooks": {
     "PreToolUse": [

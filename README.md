@@ -408,3 +408,76 @@ must enable **Allow GitHub Actions to create and approve pull requests**. Keep
 the existing `gate` job required and allow the `workflow_dispatch` event under
 any Actions execution policy. A manual run defaults to a read-only candidate
 preview; select the non-preview option only when a pull request is intended.
+
+
+### Repository commands and approved network access
+
+Claude Code keeps its sandbox enabled, its general unsandboxed retry disabled,
+regular permission prompts, the existing deny list and PreToolUse hook. Only
+`git` and `gh` are listed in `sandbox.excludedCommands`; explicit ask rules retain
+prompts for these tools. This is the documented exception even with
+`allowUnsandboxedCommands: false`; no general domain/network allow is added.
+The native GitHub CLI may use its existing credential store; agents must never
+read or print credential files or values.
+
+Codex keeps `workspace-write`, `network_access = false`, `on-request` and the
+user approval reviewer. Prompt-only execution rules cover git/gh. Its
+PermissionRequest hook denies other Bash escalations and returns no grant for
+git/gh, so the native user prompt still decides the exact request. This also
+denies non-git/gh shell escalations for filesystem access; ordinary commands
+inside the sandbox continue through PreToolUse. Never approve broad shell or
+persistent allow prefixes as a substitute for the exact repository operation.
+
+The shared policy permits log, show, diff, status, rev-parse, ls-files, grep and
+blame against repositories under `/home/agent/dev_workspace` and
+`/home/agent/cortex`. Other Git subcommands remain limited to the current repo.
+Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
+so no pager runs and status cannot refresh another repository's index. Add
+`--no-textconv` to cross-repository log, show, diff and blame, and
+`--no-ext-diff` to log, show and diff. Spell short options separately; aggregated
+short flags and external input-file options are refused. Current-repository
+Git commands retain ordinary add/commit/push use. All agent `git config`
+writes are blocked, including local configuration and hook/fsmonitor/SSH/
+alias/filter/diff keys; only explicit `--get` and `--list`/`-l` reads are
+permitted. Owner-provisioned identity/remotes remain in place. A future key
+exception needs an exact-name decision in a later PR. New
+repository/worktree creation, output-file primitives and local filesystem
+remotes require separate setup and are blocked. Push, fetch and pull require
+one explicit named remote; its effective URLs (including pushurl, insteadOf
+and pushInsteadOf rewrites)
+must be GitHub HTTPS or SSH. No remote connection is made by the policy check.
+Common flags such as `git push -u origin <branch>` work. Supported fetch/pull
+value options use `--key=value`; custom transport/push options, direct URL
+operands and unspecified remotes are refused rather than guessed.
+Repeated and attached `-C` selectors resolve sequentially; symlink escapes,
+config/git-dir/work-tree overrides and side-effecting cross-repo read options
+are refused. The existing host-command, file-write and staged-secret checks
+remain in force. Native Edit/Write/MultiEdit and patches, including patch
+renames, refuse direct Git metadata writes. Shell redirection and recognised
+file writers use the same protection for lexical/resolved `.git` paths,
+symlink aliases, and Git's reported worktree/common metadata directories.
+Target-ancestor checks also protect existing nested repositories' separately
+named Git directories (HEAD/objects/refs or HEAD/commondir), without scanning
+the repository tree. Git file-write/staging operands use the same metadata
+protection. Indirect pathspec files, directory move/remove/restore and agent
+Git cleanup are refused. Git pathspec magic and directory/implicit staging
+(`git add .`, `-A`/`-u` without filenames) are refused; stage explicit filenames.
+For example, `git add file1 file2`, `git commit -m "..."` and
+`git push -u origin <branch>` remain usable. Recursive cleanup could otherwise delete nested metadata without
+naming it. Explicit ordinary-file operations and add/commit/push remain usable.
+Ambiguous transfer options, directory transfers and directory mutations are
+refused to prevent indirect metadata writes. Plain file copies remain usable.
+Git `-c`/`--config-env`, environment-prefixed commands, inherited/per-tool
+`GIT_CONFIG*`, `GIT_DIR`, `GIT_EXEC_PATH` and related execution overrides are
+refused before helper Git calls. Normal Git commands may still update their
+own index/refs; agents cannot edit the control files directly.
+This hook is a command guard, not an OS boundary against
+arbitrary programs or a replacement for reviewing the exact approval.
+
+Sources checked 2026-10-01: [Claude sandbox modes and exclusions](https://code.claude.com/docs/en/sandboxing#the-unsandboxed-retry-escape-hatch),
+[Codex approvals](https://learn.chatgpt.com/docs/agent-approvals-security),
+[Codex execution rules](https://learn.chatgpt.com/docs/agent-configuration/rules),
+and [Codex PermissionRequest](https://learn.chatgpt.com/docs/hooks#permissionrequest).
+Pinned Codex `0.159.2` exposes the same PermissionRequest event and deny output;
+CI checks the managed hook and uses the installed CLI's execution-policy checker.
+No authentication, GitHub write or owner-host check is run by these tests.

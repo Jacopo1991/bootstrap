@@ -1,0 +1,5 @@
+# Network stays off in the sandbox. These exceptions always require user approval.
+prefix_rule(pattern = ["git"], decision = "prompt", justification = "Approve the exact repository-scoped Git command.")
+prefix_rule(pattern = ["gh"], decision = "prompt", justification = "Approve the exact GitHub CLI operation.")
+prefix_rule(pattern = ["/usr/bin/git"], decision = "prompt", justification = "Approve the exact repository-scoped Git command.")
+prefix_rule(pattern = ["/usr/bin/gh"], decision = "prompt", justification = "Approve the exact GitHub CLI operation.")
