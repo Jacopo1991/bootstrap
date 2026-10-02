@@ -449,7 +449,18 @@ blocked.
 
 The shared policy permits log, show, diff, status, rev-parse, ls-files, grep and
 blame against repositories under `/home/agent/dev_workspace` and
-`/home/agent/cortex`. Other Git subcommands remain limited to the current repo.
+`/home/agent/cortex`. A narrow fetch exception also permits
+`git fetch` / `git fetch origin` and `git -C <sibling> fetch [origin]` in either
+approved root, updating refs/objects/FETCH_HEAD without changing the working
+tree. Sibling fetch does not need the read-only pager/lock selectors below;
+extra fetch options, refspecs, URLs and remote groups remain blocked there.
+Sibling repositories with effective submodule configuration (including retained
+activation/URL settings and includes), submodule files, gitlinks or stored
+metadata are excluded: plain fetch can recurse into unchecked child remotes.
+Inspection failures also deny this exception.
+Bare fetch resolves the branch-configured remote (falling back to origin)
+and verifies its effective GitHub URL. Pull, merge, checkout, switch and other
+Git writes remain limited to the current repo; build agents never merge.
 Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
 so no pager runs and status cannot refresh another repository's index. Add
 `--no-textconv` to cross-repository log, show, diff and blame, and
@@ -461,13 +472,13 @@ alias/filter/diff keys; only explicit `--get` and `--list`/`-l` reads are
 permitted. Owner-provisioned identity/remotes remain in place. A future key
 exception needs an exact-name decision in a later PR. New
 repository/worktree creation, output-file primitives and local filesystem
-remotes require separate setup and are blocked. Push, fetch and pull require
-one explicit named remote; its effective URLs (including pushurl, insteadOf
+remotes require separate setup and are blocked. Push and pull require
+one explicit named remote; fetch may omit it as described above. Effective URLs (including pushurl, insteadOf
 and pushInsteadOf rewrites)
 must be GitHub HTTPS or SSH. No remote connection is made by the policy check.
 Common flags such as `git push -u origin <branch>` work. Supported fetch/pull
 value options use `--key=value`; custom transport/push options, direct URL
-operands and unspecified remotes are refused rather than guessed.
+operands and unspecified push/pull remotes are refused rather than guessed.
 Repeated and attached `-C` selectors resolve sequentially; symlink escapes,
 config/git-dir/work-tree overrides and side-effecting cross-repo read options
 are refused. The existing host-command, file-write and staged-secret checks
