@@ -327,9 +327,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
                 literal_paths = True
             elif literal_paths or not argument.startswith("-"):
                 operands.append(argument)
+        if any(argument.startswith(":") for argument in operands):
+            return "Git pathspec magic is blocked; use literal non-metadata file paths."
+        if subcommand == "add" and not operands:
+            return "Agent staging requires explicit non-metadata file paths."
         if any(protected_git_path(arg, str(target), metadata) for arg in operands):
             return "Git file operands cannot modify or stage protected repository metadata."
-        if subcommand in {"mv", "rm", "restore"} and any(
+        if subcommand in {"add", "mv", "rm", "restore"} and any(
                 (target / arg).is_dir() for arg in operands):
             return "Git directory mutations are blocked; use explicit non-metadata file paths."
     if subcommand == "config" and not git_config_read_only(arguments):

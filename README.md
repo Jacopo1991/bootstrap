@@ -460,7 +460,10 @@ Target-ancestor checks also protect existing nested repositories' separately
 named Git directories (HEAD/objects/refs or HEAD/commondir), without scanning
 the repository tree. Git file-write/staging operands use the same metadata
 protection. Indirect pathspec files, directory move/remove/restore and agent
-Git cleanup are refused; cleanup could otherwise delete nested metadata without
+Git cleanup are refused. Git pathspec magic and directory/implicit staging
+(`git add .`, `-A`/`-u` without filenames) are refused; stage explicit filenames.
+For example, `git add file1 file2`, `git commit -m "..."` and
+`git push -u origin <branch>` remain usable. Recursive cleanup could otherwise delete nested metadata without
 naming it. Explicit ordinary-file operations and add/commit/push remain usable.
 Ambiguous transfer options, directory transfers and directory mutations are
 refused to prevent indirect metadata writes. Plain file copies remain usable.
