@@ -318,9 +318,15 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         metadata = git_metadata(target_root)
         if metadata is None:
             return "Cannot identify protected Git metadata; Git file operation blocked."
-        if any(arg.startswith("--pathspec-from-file") for arg in arguments):
+        if any(option_matches(arg, "--pathspec-from-file") for arg in arguments):
             return "Indirect Git pathspec files are blocked; use explicit file paths."
-        operands = [arg for arg in arguments if not arg.startswith("-")]
+        operands: list[str] = []
+        literal_paths = False
+        for argument in arguments:
+            if argument == "--" and not literal_paths:
+                literal_paths = True
+            elif literal_paths or not argument.startswith("-"):
+                operands.append(argument)
         if any(protected_git_path(arg, str(target), metadata) for arg in operands):
             return "Git file operands cannot modify or stage protected repository metadata."
         if subcommand in {"mv", "rm", "restore"} and any(

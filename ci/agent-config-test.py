@@ -301,7 +301,11 @@ with tempfile.TemporaryDirectory() as temp:
                     "mv safe.txt nested-control/config"):
         assert policy.evaluate(event(command), roots) is not None, command
 
-    for command in ("git mv -f safe.txt nested-control/config",
+    (current / "-control").symlink_to(nested_control, target_is_directory=True)
+    for command in ("git add --pathspec-from=paths.txt",
+                    "git mv -f -- safe.txt -control/config",
+                    "git add -- -control/config",
+                    "git mv -f safe.txt nested-control/config",
                     "git rm -f nested-control/config", "git restore nested-control/config",
                     "git checkout -- nested-control/config", "git add nested-control/config",
                     "git clean -ffdx nested-control", "git clean -ffdx .", "git clean -fd",
