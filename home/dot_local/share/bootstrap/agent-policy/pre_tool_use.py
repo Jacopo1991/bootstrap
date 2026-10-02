@@ -56,9 +56,20 @@ def protected_git_path(path_text: str, cwd: str, metadata: tuple[Path, ...]) -> 
         path = Path(cwd) / path
     try:
         resolved = path.resolve()
-        return (".git" in path.parts or ".git" in resolved.parts
+        if (".git" in path.parts or ".git" in resolved.parts
                 or any(resolved == directory or directory in resolved.parents
-                       for directory in metadata))
+                       for directory in metadata)):
+            return True
+        # An owner-provisioned nested repo may store its Git directory under
+        # another name. Inspect only target ancestors (no recursive traversal):
+        # normal Git dirs carry HEAD/objects/refs; linked worktree dirs carry
+        # HEAD/commondir. Metadata remains protected from the enclosing repo.
+        for ancestor in (resolved, *resolved.parents):
+            if ((ancestor / "HEAD").is_file()
+                    and ((ancestor / "commondir").is_file()
+                         or (ancestor / "objects").is_dir() and (ancestor / "refs").is_dir())):
+                return True
+        return False
     except (OSError, ValueError):
         return True
 

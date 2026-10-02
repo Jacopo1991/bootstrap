@@ -456,6 +456,9 @@ remain in force. Native Edit/Write/MultiEdit and patches, including patch
 renames, refuse direct Git metadata writes. Shell redirection and recognised
 file writers use the same protection for lexical/resolved `.git` paths,
 symlink aliases, and Git's reported worktree/common metadata directories.
+Target-ancestor checks also protect existing nested repositories' separately
+named Git directories (HEAD/objects/refs or HEAD/commondir), without scanning
+the repository tree.
 Ambiguous transfer options, directory transfers and directory mutations are
 refused to prevent indirect metadata writes. Plain file copies remain usable.
 Git `-c`/`--config-env`, environment-prefixed commands, inherited/per-tool

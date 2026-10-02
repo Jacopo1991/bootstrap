@@ -285,6 +285,22 @@ with tempfile.TemporaryDirectory() as temp:
     with unittest.mock.patch.object(policy, "git_metadata", return_value=None):
         assert policy.evaluate(payload, roots) is not None, "metadata discovery must fail closed"
 
+    # The enclosing repository must also protect an existing nested repo's
+    # custom Git directory, even when it was not returned for the current cwd.
+    nested_repo = current / "nested-owner-repo"
+    nested_control = current / "nested-control"
+    subprocess.run(["git", "init", "-q", "--separate-git-dir=" + str(nested_control),
+                    str(nested_repo)], check=True)
+    for filename in ("nested-control/config", "nested-control/hooks/pre-commit",
+                     "nested-control/HEAD", "nested-owner-repo/.git"):
+        payload = {"tool_name": "Write", "tool_input": {"file_path": filename}, "cwd": str(current)}
+        assert policy.evaluate(payload, roots) is not None, filename
+    for command in ("printf fixture > nested-control/hooks/pre-commit",
+                    "tee nested-control/config",
+                    "cp safe.txt nested-control/hooks/pre-commit",
+                    "mv safe.txt nested-control/config"):
+        assert policy.evaluate(event(command), roots) is not None, command
+
     # A real local add/commit completes after passing the hook; GitHub push is
     # permission-tested against its named HTTPS remote, with no authentication
     # or network push from CI.
