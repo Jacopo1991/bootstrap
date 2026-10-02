@@ -280,8 +280,46 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
             if key not in attached_values or not separator or not value:
                 return "Unsupported remote option; use ordinary flags or supported --key=value options."
     if not operands:
-        return "Git network commands require an explicit named GitHub remote."
-    remote = operands[0]
+        if subcommand != "fetch" or arguments:
+            return "Git network commands require an explicit named GitHub remote (except plain fetch)."
+        # Bare fetch uses the current branch's configured remote, then origin.
+        # Resolve that choice before checking URLs; checking origin alone would
+        # miss a local/non-GitHub upstream selected by Git.
+        remote = "origin"
+        try:
+            head = subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"],
+                                  cwd=target, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  text=True, timeout=3)
+            if head.returncode == 0:
+                reference = head.stdout.strip()
+                if not reference.startswith("refs/heads/"):
+                    return "Cannot identify the default fetch branch safely; specify origin."
+                configured = subprocess.run(
+                    ["git", "config", "--get", "branch." + reference[11:] + ".remote"],
+                    cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, timeout=3)
+                if configured.returncode == 0:
+                    remote = configured.stdout.strip()
+                elif configured.returncode != 1:
+                    return "Cannot identify the default fetch remote safely; specify origin."
+            elif head.returncode != 1:
+                return "Cannot identify the default fetch remote safely; specify origin."
+        except (OSError, subprocess.SubprocessError):
+            return "Cannot identify the default fetch remote safely; specify origin."
+    else:
+        remote = operands[0]
+    if subcommand == "fetch":
+        # A fetch group can expand one name into multiple unchecked remotes.
+        try:
+            group = subprocess.run(["git", "config", "--get-all", "remotes." + remote],
+                                   cwd=target, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return "Cannot inspect fetch groups safely."
+        if group.returncode != 1:
+            return "Fetch groups are blocked; use a single configured GitHub remote."
     # Named remotes let Git expand both insteadOf and pushInsteadOf itself.
     # A direct URL cannot be resolved as a push URL without synthetic config.
     command = ["git", "remote", "get-url"]
@@ -329,7 +367,10 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if str(target_root) == "/__bootstrap_outside_approved_roots__":
         return "Git target is outside approved code and knowledge roots."
     cross_repo = target_root != root
-    if cross_repo and subcommand not in READ_ONLY_GIT:
+    sibling_fetch = cross_repo and subcommand == "fetch"
+    if sibling_fetch and arguments not in ([], ["origin"]):
+        return "Sibling fetch permits only fetch or fetch origin; options/refspecs are blocked."
+    if cross_repo and subcommand not in READ_ONLY_GIT and not sibling_fetch:
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
         return "Build agents never merge."
@@ -375,7 +416,7 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
             return "Git directory mutations are blocked; use explicit non-metadata file paths."
     if subcommand == "config" and not git_config_read_only(arguments):
         return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
-    if cross_repo:
+    if cross_repo and not sibling_fetch:
         if not {"--no-pager", "--no-optional-locks"}.issubset(selectors):
             return "Cross-repository reads require --no-pager and --no-optional-locks."
         if subcommand in {"log", "show", "diff", "blame"} and "--no-textconv" not in arguments:

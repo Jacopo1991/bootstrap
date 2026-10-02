@@ -143,9 +143,58 @@ with tempfile.TemporaryDirectory() as temp:
                 extra += " --no-ext-diff"
             command = f"git --no-pager --no-optional-locks -C {target} {subcommand}{extra}"
             assert policy.evaluate(event(command), roots) is None, command
-        for subcommand in ("add", "commit", "push", "fetch", "checkout", "reset", "config"):
+        for subcommand in ("add", "commit", "push", "pull", "merge", "checkout", "switch", "reset", "config"):
             command = f"git -C {target} {subcommand}"
             assert policy.evaluate(event(command), roots) is not None, command
+    # Fetch updates refs/objects/FETCH_HEAD, never the working tree. Its narrow
+    # cross-repository exception does not require read-only pager/lock selectors.
+    for executable in ("git", "/usr/bin/git"):
+        for target in (current, sibling, knowledge):
+            for suffix in ("fetch", "fetch origin"):
+                command = f"{executable} -C {target} {suffix}"
+                assert policy.evaluate(event(command), roots) is None, command
+                assert policy.permission_reason(event(command), roots) is None, command
+        for suffix in ("fetch", "fetch origin"):
+            assert policy.evaluate(event(executable + " " + suffix), roots) is None
+        for target in (sibling, knowledge):
+            for suffix in ("fetch --all", "fetch --multiple origin", "fetch --update-head-ok origin",
+                           "fetch origin HEAD:refs/heads/task", "fetch --refmap=refs/heads/* origin",
+                           "fetch https://github.com/Jacopo1991/ci-fixture.git",
+                           "fetch local-target", "fetch origin --upload-pack=fixture",
+                           "pull origin", "merge fixture", "checkout fixture", "switch fixture",
+                           "switch -c fixture"):
+                assert policy.evaluate(event(f"{executable} -C {target} {suffix}"), roots) is not None
+        for target in (outsider, link):
+            assert policy.evaluate(event(f"{executable} -C {target} fetch origin"), roots) is not None
+    assert policy.evaluate(event("git -C ../sibling fetch"), roots) is None
+    assert policy.evaluate(event("git -C.. -Csibling fetch origin"), roots) is None
+    for target in (sibling, knowledge):
+        original_url = "https://github.com/Jacopo1991/ci-fixture.git"
+        for unsafe_url in (str(current), "file://" + str(current), "https://example.invalid/repo"):
+            subprocess.run(["git", "remote", "set-url", "origin", unsafe_url], cwd=target, check=True)
+            for suffix in ("fetch", "fetch origin"):
+                assert policy.evaluate(event(f"git -C {target} {suffix}"), roots) is not None
+        subprocess.run(["git", "remote", "set-url", "origin", original_url], cwd=target, check=True)
+        # Owner-provisioned default-remote selection cannot bypass the URL check.
+        subprocess.run(["git", "remote", "add", "local-default", str(current)], cwd=target, check=True)
+        head = subprocess.check_output(["git", "symbolic-ref", "--short", "HEAD"], cwd=target,
+                                       text=True).strip()
+        key = "branch." + head + ".remote"
+        subprocess.run(["git", "config", key, "local-default"], cwd=target, check=True)
+        assert policy.evaluate(event(f"git -C {target} fetch"), roots) is not None
+        assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is None
+        subprocess.run(["git", "config", "--unset", key], cwd=target, check=True)
+        subprocess.run(["git", "config", "remotes.origin", "origin local-default"], cwd=target, check=True)
+        assert policy.evaluate(event(f"git -C {target} fetch"), roots) is not None
+        assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is not None
+        subprocess.run(["git", "config", "--unset", "remotes.origin"], cwd=target, check=True)
+        subprocess.run(["git", "config", "url." + str(current) + ".insteadOf",
+                        original_url], cwd=target, check=True)
+        assert policy.evaluate(event(f"git -C {target} fetch origin"), roots) is not None
+        subprocess.run(["git", "config", "--unset-all", "url." + str(current) + ".insteadOf"],
+                       cwd=target, check=True)
+    print("PASS: sibling fetch/default remote allowed in both roots; checkout/pull/merge/switch and unsafe fetches denied")
+
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
