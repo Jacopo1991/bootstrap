@@ -61,6 +61,18 @@ with tempfile.TemporaryDirectory() as temporary:
                 denied("FOO=fixture " + executable + " merge origin/" + default)
                 denied(executable + " -c core.hooksPath=fixture merge origin/" + default)
                 denied(executable + " --config-env=alias.merge=FIXTURE merge origin/" + default)
+            # Short refs must not be shadowed, even at the same commit.
+            for shadow in ("refs/tags/origin/", "refs/heads/origin/"):
+                git(repo, "update-ref", shadow + default, "HEAD")
+                denied("git merge origin/" + default)
+                denied("git merge --no-edit origin/" + default)
+                git(repo, "update-ref", "-d", shadow + default)
+            for value in ("--strategy=fixture", "--squash", "--no-verify", ""):
+                git(repo, "config", "branch.task.mergeOptions", value)
+                denied("git merge origin/" + default)
+                denied("git merge --no-edit origin/" + default)
+                git(repo, "config", "--unset-all", "branch.task.mergeOptions")
+            allowed("git merge origin/" + default)
             git(repo, "merge", "--no-edit", "origin/" + default)
             git(repo, "checkout", "-q", "--detach")
             denied("git merge origin/" + default)

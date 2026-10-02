@@ -401,6 +401,15 @@ def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
         if arguments not in ([wanted], ["--no-edit", wanted]):
             return "Only git merge [--no-edit] origin/<default branch> is allowed."
         read_git("rev-parse", "--verify", default + "^{commit}")
+        if read_git("rev-parse", "--symbolic-full-name", "--verify", wanted) != default:
+            return "The merge source must resolve uniquely to the origin default ref."
+        # Git applies branch mergeOptions before argv, including custom strategies.
+        options = subprocess.run(
+            ["git", "config", "--get-all", "branch." + current[len("refs/heads/"):] + ".mergeOptions"],
+            cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=3)
+        if options.returncode != 1:
+            return "Configured merge options or unreadable configuration are blocked."
         urls = read_git("remote", "get-url", "--all", "origin").splitlines()
         if len(urls) != 1:
             return "Origin must have one unambiguous GitHub URL."
