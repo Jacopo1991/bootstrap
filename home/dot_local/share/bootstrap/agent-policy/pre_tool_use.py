@@ -420,7 +420,7 @@ def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
 
 def plain_branch_name(value: str) -> bool:
     """Literal branch-ref syntax without revision operators or control characters."""
-    return bool(value and value != "@" and not value.startswith("-")
+    return bool(value and value != "@" and not value.startswith(("-", "/"))
                 and not any(ord(char) <= 32 or ord(char) == 127 or char in "~^:?*[\\"
                             for char in value)
                 and ".." not in value and "@{" not in value and "//" not in value

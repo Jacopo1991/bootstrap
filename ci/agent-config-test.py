@@ -525,7 +525,7 @@ with tempfile.TemporaryDirectory() as temp:
                          "-C task-fixture origin/main", "--force-create task-fixture origin/main",
                          "--cre task-fixture origin/main", "-q -c task-fixture origin/main",
                          "-c task-fixture --config-env=core.hooksPath=FIXTURE",
-                         "-c -option origin/main", "-c 'task fixture' origin/main"):
+                         "-c -option origin/main", "-c /bad origin/main", "-c 'task fixture' origin/main"):
                 assert policy.evaluate(switch_event(executable + " switch " + tail), roots) is not None, tail
     print("PASS: literal switch creation start points allowed; options/overrides/other refs/siblings denied")
 
