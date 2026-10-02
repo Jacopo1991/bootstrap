@@ -474,6 +474,57 @@ with tempfile.TemporaryDirectory() as temp:
         assert policy.evaluate(event(f"git -C {target} switch task-fixture"), roots) is not None
         assert policy.evaluate(event(f"git -C {target} switch -c task-fixture"), roots) is not None
 
+    # Literal creation start points are allowed only in the current repository.
+    # Test both shared hooks, executable spellings and approved root families.
+    for repo in (current, knowledge):
+        def switch_event(command):
+            return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
+        for executable in ("git", "/usr/bin/git"):
+            for create in ("-c", "--create"):
+                for start in ("", " origin/main", " origin/topic/nested",
+                              " abcd", " a1b2c3d", " " + "a1" * 20, " " + "A1" * 20,
+                              " " + "ab" * 32):
+                    command = executable + " switch " + create + " task-fixture" + start
+                    assert policy.evaluate(switch_event(command), roots) is None, command
+                    assert policy.permission_reason(switch_event(command), roots) is None, command
+                    assert policy.evaluate(switch_event(executable + " -C . switch " + create
+                                                       + " task-fixture" + start), roots) is None
+                for start in ("HEAD", "main", "upstream/main", "refs/remotes/origin/main",
+                              "origin/main~1", "origin/main^", "origin/main..origin/topic",
+                              "origin/main...", "origin/", "origin//main", "origin/.hidden",
+                              "origin/main.lock", "origin/main/", "origin/main.", "origin/a..b",
+                              "abc", "a" * 41, "g" * 40, "../sibling", "/tmp/fixture",
+                              "--orphan", "-"):
+                    command = executable + " switch " + create + " task-fixture " + start
+                    assert policy.evaluate(switch_event(command), roots) is not None, command
+                    assert policy.permission_reason(switch_event(command), roots) is not None, command
+                for tail in ("", " -f", " --discard-changes", " --merge", " --track",
+                             " --recurse-submodules", " --create extra", " -c extra", " extra"):
+                    # The empty tail is an ordinary valid control, checked above.
+                    if tail:
+                        command = executable + " switch " + create + " task-fixture origin/main" + tail
+                        assert policy.evaluate(switch_event(command), roots) is not None, command
+                for prefix in ("-c core.hooksPath=fixture ", "-ccore.hooksPath=fixture ",
+                               "--config-env=core.hooksPath=FIXTURE "):
+                    assert policy.evaluate(switch_event(executable + " " + prefix + "switch "
+                                                        + create + " task-fixture origin/main"), roots) is not None
+                assert policy.evaluate(switch_event("FIXTURE=value " + executable + " switch "
+                                                    + create + " task-fixture origin/main"), roots) is not None
+                for env in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_EXEC_PATH"):
+                    request = switch_event(executable + " switch " + create + " task-fixture origin/main")
+                    request["tool_input"]["env"] = {env: "fixture"}
+                    assert policy.evaluate(request, roots) is not None, env
+                for target in (sibling, outsider, link):
+                    assert policy.evaluate(switch_event(executable + " -C " + str(target) + " switch "
+                                                        + create + " task-fixture origin/main"), roots) is not None
+            for tail in ("-ctask-fixture origin/main", "--create=task-fixture origin/main",
+                         "-C task-fixture origin/main", "--force-create task-fixture origin/main",
+                         "--cre task-fixture origin/main", "-q -c task-fixture origin/main",
+                         "-c task-fixture --config-env=core.hooksPath=FIXTURE",
+                         "-c -option origin/main", "-c 'task fixture' origin/main"):
+                assert policy.evaluate(switch_event(executable + " switch " + tail), roots) is not None, tail
+    print("PASS: literal switch creation start points allowed; options/overrides/other refs/siblings denied")
+
     # Founder decision: ordinary Git/gh has native allow rules; forbidden
     # operations are denied independently of flag position or inherited selectors.
     for executable in ("git", "/usr/bin/git"):
@@ -528,6 +579,26 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run(["git", "branch", "ci-existing-fixture"], cwd=current, check=True)
     assert policy.evaluate(event("git switch ci-existing-fixture"), roots) is None
     subprocess.run(["git", "switch", "-q", "ci-existing-fixture"], cwd=current, check=True)
+    # Execute the allowed forms against two different synthetic commits so the
+    # explicit start point, not current HEAD, determines each created branch.
+    first = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=current, text=True).strip()
+    (current / "start-fixture.txt").write_text("second synthetic commit\n")
+    subprocess.run(["git", "add", "start-fixture.txt"], cwd=current, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "second fixture"], cwd=current, check=True)
+    second = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=current, text=True).strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/start-fixture", first], cwd=current, check=True)
+    for index, (create, start, expected) in enumerate((
+            ("-c", first, first), ("--create", second, second),
+            ("-c", first[:7], first), ("--create", "origin/start-fixture", first))):
+        name = "ci-start-fixture-" + str(index)
+        command = "git switch " + create + " " + name + " " + start
+        assert policy.evaluate(event(command), roots) is None, command
+        assert policy.permission_reason(event(command), roots) is None, command
+        subprocess.run(["git", "switch", create, name, start], cwd=current, check=True)
+        assert subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=current, text=True).strip() == expected
+        assert subprocess.check_output(["git", "symbolic-ref", "--short", "HEAD"],
+                                       cwd=current, text=True).strip() == name
+    print("PASS: real switch creation selects the explicit commit or origin ref")
     assert policy.evaluate(event("git push -u origin HEAD"), roots) is None
     assert policy.permission_reason(event("git push -u origin HEAD"), roots) is None
     print("PASS: agent config/metadata/override attempts denied; real add/commit and GitHub push approval permitted")
