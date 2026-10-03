@@ -52,5 +52,6 @@ docker run --name "$container" --rm \
       cd /tmp
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/boundary.sh
+      bash /repo/ci/claude-mods-load-test.sh
     '\''
   '
