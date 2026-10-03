@@ -24,7 +24,7 @@ Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project tas
  $powershell='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
  function Get-ScheduledTask {param($ErrorAction)
   @(
-   [pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
+   [pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory" -ExportDirectory "C:\ProgramData\machine-bootstrap\export"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
    [pscustomobject]@{TaskName='MachineBootstrap-Compact-Test';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\check-compaction.ps1" -Name "Test" -LogPath "C:\ProgramData\machine-bootstrap\compact.log"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
    [pscustomobject]@{TaskName='MachineBootstrap-Evil';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments=$synthetic;WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
    [pscustomobject]@{TaskName='Custom-Outside';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='powershell.exe';Arguments=$synthetic;WorkingDirectory='C:\Users\tester\Documents\Codex\repo'})},
@@ -46,7 +46,7 @@ Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project tas
 & {
  $powershell='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
  function Get-ScheduledTask {param($ErrorAction)
-  [pscustomobject]@{TaskName='MachineBootstrap-Inventory';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})}
+  [pscustomobject]@{TaskName='MachineBootstrap-Inventory';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory" -ExportDirectory "C:\ProgramData\machine-bootstrap\export"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})}
  }
  $review=Get-ScheduledTaskReview
  Assert-Equal $review.Status 'UNAVAILABLE' 'missing task path is never reported clean'
@@ -110,7 +110,7 @@ try {
   function Get-PSDrive {param($Name,$PSProvider,$ErrorAction);[pscustomobject]@{Free=123}}
   function Test-Path {param($LiteralPath,$PathType);if($LiteralPath -like 'HKLM:*'){return $false};if($PathType){Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -PathType $PathType -ErrorAction SilentlyContinue}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath -ErrorAction SilentlyContinue}}
   function Get-ItemProperty {throw 'No registry value'}
-  function Get-ScheduledTask {param($TaskName,$ErrorAction);[pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})}}
+  function Get-ScheduledTask {param($TaskName,$ErrorAction);[pscustomobject]@{TaskName='MachineBootstrap-Inventory';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory" -ExportDirectory "C:\ProgramData\machine-bootstrap\export"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})}}
   $v=Get-MachineInventoryValue -OutputDirectory $probeDir -CurrentTime ([datetime]'2026-10-01')
   Assert-Equal $inventoryFixtureState.ProbeCalls 0 'stopped distro never probed'
   Assert-Equal $inventoryFixtureState.AgentDriftCalls 0 'stopped distro never queried for drift'
@@ -168,10 +168,11 @@ try {
 
 & {
  . "$PSScriptRoot/../windows/install-inventory-task.ps1"
- $inventoryTaskFixtureState=@{Tasks=0;Copied=[collections.generic.list[string]]::new()}
+ $inventoryTaskFixtureState=@{Tasks=0;Copied=[collections.generic.list[string]]::new();Acls=@{}}
  function Assert-BootstrapAdministrator {}
+ function wsl.exe {throw 'Inventory task installer must never call wsl.exe.'}
  function New-Item {param($ItemType,[switch]$Force,$Path)}
- function Set-Acl {param($LiteralPath,$AclObject);Assert-Equal $AclObject.AreAccessRulesProtected $true 'inventory task directory ACL protected'|Out-Null}
+ function Set-Acl {param($LiteralPath,$AclObject);Assert-Equal $AclObject.AreAccessRulesProtected $true 'inventory task directory ACL protected'|Out-Null;$inventoryTaskFixtureState.Acls[$LiteralPath]=$AclObject}
  function Copy-Item {param($LiteralPath,$Destination,[switch]$Force);$inventoryTaskFixtureState.Copied.Add([IO.Path]::GetFileName($LiteralPath))}
  function Register-ScheduledTask {param($TaskName,$Xml,[switch]$Force)
   Assert-Equal $TaskName MachineBootstrap-Inventory 'stable task identity'|Out-Null
@@ -183,12 +184,21 @@ try {
   Assert-Equal $doc.SelectSingleNode('//t:Principal/t:LogonType',$ns).InnerText S4U 'inventory task stores no password'|Out-Null
   Assert-Equal $doc.SelectSingleNode('//t:Principal/t:RunLevel',$ns).InnerText HighestAvailable 'inventory task elevated'|Out-Null
   Assert-Equal ($doc.SelectSingleNode('//t:Exec/t:Arguments',$ns).InnerText.Contains('-OutputDirectory')) $true 'task writes to inventory folder'|Out-Null
+  Assert-Equal ($doc.SelectSingleNode('//t:Exec/t:Arguments',$ns).InnerText.EndsWith('-ExportDirectory "C:\ProgramData\machine-bootstrap\export"')) $true 'task exports latest.json to the Windows-owned export folder'|Out-Null
   $inventoryTaskFixtureState.Tasks++
  }
  function Get-ScheduledTask {param($TaskName);[pscustomobject]@{TaskName=$TaskName;State='Ready'}}
  Install-MachineInventoryTask
  Install-MachineInventoryTask
  Assert-Equal $inventoryTaskFixtureState.Tasks 2 'repeat task install converges same task'
+ $exportAcl=$inventoryTaskFixtureState.Acls['C:\ProgramData\machine-bootstrap\export']
+ Assert-True ($null -ne $exportAcl) 'export folder ACL set'
+ $owner=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+ $rules=@{};foreach($rule in $exportAcl.Access){$rules[$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value]=$rule.FileSystemRights}
+ Assert-Equal ((@($rules.Keys)|Sort-Object) -join ',') ((@('S-1-5-18','S-1-5-32-544',$owner)|Sort-Object) -join ',') 'export folder grants only SYSTEM, Administrators and the owner'
+ $full=[Security.AccessControl.FileSystemRights]::FullControl;$write=[Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete
+ Assert-True (($rules['S-1-5-18'] -band $full) -eq $full -and ($rules['S-1-5-32-544'] -band $full) -eq $full) 'SYSTEM and Administrators keep full control of the export folder'
+ Assert-True (($rules[$owner] -band [Security.AccessControl.FileSystemRights]::ReadData) -ne 0 -and ($rules[$owner] -band $write) -eq 0) 'owner account can read but not write or delete the export'
  Assert-Equal ($inventoryTaskFixtureState.Copied -join ',') 'common.ps1,inventory.ps1,common.ps1,inventory.ps1' 'only fixed inventory scripts copied'
 }
 & {
@@ -304,4 +314,28 @@ foreach($case in @(
   Assert-Equal (@($lines|Where-Object{$_ -like 'WARNING: AgentDev gh token expires within 14 days:*'}).Count) 1 'inventory emits a fixed warning line'
   Assert-Equal (($lines -join [Environment]::NewLine).Contains('gho-')) $false 'warning line contains no credential value'
  } finally {Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue}
+}
+
+# The export only writes a Windows-owned file: no distro command, no UNC path.
+& {
+ $dir=Join-Path $env:TEMP ('bootstrap-inventory-export-'+[guid]::NewGuid().ToString('N'))
+ $export=Join-Path $env:TEMP ('bootstrap-inventory-export-out-'+[guid]::NewGuid().ToString('N'));$parent=$null
+ function Get-MachineInventoryValue {param($OutputDirectory,$CurrentTime);[pscustomobject]@{schemaVersion=2;createdAtISO=$CurrentTime.ToString('o');distros=@()}}
+ function Invoke-BoundedNative {throw 'Export must never run a native command.'}
+ function wsl.exe {throw 'Export must never call wsl.exe.'}
+ try {
+  Invoke-MachineInventory -OutputDirectory $dir -ExportDirectory $export -At ([datetime]'2026-10-03T02:30:00')|Out-Null
+  $target=Join-Path $export 'latest.json'
+  Assert-Equal ([IO.File]::ReadAllText($target)) ([IO.File]::ReadAllText((Join-Path $dir 'latest.json'))) 'export is the exact Windows latest snapshot'
+  Assert-Equal ([IO.File]::ReadAllBytes($target)[0] -eq 123) $true 'export has no UTF-8 BOM'
+  Invoke-MachineInventory -OutputDirectory $dir -ExportDirectory $export -At ([datetime]'2026-10-04T02:30:00')|Out-Null
+  Assert-True ([IO.File]::ReadAllText($target).Contains('2026-10-04')) 'next run atomically replaces the export'
+  Assert-Equal (@(Get-ChildItem -LiteralPath $export -Force).Count) 1 'export folder holds only latest.json'
+  Assert-Equal (@(Get-ChildItem -LiteralPath $export -Filter '2026-*.json' -Force).Count) 0 'dated history is never exported'
+  $parent=Join-Path $env:TEMP ('bootstrap-inventory-no-export-'+[guid]::NewGuid().ToString('N'))
+  Invoke-MachineInventory -OutputDirectory (Join-Path $parent 'inventory') -At ([datetime]'2026-10-03T02:30:00')|Out-Null
+  Assert-Equal (@(Get-ChildItem -LiteralPath $parent -Directory -Force).Count) 1 'no export folder is created unless requested'
+ } finally {foreach($path in $dir,$export,$parent){if($path){Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue}}}
+ $source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../windows/inventory.ps1'))
+ Assert-Equal $source.Contains('wsl.localhost') $false 'inventory never references the WSL UNC share'
 }

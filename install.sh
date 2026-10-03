@@ -10,6 +10,7 @@ sudo -v
 bash_cmd=/bin/bash
 sudo "$bash_cmd" "$ROOT/system/base.sh"
 sudo "$bash_cmd" "$ROOT/system/users.sh" "$(id -un)"
+sudo "$bash_cmd" "$ROOT/system/inventory-mirror.sh"
 # shellcheck source=system/common.sh
 source "$ROOT/system/common.sh"
 tmp=$(mktemp -d)
