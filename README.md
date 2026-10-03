@@ -275,8 +275,13 @@ that. The option is read from managed settings only, so it is deliberately not
 in the agent's `~/.claude/settings.json`. `disableSideloadFlags` is not set
 because it would also reject `--agents` and `--mcp-config`. The policy hook
 itself still lives in user settings; moving it into managed settings is a
-separate follow-up. The pinned Claude Code release must be 2.1.287 or later
-before CI can exercise mod loading itself.
+separate follow-up. The pinned Claude Code release is 2.1.287 or later, so
+the distro job's last step (`ci/claude-mods-load-test.sh`) runs a fixture mod both
+with `--plugin-dir` and installed into the agent's plugin scope: neither answers
+`/modping` under the managed drop-in, and both do once the drop-in is moved aside
+in the disposable container, which is the control. It also requires the
+`allowManagedModsOnly` refusal in the debug log and fails if the pin is older
+than 2.1.287.
 
 Approved code roots are `/home/agent/dev_workspace/<repo>`; Cortex knowledge
 repositories belong in sibling paths under `/home/agent/cortex/<repo>`, never
