@@ -1,0 +1,20 @@
+[Unit]
+Description=Copy the Windows-written inventory snapshot into agent project-data
+ConditionPathExists=/opt/machine-bootstrap/current/system/inventory-mirror.py
+
+[Service]
+Type=oneshot
+User=root
+# The Windows folder is mounted read-only inside this unit's private mount
+# namespace only. The agent's sessions and the boundary check never see it.
+PrivateMounts=yes
+PrivateTmp=yes
+RuntimeDirectory=inventory-mirror
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+TimeoutStartSec=120
+ExecStart=/usr/bin/python3 /opt/machine-bootstrap/current/system/inventory-mirror.py

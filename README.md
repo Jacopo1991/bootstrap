@@ -199,10 +199,44 @@ when available, with the source date and timestamp visible in the JSON.
 
 Each running distro probe has a 60-second wall limit. Native-command stderr is
 discarded and failures use fixed status values; command diagnostics, environment
-values, and file contents are not written to inventory. The inventory stays on
-the Windows machine under the protected ProgramData directory. These values
+values, and file contents are not written to inventory. The dated records stay
+on the Windows machine under the protected ProgramData directory. These values
 describe the host at collection time and do not certify that a stopped distro's
 cached measurements are current beyond the retained record window.
+
+#### Inventory copy into AgentDev
+
+PM lanes read the newest snapshot from
+`/home/agent/project-data/inventory/latest.json`. The direction is inverted so
+that the inventory never starts AgentDev: Windows only writes the same sanitized
+`latest.json` to its own `C:\ProgramData\machine-bootstrap\export` folder (never
+the dated history), and calls neither `wsl.exe` nor `\\wsl.localhost` for it. The
+inventory task installer creates that folder with a protected ACL: SYSTEM and
+Administrators have full control and the owner account has read-only access,
+because a non-elevated token carries Administrators as deny-only. Re-run
+`.\windows\install-inventory-task.ps1` once to add `-ExportDirectory` to the task.
+
+Inside AgentDev, `system/inventory-mirror.sh` (run by `install.sh`) installs a
+root-owned `inventory-mirror.timer` that starts `inventory-mirror.service` two
+minutes after boot and every 15 minutes after. A timer only fires while the
+distro already runs, so it can never wake a stopped one. The service mounts the
+export folder read-only (`mount -t drvfs`, `uid=0,umask=077`) in its own private
+mount namespace and unmounts it afterwards, so automount stays off, the agent's
+sessions never see a Windows mount, and the boundary check still passes.
+`system/inventory-mirror.py` refuses to mount in the shared namespace.
+
+The copy runs as root but only into agent-owned directories. It refuses a
+symlink, hardlink, FIFO or other non-regular file as the source and as an
+existing `latest.json`, refuses a symlinked `project-data` or `inventory`
+directory or one not owned by `agent`, requires UTF-8 JSON that looks like an
+inventory snapshot (schema 1 or 2, at most 4 MiB), and publishes the exact bytes
+by writing a `0600` temporary file in the same directory and renaming it over
+`latest.json`. The result is owned by `agent` with mode `0600`; `project-data`
+and `inventory` are `0700`. A missing source (no inventory run yet) is not an
+error. Any refusal fails the service and leaves the previous snapshot in place.
+The agent still cannot read Windows paths. Check the timer with
+`systemctl list-timers inventory-mirror.timer` and the last run with
+`systemctl status inventory-mirror.service`.
 
 This checks the requested Linux user boundary. The Windows account that owns WSL
 can still launch the distro as root; this is not a boundary against that owner.
