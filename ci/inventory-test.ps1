@@ -210,6 +210,7 @@ try {
 
 & {
  $dir=Join-Path $env:TEMP ('bootstrap-inventory-write-'+[guid]::NewGuid().ToString('N'))
+ function Copy-AgentDevInventory {param($Json);'SKIP'}
  function Get-MachineInventoryValue {param($OutputDirectory,$CurrentTime);[pscustomobject]@{schemaVersion=1;createdAtISO=$CurrentTime.ToString('o');distros=@()}}
  try {
   $at=[datetime]'2026-10-01T02:30:00'
@@ -298,10 +299,89 @@ foreach($case in @(
 }
 & {
  $dir=Join-Path $env:TEMP ('bootstrap-gh-expiry-warning-'+[guid]::NewGuid().ToString('N'))
+ function Copy-AgentDevInventory {param($Json);'SKIP'}
  function Get-MachineInventoryValue {param($OutputDirectory,$CurrentTime);[pscustomobject]@{schemaVersion=2;createdAtISO=$CurrentTime.ToString('o');distros=@([pscustomobject]@{Name='AgentDev';GhTokenExpiryStatus='AVAILABLE';GhTokenExpiresAtISO='2026-10-14T23:59:59Z';GhTokenExpiryWarning='expires-within-14-days'})}}
  try {
   $lines=@(Invoke-MachineInventory -OutputDirectory $dir -At ([datetime]'2026-10-01T00:00:00Z'))
   Assert-Equal (@($lines|Where-Object{$_ -like 'WARNING: AgentDev gh token expires within 14 days:*'}).Count) 1 'inventory emits a fixed warning line'
   Assert-Equal (($lines -join [Environment]::NewLine).Contains('gho-')) $false 'warning line contains no credential value'
  } finally {Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue}
+}
+
+
+# No actual UNC or distro access: exercise all fresh state gates with mocks.
+$mirrorCases=@(
+ @{Name='running';States=@('Running','Running','Running');Status='SUCCESS';Ops='prepare,publish';Writes=1},
+ @{Name='stopped';States=@('Stopped');Status='SKIP';Ops='';Writes=0},
+ @{Name='missing';States=@('Missing');Status='SKIP';Ops='';Writes=0},
+ @{Name='unsupported';States=@('Wsl1');Status='SKIP';Ops='';Writes=0},
+ @{Name='malformed';States=@('Malformed');Status='SKIP';Ops='';Writes=0},
+ @{Name='failed-list';States=@('Failed');Status='SKIP';Ops='';Writes=0},
+ @{Name='timeout-list';States=@('Timeout');Status='SKIP';Ops='';Writes=0},
+ @{Name='stops-before-copy';States=@('Running','Stopped','Stopped');Status='SKIP';Ops='prepare';Writes=0},
+ @{Name='stops-before-publish';States=@('Running','Running','Stopped','Stopped');Status='SKIP';Ops='prepare';Writes=1},
+ @{Name='copy-error';States=@('Running','Running','Running');Status='UNAVAILABLE';Ops='prepare,cleanup';Writes=1;Fail='copy'},
+ @{Name='prepare-error';States=@('Running');Status='UNAVAILABLE';Ops='prepare';Writes=0;Fail='prepare'},
+ @{Name='publish-error';States=@('Running','Running','Running','Running');Status='UNAVAILABLE';Ops='prepare,publish,cleanup';Writes=1;Fail='publish'},
+ @{Name='publish-timeout';States=@('Running','Running','Running','Running');Status='UNAVAILABLE';Ops='prepare,publish,cleanup';Writes=1;Fail='timeout'}
+)
+foreach($case in $mirrorCases){
+ & {
+  $mirrorState=@{Lists=0;Ops=[collections.generic.list[string]]::new();Writes=0;Stage=$null}
+  $safeJson='{"schemaVersion":2,"distros":[]}'
+  function Invoke-BoundedNative {
+   param($FilePath,$Arguments,$TimeoutMilliseconds,$MaximumOutputCharacters)
+   if($Arguments[0] -eq '--list'){
+    Assert-Equal ($Arguments -join ' ') '--list --verbose' 'mirror only lists state'|Out-Null
+    $position=[Math]::Min($mirrorState.Lists,$case.States.Count-1);$mirrorState.Lists++
+    $state=$case.States[$position]
+    if($state -in @('Failed','Timeout')){return [pscustomobject]@{Status=$state;Output=$null;ExitCode=1}}
+    $text=' NAME STATE VERSION'+[Environment]::NewLine
+    if($state -eq 'Missing'){$text+='Other Running 2'}
+    elseif($state -eq 'Wsl1'){$text+='AgentDev Running 1'}
+    elseif($state -eq 'Malformed'){$text='unparseable state'}
+    else{$text+="AgentDev $state 2"}
+    return [pscustomobject]@{Status='Success';Output=$text;ExitCode=0}
+   }
+   Assert-Equal (($Arguments[0..6]) -join ' ') '-d AgentDev -u agent -- python3 -c' 'mirror uses only agent with fixed launcher'|Out-Null
+   Assert-Equal $Arguments[7] $script:InventoryMirrorPython 'mirror invokes reviewed fixed helper'|Out-Null
+   Assert-True ($Arguments[9] -match '^\.inventory-[a-f0-9]{32}\.tmp$') 'mirror uses a random private stage name'|Out-Null
+   if($null -eq $mirrorState.Stage){$mirrorState.Stage=$Arguments[9]}
+   Assert-Equal $Arguments[9] $mirrorState.Stage 'one staging name per copy'|Out-Null
+   $op=$Arguments[8];$mirrorState.Ops.Add($op)
+   Assert-True ($op -in @('prepare','publish','cleanup')) 'mirror never starts shells or unrelated commands'|Out-Null
+   if($case.ContainsKey('Fail') -and ($case.Fail -eq $op -or $case.Fail -eq 'timeout' -and $op -eq 'publish')){
+    return [pscustomobject]@{Status=$(if($case.Fail -eq 'timeout'){'Timeout'}else{'Failed'});Output='diagnostic-not-for-output';ExitCode=1}
+   }
+   [pscustomobject]@{Status='Success';Output='';ExitCode=0}
+  }
+  function Write-AgentDevInventoryStagingJson {
+   param($Path,$Json)
+   $mirrorState.Writes++
+   Assert-Equal $Path ('\\wsl.localhost\AgentDev\home\agent\project-data\inventory\'+$mirrorState.Stage) 'copy uses fixed AgentDev UNC location'|Out-Null
+   Assert-Equal $Json $safeJson 'copy contains exactly sanitized inventory JSON'|Out-Null
+   if($case.ContainsKey('Fail') -and $case.Fail -eq 'copy'){throw 'diagnostic-not-for-output'}
+  }
+  $status=Copy-AgentDevInventory -Json $safeJson
+  Assert-Equal $status $case.Status "$($case.Name) fixed mirror status"
+  Assert-Equal ($mirrorState.Ops -join ',') $case.Ops "$($case.Name) exact distro operations"
+  Assert-Equal $mirrorState.Writes $case.Writes "$($case.Name) UNC writes"
+ }
+}
+& {
+ $dir=Join-Path $env:TEMP ('bootstrap-inventory-mirror-integration-'+[guid]::NewGuid().ToString('N'))
+ $captured=@{Json=$null}
+ function Get-MachineInventoryValue {param($OutputDirectory,$CurrentTime);[pscustomobject]@{schemaVersion=2;createdAtISO=$CurrentTime.ToString('o');distros=@()}}
+ function Copy-AgentDevInventory {param($Json);$captured.Json=$Json;'UNAVAILABLE'}
+ try{
+  $lines=@(Invoke-MachineInventory -OutputDirectory $dir -At ([datetime]'2026-10-03T02:30:00'))
+  $windows=[IO.File]::ReadAllText((Join-Path $dir 'latest.json'))
+  Assert-Equal $captured.Json $windows 'AgentDev receives exact Windows latest snapshot'
+  Assert-Equal ([IO.File]::ReadAllText((Join-Path $dir '2026-10-03.json'))) $windows 'Windows dated copy survives mirror failure'
+  Assert-True ($lines -contains 'AgentDev inventory copy: UNAVAILABLE') 'mirror failure logged with fixed status only'
+  $target=Join-Path $dir 'stage.json'
+  Write-AgentDevInventoryStagingJson -Path $target -Json $windows
+  Assert-Equal ([IO.File]::ReadAllText($target)) $windows 'staging writer preserves exact JSON'
+  Assert-Equal ([IO.File]::ReadAllBytes($target)[0] -eq 123) $true 'staging JSON is UTF-8 without BOM'
+ }finally{Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue}
 }

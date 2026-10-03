@@ -324,6 +324,101 @@ function Write-AtomicInventoryJson {
  $tmp=Join-Path (Split-Path -Parent $Path) ('.inventory-'+[guid]::NewGuid().ToString('N')+'.tmp')
  try{[IO.File]::WriteAllText($tmp,$Json,[text.UTF8Encoding]::new($false));if([IO.File]::Exists($Path)){[IO.File]::Replace($tmp,$Path,[System.Management.Automation.Language.NullString]::Value)}else{[IO.File]::Move($tmp,$Path)}}finally{if([IO.File]::Exists($tmp)){[IO.File]::Delete($tmp)}}
 }
+$script:InventoryMirrorPython=@'
+import os,pwd,re,stat,sys
+
+BASE="/home/agent/project-data"
+
+def main(mode,name):
+    if mode not in ("prepare","publish","cleanup") or not re.fullmatch(r"[.]inventory-[a-f0-9]{32}[.]tmp",name):
+        raise ValueError("invalid mirror operation")
+    uid=pwd.getpwnam("agent").pw_uid
+    if os.getuid()!=uid:
+        raise PermissionError("agent required")
+    base=os.open(BASE,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    directory=None
+    try:
+        if mode=="prepare":
+            try:
+                os.mkdir("inventory",0o700,dir_fd=base)
+            except FileExistsError:
+                pass
+        directory=os.open("inventory",os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=base)
+        if os.fstat(directory).st_uid!=uid:
+            raise PermissionError("inventory directory owner")
+        os.fchmod(directory,0o700)
+        if mode=="prepare":
+            fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
+            try:
+                os.fchmod(fd,0o600)
+            finally:
+                os.close(fd)
+        else:
+            fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+            try:
+                info=os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid!=uid or info.st_nlink!=1:
+                    raise PermissionError("inventory staging file")
+                os.fchmod(fd,0o600)
+            finally:
+                os.close(fd)
+            if mode=="publish":
+                os.replace(name,"latest.json",src_dir_fd=directory,dst_dir_fd=directory)
+            else:
+                os.unlink(name,dir_fd=directory)
+    finally:
+        if directory is not None:
+            os.close(directory)
+        os.close(base)
+
+if __name__=="__main__":
+    main(sys.argv[1],sys.argv[2])
+'@
+
+function Test-AgentDevInventoryRunning {
+ $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
+ $r=Invoke-BoundedNative $wsl @('--list','--verbose') 10000
+ if($r.Status -ne 'Success'){return $false}
+ try{
+  $current=@(ConvertFrom-WslList $r.Output|Where-Object{[string]::Equals($_.Name,'AgentDev','OrdinalIgnoreCase')})
+  return $current.Count -eq 1 -and $current[0].State -eq 'Running' -and $current[0].WslVersion -eq 2
+ }catch{return $false}
+}
+function Write-AgentDevInventoryStagingJson {
+ param([string]$Path,[string]$Json)
+ # prepare created this private agent-owned inode; writing it preserves mode.
+ [IO.File]::WriteAllText($Path,$Json,[text.UTF8Encoding]::new($false))
+}
+function Copy-AgentDevInventory {
+ param([string]$Json)
+ $name='.inventory-'+[guid]::NewGuid().ToString('N')+'.tmp'
+ $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
+ $prepared=$false
+ try{
+  # UNC access and distro commands must never be attempted for a stopped,
+  # absent, unsupported or unobservable AgentDev, including state changes.
+  if(-not(Test-AgentDevInventoryRunning)){return 'SKIP'}
+  $r=Invoke-BoundedNative $wsl @('-d','AgentDev','-u','agent','--','python3','-c',$script:InventoryMirrorPython,'prepare',$name) 10000 4096
+  if($r.Status -ne 'Success'){return 'UNAVAILABLE'}
+  $prepared=$true
+  if(-not(Test-AgentDevInventoryRunning)){return 'SKIP'}
+  $path='\\wsl.localhost\AgentDev\home\agent\project-data\inventory\'+$name
+  Write-AgentDevInventoryStagingJson -Path $path -Json $Json
+  if(-not(Test-AgentDevInventoryRunning)){return 'SKIP'}
+  $r=Invoke-BoundedNative $wsl @('-d','AgentDev','-u','agent','--','python3','-c',$script:InventoryMirrorPython,'publish',$name) 10000 4096
+  if($r.Status -ne 'Success'){return 'UNAVAILABLE'}
+  $prepared=$false
+  return 'SUCCESS'
+ }catch{return 'UNAVAILABLE'}
+ finally{
+  # Best-effort removal also has a fresh running gate; never wake a distro
+  # just to clean up its private, randomly named staging file.
+  try{if($prepared -and (Test-AgentDevInventoryRunning)){
+   $null=Invoke-BoundedNative $wsl @('-d','AgentDev','-u','agent','--','python3','-c',$script:InventoryMirrorPython,'cleanup',$name) 10000 4096
+  }}catch{}
+ }
+}
+
 function Remove-ExpiredInventoryRecords {
  param([string]$Directory,[datetime]$CurrentDate)
  $cut=$CurrentDate.Date.AddDays(-29)
@@ -335,6 +430,7 @@ function Invoke-MachineInventory {
  $v=Get-MachineInventoryValue $OutputDirectory $At;$json=$v|ConvertTo-Json -Depth 8;$date=Join-Path $OutputDirectory ($At.ToString('yyyy-MM-dd')+'.json')
  Write-AtomicInventoryJson $date $json;Write-AtomicInventoryJson (Join-Path $OutputDirectory 'latest.json') $json
  Remove-ExpiredInventoryRecords $OutputDirectory $At;Write-Output ('Inventory recorded: '+$date)
+ Write-Output ('AgentDev inventory copy: '+(Copy-AgentDevInventory -Json $json))
  foreach($d in @($v.distros|Where-Object{$_.GhTokenExpiryWarning -eq 'expires-within-14-days'})){
   Write-Output ('WARNING: AgentDev gh token expires within 14 days: '+$d.GhTokenExpiresAtISO)
  }

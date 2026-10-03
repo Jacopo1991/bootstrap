@@ -199,8 +199,18 @@ when available, with the source date and timestamp visible in the JSON.
 
 Each running distro probe has a 60-second wall limit. Native-command stderr is
 discarded and failures use fixed status values; command diagnostics, environment
-values, and file contents are not written to inventory. The inventory stays on
-the Windows machine under the protected ProgramData directory. These values
+values, and file contents are not written to inventory. The Windows inventory stays under the protected ProgramData directory. When
+AgentDev is observed running as WSL 2, the same sanitized snapshot is also
+copied through `\\wsl.localhost\AgentDev` to
+`/home/agent/project-data/inventory/latest.json` for PM lanes. Each step gets a
+fresh running-state check; stopped, absent or unobservable AgentDev is skipped.
+The fixed helper runs as `agent`, prepares a private staging file (0600) in an
+agent-owned directory (0700), and atomically publishes it as `latest.json`,
+owned by `agent` with mode 0600. UNC uses the baseline's default user `agent`;
+no root/sudo, mount change or new credentials are used. Copy errors report a
+fixed status and preserve the Windows record and previous Linux snapshot.
+Private staging cleanup is best effort and also skips a stopped distro.
+No raw diagnostics, secret values or extra inventory fields are copied. These values
 describe the host at collection time and do not certify that a stopped distro's
 cached measurements are current beyond the retained record window.
 
