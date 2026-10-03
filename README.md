@@ -263,6 +263,21 @@ with Codex's `/hooks` command before relying on it. Codex skips an untrusted
 hook. Do not use a hook-trust bypass. Hooks are additional guardrails; the
 Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
 
+Claude Code mods (v2.1.287 and later) run inside Claude Code and can approve
+tool calls that a non-managed `PreToolUse` hook blocked. `install.sh` therefore
+runs `system/claude-managed.sh` as admin, which installs the root-owned drop-in
+`/etc/claude-code/managed-settings.d/50-managed-mods-only.json`. It sets
+`allowManagedModsOnly` on the built-in guard (`cc-plugin-sec-default@builtin`),
+so mods the agent installs, loads with `--plugin-dir`, or has Claude write do not
+load; built-in mods and the agent's own settings hooks are unaffected. The
+directory and file are `root:root` and not writable by the agent, and CI checks
+that. The option is read from managed settings only, so it is deliberately not
+in the agent's `~/.claude/settings.json`. `disableSideloadFlags` is not set
+because it would also reject `--agents` and `--mcp-config`. The policy hook
+itself still lives in user settings; moving it into managed settings is a
+separate follow-up. The pinned Claude Code release must be 2.1.287 or later
+before CI can exercise mod loading itself.
+
 Approved code roots are `/home/agent/dev_workspace/<repo>`; Cortex knowledge
 repositories belong in sibling paths under `/home/agent/cortex/<repo>`, never
 inside code repositories. Runtime data belongs under
