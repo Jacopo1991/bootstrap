@@ -30,11 +30,15 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     # Bare names match only argument-less calls; keep the exact approved patterns.
     "failIfUnavailable": True,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
-    "autoAllowBashIfSandboxed": False}
+    "autoAllowBashIfSandboxed": False,
+    # Package registries for `uv sync` and the one writable cache path, nothing wider.
+    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org"]},
+    "filesystem": {"allowWrite": ["~/.cache/uv"]}}
+assert 'mkdir -p "$HOME/.cache/uv"' in (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
 assert "Bash(git merge *)" not in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
-assert "network" not in claude["sandbox"]
+assert not any("*" in d for d in claude["sandbox"]["network"]["allowedDomains"])
 # Documented Bash glob patterns cover destructive flags before and after
 # ordinary remote/branch operands. Selector/quote variants are hook-tested below.
 from fnmatch import fnmatchcase
