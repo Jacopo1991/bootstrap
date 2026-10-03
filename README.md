@@ -199,9 +199,14 @@ when available, with the source date and timestamp visible in the JSON.
 
 Each running distro probe has a 60-second wall limit. Native-command stderr is
 discarded and failures use fixed status values; command diagnostics, environment
-values, and file contents are not written to inventory. The Windows inventory stays under the protected ProgramData directory. When
-AgentDev is observed running as WSL 2, the same sanitized snapshot is also
-copied through `\\wsl.localhost\AgentDev` to
+values, and file contents are not written to inventory. **Draft mirror is disabled:** the founder requires a strict no-start guarantee,
+including a distro stopping between a state check and an operation. Ordinary
+WSL launches and UNC access cannot establish that guarantee with polling alone.
+Inventory reports `SKIP-NONSTARTING-TRANSPORT-REQUIRED` and never invokes the
+candidate copy helper. Do not enable it until a non-starting transport is
+established and independently reviewed.
+
+The proposed, disabled helper would copy the same sanitized snapshot through `\\wsl.localhost\AgentDev` to
 `/home/agent/project-data/inventory/latest.json` for PM lanes. Each step gets a
 fresh running-state check; stopped, absent or unobservable AgentDev is skipped.
 The fixed helper runs as `agent`, prepares a private staging file (0600) in an
@@ -210,7 +215,9 @@ owned by `agent` with mode 0600. UNC uses the baseline's default user `agent`;
 no root/sudo, mount change or new credentials are used. Copy errors report a
 fixed status and preserve the Windows record and previous Linux snapshot.
 Private staging cleanup is best effort and also skips a stopped distro.
-No raw diagnostics, secret values or extra inventory fields are copied. These values
+The prototype is tested only with mocks and hosted temporary files; it is not
+an implemented or accepted strict no-start mirror. Its failure mocks and the
+production skip gate are covered in CI. No host setup or new service is approved. These values
 describe the host at collection time and do not certify that a stopped distro's
 cached measurements are current beyond the retained record window.
 

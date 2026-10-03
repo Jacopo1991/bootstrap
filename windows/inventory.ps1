@@ -391,6 +391,12 @@ function Write-AgentDevInventoryStagingJson {
 }
 function Copy-AgentDevInventory {
  param([string]$Json)
+ # Founder requires a strict no-start guarantee, including check/use races.
+ # The prototype below uses launch-capable interfaces; keep it unreachable.
+ return 'SKIP-NONSTARTING-TRANSPORT-REQUIRED'
+}
+function Copy-AgentDevInventoryPrototype {
+ param([string]$Json)
  $name='.inventory-'+[guid]::NewGuid().ToString('N')+'.tmp'
  $wsl=Join-Path $env:SystemRoot 'System32\wsl.exe'
  $prepared=$false

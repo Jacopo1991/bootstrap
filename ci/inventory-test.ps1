@@ -350,7 +350,7 @@ foreach($case in $mirrorCases){
    Assert-Equal $Arguments[9] $mirrorState.Stage 'one staging name per copy'|Out-Null
    $op=$Arguments[8];$mirrorState.Ops.Add($op)
    Assert-True ($op -in @('prepare','publish','cleanup')) 'mirror never starts shells or unrelated commands'|Out-Null
-   if($case.ContainsKey('Fail') -and ($case.Fail -eq $op -or $case.Fail -eq 'timeout' -and $op -eq 'publish')){
+   if($case.ContainsKey('Fail') -and ($case.Fail -eq $op -or ($case.Fail -eq 'timeout' -and $op -eq 'publish'))){
     return [pscustomobject]@{Status=$(if($case.Fail -eq 'timeout'){'Timeout'}else{'Failed'});Output='diagnostic-not-for-output';ExitCode=1}
    }
    [pscustomobject]@{Status='Success';Output='';ExitCode=0}
@@ -362,7 +362,7 @@ foreach($case in $mirrorCases){
    Assert-Equal $Json $safeJson 'copy contains exactly sanitized inventory JSON'|Out-Null
    if($case.ContainsKey('Fail') -and $case.Fail -eq 'copy'){throw 'diagnostic-not-for-output'}
   }
-  $status=Copy-AgentDevInventory -Json $safeJson
+  $status=Copy-AgentDevInventoryPrototype -Json $safeJson
   Assert-Equal $status $case.Status "$($case.Name) fixed mirror status"
   Assert-Equal ($mirrorState.Ops -join ',') $case.Ops "$($case.Name) exact distro operations"
   Assert-Equal $mirrorState.Writes $case.Writes "$($case.Name) UNC writes"
@@ -384,4 +384,10 @@ foreach($case in $mirrorCases){
   Assert-Equal ([IO.File]::ReadAllText($target)) $windows 'staging writer preserves exact JSON'
   Assert-Equal ([IO.File]::ReadAllBytes($target)[0] -eq 123) $true 'staging JSON is UTF-8 without BOM'
  }finally{Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue}
+}
+
+& {
+ function Invoke-BoundedNative {throw 'Disabled mirror must not call any native interface.'}
+ function Write-AgentDevInventoryStagingJson {throw 'Disabled mirror must not touch UNC.'}
+ Assert-Equal (Copy-AgentDevInventory -Json '{"schemaVersion":2,"distros":[]}') 'SKIP-NONSTARTING-TRANSPORT-REQUIRED' 'strict no-start requirement keeps mirror disabled'
 }
