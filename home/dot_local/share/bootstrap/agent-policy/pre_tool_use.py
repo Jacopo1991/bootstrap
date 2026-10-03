@@ -12,15 +12,16 @@ import subprocess
 import sys
 
 HOST_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe",
-              "wsl", "wsl.exe", "wslconfig.exe", "diskpart.exe", "schtasks.exe"}
+              "wsl", "wsl.exe", "wslconfig.exe", "diskpart", "diskpart.exe", "schtasks", "schtasks.exe"}
 HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
             "mount", "umount", "shutdown", "reboot", "modprobe", "useradd",
             "adduser", "usermod", "passwd", "visudo"}
 # Inspect paths in argv, never a substring in an entire shell/body string.
 # Unquoted Windows backslashes can be consumed by shlex, so drive prefixes
 # remain blocked even after that normalization.
-WINDOWS_PATH = re.compile(r"(?i)(?:^[A-Z]:|=[A-Z]:|/mnt/[a-z](?:/|$)|"
-                          r"(?:^|=)\\\\|(?:^|=)\\[A-Za-z0-9_-]+$)")
+WINDOWS_PATH = re.compile(r"(?i)(?:[A-Z]:[\\/](?!/)|"
+                          r"(?:^|=|^-[A-Za-z]+)[A-Z]:|/mnt/[a-z](?:/|$)|"
+                          r"(?:^|=|^-[A-Za-z]+)\\(?:\\|[A-Za-z0-9_-]))")
 HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
@@ -636,25 +637,49 @@ def gh_prose_positions(tokens: list[str]) -> set[int]:
             ["issue", "create"], ["issue", "edit"], ["issue", "comment"]):
         return set()
     prose: set[int] = set()
+    value_flags = {
+        "--body-file", "-F", "--assignee", "-a", "--label", "-l",
+        "--milestone", "-m", "--project", "-p", "--reviewer", "-r",
+        "--repo", "-R", "--hostname", "--base", "-B", "--head", "-H",
+        "--template", "-T", "--recover", "--add-assignee", "--remove-assignee",
+        "--add-label", "--remove-label", "--add-project", "--remove-project",
+        "--add-reviewer", "--remove-reviewer",
+    }
+    switches = {
+        "--draft", "-d", "--editor", "-e", "--web", "-w", "--edit-last",
+        "--create-if-none", "--delete-last", "--yes", "--help", "-h",
+    }
     index += 2
     while index < len(tokens):
         token = tokens[index]
+        if token == "--":
+            break  # Remaining operands are never option payloads.
         if token in {"--body", "--title", "-b", "-t"}:
             if index + 1 < len(tokens):
                 prose.add(index + 1)
             index += 2
             continue
+        if token in value_flags:
+            index += 2  # Even option-looking values belong to this real flag.
+            continue
         if token.startswith(("--body=", "--title=")) or (
                 token.startswith(("-b", "-t")) and len(token) > 2
                 and not token.startswith("--")):
             prose.add(index)
+        elif token.split("=", 1)[0] in value_flags and "=" in token:
+            pass
+        elif token[:2] in value_flags and not token.startswith("--") and len(token) > 2:
+            pass
+        elif token.startswith("-") and token not in switches:
+            return set()  # Unknown/combined options must not hide path operands.
         index += 1
     return prose
 
 
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
     """Block host execution and real Windows path arguments, not gh prose."""
-    if (executable in HOST_NAMES | HOST_OPS or HOST_EXECUTABLE.search(tokens[0])
+    if (SHELL_EXPANSION.search(tokens[0]) or executable in HOST_NAMES | HOST_OPS
+            or HOST_EXECUTABLE.search(tokens[0])
             or WINDOWS_PATH.search(tokens[0])):
         return "Host, Windows, and operating-system commands are blocked."
     prose = gh_prose_positions(tokens) if executable == "gh" else set()

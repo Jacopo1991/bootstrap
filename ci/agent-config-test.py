@@ -542,6 +542,8 @@ with tempfile.TemporaryDirectory() as temp:
                 "issue edit 7 -t'cmd.exe findings' -b'\\\\host\\share is prose'",
                 "-R Jacopo1991/ci-fixture pr create --body 'diskpart.exe C:\\Windows\\System32'",
                 "--hostname github.com issue comment 7 --body '/mnt/c/example'",
+                "pr create --assignee fixture --label fixture --body 'wsl.exe C:\\Windows\\System32'",
+                "pr create -F body.com --body 'wsl.exe C:\\Windows\\System32'",
                 "pr create --body-file body.com",
                 "issue comment 7 --body-file body.exe"):
             command = executable + " " + tail
@@ -551,6 +553,14 @@ with tempfile.TemporaryDirectory() as temp:
                 "pr create --body 'safe' --body-file 'C:\\Windows\\body.md'",
                 "issue comment 7 --body-file /mnt/c/body.md",
                 "pr create --body-file='C:\\Windows\\body.md'",
+                "pr create -F'C:\\Windows\\body.md'",
+                "pr create -FC:\\Windows\\body.md",
+                "pr create --body-file \\\\host\\share\\body.md",
+                "pr create -F'\\\\host\\share\\body.md'",
+                "pr create --body-file '-bC:\\Windows\\body.md'",
+                "pr create -F '-tC:\\Windows\\body.md'",
+                "pr create --body-file=-bC:\\Windows\\body.md",
+                "pr create --body-file '\\\\host\\share\\with spaces.md'",
                 "pr create --body-file C:\\Windows\\body.md",
                 "issue comment 7 --body-file '\\\\host\\share\\body.md'",
                 "pr create --body 'safe' > /mnt/c/body.md",
@@ -565,6 +575,8 @@ with tempfile.TemporaryDirectory() as temp:
             assert policy.permission_reason(event(command), roots) is not None, command
     for command in (
             "wsl.exe -d AgentDev", "/usr/bin/wsl.exe -d AgentDev",
+            "wsl${empty}", "wsl$empty", "fixture${empty}.com", "diskpart", "schtasks",
+            "git -CC:\\Windows\\repo status",
             "fixture.com", "/tmp/fixture.COM", "'/tmp/fixture.exe'",
             "'C:\\Windows\\System32\\cmd.exe' /c echo safe",
             "C:\\Windows\\System32\\cmd.exe /c echo safe",
