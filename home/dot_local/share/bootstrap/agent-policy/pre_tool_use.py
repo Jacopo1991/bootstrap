@@ -643,11 +643,15 @@ def gh_prose_positions(tokens: list[str]) -> set[int]:
         "--repo", "-R", "--hostname", "--base", "-B", "--head", "-H",
         "--template", "-T", "--recover", "--add-assignee", "--remove-assignee",
         "--add-label", "--remove-label", "--add-project", "--remove-project",
-        "--add-reviewer", "--remove-reviewer",
+        "--add-reviewer", "--remove-reviewer", "--attach", "--parent", "--type",
+        "--blocked-by", "--blocking", "--add-sub-issue", "--remove-sub-issue",
+        "--add-blocked-by", "--remove-blocked-by", "--add-blocking", "--remove-blocking",
     }
     switches = {
         "--draft", "-d", "--editor", "-e", "--web", "-w", "--edit-last",
         "--create-if-none", "--delete-last", "--yes", "--help", "-h",
+        "--fill", "-f", "--fill-first", "--fill-verbose", "--no-maintainer-edit",
+        "--dry-run", "--remove-milestone", "--remove-parent", "--remove-type",
     }
     index += 2
     while index < len(tokens):
