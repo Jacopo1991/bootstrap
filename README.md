@@ -418,7 +418,10 @@ Git/gh ask rules. The existing deny list and PreToolUse hook remain active.
 The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
 Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
 and `/usr/bin/gh *`: bare names alone only match argument-less calls.
-No general domain/network allow is added. The native GitHub CLI may use its
+The only network allow is `sandbox.network.allowedDomains` of exactly `pypi.org`
+and `files.pythonhosted.org` (no wildcards), so `uv sync` works in the sandbox;
+`sandbox.filesystem.allowWrite` adds only `~/.cache/uv`, created by the tools
+script, as its writable cache. CI asserts both lists exactly. The native GitHub CLI may use its
 existing credential store; agents must never read or print credential files.
 
 Force pushes (including lease variants, short flags, force refspecs and flags
