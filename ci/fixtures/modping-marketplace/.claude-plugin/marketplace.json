@@ -1,0 +1,7 @@
+{
+  "name": "ci-mods",
+  "owner": { "name": "Bootstrap CI" },
+  "plugins": [
+    { "name": "ci-modping", "source": "./plugins/ci-modping", "description": "CI fixture mod" }
+  ]
+}

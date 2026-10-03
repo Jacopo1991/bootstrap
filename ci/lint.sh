@@ -16,6 +16,7 @@ bash ci/boundary-test.sh
 bash -n system/ssh.sh system/authorize-agent-key.sh ci/vscode-ssh-test.sh
 python3 ci/monthly_pins_test.py
 python3 ci/agent-config-test.py
+python3 ci/claude-managed-mods-test.py
 python3 ci/git-default-merge-test.py
 python3 ci/agent-drift-test.py
 python3 ci/inventory-mirror-test.py

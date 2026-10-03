@@ -10,6 +10,8 @@ download() {
   printf '%s  %s\n' "$2" "$3" | sha256sum --check --status
 }
 mkdir -p "$HOME/.local/bin"
+# uv's cache is the one sandbox-writable path outside the repository.
+mkdir -p "$HOME/.cache/uv"
 download "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
 tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
 cmp -s "$tmp/gitleaks" "$HOME/.local/bin/gitleaks" || install -m 0755 "$tmp/gitleaks" "$HOME/.local/bin/gitleaks"
