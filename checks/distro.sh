@@ -7,9 +7,11 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$ROOT/home/.chezmoitemplates/pins.env"
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib"
 export DISABLE_AUTOUPDATER=1
-for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage bws secretspec bwrap socat gitleaks; do
+for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage bws secretspec bwrap socat exiftool gitleaks; do
   command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
 done
+# Execute ExifTool as agent to verify its interpreter/runtime as well as PATH.
+exiftool -ver >/dev/null
 [[ $(chezmoi --version) == "chezmoi version v$CHEZMOI_VERSION"* ]]
 [[ $(mise --version) == "$MISE_VERSION "* ]]
 [[ $(node --version) == "v$NODE_VERSION" ]]
