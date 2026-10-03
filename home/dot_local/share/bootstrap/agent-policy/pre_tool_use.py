@@ -20,8 +20,8 @@ HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
 # Unquoted Windows backslashes can be consumed by shlex, so drive prefixes
 # remain blocked even after that normalization.
 WINDOWS_PATH = re.compile(r"(?i)(?:[A-Z]:[\\/](?!/)|"
-                          r"(?:^|=|^-[A-Za-z]+)[A-Z]:|/mnt/[a-z](?:/|$)|"
-                          r"(?:^|=|^-[A-Za-z]+)\\(?:\\|[A-Za-z0-9_-]))")
+                          r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:|/mnt/[a-z](?:/|$)|"
+                          r"(?:^|=)(?:-[A-Za-z]+)?\\(?:\\|[A-Za-z0-9_-]))")
 HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
