@@ -12,13 +12,17 @@ import subprocess
 import sys
 
 HOST_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe",
-              "wsl", "wsl.exe", "wslconfig.exe", "diskpart.exe", "schtasks.exe"}
+              "wsl", "wsl.exe", "wslconfig.exe", "diskpart", "diskpart.exe", "schtasks", "schtasks.exe"}
 HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
             "mount", "umount", "shutdown", "reboot", "modprobe", "useradd",
             "adduser", "usermod", "passwd", "visudo"}
-WINDOWS = re.compile(r"(?i)(?:[A-Z]:[\\/]|/mnt/[a-z](?:/|$)|\\\\[^\\]+\\|"
-                     r"(?<![A-Za-z0-9_])(?:powershell(?:\.exe)?|pwsh(?:\.exe)?|"
-                     r"cmd\.exe|wsl(?:\.exe)?|diskpart(?:\.exe)?|schtasks\.exe)(?![A-Za-z0-9_]))")
+# Inspect paths in argv, never a substring in an entire shell/body string.
+# Unquoted Windows backslashes can be consumed by shlex, so drive prefixes
+# remain blocked even after that normalization.
+WINDOWS_PATH = re.compile(r"(?i)(?:[A-Z]:[\\/](?!/)|"
+                          r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:|/mnt/[a-z](?:/|$)|"
+                          r"(?:^|=)(?:-[A-Za-z]+)?\\(?:\\|[A-Za-z0-9_-]))")
+HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
 COMMAND_WRAPPERS = {"env", "command", "exec", "nohup", "timeout", "nice", "setsid",
@@ -612,6 +616,83 @@ def gh_policy(tokens: list[str]) -> str | None:
     return None
 
 
+def gh_prose_positions(tokens: list[str]) -> set[int]:
+    """Only documented inline PR/issue body/title values are textual payloads.
+
+    A body-file operand remains a real path and is checked; its contents are
+    never read by the hook. Exempting prose here does not exempt any shell
+    syntax, repository policy, destructive operation or permission check.
+    """
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"-R", "--repo", "--hostname"}:
+            index += 2
+        elif token.startswith(("--repo=", "--hostname=")) or token.startswith("-R") and len(token) > 2:
+            index += 1
+        else:
+            break
+    if tokens[index:index + 2] not in (
+            ["pr", "create"], ["pr", "edit"], ["pr", "comment"],
+            ["issue", "create"], ["issue", "edit"], ["issue", "comment"]):
+        return set()
+    prose: set[int] = set()
+    value_flags = {
+        "--body-file", "-F", "--assignee", "-a", "--label", "-l",
+        "--milestone", "-m", "--project", "-p", "--reviewer", "-r",
+        "--repo", "-R", "--hostname", "--base", "-B", "--head", "-H",
+        "--template", "-T", "--recover", "--add-assignee", "--remove-assignee",
+        "--add-label", "--remove-label", "--add-project", "--remove-project",
+        "--add-reviewer", "--remove-reviewer", "--attach", "--parent", "--type",
+        "--blocked-by", "--blocking", "--add-sub-issue", "--remove-sub-issue",
+        "--add-blocked-by", "--remove-blocked-by", "--add-blocking", "--remove-blocking",
+    }
+    switches = {
+        "--draft", "-d", "--editor", "-e", "--web", "-w", "--edit-last",
+        "--create-if-none", "--delete-last", "--yes", "--help", "-h",
+        "--fill", "-f", "--fill-first", "--fill-verbose", "--no-maintainer-edit",
+        "--dry-run", "--remove-milestone", "--remove-parent", "--remove-type",
+    }
+    index += 2
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break  # Remaining operands are never option payloads.
+        if token in {"--body", "--title", "-b", "-t"}:
+            if index + 1 < len(tokens):
+                prose.add(index + 1)
+            index += 2
+            continue
+        if token in value_flags:
+            index += 2  # Even option-looking values belong to this real flag.
+            continue
+        if token.startswith(("--body=", "--title=")) or (
+                token.startswith(("-b", "-t")) and len(token) > 2
+                and not token.startswith("--")):
+            prose.add(index)
+        elif token.split("=", 1)[0] in value_flags and "=" in token:
+            pass
+        elif token[:2] in value_flags and not token.startswith("--") and len(token) > 2:
+            pass
+        elif token.startswith("-") and token not in switches:
+            return set()  # Unknown/combined options must not hide path operands.
+        index += 1
+    return prose
+
+
+def host_command_reason(tokens: list[str], executable: str) -> str | None:
+    """Block host execution and real Windows path arguments, not gh prose."""
+    if (SHELL_EXPANSION.search(tokens[0]) or executable in HOST_NAMES | HOST_OPS
+            or HOST_EXECUTABLE.search(tokens[0])
+            or WINDOWS_PATH.search(tokens[0])):
+        return "Host, Windows, and operating-system commands are blocked."
+    prose = gh_prose_positions(tokens) if executable == "gh" else set()
+    if any(WINDOWS_PATH.search(token) for index, token in enumerate(tokens[1:], 1)
+           if index not in prose):
+        return "Windows path arguments are blocked."
+    return None
+
+
 def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str | None:
     tool = event.get("tool_name")
     data = event.get("tool_input")
@@ -647,8 +728,6 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     command = data.get("command")
     if not isinstance(command, str) or not command.strip():
         return "Shell command is unrecognized; blocked by policy."
-    if WINDOWS.search(command):
-        return "Windows paths and host executables are blocked."
     if "\n" in command or "\r" in command or "$(" in command or "`" in command:
         return "Compound or dynamic shell commands are blocked."
     try:
@@ -669,9 +748,9 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
         t in {"-c", "-e", "--eval"} for t in tokens[1:]
     ):
         return "Inline shell and interpreter programs are blocked."
-    names = {Path(t).name.lower() for t in tokens}
-    if names & (HOST_NAMES | HOST_OPS):
-        return "Host, Windows, and operating-system commands are blocked."
+    host_reason = host_command_reason(tokens, executable)
+    if host_reason:
+        return host_reason
     output_operators = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
     metadata = git_metadata(root) if executable in WRITERS | {"sed"} or any(
         token in output_operators for token in tokens) else None

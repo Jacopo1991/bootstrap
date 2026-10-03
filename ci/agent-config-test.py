@@ -529,6 +529,88 @@ with tempfile.TemporaryDirectory() as temp:
                 assert policy.evaluate(switch_event(executable + " switch " + tail), roots) is not None, tail
     print("PASS: literal switch creation start points allowed; options/overrides/other refs/siblings denied")
 
+    # Host checks apply to executable/path argv, never GitHub prose. These
+    # requests reach native permission rules without an unconditional grant.
+    for executable in ("gh", "/usr/bin/gh"):
+        for tail in (
+                "pr create --body 'Attribution: https://claude.com/claude-code'",
+                "issue create --title 'Discuss wsl.exe' --body 'C:\\Windows\\System32 and /mnt/c are documentation'",
+                "pr edit 7 --body 'sudo'",
+                "pr comment 7 -b 'wsl.exe'",
+                "issue comment 7 --body='powershell.exe at C:\\Windows\\System32'",
+                "pr create -b'https://claude.com/claude-code /mnt/c/example'",
+                "issue edit 7 -t'cmd.exe findings' -b'\\\\host\\share is prose'",
+                "-R Jacopo1991/ci-fixture pr create --body 'diskpart.exe C:\\Windows\\System32'",
+                "--hostname github.com issue comment 7 --body '/mnt/c/example'",
+                "pr create --assignee fixture --label fixture --body 'wsl.exe C:\\Windows\\System32'",
+                "pr create --fill --body 'C:\\Windows\\System32 is documentation'",
+                "pr create -f --body 'C:\\Windows\\System32 is documentation'",
+                "pr create --fill-first --body 'C:\\Windows\\System32 is documentation'",
+                "pr create --fill-verbose --body 'C:\\Windows\\System32 is documentation'",
+                "pr create --no-maintainer-edit --body 'C:\\Windows\\System32 is documentation'",
+                "pr create --dry-run --body 'C:\\Windows\\System32 is documentation'",
+                "pr edit 7 --remove-milestone --body 'C:\\Windows\\System32 is documentation'",
+                "issue edit 7 --remove-parent --remove-type --body '/mnt/c is documentation'",
+                "issue create --type Bug --parent 100 --body '/mnt/c is documentation'",
+                "pr create --attach image.png --body 'C:\\Windows\\System32 is documentation'",
+                "pr create -F body.com --body 'wsl.exe C:\\Windows\\System32'",
+                "pr create --body-file body.com",
+                "issue comment 7 --body-file body.exe"):
+            command = executable + " " + tail
+            assert policy.evaluate(event(command), roots) is None, command
+            assert policy.permission_reason(event(command), roots) is None, command
+        for tail in (
+                "pr create --body 'safe' --body-file 'C:\\Windows\\body.md'",
+                "issue comment 7 --body-file /mnt/c/body.md",
+                "pr create --body-file='C:\\Windows\\body.md'",
+                "pr create -F'C:\\Windows\\body.md'",
+                "pr create -FC:\\Windows\\body.md",
+                "pr create --body-file \\\\host\\share\\body.md",
+                "pr create -F'\\\\host\\share\\body.md'",
+                "pr create --body-file '-bC:\\Windows\\body.md'",
+                "pr create -F '-tC:\\Windows\\body.md'",
+                "pr create --body-file=-bC:\\Windows\\body.md",
+                "pr create --attach '-bC:\\Windows\\file.png'",
+                "pr create --unknown --body 'C:\\Windows\\System32'",
+                "pr create -dt'C:\\Windows\\System32'",
+                "pr create -- --body 'C:\\Windows\\System32'",
+                "pr create --body-file '\\\\host\\share\\with spaces.md'",
+                "pr create --body-file C:\\Windows\\body.md",
+                "issue comment 7 --body-file '\\\\host\\share\\body.md'",
+                "pr create --body 'safe' > /mnt/c/body.md",
+                "pr create --body 'safe'; wsl.exe",
+                "pr create --body 'safe' && fixture.com",
+                "pr create --body \"$(wsl.exe)\"",
+                "pr create --body 'safe' --repo 'C:\\Windows\\repo'",
+                "pr merge 7 --body 'wsl.exe'",
+                "repo delete fixture --body 'safe'"):
+            command = executable + " " + tail
+            assert policy.evaluate(event(command), roots) is not None, command
+            assert policy.permission_reason(event(command), roots) is not None, command
+    for command in (
+            "wsl.exe -d AgentDev", "/usr/bin/wsl.exe -d AgentDev",
+            "wsl${empty}", "wsl$empty", "fixture${empty}.com", "diskpart", "schtasks",
+            "git -CC:\\Windows\\repo status",
+            "fixture.com", "/tmp/fixture.COM", "'/tmp/fixture.exe'",
+            "'C:\\Windows\\System32\\cmd.exe' /c echo safe",
+            "C:\\Windows\\System32\\cmd.exe /c echo safe",
+            "'\\\\host\\share\\fixture.com'", "sudo true",
+            "cat 'C:\\Windows\\file.md'", "cat /mnt/c/file.md",
+            "cat '\\\\host\\share\\file.md'", "cp safe.txt 'C:\\Windows\\file.md'",
+            "env fixture.com", "command fixture.exe", "bash -c 'fixture.com'"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    # A Linux data filename or prose argument is not a Windows executable.
+    for command in ("cat fixture.com", "cat fixture.exe", "printf 'wsl.exe'",
+                    "printf 'sudo'", "cat /mnt/customer/file.md", "git grep '\\.com'"):
+        assert policy.evaluate(event(command), roots) is None, command
+    body_file = current / "body.com"
+    body_file.write_text("wsl.exe C:\\Windows\\System32 https://claude.com/claude-code\n",
+                         encoding="utf-8")
+    with unittest.mock.patch.object(Path, "read_text", side_effect=AssertionError("no body-file reads")):
+        assert policy.evaluate(event("gh pr create --body-file body.com"), roots) is None
+        assert policy.permission_reason(event("gh pr create --body-file body.com"), roots) is None
+    print("PASS: gh prose/body files accepted; real host execution and Windows paths denied")
+
     # Founder decision: ordinary Git/gh has native allow rules; forbidden
     # operations are denied independently of flag position or inherited selectors.
     for executable in ("git", "/usr/bin/git"):
