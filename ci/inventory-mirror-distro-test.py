@@ -73,7 +73,7 @@ try:
             owned(PROJECT_DATA, agent.pw_uid, agent.pw_gid, 0o700)
             owned(LATEST.parent, agent.pw_uid, agent.pw_gid, 0o700)
             owned(LATEST, agent.pw_uid, agent.pw_gid, 0o600)
-            assert LATEST.read_bytes() == SNAPSHOT
+            assert LATEST.read_bytes() == source.read_bytes()
             assert [p.name for p in LATEST.parent.iterdir()] == ["latest.json"]
             source.write_bytes(SNAPSHOT.replace(b"02:30", b"03:30"))
         # The agent can read its own copy, and it is the only account that can.
