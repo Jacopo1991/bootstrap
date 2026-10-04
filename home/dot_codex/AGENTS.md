@@ -4,8 +4,8 @@ These rules apply to every project in the agent user's home.
 
 ## Work and authority
 
-- Before acting, identify the current repository and branch, read its README and relevant source-controlled design and acceptance documents, and find the existing GitHub issue for the task. Claim work on that issue before implementing remote-repository work. If there is no matching issue or required source material is missing or contradictory, stop and report the blocker; do not invent a substitute. The founder-approved local-only CustomerHarness and Typo3/DKM projects have no GitHub issue or remote; act there only within the founder's explicit task scope.
-- Keep each authorized task in one focused pull request. Push only the task branch needed for that pull request. Never merge a pull request or enable auto-merge.
+- For project work, follow the `slim-workflow` skill: identify the repository and branch, read the project's INTENT, STATUS and task, work on a task branch, and finish only when the task's verification command passes. A GitHub issue is optional. If the task, its criteria or required material is missing or contradictory, stop and report the blocker; do not invent a substitute. The founder-approved local-only CustomerHarness and Typo3/DKM projects have no GitHub remote; act there only within the founder's explicit task scope.
+- Keep each task in one focused branch and pull request, and push only that branch. Workers never merge a pull request or enable auto-merge; the PM seat merges only after running the verification command itself.
 - After every GitHub write, read the affected file, ref, commit, issue, or pull request back and verify that it matches the intended result before continuing.
 - Do not create, delete, rename, archive, or change repository settings, branch protection, rulesets, Actions permissions, secrets, credentials, or access unless the user explicitly authorizes that exact operation.
 - Do not install or adopt toolkit skills, MCP servers, plugins, dispatchers, or other optional agent machinery based on an inventory. Present candidates for the founder's choice first. The managed policy hooks in this bootstrap are the baseline workspace and host-boundary guardrails.
@@ -25,4 +25,4 @@ These rules apply to every project in the agent user's home.
 - CustomerHarness and Typo3/DKM are founder-approved local-only projects under `/home/agent/dev_workspace/<project>`; do not add GitHub remotes, publish them, or copy their private contents into this repository.
 - Do not work from or write to `Documents\Codex`, arbitrary Windows paths, or any other project root. Do not start stopped WSL distros to inspect them.
 - Scheduled project jobs remain deferred. Do not create workflow hooks, inbox dispatch, scheduled PM jobs, or new scheduler entries. Existing machine inventory and compaction tasks are owner-managed maintenance.
-- Shared skills, MCP servers, and plugins start empty. Candidate inventory entries are for founder review; do not install or link candidates. Optional Superpowers installation is outside the toolkit sync and pilot-critical path.
+- Shared skills, MCP servers, and plugins: only the `slim-workflow` skill is installed. Other candidates are for founder review; do not install or link them. Optional Superpowers installation is outside the toolkit sync and pilot-critical path.
