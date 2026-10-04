@@ -374,7 +374,7 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 | Ubuntu WSL image (24.04.5 amd64) and SHA-256 | `windows/new-distro.ps1` |
 | chezmoi, mise, Node 24 LTS, Python 3.12, uv, native Claude Code, bws, SecretSpec | `home/.chezmoitemplates/pins.env` |
 | Node/Python/uv global tools | `home/dot_config/mise/config.toml` |
-| Codex CLI and ccusage, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
+| Codex CLI, ccusage and Backlog.md, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
 | Explicit apt package versions (held after install) | `system/apt-*.lock` |
 | Ubuntu dependency resolution | Signed Ubuntu snapshot `20260930T000000Z` |
 | apt signing key hashes | `home/.chezmoitemplates/pins.env` |
