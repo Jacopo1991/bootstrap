@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "dependencies": {
     "@openai/codex": "0.159.2",
+    "backlog.md": "1.53.0",
     "ccusage": "20.0.26"
   }
 }

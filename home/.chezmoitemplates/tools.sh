@@ -35,3 +35,4 @@ npm_root="$HOME/.local/share/bootstrap/npm"
 mise exec -- npm ci --prefix "$npm_root" --no-audit --no-fund
 ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
+ln -sfn "$npm_root/node_modules/.bin/backlog" "$HOME/.local/bin/backlog"
