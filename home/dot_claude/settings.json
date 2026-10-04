@@ -116,12 +116,14 @@
     "network": {
       "allowedDomains": [
         "pypi.org",
-        "files.pythonhosted.org"
+        "files.pythonhosted.org",
+        "registry.npmjs.org"
       ]
     },
     "filesystem": {
       "allowWrite": [
-        "~/.cache/uv"
+        "~/.cache/uv",
+        "~/.npm"
       ]
     }
   },
