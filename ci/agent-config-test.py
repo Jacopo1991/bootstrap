@@ -32,8 +32,8 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False,
     # Package registries for `uv sync` and the one writable cache path, nothing wider.
-    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org"]},
-    "filesystem": {"allowWrite": ["~/.cache/uv"]}}
+    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]},
+    "filesystem": {"allowWrite": ["~/.cache/uv", "~/.npm"]}}
 assert 'mkdir -p "$HOME/.cache/uv"' in (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
 assert "Bash(git merge *)" not in claude["permissions"]["deny"]

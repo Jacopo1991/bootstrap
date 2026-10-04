@@ -20,6 +20,7 @@ python3 ci/claude-managed-mods-test.py
 python3 ci/git-default-merge-test.py
 python3 ci/agent-drift-test.py
 python3 ci/inventory-mirror-test.py
+bash ci/new-project-test.sh
 mapfile -t scripts < <(find . -name '*.sh' -type f -not -path './.git/*')
 "$tmp/shellcheck-v0.11.0/shellcheck" --external-sources --source-path=SCRIPTDIR "${scripts[@]}"
 # Render the actual chezmoi script too; shared pin constants are intentionally
