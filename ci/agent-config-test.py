@@ -755,7 +755,7 @@ print("PASS: founder-approved routine Git/gh, destructive denies and canonical n
 
 for path in ("home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md"):
     rules = (ROOT / path).read_text(encoding="utf-8").lower()
-    for phrase in ("claim work", "never merge", "read the affected", "secret values",
+    for phrase in ("slim-workflow", "never merge", "read the affected", "secret values",
                    "approved workspace roots", "scheduled project jobs remain deferred",
                    "customerharness and typo3"):
         assert phrase in rules, (path, phrase)
