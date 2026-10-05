@@ -2,7 +2,7 @@
 # Create a new project the standard way (slim workflow, 2026-10-04).
 # Run by the founder or the PM from a normal shell as the agent user, never from inside an agent session
 # (the agent policy hook blocks git init there on purpose).
-#   new-project create <name> [--local-only]   code repo + cortex-kb repo, each on main with a first commit
+#   new-project create <name> [--local-only]   code repo + cortex-kb repo, each on main with the pre-commit gate and a first commit
 #   new-project publish <name>                 after the PM created both GitHub repos: add origin and push
 set -euo pipefail
 
@@ -15,12 +15,18 @@ owner=${NEW_PROJECT_OWNER:-Jacopo1991}
 code="$HOME/dev_workspace/$name"
 kb="$HOME/cortex/cortex-kb-$name"
 today=$(date +%Y-%m-%d)
+gate_config="$(cd -- "$(dirname -- "$0")/../share/bootstrap/pre-commit" && pwd)/pre-commit-config.yaml"
 
+# The standard local quality gate (see pre-commit-enable), so the first commit already runs it.
+install_gate() { cp "$gate_config" "$1/.pre-commit-config.yaml" && (cd "$1" && pre-commit install >/dev/null); }
 first_commit() { git -C "$1" add -A && git -C "$1" commit -q -m "Initial project skeleton (new-project)"; }
 
 case $cmd in
 create)
   for d in "$code" "$kb"; do [ ! -e "$d" ] || { echo "$d already exists; nothing changed" >&2; exit 1; }; done
+  for tool in pre-commit gitleaks lychee osv-scanner; do
+    command -v "$tool" >/dev/null || { echo "$tool is not on PATH; run the bootstrap install first. Nothing changed." >&2; exit 1; }
+  done
   mkdir -p "$code" "$kb"
   git -C "$code" init -q -b main
   git -C "$kb" init -q -b main
@@ -77,6 +83,8 @@ MD
     && backlog config set autoCommit false >/dev/null \
     && backlog config set remoteOperations false >/dev/null \
     && backlog config set checkActiveBranches false >/dev/null)
+  install_gate "$code"
+  install_gate "$kb"
   first_commit "$code"
   first_commit "$kb"
   echo "Created $code and $kb on main."

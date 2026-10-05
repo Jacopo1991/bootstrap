@@ -15,7 +15,8 @@ import subprocess
 import sys
 import tomllib
 
-EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks"}
+EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
+                     "lychee", "osv-scanner", "pre-commit"}
 VERSION_COMMANDS = {
     "claude": ["claude", "--version"],
     "codex": ["codex", "--version"],
@@ -23,6 +24,14 @@ VERSION_COMMANDS = {
     "secretspec": ["secretspec", "--version"],
     "gitleaks": ["gitleaks", "version"],
     "ccusage": ["ccusage", "--version"],
+    "lychee": ["lychee", "--version"],
+    "osv-scanner": ["osv-scanner", "--version"],
+}
+# Release binaries pinned only by URL: the version is the URL's tag.
+URL_VERSIONS = {
+    "gitleaks": ("GITLEAKS_URL", "/download/v"),
+    "lychee": ("LYCHEE_URL", "/download/lychee-v"),
+    "osv-scanner": ("OSV_SCANNER_URL", "/download/v"),
 }
 
 
@@ -138,8 +147,10 @@ def scan(root: Path, home: Path) -> list[str]:
         pins = {}
     for name, args in VERSION_COMMANDS.items():
         expected = pins.get(name.upper() + "_VERSION")
-        if name == "gitleaks":
-            expected = pins.get("GITLEAKS_URL", "").split("/download/v")[-1].split("/", 1)[0]
+        if name in URL_VERSIONS:
+            key, marker = URL_VERSIONS[name]
+            url = pins.get(key, "")
+            expected = url.split(marker, 1)[1].split("/", 1)[0] if marker in url else None
         if not expected:
             findings.add("pin-unavailable:" + name)
             continue

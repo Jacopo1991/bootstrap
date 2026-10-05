@@ -2,7 +2,9 @@
 # The new-project command creates both repositories on main with one commit each and refuses to overwrite.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
-command -v backlog >/dev/null || { echo "SKIP: backlog is not installed (installed by the chezmoi tools script)"; exit 0; }
+for tool in backlog pre-commit gitleaks lychee osv-scanner; do
+  command -v "$tool" >/dev/null || { echo "SKIP: $tool is not installed (installed by the chezmoi tools script)"; exit 0; }
+done
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # backlog is a node script behind a mise shim; keep mise pointed at the real home.
@@ -16,6 +18,10 @@ for repo in "$HOME/dev_workspace/demo-site" "$HOME/cortex/cortex-kb-demo-site"; 
   [ "$(git -C "$repo" branch --show-current)" = main ]
   [ "$(git -C "$repo" rev-list --count HEAD)" = 1 ]
   [ -z "$(git -C "$repo" status --porcelain)" ]
+  # The standard pre-commit gate is committed and its hook installed.
+  cmp -s "$ROOT/home/dot_local/share/bootstrap/pre-commit/pre-commit-config.yaml" "$repo/.pre-commit-config.yaml"
+  git -C "$repo" ls-files --error-unmatch .pre-commit-config.yaml >/dev/null
+  grep -q pre-commit "$repo/.git/hooks/pre-commit"
 done
 kb="$HOME/cortex/cortex-kb-demo-site"
 for f in INTENT.md STATUS.md AGENTS.md README.md backlog/config.yml; do
@@ -39,4 +45,4 @@ git -C "$kb" clean -fdq
 grep -q "local only" "$HOME/cortex/cortex-kb-demo-site/README.md"
 if bash "$cmd" create demo-site >/dev/null 2>&1; then echo "FAIL: overwrite allowed"; exit 1; fi
 if bash "$cmd" create Bad_Name >/dev/null 2>&1; then echo "FAIL: bad name accepted"; exit 1; fi
-echo "PASS: new-project creates both repositories on main and refuses overwrites and bad names"
+echo "PASS: new-project creates both repositories on main with the pre-commit gate and refuses overwrites and bad names"

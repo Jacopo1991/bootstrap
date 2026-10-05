@@ -7,7 +7,7 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$ROOT/home/.chezmoitemplates/pins.env"
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib"
 export DISABLE_AUTOUPDATER=1
-for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage qmd bws secretspec bwrap socat exiftool gitleaks; do
+for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage qmd bws secretspec bwrap socat exiftool gitleaks lychee osv-scanner pre-commit osv-db-refresh pre-commit-enable; do
   command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
 done
 # Execute ExifTool as agent to verify its interpreter/runtime as well as PATH.
@@ -25,6 +25,14 @@ exiftool -ver >/dev/null
 gitleaks_expected=${GITLEAKS_URL##*/download/v}
 gitleaks_expected=${gitleaks_expected%%/*}
 [[ $(gitleaks version) == *"$gitleaks_expected"* ]]
+lychee_expected=${LYCHEE_URL##*/download/lychee-v}
+[[ $(lychee --version) == "lychee ${lychee_expected%%/*}" ]]
+osv_expected=${OSV_SCANNER_URL##*/download/v}
+[[ $(osv-scanner --version) == *"osv-scanner version: ${osv_expected%%/*}"* ]]
+[[ $(pre-commit --version) == "pre-commit $(sed -n 's/^pre-commit==//p' "$ROOT/home/dot_local/share/bootstrap/pre-commit/requirements.in")" ]]
+# The gate's store and offline vulnerability data exist outside the sandbox.
+[[ -f $HOME/.cache/pre-commit/db.db && -f $HOME/.cache/osv-scalibr/PyPI/all.zip ]]
+bash "$ROOT/ci/pre-commit-test.sh"
 for lock in "$ROOT/system/apt-base.lock" "$ROOT/system/apt-gh.lock"; do
   while IFS='=' read -r package version; do
     [[ $(dpkg-query -W -f='${Version}' "$package") == "$version" ]] || {

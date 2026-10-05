@@ -18,6 +18,28 @@ cmp -s "$tmp/gitleaks" "$HOME/.local/bin/gitleaks" || install -m 0755 "$tmp/gitl
 gitleaks_expected=${GITLEAKS_URL##*/download/v}
 gitleaks_expected=${gitleaks_expected%%/*}
 [[ $("$HOME/.local/bin/gitleaks" version) == *"$gitleaks_expected"* ]]
+# Local quality gate (pre-commit-enable): lychee, osv-scanner and pre-commit from a hashed lock.
+download "$LYCHEE_URL" "$LYCHEE_SHA256" "$tmp/lychee.tar.gz"
+tar -xzf "$tmp/lychee.tar.gz" -C "$tmp"
+lychee_binary=$(find "$tmp" -type f -name lychee -print -quit)
+[[ -n $lychee_binary ]]
+cmp -s "$lychee_binary" "$HOME/.local/bin/lychee" || install -m 0755 "$lychee_binary" "$HOME/.local/bin/lychee"
+lychee_expected=${LYCHEE_URL##*/download/lychee-v}
+[[ $("$HOME/.local/bin/lychee" --version) == "lychee ${lychee_expected%%/*}" ]]
+download "$OSV_SCANNER_URL" "$OSV_SCANNER_SHA256" "$tmp/osv-scanner"
+cmp -s "$tmp/osv-scanner" "$HOME/.local/bin/osv-scanner" || install -m 0755 "$tmp/osv-scanner" "$HOME/.local/bin/osv-scanner"
+osv_expected=${OSV_SCANNER_URL##*/download/v}
+[[ $("$HOME/.local/bin/osv-scanner" --version) == *"osv-scanner version: ${osv_expected%%/*}"* ]]
+pre_commit_root="$HOME/.local/share/bootstrap/pre-commit"
+mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$pre_commit_root/venv"
+mise exec -- uv pip sync --quiet --require-hashes --python "$pre_commit_root/venv/bin/python" "$pre_commit_root/requirements.lock"
+ln -sfn "$pre_commit_root/venv/bin/pre-commit" "$HOME/.local/bin/pre-commit"
+pre_commit_expected=$(sed -n 's/^pre-commit==//p' "$pre_commit_root/requirements.in")
+[[ $("$HOME/.local/bin/pre-commit" --version) == "pre-commit $pre_commit_expected" ]]
+# Create pre-commit's store here: inside the agent sandbox ~/.cache is read-only and
+# pre-commit then runs local hooks from the existing store without writing to it.
+"$HOME/.local/bin/pre-commit" gc >/dev/null
+osv-db-refresh >/dev/null
 if [[ ! -x $HOME/.local/bin/claude ]] || [[ $("$HOME/.local/bin/claude" --version) != "$CLAUDE_VERSION (Claude Code)" ]]; then
   download "$CLAUDE_INSTALLER_URL" "$CLAUDE_INSTALLER_SHA256" "$tmp/claude-install.sh"
   bash "$tmp/claude-install.sh" "$CLAUDE_VERSION"

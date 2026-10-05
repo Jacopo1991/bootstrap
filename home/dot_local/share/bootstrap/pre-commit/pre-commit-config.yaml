@@ -1,0 +1,24 @@
+# Standard local quality gate, written by bootstrap (new-project, pre-commit-enable).
+# Local hooks only: they call the pinned binaries bootstrap installs on PATH, so
+# nothing is fetched at commit time and the gate works inside the agent sandbox.
+minimum_pre_commit_version: '4.0.0'
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (staged changes)
+        entry: gitleaks git --pre-commit --staged --redact --no-banner
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: lychee
+        name: lychee (relative links, offline)
+        entry: lychee --offline --scheme file --no-progress --
+        language: system
+        types: [markdown]
+      # Offline vulnerability databases come from osv-db-refresh (run by bootstrap).
+      - id: osv-scanner
+        name: osv-scanner (lockfiles, offline database)
+        entry: osv-scanner scan source --offline
+        language: system
+        files: (^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|uv\.lock|poetry\.lock|pdm\.lock|Pipfile\.lock|requirements[^/]*\.txt|Cargo\.lock|go\.mod|composer\.lock|Gemfile\.lock)$
