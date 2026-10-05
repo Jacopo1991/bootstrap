@@ -4,6 +4,7 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
 export DISABLE_AUTOUPDATER=1
 # npm lock: {{ include "dot_local/share/bootstrap/npm/package-lock.json" | sha256sum }}
-# mise config: {{ include "dot_config/mise/config.toml" | sha256sum }}
+# pre-commit lock: {{ include "dot_local/share/bootstrap/pre-commit/requirements.lock" | sha256sum }}
+# mise config:{{ include "dot_config/mise/config.toml" | sha256sum }}
 {{ include ".chezmoitemplates/pins.env" }}
 {{ include ".chezmoitemplates/tools.sh" }}
