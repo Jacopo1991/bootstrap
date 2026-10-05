@@ -54,7 +54,9 @@ class PinTests(unittest.TestCase):
 
     def test_tools_script_links_qmd_and_installs_pinned_cuda_libraries(self):
         tools = (ROOT / "home/.chezmoitemplates/tools.sh").read_text()
-        self.assertIn('ln -sfn "$npm_root/node_modules/.bin/qmd" "$HOME/.local/bin/qmd"', tools)
+        self.assertIn('exec "$HOME/.local/share/bootstrap/npm/node_modules/.bin/qmd" "$@"', tools)
+        self.assertIn('linux-x64-cuda/bins/linux-x64-cuda', tools)
+        self.assertIn('/usr/lib/wsl/lib', tools)
         pins = (ROOT / "home/.chezmoitemplates/pins.env").read_text()
         for key in ("CUDA_RUNTIME", "CUBLAS"):
             self.assertIn(f"{key}_URL='https://files.pythonhosted.org/", pins)

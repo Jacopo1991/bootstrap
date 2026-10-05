@@ -36,7 +36,18 @@ mise exec -- npm ci --prefix "$npm_root" --no-audit --no-fund
 ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
 ln -sfn "$npm_root/node_modules/.bin/backlog" "$HOME/.local/bin/backlog"
-ln -sfn "$npm_root/node_modules/.bin/qmd" "$HOME/.local/bin/qmd"
+# qmd runs through a small wrapper so every caller (CLI, timer, MCP server) uses the GPU:
+# node-llama-cpp only detects the CUDA runtime through LD_LIBRARY_PATH and the WSL
+# driver tools on PATH, not through the backend's own $ORIGIN runpath.
+rm -f "$HOME/.local/bin/qmd"
+cat > "$HOME/.local/bin/qmd" <<'QMD'
+#!/usr/bin/env bash
+cuda="$HOME/.local/share/bootstrap/npm/node_modules/@node-llama-cpp/linux-x64-cuda/bins/linux-x64-cuda"
+export LD_LIBRARY_PATH="$cuda${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+case ":$PATH:" in *:/usr/lib/wsl/lib:*) ;; *) export PATH="$PATH:/usr/lib/wsl/lib" ;; esac
+exec "$HOME/.local/share/bootstrap/npm/node_modules/.bin/qmd" "$@"
+QMD
+chmod 0755 "$HOME/.local/bin/qmd"
 # qmd GPU: node-llama-cpp's prebuilt CUDA backend links libcudart.so.13 and
 # libcublas.so.13 and finds them through its $ORIGIN runpath. Put the hash-pinned
 # NVIDIA runtime libraries from the PyPI wheels next to it (no root, no env vars;
