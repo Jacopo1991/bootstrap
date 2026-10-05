@@ -22,6 +22,7 @@ python3 ci/agent-drift-test.py
 python3 ci/inventory-mirror-test.py
 bash ci/new-project-test.sh
 mapfile -t scripts < <(find . -name '*.sh' -type f -not -path './.git/*')
+scripts+=(home/dot_local/bin/executable_qmd-refresh)
 "$tmp/shellcheck-v0.11.0/shellcheck" --external-sources --source-path=SCRIPTDIR "${scripts[@]}"
 # Render the actual chezmoi script too; shared pin constants are intentionally
 # unused in each individual consumer, hence only SC2034 is excluded here.

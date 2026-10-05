@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Run by qmd-index.timer: bring the Cortex checkouts up to date, then reindex.
+# Only a checkout that has an origin, is on main and is clean is touched (fetch
+# plus fast-forward only); every other one is left alone and logged as skipped.
+# Git authenticates through the agent's own ~/.gitconfig credential helper.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+# A credential prompt would hang the timer; fail and log instead.
+export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1
+
+cortex="${QMD_CORTEX_DIR:-$HOME/cortex}"
+failed=0
+
+sync_repo() {
+  local repo=$1 name branch before after
+  name=$(basename -- "$repo")
+  if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "skip $name: not a git checkout"; return
+  fi
+  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    echo "skip $name: no origin"; return
+  fi
+  branch=$(git -C "$repo" symbolic-ref --quiet --short HEAD || echo '(detached)')
+  if [[ $branch != main ]]; then
+    echo "skip $name: on $branch, not main"; return
+  fi
+  if [[ -n $(git -C "$repo" status --porcelain 2>&1) ]]; then
+    echo "skip $name: working tree not clean"; return
+  fi
+  if ! git -C "$repo" fetch --quiet origin 2>&1; then
+    echo "ERROR $name: git fetch failed (network or authentication)" >&2
+    failed=1; return
+  fi
+  before=$(git -C "$repo" rev-parse HEAD)
+  if ! git -C "$repo" merge --quiet --ff-only origin/main 2>&1; then
+    echo "skip $name: main cannot fast-forward to origin/main (diverged or ahead)"; return
+  fi
+  after=$(git -C "$repo" rev-parse HEAD)
+  if [[ $before == "$after" ]]; then
+    echo "ok $name: up to date"
+  else
+    echo "ok $name: updated ${before:0:7}..${after:0:7}"
+  fi
+}
+
+shopt -s nullglob
+for repo in "$cortex"/*/; do
+  sync_repo "${repo%/}"
+done
+
+qmd update || failed=1
+qmd embed || failed=1
+exit "$failed"

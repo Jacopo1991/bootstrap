@@ -21,20 +21,20 @@ first_commit() { git -C "$1" add -A && git -C "$1" commit -q -m "Initial project
 case $cmd in
 create)
   for d in "$code" "$kb"; do [ ! -e "$d" ] || { echo "$d already exists; nothing changed" >&2; exit 1; }; done
-  mkdir -p "$code" "$kb/tasks"
+  mkdir -p "$code" "$kb"
   git -C "$code" init -q -b main
   git -C "$kb" init -q -b main
 
   cat > "$code/README.md" <<MD
 # $name
 
-Code repository. Project knowledge (intent, status, tasks, decisions) lives in \`cortex-kb-$name\`.
+Code repository. Project knowledge (intent, status, and the backlog of tasks and decisions) lives in \`cortex-kb-$name\`.
 MD
   cat > "$code/AGENTS.md" <<MD
 # Agent instructions
 
 Follow the \`slim-workflow\` skill. Read \`~/cortex/cortex-kb-$name\` (INTENT.md, STATUS.md, your task) before working.
-Commit only in this repository; report results in chat. The PM records STATUS.md, decisions.md and task updates in the knowledge repository.
+Commit only in this repository; report results in chat. The PM records STATUS.md, backlog tasks and decisions in the knowledge repository.
 MD
   printf '.env\n.env.*\nnode_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n' > "$code/.gitignore"
 
@@ -47,7 +47,7 @@ MD
   cat > "$kb/AGENTS.md" <<MD
 # Agent instructions
 
-Follow the \`slim-workflow\` skill. The PM keeps STATUS.md, decisions.md and tasks/ current; build lanes work in the code repository and report in chat.
+Follow the \`slim-workflow\` skill. The PM keeps STATUS.md and the backlog/ tasks and decisions current; build lanes work in the code repository and report in chat.
 MD
   cat > "$kb/INTENT.md" <<MD
 # Intent
@@ -70,26 +70,17 @@ Project created.
 
 ## Open questions
 MD
-  cat > "$kb/decisions.md" <<MD
-# Decisions
-
-- $today: Project created with \`new-project\`.
-MD
-  cat > "$kb/tasks/TEMPLATE.md" <<'MD'
-# T<n>: <title>
-
-- Outcome: what is true when this is done.
-- Scope in:
-- Scope out:
-- Acceptance (2-6 checkable criteria; founder approves for meaningful user-facing features):
-  - [ ]
-- Verification command:
-- Time box: one session
-- Stop and report if: the criteria look wrong, two attempts fail, or the time box is reached.
-MD
+  # Tasks and decisions live in backlog/, managed with Backlog.md. Offline and
+  # manual: no integration files, no auto commits, no remote or branch scans.
+  (cd "$kb" && backlog init "$name" --defaults --integration-mode none \
+    --task-prefix T --check-branches false --include-remote false >/dev/null \
+    && backlog config set autoCommit false >/dev/null \
+    && backlog config set remoteOperations false >/dev/null \
+    && backlog config set checkActiveBranches false >/dev/null)
   first_commit "$code"
   first_commit "$kb"
   echo "Created $code and $kb on main."
+  echo "Next: run chezmoi apply to add it to the qmd index."
   if [ $local_only = 0 ]; then
     echo "Next (PM): create private GitHub repos $owner/$name and $owner/cortex-kb-$name, apply the standard ruleset, then run: new-project publish $name"
   fi

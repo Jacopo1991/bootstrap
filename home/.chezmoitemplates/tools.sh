@@ -37,15 +37,29 @@ ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
 ln -sfn "$npm_root/node_modules/.bin/backlog" "$HOME/.local/bin/backlog"
 ln -sfn "$npm_root/node_modules/.bin/qmd" "$HOME/.local/bin/qmd"
-# qmd: models are fetched here, outside agent sessions and the Claude sandbox,
-# then the first index is built. The 15-minute user timer only reindexes.
-"$HOME/.local/bin/qmd" pull
-"$HOME/.local/bin/qmd" update
-"$HOME/.local/bin/qmd" embed
-if [[ -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
-  systemctl --user daemon-reload
-  systemctl --user start qmd-index.timer
+# qmd GPU: node-llama-cpp's prebuilt CUDA backend links libcudart.so.13 and
+# libcublas.so.13 and finds them through its $ORIGIN runpath. Put the hash-pinned
+# NVIDIA runtime libraries from the PyPI wheels next to it (no root, no env vars;
+# the driver's libcuda comes from /usr/lib/wsl/lib). npm ci above wiped the
+# directory, so restore it on every run from the wheel cache.
+cuda_dir="$npm_root/node_modules/@node-llama-cpp/linux-x64-cuda/bins/linux-x64-cuda"
+wheels="$HOME/.cache/bootstrap/cuda-wheels"
+mkdir -p "$wheels"
+cuda_wheel() {
+  local file="$wheels/$2.whl"
+  if [[ ! -f $file ]] || ! printf '%s  %s\n' "$3" "$file" | sha256sum --check --status; then
+    download "$1" "$3" "$file.part"
+    mv "$file.part" "$file"
+  fi
+  shift 3
+  unzip -q -j -o "$file" "$@" -d "$cuda_dir"
+}
+cuda_wheel "$CUDA_RUNTIME_URL" cuda-runtime "$CUDA_RUNTIME_SHA256" nvidia/cu13/lib/libcudart.so.13
+cuda_wheel "$CUBLAS_URL" cublas "$CUBLAS_SHA256" nvidia/cu13/lib/libcublas.so.13 nvidia/cu13/lib/libcublasLt.so.13
+if ldd "$cuda_dir/libggml-cuda.so" | grep -Eq 'libcu(dart|blas)[^ ]* => not found'; then
+  ldd "$cuda_dir/libggml-cuda.so" >&2
+  echo 'qmd CUDA backend still has unresolved CUDA runtime libraries.' >&2
+  exit 1
 fi
-# Claude Code MCP server, user scope, stdio. Remove first so a re-run replaces a stale entry.
-"$HOME/.local/bin/claude" mcp remove --scope user qmd >/dev/null 2>&1 || true
-"$HOME/.local/bin/claude" mcp add --scope user qmd -- "$HOME/.local/bin/qmd" mcp
+# Models, the first index, the timer and the MCP registration need the agent's
+# user systemd; install.sh runs ~/.local/share/bootstrap/qmd-setup.sh for them.

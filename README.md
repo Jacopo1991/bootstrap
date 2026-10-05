@@ -361,11 +361,12 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 ## Projects, registries and repository boundaries
 
-**Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `decisions.md`, `tasks/TEMPLATE.md`, `README.md` and `AGENTS.md`. Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
+**Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `README.md` and `AGENTS.md` at the root, and a Backlog.md `backlog/` from `backlog init` (integration mode none, task prefix `T`, `auto_commit`, `remote_operations` and `check_active_branches` all false) for tasks and decisions. The command ends by printing "run chezmoi apply to add it to the qmd index". Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
 
 **Package registries.** The Claude Code sandbox may reach exactly `pypi.org`, `files.pythonhosted.org` and `registry.npmjs.org`, and may write `~/.cache/uv` and `~/.npm`. Other registries are added here, by PR, when a project needs them. Codex keeps `network_access = false`: its domain-allowlist proxy does not yet resolve allowlisted hosts inside the Linux sandbox (openai/codex#22387), so a Codex lane asks for approval (`on-request`) to run an install outside the sandbox.
 
-**One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, `decisions.md` and task updates in the knowledge repository.
+**One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, backlog tasks and decisions in the knowledge repository.
+
 ### Cortex knowledge search (qmd)
 
 [qmd](https://www.npmjs.com/package/@tobilu/qmd) (MIT) indexes the Markdown in
@@ -379,17 +380,34 @@ every `~/cortex/*` repository for local keyword and semantic search.
   apply time, so no project detail lives in this public source. After adding a
   repository run `chezmoi apply`.
 - **Timer:** the user timer `qmd-index.timer` (every 15 minutes, `OnCalendar=*:0/15`)
-  runs `qmd update` then `qmd embed`: plain indexing, no agent runs. It is enabled
-  through a chezmoi-managed symlink, and `users.sh` enables lingering for `agent`
-  so it fires without a login session.
-- **Models:** `install.sh` (through the chezmoi tools script) runs `qmd pull`,
-  `qmd update` and `qmd embed`, so the GGUF models are downloaded into
-  `~/.cache/qmd/models` outside the sandbox. Agent sessions and the timer never download.
-- **MCP:** the same script registers `qmd` for Claude Code at user scope
-  (`claude mcp add --scope user qmd -- ~/.local/bin/qmd mcp`, stdio), replacing any
-  earlier entry.
-- **Tests:** `python3 ci/qmd-test.py [chezmoi]` checks the pin, the rendered config
-  and the units; `ci/lint.sh` runs it with the pinned chezmoi.
+  runs `~/.local/bin/qmd-refresh`: plain indexing, no agent runs. `users.sh` enables
+  lingering for `agent` so it fires without a login session.
+- **Freshness:** before `qmd update` and `qmd embed`, `qmd-refresh` fetches and
+  fast-forwards (`--ff-only`) every `~/cortex/*` checkout that has an `origin`, is on
+  `main` and is clean. It leaves every other checkout alone and logs why it skipped
+  it (`journalctl --user -u qmd-index`). Git authenticates through the agent's
+  `~/.gitconfig` credential helper (`gh auth git-credential`, so the agent's `gh`
+  login), with prompts disabled: a failed fetch is logged and makes the unit fail,
+  while indexing still runs.
+- **Setup:** after `chezmoi init --apply`, `install.sh` starts agent's user manager
+  (`system/user-systemd.sh`) and runs `~/.local/share/bootstrap/qmd-setup.sh` as agent
+  with the user bus. It renders `index.yml`, runs `qmd pull`, `qmd update` and
+  `qmd embed` (models land in `~/.cache/qmd/models`, outside the sandbox; agent
+  sessions and the timer never download), enables and checks the timer, and registers
+  the MCP server at user scope (`claude mcp add --scope user qmd -- ~/.local/bin/qmd mcp`,
+  stdio, replacing any earlier entry). Each step is fatal on error and re-runnable.
+- **GPU:** node-llama-cpp's prebuilt CUDA backend needs `libcudart.so.13` and
+  `libcublas.so.13`, which the WSL driver does not provide (only `libcuda` comes from
+  `/usr/lib/wsl/lib`). The tools script unpacks the hash-pinned NVIDIA wheels
+  (`CUDA_RUNTIME_*`, `CUBLAS_*` in `pins.env`, cached in `~/.cache/bootstrap/cuda-wheels`)
+  next to the backend library, which finds them through its `$ORIGIN` runpath: no root and
+  no environment variables. Vulkan is not an option here: only the CPU `lvp` device is
+  installed. If the qmd pin moves to a node-llama-cpp built for another CUDA major
+  version, update those two pins. Check with
+  `~/.local/share/bootstrap/npm/node_modules/.bin/node-llama-cpp inspect gpu`.
+- **Tests:** `python3 ci/qmd-test.py [chezmoi]` checks the pin, the rendered config,
+  the units, the install wiring and `qmd-refresh` against real temporary git
+  repositories; `ci/lint.sh` runs it with the pinned chezmoi.
 
 ## Pins and repeatability
 
