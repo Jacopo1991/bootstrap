@@ -63,12 +63,12 @@ function Get-BackrestSources {
 function New-BackrestConfig {
     param([Parameter(Mandatory)][string[]]$Sources, [string]$Distro = 'AgentDev', [string]$RepoPath = $script:BackrestRepoPath)
     $schedule = { param($cron) [ordered]@{ cron = $cron; clock = 'CLOCK_LOCAL' } }
-    # No password on purpose: the founder sets it in the web UI. autoInit creates the restic
+    # No password on purpose: the founder sets it in the web UI. autoInitialize creates the restic
     # repository the first time a password is saved.
     $repo = [ordered]@{
         id = 'restic'
         uri = $RepoPath
-        autoInit = $true
+        autoInitialize = $true
         autoUnlock = $true
         prunePolicy = [ordered]@{ schedule = (& $schedule $script:BackrestPruneCron); maxUnusedPercent = 10 }
         checkPolicy = [ordered]@{ schedule = (& $schedule $script:BackrestCheckCron); readDataSubsetPercent = 5 }
@@ -88,7 +88,7 @@ function New-BackrestConfig {
         retention = [ordered]@{ policyTimeBucketed = [ordered]@{ daily = 7; weekly = 4; monthly = 6 } }
         hooks = @($startDistro)
     }
-    return [ordered]@{ modno = 1; version = 4; instance = 'founder-windows'; repos = @($repo); plans = @($plan) }
+    return [ordered]@{ modno = 1; version = 6; instance = 'founder-windows'; repos = @($repo); plans = @($plan) }
 }
 
 function Merge-BackrestConfig {

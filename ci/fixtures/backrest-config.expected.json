@@ -1,12 +1,12 @@
 {
   "modno": 1,
-  "version": 4,
+  "version": 6,
   "instance": "founder-windows",
   "repos": [
     {
       "id": "restic",
       "uri": "C:\\backups\\restic",
-      "autoInit": true,
+      "autoInitialize": true,
       "autoUnlock": true,
       "prunePolicy": {
         "schedule": { "cron": "30 3 * * 0", "clock": "CLOCK_LOCAL" },

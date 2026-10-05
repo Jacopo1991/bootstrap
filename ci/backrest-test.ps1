@@ -63,22 +63,22 @@ try {
 Write-Output 'backrest-test.ps1 OK'
 
 if ($Live) {
-    $live = Join-Path ([IO.Path]::GetTempPath()) ('backrest-live-' + [Guid]::NewGuid().ToString('N'))
+    $liveRoot = Join-Path ([IO.Path]::GetTempPath()) ('backrest-live-' + [Guid]::NewGuid().ToString('N'))
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $listener.Start(); $port = $listener.LocalEndpoint.Port; $listener.Stop()
     $process = $null
     try {
-        $bin = Join-Path $live 'bin'; $data = Join-Path $live 'data'; $source = Join-Path $live 'source'
-        New-Item -ItemType Directory -Force -Path $data, $source, (Join-Path $live 'repo') | Out-Null
+        $bin = Join-Path $liveRoot 'bin'; $data = Join-Path $liveRoot 'data'; $source = Join-Path $liveRoot 'source'
+        New-Item -ItemType Directory -Force -Path $data, $source, (Join-Path $liveRoot 'repo') | Out-Null
         Set-Content -LiteralPath (Join-Path $source 'hello.txt') -Value 'hello'
         Install-BackrestBinary -InstallDirectory $bin
         Write-Output 'PASS: pinned Backrest and restic downloaded, hashes verified'
-        $config = New-BackrestConfig -Sources @($source) -RepoPath (Join-Path $live 'repo')
-        $configFile = Join-Path $live 'config.json'
+        $config = New-BackrestConfig -Sources @($source) -RepoPath (Join-Path $liveRoot 'repo')
+        $configFile = Join-Path $liveRoot 'config.json'
         [IO.File]::WriteAllText($configFile, (ConvertTo-BackrestJson -Config $config), [Text.UTF8Encoding]::new($false))
-        $launcherFile = Join-Path $live 'start.ps1'
-        [IO.File]::WriteAllText($launcherFile, (Get-BackrestLauncherText -Base $live -ConfigFile $configFile -BinDirectory $bin -Port "127.0.0.1:$port"))
-        $log = Join-Path $live 'out.log'; $errLog = Join-Path $live 'err.log'
+        $launcherFile = Join-Path $liveRoot 'start.ps1'
+        [IO.File]::WriteAllText($launcherFile, (Get-BackrestLauncherText -Base $liveRoot -ConfigFile $configFile -BinDirectory $bin -Port "127.0.0.1:$port"))
+        $log = Join-Path $liveRoot 'out.log'; $errLog = Join-Path $liveRoot 'err.log'
         $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $process = Start-Process -FilePath $powerShell -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launcherFile) `
             -WorkingDirectory $env:SystemRoot -RedirectStandardOutput $log -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
@@ -95,12 +95,12 @@ if ($Live) {
         if ($text -match 'FATAL') { throw "FATAL in Backrest log:`n$text" }
         Write-Output 'PASS: Backrest stayed up, no FATAL in log'
     } finally {
-        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='backrest.exe'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($live) })) {
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='backrest.exe'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($liveRoot) })) {
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
         if ($null -ne $process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
         Start-Sleep -Seconds 1
-        Remove-Item -LiteralPath $live -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $liveRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     Write-Output 'backrest live smoke OK'
 }
