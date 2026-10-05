@@ -19,7 +19,7 @@ import tomllib
 EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
                      "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just",
                      "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
-                     "verify-enable", "new-project", "qmd-refresh"}
+                     "verify-enable", "new-project", "qmd-refresh", "gh-skill-update"}
 VERSION_COMMANDS = {
     "claude": ["claude", "--version"],
     "codex": ["codex", "--version"],
@@ -94,6 +94,27 @@ def osv_db_findings(home: Path, now: float) -> list[str]:
     except OSError:
         return ["osv-db-never-refreshed"]
     return ["osv-db-stale"] if age > OSV_DB_MAX_AGE else []
+
+
+SKILLS_SOURCE = "Jacopo1991/cortex-core"
+
+
+def unexpected_skills(directory: Path) -> list[str]:
+    """Skills not installed by `gh skill` from cortex-core (hand copies, other sources).
+
+    gh writes the source repository into the SKILL.md frontmatter, so a skill folder
+    is expected when its frontmatter names SKILLS_SOURCE.
+    """
+    unexpected = []
+    for name in sorted(installed_names(directory)):
+        try:
+            head = (directory / name / "SKILL.md").read_text(encoding="utf-8").split("\n---", 2)
+            frontmatter = head[0] if len(head) > 1 else ""
+        except (OSError, UnicodeDecodeError):
+            frontmatter = ""
+        if SKILLS_SOURCE not in frontmatter:
+            unexpected.append(name)
+    return unexpected
 
 
 def unexpected_global_binaries(home: Path) -> list[str]:
@@ -216,9 +237,9 @@ def scan(root: Path, home: Path) -> list[str]:
     findings.update(osv_db_findings(home, time.time()))
     extras = unexpected_global_binaries(home)
     findings.update("global-cli-outside-bootstrap:" + name for name in extras)
-    for rel in (".agents/skills", ".claude/skills"):
-        names = installed_names(home / rel)
-        findings.update("global-skill-outside-bootstrap:" + name for name in names)
+    for rel in (".agents/skills", ".claude/skills", ".codex/skills"):
+        findings.update("global-skill-outside-bootstrap:" + name
+                        for name in unexpected_skills(home / rel))
     for name in configured_mcp_names(home):
         findings.add("mcp-outside-empty-baseline:" + name)
     for name in configured_plugin_names(home):

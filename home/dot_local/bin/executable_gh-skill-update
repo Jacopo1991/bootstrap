@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Update the cortex-core skills that skills-setup.sh installed with `gh skill`. Plain
+# update, no agent runs: gh-skill-update.timer runs it daily; run it by hand from a normal
+# shell to update now. Any failure is printed and makes the command (and the timer's unit)
+# fail, so it shows in `systemctl --user --failed` and the journal.
+set -uo pipefail
+output=$(gh skill update --all 2>&1)
+status=$?
+printf '%s\n' "$output"
+if [ $status -ne 0 ]; then
+  echo "ERROR gh skill update --all exited with status $status" >&2
+  exit 1
+fi
+if printf '%s\n' "$output" | grep -qiE '(^|[^a-z])(failed|error)([^a-z]|$)'; then
+  echo 'ERROR gh skill update --all reported a failure above' >&2
+  exit 1
+fi
+echo 'Skills current.'
