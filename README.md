@@ -366,6 +366,30 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 **Package registries.** The Claude Code sandbox may reach exactly `pypi.org`, `files.pythonhosted.org` and `registry.npmjs.org`, and may write `~/.cache/uv` and `~/.npm`. Other registries are added here, by PR, when a project needs them. Codex keeps `network_access = false`: its domain-allowlist proxy does not yet resolve allowlisted hosts inside the Linux sandbox (openai/codex#22387), so a Codex lane asks for approval (`on-request`) to run an install outside the sandbox.
 
 **One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, `decisions.md` and task updates in the knowledge repository.
+### Cortex knowledge search (qmd)
+
+[qmd](https://www.npmjs.com/package/@tobilu/qmd) (MIT) indexes the Markdown in
+every `~/cortex/*` repository for local keyword and semantic search.
+
+- **Pin:** `@tobilu/qmd` 2.8.3 in the npm lockfile (v2); `tools.sh` links
+  `~/.local/bin/qmd`. The monthly pin updater leaves it alone, so bump it by hand.
+- **Config:** chezmoi renders `~/.config/qmd/index.yml` with one collection per
+  non-hidden `~/cortex/*` directory (mask `**/*.md`). Each one-line context is
+  `<repo>: <title>` taken from that repository's `INTENT.md` front matter at
+  apply time, so no project detail lives in this public source. After adding a
+  repository run `chezmoi apply`.
+- **Timer:** the user timer `qmd-index.timer` (every 15 minutes, `OnCalendar=*:0/15`)
+  runs `qmd update` then `qmd embed`: plain indexing, no agent runs. It is enabled
+  through a chezmoi-managed symlink, and `users.sh` enables lingering for `agent`
+  so it fires without a login session.
+- **Models:** `install.sh` (through the chezmoi tools script) runs `qmd pull`,
+  `qmd update` and `qmd embed`, so the GGUF models are downloaded into
+  `~/.cache/qmd/models` outside the sandbox. Agent sessions and the timer never download.
+- **MCP:** the same script registers `qmd` for Claude Code at user scope
+  (`claude mcp add --scope user qmd -- ~/.local/bin/qmd mcp`, stdio), replacing any
+  earlier entry.
+- **Tests:** `python3 ci/qmd-test.py [chezmoi]` checks the pin, the rendered config
+  and the units; `ci/lint.sh` runs it with the pinned chezmoi.
 
 ## Pins and repeatability
 
@@ -374,7 +398,7 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 | Ubuntu WSL image (24.04.5 amd64) and SHA-256 | `windows/new-distro.ps1` |
 | chezmoi, mise, Node 24 LTS, Python 3.12, uv, native Claude Code, bws, SecretSpec | `home/.chezmoitemplates/pins.env` |
 | Node/Python/uv global tools | `home/dot_config/mise/config.toml` |
-| Codex CLI, ccusage and Backlog.md, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
+| Codex CLI, ccusage, Backlog.md and qmd, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
 | Explicit apt package versions (held after install) | `system/apt-*.lock` |
 | Ubuntu dependency resolution | Signed Ubuntu snapshot `20260930T000000Z` |
 | apt signing key hashes | `home/.chezmoitemplates/pins.env` |

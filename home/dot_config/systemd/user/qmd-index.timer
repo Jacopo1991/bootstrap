@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the qmd index refresh every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

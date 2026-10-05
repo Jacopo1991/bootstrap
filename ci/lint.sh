@@ -36,5 +36,6 @@ CHEZMOI_GIT_NAME='Bootstrap CI' CHEZMOI_GIT_EMAIL='bootstrap-ci@example.invalid'
 "$tmp/chezmoi" --source "$ROOT" --destination "$tmp/home" --config "$tmp/chezmoi.toml" \
   execute-template < home/dot_gitconfig.tmpl > "$tmp/gitconfig"
 python3 ci/git-credentials-test.py "$tmp/gitconfig"
+python3 ci/qmd-test.py "$tmp/chezmoi"
 "$tmp/gitleaks" git --redact --no-banner .
 "$tmp/gitleaks" dir --redact --no-banner .
