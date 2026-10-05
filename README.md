@@ -409,6 +409,41 @@ every `~/cortex/*` repository for local keyword and semantic search.
   the units, the install wiring and `qmd-refresh` against real temporary git
   repositories; `ci/lint.sh` runs it with the pinned chezmoi.
 
+### Verification pack (Playwright)
+
+Tooling for SPEC-0015 (independent black-box verification of a task's acceptance
+criteria); the method is in `skills-proposed/verify-ui/SKILL.md` for the PM to move
+into cortex-core's `skills/`.
+
+- **Pin:** `@playwright/test`, `@playwright/mcp` and `@axe-core/playwright` in the npm
+  lockfile. `@playwright/mcp` only ships builds pinned to a Playwright alpha, so the
+  whole set runs on that alpha build (`@playwright/test` and `playwright-core` carry
+  the same version; an npm `overrides` entry stops axe-core's open peer range from
+  pulling a second copy). Bump `@playwright/mcp` to the newest release and set the
+  other two to the version its `playwright` dependency names; `ci/verification-pack-test.py`
+  checks that they match.
+- **Browser:** `~/.local/bin/playwright` and `playwright-mcp` wrap the pinned binaries
+  with one shared cache (`PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright`) that
+  sessions, the MCP server and test runs all use. `install.sh` runs
+  `~/.local/share/bootstrap/verify-setup.sh` as agent after `qmd-setup.sh`, outside the
+  sandbox: it downloads Chromium for the pinned version and registers the MCP server
+  at user scope (`claude mcp add --scope user playwright -- ~/.local/bin/playwright-mcp`,
+  stdio, headless Chromium). Nothing downloads at test time. Chromium also needs its
+  shared libraries (`libnss3`, `libnspr4`, `libasound2t64`, and the like) installed
+  on the machine.
+- **Per project:** the founder or the PM runs `verify-enable <knowledge-repo>` (a
+  `cortex-kb-<name>` checkout) from a normal shell. It adds `acceptance/` (Playwright
+  config with desktop and phone viewports, trace and screenshot on failure, no HTML
+  report; an example test tagged `@EXAMPLE-AC1`; axe-core helper), links
+  `acceptance/node_modules` to the pinned install, and adds a `just verify <url> [tag]`
+  recipe to the repository's `justfile` (needs `just`). Evidence goes to
+  `~/project-data/<project>/verification/<run>/`. Existing files are kept; a different
+  config is never overwritten.
+- **Tests:** `python3 ci/verification-pack-test.py` checks the pins and version match,
+  the wiring, `verify-enable` against temporary repositories and, when the pinned install
+  is present, that the written config loads. It also runs the example against a local
+  static page when a startable Chromium is in the shared cache.
+
 ### Local quality gate (pre-commit)
 
 Every project repository runs the same checks before each commit, replacing the
@@ -480,7 +515,7 @@ PyPI and about six for npm (its database is about 200 MB).
 | Ubuntu WSL image (24.04.5 amd64) and SHA-256 | `windows/new-distro.ps1` |
 | chezmoi, mise, Node 24 LTS, Python 3.12, uv, native Claude Code, bws, SecretSpec | `home/.chezmoitemplates/pins.env` |
 | Node/Python/uv global tools | `home/dot_config/mise/config.toml` |
-| Codex CLI, ccusage, Backlog.md and qmd, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
+| Codex CLI, ccusage, Backlog.md, qmd and Playwright (test, MCP, axe-core), including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
 | Explicit apt package versions (held after install) | `system/apt-*.lock` |
 | Ubuntu dependency resolution | Signed Ubuntu snapshot `20260930T000000Z` |
 | apt signing key hashes | `home/.chezmoitemplates/pins.env` |

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Add the acceptance setup (SPEC-0015 verification pack) to a knowledge repository.
+# Run by the founder or the PM from a normal shell as the agent user, never from inside an agent session.
+#   verify-enable <knowledge-repo>   add acceptance/ (Playwright config, example tagged test, axe-core
+#                                    wiring) and a `just verify` target; existing files are kept
+set -euo pipefail
+
+[ $# -eq 1 ] || { echo "usage: verify-enable <knowledge-repo>" >&2; exit 2; }
+here="$(cd -- "$(dirname -- "$0")" && pwd)"
+share="$(cd -- "$here/../share/bootstrap" && pwd)"
+templates="$share/verification"
+modules="$share/npm/node_modules"
+command -v playwright >/dev/null || { echo "playwright is not on PATH; run the bootstrap install first" >&2; exit 1; }
+[ -d "$modules" ] || { echo "$modules is missing; run the bootstrap install first" >&2; exit 1; }
+repo=$(git -C "$1" rev-parse --show-toplevel)
+case "$(basename "$repo")" in
+  cortex-kb-?*) project=$(basename "$repo"); project=${project#cortex-kb-} ;;
+  *) echo "$repo is not a knowledge repository (expected a cortex-kb-<name> checkout)" >&2; exit 1 ;;
+esac
+acceptance="$repo/acceptance"
+
+# The managed files must match unless the repository has none yet; the example test and
+# .gitignore are written only once so a project can replace them.
+if [ -e "$acceptance/playwright.config.ts" ] && ! cmp -s "$templates/playwright.config.ts" "$acceptance/playwright.config.ts"; then
+  echo "$acceptance/playwright.config.ts exists and differs from the standard config; merge it by hand. Nothing changed." >&2
+  exit 1
+fi
+if [ -e "$acceptance/axe.ts" ] && ! cmp -s "$templates/axe.ts" "$acceptance/axe.ts"; then
+  echo "$acceptance/axe.ts exists and differs from the standard helper; merge it by hand. Nothing changed." >&2
+  exit 1
+fi
+
+wrote=()
+put() {  # put <template> <destination name>
+  if [ ! -e "$acceptance/$2" ]; then
+    cp "$templates/$1" "$acceptance/$2"
+    wrote+=("acceptance/$2")
+  fi
+}
+mkdir -p "$acceptance"
+put playwright.config.ts playwright.config.ts
+put axe.ts axe.ts
+put example.spec.ts example.spec.ts
+put acceptance.gitignore .gitignore
+# Tests import Playwright and axe-core from the one pinned install.
+ln -sfn "$modules" "$acceptance/node_modules"
+
+recipe_file="$repo/justfile"
+if [ -e "$recipe_file" ] && grep -qE '^verify([[:space:]]|:)' "$recipe_file"; then
+  echo "justfile already has a verify recipe; kept."
+else
+  { [ ! -s "$recipe_file" ] || printf '\n'; sed "s/@PROJECT@/$project/g" "$templates/verify.just"; } >> "$recipe_file"
+  wrote+=("justfile")
+fi
+
+if [ ${#wrote[@]} -eq 0 ]; then
+  echo "Acceptance setup in $repo is already in place."
+else
+  printf 'Wrote: %s\n' "${wrote[*]}"
+  echo "Next: commit acceptance/ and justfile on a branch and open a pull request."
+fi
+echo "Run it with: just verify <app-url>   (evidence: ~/project-data/$project/verification/<run>/)"

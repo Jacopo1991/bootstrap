@@ -3,9 +3,18 @@
   "private": true,
   "version": "1.0.0",
   "dependencies": {
+    "@axe-core/playwright": "4.13.0",
     "@openai/codex": "0.159.2",
+    "@playwright/mcp": "0.0.83",
+    "@playwright/test": "1.64.0-alpha-1790635538000",
     "@tobilu/qmd": "2.8.3",
     "backlog.md": "1.53.0",
-    "ccusage": "20.0.26"
+    "ccusage": "20.0.26",
+    "playwright-core": "1.64.0-alpha-1790635538000"
+  },
+  "overrides": {
+    "@axe-core/playwright": {
+      "playwright-core": "$playwright-core"
+    }
   }
 }
