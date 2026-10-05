@@ -52,12 +52,30 @@ class PinTests(unittest.TestCase):
             self.assertTrue(entry["resolved"].startswith("https://registry.npmjs.org/"), path)
             self.assertTrue(entry["integrity"].startswith("sha512-"), path)
 
-    def test_tools_script_links_qmd_and_registers_mcp(self):
+    def test_tools_script_links_qmd_and_installs_pinned_cuda_libraries(self):
         tools = (ROOT / "home/.chezmoitemplates/tools.sh").read_text()
         self.assertIn('ln -sfn "$npm_root/node_modules/.bin/qmd" "$HOME/.local/bin/qmd"', tools)
-        self.assertIn('mcp add --scope user qmd -- "$HOME/.local/bin/qmd" mcp', tools)
-        for step in ("qmd\" pull", "qmd\" update", "qmd\" embed"):
-            self.assertIn(step, tools)
+        pins = (ROOT / "home/.chezmoitemplates/pins.env").read_text()
+        for key in ("CUDA_RUNTIME", "CUBLAS"):
+            self.assertIn(f"{key}_URL='https://files.pythonhosted.org/", pins)
+            self.assertRegex(pins, rf"{key}_SHA256='[0-9a-f]{{64}}'")
+            self.assertIn(f"${key}_URL", tools)
+        for library in ("libcudart.so.13", "libcublas.so.13", "libcublasLt.so.13"):
+            self.assertIn(library, tools)
+
+    def test_setup_script_does_every_step_and_hides_no_error(self):
+        setup = (ROOT / "home/dot_local/share/bootstrap/executable_qmd-setup.sh").read_text()
+        order = ["apply \"$HOME/.config/qmd/index.yml\"", "qmd pull", "qmd update", "qmd embed",
+                 "enable --now qmd-index.timer", "mcp add --scope user qmd"]
+        positions = [setup.index(step) for step in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("|| true\n", setup.replace("grep -E '^(CUDA|Vulkan):' || true\n", ""))
+        self.assertNotIn("2>/dev/null", setup)
+        install = (ROOT / "install.sh").read_text()
+        self.assertIn("system/user-systemd.sh", install)
+        self.assertIn("qmd-setup.sh", install)
+        self.assertLess(install.index("chezmoi --source"), install.index("qmd-setup.sh"))
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS", install)
 
 
 @unittest.skipUnless(CHEZMOI, "chezmoi not available")
@@ -112,6 +130,106 @@ class RenderedConfigTests(unittest.TestCase):
         self.assertIn("# d", config["collections"]["cortex-kb-x"]["context"]["/"])
 
 
+class RefreshTests(unittest.TestCase):
+    """qmd-refresh fast-forwards only clean main checkouts that have an origin."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.temp = Path(self._temp.name)
+        self.cortex = self.temp / "cortex"
+        self.cortex.mkdir()
+        bin_dir = self.temp / "bin"
+        bin_dir.mkdir()
+        # Record qmd calls instead of indexing.
+        self.calls = self.temp / "qmd-calls"
+        stub = bin_dir / "qmd"
+        stub.write_text(f'#!/bin/sh\necho "$1" >> {self.calls}\n[ "$1" != embed ] || exit "${{QMD_STUB_EMBED_EXIT:-0}}"\n')
+        stub.chmod(0o755)
+        self.env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(self.temp),
+            "QMD_CORTEX_DIR": str(self.cortex), "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+        # The script prepends ~/.local/bin; point HOME's one at the stub too.
+        (self.temp / ".local/bin").mkdir(parents=True)
+        (self.temp / ".local/bin/qmd").symlink_to(stub)
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def make_origin(self, name):
+        origin = self.temp / "origin" / name
+        origin.mkdir(parents=True)
+        self.git(origin, "init", "-q", "-b", "main")
+        (origin / "a.md").write_text("one\n")
+        self.git(origin, "add", "-A")
+        self.git(origin, "commit", "-q", "-m", "one")
+        clone = self.cortex / name
+        self.git(self.temp, "clone", "-q", str(origin), str(clone))
+        return origin, clone
+
+    def advance(self, origin):
+        (origin / "b.md").write_text("two\n")
+        self.git(origin, "add", "-A")
+        self.git(origin, "commit", "-q", "-m", "two")
+        return self.git(origin, "rev-parse", "HEAD")
+
+    def refresh(self):
+        return subprocess.run(["bash", str(ROOT / "home/dot_local/bin/executable_qmd-refresh")],
+                              env=self.env, capture_output=True, text=True)
+
+    def test_fast_forwards_clean_main_and_skips_everything_else(self):
+        origin, clean = self.make_origin("clean")
+        head = self.advance(origin)
+        dirty_origin, dirty = self.make_origin("dirty")
+        dirty_head = self.advance(dirty_origin)
+        (dirty / "a.md").write_text("local edit\n")
+        branch_origin, branch = self.make_origin("branch")
+        branch_head = self.advance(branch_origin)
+        self.git(branch, "switch", "-q", "-c", "topic")
+        diverged_origin, diverged = self.make_origin("diverged")
+        (diverged / "c.md").write_text("local\n")
+        self.git(diverged, "add", "-A")
+        self.git(diverged, "commit", "-q", "-m", "local commit")
+        diverged_head = self.git(diverged, "rev-parse", "HEAD")
+        self.advance(diverged_origin)
+        (self.cortex / "no-origin").mkdir()
+        self.git(self.cortex / "no-origin", "init", "-q", "-b", "main")
+        (self.cortex / "plain-dir").mkdir()
+        (self.cortex / ".worktrees").mkdir()
+        (self.cortex / "stray.md").write_text("x")
+
+        result = self.refresh()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(clean, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(dirty, "rev-parse", "HEAD"), self.git(dirty, "rev-parse", "main"))
+        self.assertNotEqual(self.git(dirty, "rev-parse", "HEAD"), dirty_head)
+        self.assertEqual((dirty / "a.md").read_text(), "local edit\n")
+        self.assertNotEqual(self.git(branch, "rev-parse", "main"), branch_head)
+        self.assertEqual(self.git(diverged, "rev-parse", "HEAD"), diverged_head)
+        for line in ("ok clean: updated", "skip dirty: working tree not clean",
+                     "skip branch: on topic, not main", "skip diverged: main cannot fast-forward",
+                     "skip no-origin: no origin", "skip plain-dir: not a git checkout"):
+            self.assertIn(line, result.stdout)
+        self.assertNotIn(".worktrees", result.stdout)
+        self.assertEqual(self.calls.read_text().split(), ["update", "embed"])
+
+    def test_fetch_failure_is_reported_but_indexing_still_runs(self):
+        _, repo = self.make_origin("gone")
+        self.git(repo, "remote", "set-url", "origin", str(self.temp / "does-not-exist"))
+        result = self.refresh()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR gone: git fetch failed", result.stderr)
+        self.assertEqual(self.calls.read_text().split(), ["update", "embed"])
+
+    def test_indexing_failure_fails_the_unit(self):
+        self.env["QMD_STUB_EMBED_EXIT"] = "3"
+        self.assertEqual(self.refresh().returncode, 1)
+
+
 class UnitTests(unittest.TestCase):
     def test_service_only_indexes(self):
         service = units("qmd-index.service")
@@ -119,7 +237,7 @@ class UnitTests(unittest.TestCase):
         # configparser keeps only the last duplicate key, so read the raw lines.
         lines = (UNITS / "qmd-index.service").read_text().splitlines()
         exec_lines = [line.split("=", 1)[1] for line in lines if line.startswith("ExecStart")]
-        self.assertEqual(exec_lines, ["%h/.local/bin/qmd update", "%h/.local/bin/qmd embed"])
+        self.assertEqual(exec_lines, ["%h/.local/bin/qmd-refresh"])
         self.assertFalse([line for line in lines if line.startswith("ExecStartPre")])
 
     def test_timer_every_fifteen_minutes_and_enabled(self):
@@ -131,7 +249,7 @@ class UnitTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not available")
     def test_systemd_accepts_the_timer_calendar(self):
-        result = subprocess.run(["systemd-analyze", "calendar", "--iterations=3", "*:0/15"],
+        result = subprocess.run(["systemd-analyze", "calendar", "--iterations=4", "*:0/15"],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         for minute in (":15:00", ":30:00", ":45:00"):

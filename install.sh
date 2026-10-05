@@ -45,4 +45,13 @@ cd /tmp
 sudo -H -u agent env PATH=/usr/local/bin:/usr/bin:/bin \
   CHEZMOI_GIT_NAME="${CHEZMOI_GIT_NAME:-}" CHEZMOI_GIT_EMAIL="${CHEZMOI_GIT_EMAIL:-}" \
   chezmoi --source /opt/machine-bootstrap/current init --apply
+
+# qmd needs the agent's user systemd (timer) and runs outside agent sessions:
+# render its config, pull models, build the index, start the timer, register the MCP server.
+sudo "$bash_cmd" "$ROOT/system/user-systemd.sh"
+agent_uid=$(id -u agent)
+sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
+  XDG_RUNTIME_DIR="/run/user/$agent_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$agent_uid/bus" \
+  BOOTSTRAP_SOURCE=/opt/machine-bootstrap/current \
+  bash /home/agent/.local/share/bootstrap/qmd-setup.sh
 echo 'Bootstrap applied. Restart this distro before the WSL boundary checks.'
