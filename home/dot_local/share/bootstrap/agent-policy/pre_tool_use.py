@@ -91,20 +91,23 @@ def git_metadata(root: Path) -> tuple[Path, ...] | None:
 
 
 def folder_delete_reason(folder: Path, root: Path | None,
-                         metadata: tuple[Path, ...] | None) -> str | None:
-    """Deleting an ordinary folder inside the repository is fine; nothing that holds
-    Git metadata (the repository root, a .git entry, a nested repository or a
-    separate Git directory) may be deleted."""
+                         metadata: tuple[Path, ...] | None, action: str = "Deleting") -> str | None:
+    """Deleting or staging an ordinary folder inside the repository is fine; nothing
+    that holds Git metadata (the repository root, a .git entry, a nested repository,
+    or a Git directory under any name) may be deleted or staged as a folder."""
     if root is None or metadata is None:
-        return "Cannot identify the repository safely; folder deletion blocked."
+        return f"Cannot identify the repository safely; {action.lower()} folders is blocked."
     target = folder.resolve()
     if target == Path(root).resolve():
-        return "Deleting the repository root is blocked."
+        return f"{action} the repository root as a folder is blocked."
     if any(path == target or target in path.parents for path in metadata):
-        return "Deleting Git metadata is blocked."
+        return f"{action} Git metadata is blocked."
     for current, dirs, files in os.walk(target):
-        if ".git" in dirs or ".git" in files:
-            return "Deleting folders that contain Git metadata is blocked."
+        here = Path(current)
+        if (".git" in dirs or ".git" in files or (here / "HEAD").is_file() and (
+                (here / "commondir").is_file()
+                or (here / "objects").is_dir() and (here / "refs").is_dir())):
+            return f"{action} folders that contain Git metadata is blocked."
     return None
 
 
@@ -539,9 +542,14 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
             return "Agent staging requires explicit non-metadata file paths."
         if any(protected_git_path(arg, str(target), metadata) for arg in operands):
             return "Git file operands cannot modify or stage protected repository metadata."
-        if subcommand in {"add", "mv", "rm", "restore"} and any(
-                (target / arg).is_dir() for arg in operands):
+        folders = [arg for arg in operands if (target / arg).is_dir()]
+        if folders and subcommand in {"mv", "rm", "restore"}:
             return "Git directory mutations are blocked; use explicit non-metadata file paths."
+        if folders and subcommand == "add":
+            for arg in folders:
+                reason = folder_delete_reason(target / arg, target_root, metadata, "Staging")
+                if reason:
+                    return reason
     if subcommand == "config" and not git_config_read_only(arguments):
         return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
     if cross_repo and not sibling_fetch:

@@ -478,6 +478,18 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git add --chmod=+x safe.txt"), roots) is None
     assert policy.evaluate(event("git add --chmod=-x safe.txt"), roots) is None
 
+    # Ordinary folders may be staged and deleted; folders holding a Git directory
+    # under any name (here nested-control) may not, and neither may the root.
+    (current / "plain-folder" / "sub").mkdir(parents=True)
+    (current / "plain-folder" / "sub" / "note.txt").write_text("fixture")
+    (current / "holds-control").mkdir()
+    subprocess.run(["git", "init", "-q", "--separate-git-dir=" + str(current / "holds-control" / "inner-control"),
+                    str(current / "holds-control-worktree")], check=True)
+    for command in ("git add plain-folder", "git add plain-folder/sub", "git add -- plain-folder"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in ("git add holds-control", "git add ./", "rm -r holds-control", "rm -rf holds-control"):
+        assert policy.evaluate(event(command), roots) is not None, command
+
     # A real current-repository branch switch/creation must pass the guard.
     # Keep global/attached configuration override variants denied.
     for executable in ("git", "/usr/bin/git"):
