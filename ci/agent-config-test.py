@@ -38,13 +38,7 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False,
     # Package registries for `uv sync` and the one writable cache path, nothing wider.
-    # github.com and api.github.com: a git/gh command is only unsandboxed (excludedCommands) when
-    # it is the whole command. Chains such as `git fetch | tail` or `git log && git status`
-    # (allowed by the policy hook for git/gh plus read-only text tools) run sandboxed, and
-    # failed with "CONNECT tunnel failed, response 403" until these two hosts were allowed.
-    # Manual check: `git ls-remote origin HEAD` works, `git ls-remote origin HEAD | head -1` fails.
-    "network": {"allowedDomains": ["github.com", "api.github.com", "pypi.org",
-                                   "files.pythonhosted.org", "registry.npmjs.org"]},
+    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]},
     "filesystem": {"allowWrite": ["~/.cache/uv", "~/.npm"]}}
 assert 'mkdir -p "$HOME/.cache/uv"' in (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
@@ -661,12 +655,12 @@ with tempfile.TemporaryDirectory() as temp:
     # Chains (; && || |) are evaluated segment by segment with the ordinary rules;
     # env/timeout/nice/stdbuf and VAR=value prefixes evaluate the wrapped command.
     for command in ("git status && git log --oneline", "git diff | head -5", "git status; git log",
-                    "git fetch origin && git status", "git log | grep fix | wc -l",
+                    "git log | grep fix | wc -l",
                     "cat safe.txt | sort > copied2.txt", "cd nested; ls",
                     "git log | head -5", "git status && git diff", "git diff | sort | uniq -c | tail -3",
-                    "gh api repos/fixture | jq .name", "git log --oneline | cut -c1-7 | cat",
+                    "git log --oneline | cut -c1-7 | cat",
                     "git status | grep -v x 2>/dev/null", "git log | wc -l > /dev/null",
-                    "git status && gh pr view | head", "timeout 5 git log | head -1",
+                    "timeout 5 git log | head -1",
                     "python3 x.py && ls", "touch y && cat y | sort > z.txt",
                     "echo ok && printf done", "git status && git commit -m fixture",
                     "env FOO=1 git status", "FOO=bar git status", "FOO=bar printf safe",
@@ -674,9 +668,20 @@ with tempfile.TemporaryDirectory() as temp:
                     "nice -n 5 git status", "nice -5 git status", "stdbuf -oL git log",
                     "timeout 5 env FOO=1 nice git status", "env -i git status", "env -u FOO git status",
                     "printf 'a;b|c && d||e'", "gh pr create --body 'one; two && three | four'",
-                    "gh issue list | head", "git status > /dev/null 2>&1", "git status &> /dev/null",
-                    "git push -u origin HEAD && gh pr create --fill"):
+                    "git status > /dev/null 2>&1", "git status &> /dev/null", "gh config get editor | head -1",
+                    "git fetch origin", "git push -u origin HEAD", "timeout 30 git fetch origin"):
         assert policy.evaluate(event(command), roots) is None, command
+    # git/gh network commands run outside the sandbox only on their own; in a chain or pipe
+    # the whole call is sandboxed and cannot reach github.com.
+    for command in ("git fetch origin && git status", "git ls-remote origin HEAD | head -1",
+                    "git status; git pull --ff-only", "git status && git push origin HEAD",
+                    "git clone https://github.com/Jacopo1991/x.git | cat", "timeout 5 git fetch | tail -1",
+                    "git -C . fetch origin && git log", "gh api repos/fixture | jq .name",
+                    "gh issue list | head", "git status && gh pr view | head",
+                    "git push -u origin HEAD && gh pr create --fill"):
+        assert policy.evaluate(event(command), roots) == policy.NETWORK_CHAIN_MESSAGE, command
+    assert policy.NETWORK_CHAIN_MESSAGE == ("Run git/gh network commands on their own; "
+                                            "only then do they run outside the sandbox.")
     for command in (
             # Guards that must still hold inside a chain, behind a pipe, or behind a wrapper.
             "echo x | tee .git/config", "git status && touch .git/config",
