@@ -1,6 +1,6 @@
 // Acceptance suite configuration, written by bootstrap (verify-enable). Run it with `just verify <url>`.
 // Inputs come from the environment: VERIFY_URL (the running app) and VERIFY_OUT (the evidence directory,
-// ~/project-data/<project>/verification/<run>/). Browsers come from the shared cache bootstrap fills at
+// acceptance/evidence/<run>/, gitignored). Browsers come from the shared cache bootstrap fills at
 // install time; nothing is downloaded when tests run.
 import { defineConfig, devices } from '@playwright/test';
 

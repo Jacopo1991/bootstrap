@@ -8,6 +8,7 @@ import glob
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -109,13 +110,55 @@ class WiringTests(unittest.TestCase):
         skill = (ROOT / "skills-proposed/verify-ui/SKILL.md").read_text()
         self.assertTrue(skill.startswith("---\nname: verify-ui\n"))
         for expected in ("Independence", "Role A", "Role B", "verdict.json", "attestation", "read_source",
-                         "~/project-data/<project>/verification/<run>/", "underspecified", "just verify"):
+                         "acceptance/evidence/<run>/", "gitignored", "underspecified", "just verify"):
             self.assertIn(expected, skill)
+        self.assertNotIn("project-data", skill)
         # The documented verdict example is valid JSON.
         block = skill.split("```json\n", 1)[1].split("\n```", 1)[0]
         verdict = json.loads(block)
         self.assertFalse(verdict["attestation"]["read_source"])
         self.assertEqual(verdict["overall"], "fail")
+
+
+CHROMIUM_PACKAGES = """fonts-freefont-ttf fonts-ipafont-gothic fonts-liberation fonts-noto-color-emoji
+fonts-tlwg-loma-otf fonts-unifont fonts-wqy-zenhei libasound2-data libasound2t64 libfontenc1 libice6 libnspr4
+libnss3 libsm6 libxaw7 libxfont2 libxkbfile1 libxmu6 libxpm4 libxt6t64 x11-xkb-utils xfonts-cyrillic
+xfonts-encodings xfonts-scalable xfonts-utils xserver-common xvfb""".split()
+
+
+class ProvisioningTests(unittest.TestCase):
+    def test_chromium_libraries_are_pinned_in_the_apt_base_lock(self):
+        lines = (ROOT / "system/apt-base.lock").read_text().splitlines()
+        pinned = dict(line.split("=", 1) for line in lines)
+        self.assertEqual(len(pinned), len(lines), "duplicate package in the lock")
+        for package in CHROMIUM_PACKAGES:
+            self.assertIn(package, pinned)
+            self.assertRegex(pinned[package], r"^[0-9][0-9A-Za-z.+:~-]*$", package)
+        # The existing entries are still there.
+        for package in ("curl", "git", "bubblewrap", "libimage-exiftool-perl"):
+            self.assertIn(package, pinned)
+
+    def test_install_applies_the_lock_as_root_and_setup_checks_the_libraries(self):
+        install = (ROOT / "install.sh").read_text()
+        self.assertIn('sudo "$bash_cmd" "$ROOT/system/base.sh"', install)
+        base = (ROOT / "system/base.sh").read_text()
+        self.assertIn('apt_locked "$BOOTSTRAP_ROOT/system/apt-base.lock"', base)
+        setup = (SHARE / "executable_verify-setup.sh").read_text()
+        self.assertIn("ldd", setup)
+        self.assertNotIn("apt-get", setup)
+        self.assertNotIn("sudo", setup)
+
+    def test_just_is_a_pinned_hash_verified_binary_linked_into_local_bin(self):
+        pins = (ROOT / "home/.chezmoitemplates/pins.env").read_text()
+        url = re.search(r"^JUST_URL='(https://github\.com/casey/just/releases/download/([0-9.]+)/"
+                        r"just-\2-x86_64-unknown-linux-musl\.tar\.gz)'$", pins, re.M)
+        self.assertTrue(url, "JUST_URL")
+        self.assertTrue(re.search(r"^JUST_SHA256='[0-9a-f]{64}'$", pins, re.M), "JUST_SHA256")
+        tools = (ROOT / "home/.chezmoitemplates/tools.sh").read_text()
+        self.assertIn('download "$JUST_URL" "$JUST_SHA256"', tools)
+        self.assertIn('"$HOME/.local/bin/just"', tools)
+        self.assertIn('[[ $("$HOME/.local/bin/just" --version) == "just ${just_expected%%/*}" ]]', tools)
+        self.assertLess(tools.index("$JUST_URL"), tools.index("npm ci"))
 
 
 class TempTree:
@@ -162,16 +205,25 @@ class VerifyEnableTests(unittest.TestCase):
         result = self.tree.enable(self.repo)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Next: commit acceptance/ and justfile", result.stdout)
-        self.assertIn("~/project-data/demo/verification/<run>/", result.stdout)
+        self.assertIn("acceptance/evidence/<run>/", result.stdout)
         acceptance = self.repo / "acceptance"
         for name in ("playwright.config.ts", "axe.ts", "example.spec.ts"):
             self.assertEqual((acceptance / name).read_text(), (TEMPLATES / name).read_text())
-        self.assertEqual((acceptance / ".gitignore").read_text(), "node_modules\n")
+        self.assertEqual((acceptance / ".gitignore").read_text(), "node_modules\nevidence/\n")
         self.assertEqual(os.readlink(acceptance / "node_modules"), str(self.tree.modules))
         recipe = (self.repo / "justfile").read_text()
         self.assertIn("verify url tag='':", recipe)
-        self.assertIn("$HOME/project-data/demo/verification/", recipe)
-        self.assertNotIn("@PROJECT@", recipe)
+        self.assertIn('out="$PWD/acceptance/evidence/', recipe)
+        self.assertNotIn("project-data", recipe)
+        # The evidence directory really is ignored by git (and tracked files stay visible).
+        evidence = acceptance / "evidence/20260101T000000Z"
+        evidence.mkdir(parents=True)
+        (evidence / "results.json").write_text("{}")
+        status = subprocess.run(["git", "-C", str(self.repo), "status", "--porcelain", "-uall"],
+                                capture_output=True, text=True, env=self.tree.env).stdout
+        self.assertNotIn("evidence", status)
+        self.assertIn("acceptance/playwright.config.ts", status)
+        self.assertNotIn("acceptance/node_modules", status)
         example = (acceptance / "example.spec.ts").read_text()
         self.assertIn("{ tag: '@EXAMPLE-AC1' }", example)
         self.assertIn("expectNoA11yViolations", example)
@@ -186,6 +238,14 @@ class VerifyEnableTests(unittest.TestCase):
         self.assertNotIn("Next:", result.stdout)
         self.assertEqual((self.repo / "acceptance/example.spec.ts").read_text(), "// replaced by the project\n")
         self.assertEqual((self.repo / "justfile").read_text(), before)
+
+    def test_gitignore_only_gains_missing_lines(self):
+        (self.repo / "acceptance").mkdir()
+        (self.repo / "acceptance/.gitignore").write_text("*.log\nnode_modules\n")
+        self.assertEqual(self.tree.enable(self.repo).returncode, 0)
+        self.assertEqual((self.repo / "acceptance/.gitignore").read_text(), "*.log\nnode_modules\nevidence/\n")
+        self.tree.enable(self.repo)
+        self.assertEqual((self.repo / "acceptance/.gitignore").read_text(), "*.log\nnode_modules\nevidence/\n")
 
     def test_appends_to_an_existing_justfile(self):
         (self.repo / "justfile").write_text("check:\n    echo ok\n")
@@ -231,6 +291,30 @@ class VerifyEnableTests(unittest.TestCase):
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split(), ["verify"])
+
+    @unittest.skipUnless(shutil.which("just"), "just not available")
+    def test_recipe_passes_the_url_tag_and_evidence_directory_to_playwright(self):
+        self.assertEqual(self.tree.enable(self.repo).returncode, 0)
+        log = self.tree.root / "stub-log"
+        stub = self.tree.root / "stubs/playwright"
+        stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {log}.args\n'
+                        f'printf "%s\\n%s\\n" "$VERIFY_URL" "$VERIFY_OUT" > {log}.env\n')
+        recipe = ["just", "--justfile", str(self.repo / "justfile"), "verify", "http://localhost:3000"]
+        result = subprocess.run(recipe + ["@T-4-AC2"], capture_output=True, text=True,
+                                env=self.tree.env, cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        url, out = Path(f"{log}.env").read_text().split("\n")[:2]
+        self.assertEqual(url, "http://localhost:3000")
+        self.assertRegex(out, rf"^{re.escape(str(self.repo))}/acceptance/evidence/\d{{8}}T\d{{6}}Z$")
+        self.assertTrue(Path(out).is_dir())
+        self.assertEqual(Path(f"{log}.args").read_text().split(),
+                         ["test", "--config", "acceptance/playwright.config.ts", "--grep", "@T-4-AC2"])
+        subprocess.run(recipe, capture_output=True, text=True, env=self.tree.env, cwd=self.repo, check=True)
+        self.assertNotIn("--grep", Path(f"{log}.args").read_text())
+        # A failing suite fails the recipe.
+        stub.write_text("#!/bin/sh\nexit 3\n")
+        failed = subprocess.run(recipe, capture_output=True, text=True, env=self.tree.env, cwd=self.repo)
+        self.assertNotEqual(failed.returncode, 0)
 
 
 def usable_chromium():

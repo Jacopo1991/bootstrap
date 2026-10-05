@@ -30,6 +30,12 @@ download "$OSV_SCANNER_URL" "$OSV_SCANNER_SHA256" "$tmp/osv-scanner"
 cmp -s "$tmp/osv-scanner" "$HOME/.local/bin/osv-scanner" || install -m 0755 "$tmp/osv-scanner" "$HOME/.local/bin/osv-scanner"
 osv_expected=${OSV_SCANNER_URL##*/download/v}
 [[ $("$HOME/.local/bin/osv-scanner" --version) == *"osv-scanner version: ${osv_expected%%/*}"* ]]
+# just runs the `verify` recipe that verify-enable adds to knowledge repositories.
+download "$JUST_URL" "$JUST_SHA256" "$tmp/just.tar.gz"
+tar -xzf "$tmp/just.tar.gz" -C "$tmp" just
+cmp -s "$tmp/just" "$HOME/.local/bin/just" || install -m 0755 "$tmp/just" "$HOME/.local/bin/just"
+just_expected=${JUST_URL##*/download/}
+[[ $("$HOME/.local/bin/just" --version) == "just ${just_expected%%/*}" ]]
 pre_commit_root="$HOME/.local/share/bootstrap/pre-commit"
 mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$pre_commit_root/venv"
 mise exec -- uv pip sync --quiet --require-hashes --python "$pre_commit_root/venv/bin/python" "$pre_commit_root/requirements.lock"

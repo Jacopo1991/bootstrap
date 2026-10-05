@@ -415,34 +415,50 @@ Tooling for SPEC-0015 (independent black-box verification of a task's acceptance
 criteria); the method is in `skills-proposed/verify-ui/SKILL.md` for the PM to move
 into cortex-core's `skills/`.
 
-- **Pin:** `@playwright/test`, `@playwright/mcp` and `@axe-core/playwright` in the npm
-  lockfile. `@playwright/mcp` only ships builds pinned to a Playwright alpha, so the
-  whole set runs on that alpha build (`@playwright/test` and `playwright-core` carry
-  the same version; an npm `overrides` entry stops axe-core's open peer range from
-  pulling a second copy). Bump `@playwright/mcp` to the newest release and set the
-  other two to the version its `playwright` dependency names; `ci/verification-pack-test.py`
-  checks that they match.
+- **Pin (alpha, deliberate):** `@playwright/test`, `@playwright/mcp` and
+  `@axe-core/playwright` in the npm lockfile. `@playwright/mcp` has never been released
+  against a stable Playwright (every version depends on an exact `-alpha-` build), and
+  the MCP server and the test runner must share one Playwright version so they use the
+  same browser build. So the whole set runs on that alpha: `@playwright/test` and
+  `playwright-core` carry the same version, and an npm `overrides` entry stops
+  axe-core's open peer range from pulling a second copy. Stable would mean a different
+  browser build per tool, so the alpha is accepted on purpose. Revisit when
+  `npm view @playwright/mcp dependencies` shows a release pinned to a stable
+  Playwright, or if the alpha breaks a run. Then bump `@playwright/mcp` and set the
+  other two to the version its `playwright` dependency names;
+  `ci/verification-pack-test.py` checks that they match.
 - **Browser:** `~/.local/bin/playwright` and `playwright-mcp` wrap the pinned binaries
   with one shared cache (`PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright`) that
   sessions, the MCP server and test runs all use. `install.sh` runs
   `~/.local/share/bootstrap/verify-setup.sh` as agent after `qmd-setup.sh`, outside the
-  sandbox: it downloads Chromium for the pinned version and registers the MCP server
-  at user scope (`claude mcp add --scope user playwright -- ~/.local/bin/playwright-mcp`,
-  stdio, headless Chromium). Nothing downloads at test time. Chromium also needs its
-  shared libraries (`libnss3`, `libnspr4`, `libasound2t64`, and the like) installed
-  on the machine.
+  sandbox: it downloads Chromium for the pinned version, checks with `ldd` that the
+  browsers resolve every system library, and registers the MCP server at user scope
+  (`claude mcp add --scope user playwright -- ~/.local/bin/playwright-mcp`, stdio,
+  headless Chromium). Nothing downloads at test time.
+- **System libraries:** the 27 packages `playwright install-deps --dry-run chromium`
+  lists (NSS, NSPR, ALSA, X fonts, Xvfb and the font packages) are pinned in
+  `system/apt-base.lock` at the snapshot's candidate versions and installed as root by
+  `system/base.sh` from `install.sh`; no apt runs from an agent session. When the
+  Playwright pin moves, rerun the dry-run and update the lock.
+- **just:** `JUST_URL` and `JUST_SHA256` in `pins.env` (hash-verified download like the
+  other release binaries); the tools script installs `~/.local/bin/just` and checks its
+  version. Bump by hand.
 - **Per project:** the founder or the PM runs `verify-enable <knowledge-repo>` (a
   `cortex-kb-<name>` checkout) from a normal shell. It adds `acceptance/` (Playwright
   config with desktop and phone viewports, trace and screenshot on failure, no HTML
   report; an example test tagged `@EXAMPLE-AC1`; axe-core helper), links
   `acceptance/node_modules` to the pinned install, and adds a `just verify <url> [tag]`
-  recipe to the repository's `justfile` (needs `just`). Evidence goes to
-  `~/project-data/<project>/verification/<run>/`. Existing files are kept; a different
-  config is never overwritten.
+  recipe to the repository's `justfile`. Evidence is written to
+  `acceptance/evidence/<run>/` inside the knowledge repository; `verify-enable`
+  gitignores `evidence/` and `node_modules` in `acceptance/.gitignore`, so it is never
+  committed. Existing files are kept; a different config is never overwritten.
 - **Tests:** `python3 ci/verification-pack-test.py` checks the pins and version match,
-  the wiring, `verify-enable` against temporary repositories and, when the pinned install
-  is present, that the written config loads. It also runs the example against a local
-  static page when a startable Chromium is in the shared cache.
+  the `just` pin, the apt lock entries, the wiring and `verify-enable` against temporary
+  repositories. When the pinned install is present it also checks that the written
+  config loads, and when `just` is present that it accepts the recipe; with a startable
+  Chromium in the shared cache it runs the example against a local static page. Only
+  `install.sh` on the real machine proves the Chromium download, that the libraries
+  install from the lock, and that browser smoke run.
 
 ### Local quality gate (pre-commit)
 

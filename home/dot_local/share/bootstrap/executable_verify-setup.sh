@@ -12,6 +12,18 @@ step 'Chromium for the pinned Playwright version'
 # Playwright version, so a pin bump downloads the new build here and nothing at test time.
 playwright install chromium
 
+step 'Chromium system libraries'
+# The libraries are pinned in system/apt-base.lock and installed as root by system/base.sh;
+# fail here if the downloaded browsers still cannot resolve one.
+for binary in chrome-headless-shell chrome; do
+  path=$(find "$HOME/.cache/ms-playwright" -type f -name "$binary" -print -quit)
+  [[ -n $path ]] || { echo "No $binary under ~/.cache/ms-playwright after playwright install chromium." >&2; exit 1; }
+  if ldd "$path" | grep 'not found' >&2; then
+    echo "$binary has unresolved system libraries; check system/apt-base.lock." >&2
+    exit 1
+  fi
+done
+
 step 'Claude Code MCP server'
 claude=$HOME/.local/bin/claude
 # Replace a stale entry; `mcp get` fails only when there is none.

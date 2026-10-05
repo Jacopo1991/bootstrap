@@ -76,10 +76,10 @@ Write `verdict.json` into the run's evidence directory:
 
 ## Evidence
 
-Everything goes under `~/project-data/<project>/verification/<run>/`, outside the repositories (`just verify` creates `<run>`, a UTC timestamp, and prints the path):
+Everything goes under `acceptance/evidence/<run>/` in the knowledge repository. The directory is gitignored, so evidence stays local and is never committed. `just verify` creates `<run>` (a UTC timestamp) and prints the path:
 
 - `results.json`: the Playwright JSON report, every test with its tags and result.
 - `artifacts/`: traces and screenshots for failed tests, axe results as attachments.
 - `verdict.json`: yours, as above. Screenshots, accessibility snapshots and console or network captures you take by hand through the MCP server go here too, referenced from `evidence`.
 
-Report in chat: the run directory, the overall verdict, and each failed or underspecified criterion with its reproduction. The PM records the verdict on the task. Browsers are already installed in the shared cache; if the browser is missing, report that instead of downloading one.
+Report in chat: the run directory, the overall verdict, and each failed or underspecified criterion with its reproduction. The PM records the verdict on the task (the evidence itself is not committed). Browsers are already installed in the shared cache; if the browser is missing, report that instead of downloading one.

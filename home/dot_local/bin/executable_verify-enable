@@ -14,13 +14,13 @@ command -v playwright >/dev/null || { echo "playwright is not on PATH; run the b
 [ -d "$modules" ] || { echo "$modules is missing; run the bootstrap install first" >&2; exit 1; }
 repo=$(git -C "$1" rev-parse --show-toplevel)
 case "$(basename "$repo")" in
-  cortex-kb-?*) project=$(basename "$repo"); project=${project#cortex-kb-} ;;
+  cortex-kb-?*) ;;
   *) echo "$repo is not a knowledge repository (expected a cortex-kb-<name> checkout)" >&2; exit 1 ;;
 esac
 acceptance="$repo/acceptance"
 
-# The managed files must match unless the repository has none yet; the example test and
-# .gitignore are written only once so a project can replace them.
+# The managed files must match unless the repository has none yet; the example test is
+# written only once so a project can replace it. The .gitignore only gains missing lines.
 if [ -e "$acceptance/playwright.config.ts" ] && ! cmp -s "$templates/playwright.config.ts" "$acceptance/playwright.config.ts"; then
   echo "$acceptance/playwright.config.ts exists and differs from the standard config; merge it by hand. Nothing changed." >&2
   exit 1
@@ -41,7 +41,13 @@ mkdir -p "$acceptance"
 put playwright.config.ts playwright.config.ts
 put axe.ts axe.ts
 put example.spec.ts example.spec.ts
-put acceptance.gitignore .gitignore
+# Evidence and the node_modules link never get committed.
+while IFS= read -r line; do
+  if ! grep -qxF "$line" "$acceptance/.gitignore" 2>/dev/null; then
+    printf '%s\n' "$line" >> "$acceptance/.gitignore"
+    case " ${wrote[*]:-} " in *" acceptance/.gitignore "*) ;; *) wrote+=("acceptance/.gitignore") ;; esac
+  fi
+done < "$templates/acceptance.gitignore"
 # Tests import Playwright and axe-core from the one pinned install.
 ln -sfn "$modules" "$acceptance/node_modules"
 
@@ -49,7 +55,7 @@ recipe_file="$repo/justfile"
 if [ -e "$recipe_file" ] && grep -qE '^verify([[:space:]]|:)' "$recipe_file"; then
   echo "justfile already has a verify recipe; kept."
 else
-  { [ ! -s "$recipe_file" ] || printf '\n'; sed "s/@PROJECT@/$project/g" "$templates/verify.just"; } >> "$recipe_file"
+  { [ ! -s "$recipe_file" ] || printf '\n'; cat "$templates/verify.just"; } >> "$recipe_file"
   wrote+=("justfile")
 fi
 
@@ -59,4 +65,4 @@ else
   printf 'Wrote: %s\n' "${wrote[*]}"
   echo "Next: commit acceptance/ and justfile on a branch and open a pull request."
 fi
-echo "Run it with: just verify <app-url>   (evidence: ~/project-data/$project/verification/<run>/)"
+echo "Run it with: just verify <app-url>   (evidence: acceptance/evidence/<run>/, not committed)"
