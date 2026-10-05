@@ -143,6 +143,27 @@ class RenderedConfigTests(unittest.TestCase):
         self.assertEqual(config["collections"]["cortex-kb-bare"]["context"]["/"],
                          "Cortex knowledge repository cortex-kb-bare")
 
+    def test_qmd_context_front_matter_line_is_preferred_over_the_title(self):
+        _, config = self.render({
+            "cortex-kb-plain": "---\ntitle: Plain title\nqmd_context: Notes about the plain fixture project.\n---\n",
+            "cortex-kb-quoted": '---\nqmd_context: "Quoted: sentence # kept."\ntitle: Quoted title\n---\n',
+            "cortex-kb-single": "---\nqmd_context: 'Single-quoted sentence.'\n---\n",
+            "cortex-kb-empty": "---\ntitle: Empty fallback\nqmd_context:\n---\n",
+            "cortex-kb-body": "---\ntitle: Body title\n---\nqmd_context: not front matter\n",
+            "cortex-kb-nofm": "qmd_context: no front matter at all\n# Heading\n",
+        })
+        contexts = {name: c["context"]["/"] for name, c in config["collections"].items()}
+        self.assertEqual(contexts["cortex-kb-plain"], "Notes about the plain fixture project.")
+        self.assertEqual(contexts["cortex-kb-quoted"], "Quoted: sentence # kept.")
+        self.assertEqual(contexts["cortex-kb-single"], "Single-quoted sentence.")
+        self.assertEqual(contexts["cortex-kb-empty"], "cortex-kb-empty: Empty fallback")
+        self.assertEqual(contexts["cortex-kb-body"], "cortex-kb-body: Body title")
+        self.assertEqual(contexts["cortex-kb-nofm"], "Cortex knowledge repository cortex-kb-nofm")
+
+    def test_bootstrap_source_holds_no_project_descriptions(self):
+        text = (ROOT / "home/dot_config/qmd/index.yml.tmpl").read_text()
+        self.assertNotIn("cortex-kb-", text)
+
     def test_hostile_title_stays_a_single_quoted_string(self):
         _, config = self.render({"cortex-kb-x": '---\ntitle: a "b": c # d\n---\n'})
         self.assertEqual(set(config["collections"]), {"cortex-kb-x"})
