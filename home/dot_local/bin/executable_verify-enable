@@ -55,6 +55,7 @@ recipe_file="$repo/justfile"
 if [ -e "$recipe_file" ] && grep -qE '^verify([[:space:]]|:)' "$recipe_file"; then
   echo "justfile already has a verify recipe; kept."
 else
+  # shellcheck disable=SC2094  # -s only checks the size before appending; nothing reads the file
   { [ ! -s "$recipe_file" ] || printf '\n'; cat "$templates/verify.just"; } >> "$recipe_file"
   wrote+=("justfile")
 fi
