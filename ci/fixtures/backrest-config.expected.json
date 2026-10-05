@@ -1,0 +1,57 @@
+{
+  "modno": 1,
+  "version": 6,
+  "instance": "founder-windows",
+  "repos": [
+    {
+      "id": "restic",
+      "uri": "C:\\backups\\restic",
+      "env": ["RESTIC_PASSWORD_FILE=C:\\Users\\founder\\AppData\\Local\\backrest\\restic-password.txt"],
+      "autoInitialize": true,
+      "autoUnlock": true,
+      "prunePolicy": {
+        "schedule": { "cron": "30 3 * * 0", "clock": "CLOCK_LOCAL" },
+        "maxUnusedPercent": 10
+      },
+      "checkPolicy": {
+        "schedule": { "cron": "30 4 * * 0", "clock": "CLOCK_LOCAL" },
+        "readDataSubsetPercent": 5
+      }
+    }
+  ],
+  "plans": [
+    {
+      "id": "agentdev-daily",
+      "repo": "restic",
+      "paths": [
+        "\\\\wsl.localhost\\AgentDev\\home\\agent\\project-data",
+        "\\\\wsl.localhost\\AgentDev\\home\\agent\\cortex",
+        "\\\\wsl.localhost\\AgentDev\\home\\agent\\dev_workspace\\consultancy-website",
+        "\\\\wsl.localhost\\AgentDev\\home\\agent\\dev_workspace\\customer-harness",
+        "\\\\wsl.localhost\\AgentDev\\home\\agent\\dev_workspace\\scratch-local",
+        "\\\\wsl.localhost\\AgentDev\\home\\agent\\dev_workspace\\typo3-dkm-plugin"
+      ],
+      "excludes": [
+        "**/node_modules",
+        "**/.venv",
+        "**/__pycache__",
+        "**/.cache",
+        "**/dist",
+        "**/build",
+        "**/.next",
+        "**/target",
+        "**/qmd/*.sqlite*",
+        "**/.qmd"
+      ],
+      "schedule": { "cron": "30 2 * * *", "clock": "CLOCK_LOCAL" },
+      "retention": { "policyTimeBucketed": { "daily": 7, "weekly": 4, "monthly": 6 } },
+      "hooks": [
+        {
+          "conditions": ["CONDITION_SNAPSHOT_START"],
+          "onError": "ON_ERROR_CANCEL",
+          "actionCommand": { "command": "wsl.exe -d AgentDev -u agent -- true" }
+        }
+      ]
+    }
+  ]
+}
