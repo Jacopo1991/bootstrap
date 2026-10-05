@@ -106,16 +106,18 @@ if ($Live) {
         $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $process = Start-Process -FilePath $powerShell -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launcherFile) `
             -WorkingDirectory $env:SystemRoot -RedirectStandardOutput $log -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
+        $backrestAlive = { @(Get-CimInstance Win32_Process -Filter "Name='backrest.exe'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($liveRoot) }).Count -gt 0 }
         $status = $null
         for ($i = 0; $i -lt 30 -and $null -eq $status; $i++) {
             Start-Sleep -Seconds 1
-            if ($process.HasExited) { break }
+            if ($process.HasExited -and -not (& $backrestAlive)) { break }
             try { $status = (Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 3).StatusCode } catch { }
         }
         for ($i = 0; $i -lt 15 -and -not (Test-Path -LiteralPath (Join-Path $liveRoot 'repo\config')); $i++) { Start-Sleep -Seconds 1 }
         Start-Sleep -Seconds 3
         $text = ((Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue), (Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue)) -join "`n"
-        if ($process.HasExited) { throw "Backrest exited ($($process.ExitCode)). Log:`n$text" }
+        # backrest.exe may detach from the launcher (GUI subsystem), so judge the real process.
+        if (-not (& $backrestAlive)) { throw "backrest.exe is not running. Log:`n$text" }
         Assert-Equal $status 200 'web UI answers 200'
         if ($text -match 'FATAL') { throw "FATAL in Backrest log:`n$text" }
         Write-Output 'PASS: Backrest stayed up, no FATAL in log'
