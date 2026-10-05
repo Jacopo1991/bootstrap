@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Fetch the OSV offline vulnerability databases that the osv-scanner pre-commit hook
+# reads (it never fetches at commit time). Bootstrap runs this on install; run it from a
+# normal shell to refresh. Only changed databases are downloaded.
+set -euo pipefail
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/osv-scalibr"
+for ecosystem in PyPI npm crates.io Go Packagist RubyGems; do
+  file="$cache/$ecosystem/all.zip"
+  mkdir -p "${file%/*}"
+  rm -f "$file.part"
+  since=()
+  [ -f "$file" ] && since=(--time-cond "$file")
+  curl --fail --silent --show-error --location --retry 3 --remote-time "${since[@]}" \
+    "https://osv-vulnerabilities.storage.googleapis.com/$ecosystem/all.zip" -o "$file.part"
+  if [ -s "$file.part" ]; then
+    unzip -tq "$file.part" >/dev/null
+    mv "$file.part" "$file"
+  else
+    rm -f "$file.part"
+  fi
+done
+echo "OSV offline databases current in $cache"

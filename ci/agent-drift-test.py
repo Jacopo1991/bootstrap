@@ -12,8 +12,16 @@ spec = importlib.util.spec_from_file_location("agent_drift", ROOT / "checks/agen
 drift = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(drift)
 
-expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage"}
+expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
+            "lychee", "osv-scanner", "pre-commit"}
+assert drift.EXPECTED_BINARIES == expected
 assert drift.compare_sets(expected, expected) == []
+pins = drift.read_pins(ROOT / "home/.chezmoitemplates/pins.env")
+for name, (key, marker) in drift.URL_VERSIONS.items():
+    version = pins[key].split(marker, 1)[1].split("/", 1)[0]
+    assert drift.version_matches(version, f"{name} {version}"), name
+assert drift.version_matches("2.6.0", "osv-scanner version: 2.6.0\nosv-scalibr version: 0.5.2")
+assert not drift.version_matches("2.6.0", "osv-scanner version: 2.6.1\nosv-scalibr version: 2.6.0x")
 assert drift.version_matches("0.159.2", "codex-cli 0.159.2")
 assert not drift.version_matches("0.159.2", "codex-cli 0.159.20")
 assert drift.VERSION_COMMANDS["ccusage"] == ["ccusage", "--version"]

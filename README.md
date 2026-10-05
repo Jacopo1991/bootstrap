@@ -361,7 +361,7 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 ## Projects, registries and repository boundaries
 
-**Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `README.md` and `AGENTS.md` at the root, and a Backlog.md `backlog/` from `backlog init` (integration mode none, task prefix `T`, `auto_commit`, `remote_operations` and `check_active_branches` all false) for tasks and decisions. The command ends by printing "run chezmoi apply to add it to the qmd index". Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
+**Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `README.md` and `AGENTS.md` at the root, and a Backlog.md `backlog/` from `backlog init` (integration mode none, task prefix `T`, `auto_commit`, `remote_operations` and `check_active_branches` all false) for tasks and decisions. Both repositories get the standard pre-commit gate (see [Local quality gate](#local-quality-gate-pre-commit)) before the first commit, so that commit already passes it. The command ends by printing "run chezmoi apply to add it to the qmd index". Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
 
 **Package registries.** The Claude Code sandbox may reach exactly `pypi.org`, `files.pythonhosted.org` and `registry.npmjs.org`, and may write `~/.cache/uv` and `~/.npm`. Other registries are added here, by PR, when a project needs them. Codex keeps `network_access = false`: its domain-allowlist proxy does not yet resolve allowlisted hosts inside the Linux sandbox (openai/codex#22387), so a Codex lane asks for approval (`on-request`) to run an install outside the sandbox.
 
@@ -409,6 +409,52 @@ every `~/cortex/*` repository for local keyword and semantic search.
   the units, the install wiring and `qmd-refresh` against real temporary git
   repositories; `ci/lint.sh` runs it with the pinned chezmoi.
 
+### Local quality gate (pre-commit)
+
+Every project repository runs the same checks before each commit, replacing the
+secret scan lost with CI. The config (`~/.local/share/bootstrap/pre-commit/pre-commit-config.yaml`)
+uses only `repo: local` hooks that call pinned binaries on the agent's PATH, so
+nothing is fetched at commit time and it works inside the agent sandbox:
+
+- **gitleaks** on the staged diff (`gitleaks git --pre-commit --staged`, values redacted;
+  a repository's own `.gitleaks.toml` applies).
+- **lychee** on changed Markdown, offline and `file` links only: a broken relative
+  link fails; web links are never fetched.
+- **osv-scanner** on changed lockfiles (npm, pnpm, yarn, bun, uv, poetry, pdm, Pipenv,
+  `requirements*.txt`, Cargo, `go.mod`, Composer, Bundler) with `--offline`, against the
+  databases in `~/.cache/osv-scalibr`. A lockfile whose ecosystem has no offline
+  database fails closed.
+
+A change without lockfiles takes about a second. A lockfile adds about one second for
+PyPI and about six for npm (its database is about 200 MB).
+
+- **Pins:** lychee and osv-scanner are release binaries with SHA-256 in `pins.env`;
+  pre-commit and its dependencies come from the hashed
+  `home/dot_local/share/bootstrap/pre-commit/requirements.lock` (`uv pip compile
+  --generate-hashes`), installed with `uv pip sync --require-hashes` into
+  `~/.local/share/bootstrap/pre-commit/venv` and linked to `~/.local/bin/pre-commit`.
+  The monthly pin updater does not cover them, so bump them by hand.
+- **Sandbox:** inside the agent sandbox `~/.cache` is read-only. pre-commit then runs
+  local hooks from its existing store, so the tools script creates the store
+  (`pre-commit gc`) and the hook install creates it too.
+- **Vulnerability data:** `osv-db-refresh` downloads the PyPI, npm, crates.io, Go,
+  Packagist and RubyGems databases (only changed files, zip-checked). The tools script
+  runs it on install. The data is not refreshed on a schedule: before relying on a
+  dependency check, run `osv-db-refresh` from a normal shell.
+- **New projects:** `new-project create` writes `.pre-commit-config.yaml` into both
+  repositories and runs `pre-commit install`.
+- **Existing repositories:** the founder or the PM runs `pre-commit-enable <checkout>`
+  from a normal shell as the agent user (agent sessions cannot write `.git/hooks`).
+  It writes the config if absent, refuses to overwrite a different one, and installs the
+  hook. Then commit `.pre-commit-config.yaml` on a branch and open a pull request. Each
+  clone needs `pre-commit-enable` (or `pre-commit install`) once, because hooks are not
+  cloned.
+- **Tests:** `ci/pre-commit-test.sh` checks that a planted fake secret, a broken relative
+  link and a lockfile without an offline database are blocked, and that a clean change
+  passes from a read-only store. With a local PyPI database it also checks that a known
+  advisory is blocked. It also covers `pre-commit-enable`. `ci/new-project-test.sh`
+  checks the config and hook in both new repositories.
+
 ## Pins and repeatability
 
 | Component | Pin location |
@@ -423,7 +469,8 @@ every `~/cortex/*` repository for local keyword and semantic search.
 | GPU Python packages and all dependencies with hashes | `checks/gpu-requirements.lock` |
 | GPU container image | `checks/gpu-image.env` |
 | Public test model | Revision in `checks/gpu-smoke.py` |
-| ShellCheck, agent/CI Gitleaks and release SHA-256 | `home/.chezmoitemplates/pins.env` |
+| ShellCheck, agent/CI Gitleaks, lychee, osv-scanner and release SHA-256 | `home/.chezmoitemplates/pins.env` |
+| pre-commit and all dependencies with hashes | `home/dot_local/share/bootstrap/pre-commit/requirements.lock` |
 | GitHub Actions checkout | Full commit SHA in the workflow |
 
 Claude Code uses the official native installer with an exact release argument

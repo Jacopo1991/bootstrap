@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Add the standard local quality gate to an existing checkout (slim workflow, 2026-10-05).
+# Run by the founder or the PM from a normal shell as the agent user, never from inside an agent session
+# (the agent policy hook blocks writes to .git/hooks there on purpose).
+#   pre-commit-enable <checkout>   write .pre-commit-config.yaml if absent and install the pre-commit hook
+set -euo pipefail
+
+[ $# -eq 1 ] || { echo "usage: pre-commit-enable <checkout>" >&2; exit 2; }
+config="$(cd -- "$(dirname -- "$0")/../share/bootstrap/pre-commit" && pwd)/pre-commit-config.yaml"
+for tool in pre-commit gitleaks lychee osv-scanner; do
+  command -v "$tool" >/dev/null || { echo "$tool is not on PATH; run the bootstrap install first" >&2; exit 1; }
+done
+repo=$(git -C "$1" rev-parse --show-toplevel)
+target="$repo/.pre-commit-config.yaml"
+
+wrote=0
+if [ ! -e "$target" ]; then
+  cp "$config" "$target"
+  wrote=1
+elif ! cmp -s "$config" "$target"; then
+  echo "$target exists and differs from the standard config; merge it by hand. Nothing changed." >&2
+  exit 1
+fi
+(cd "$repo" && pre-commit install >/dev/null)
+echo "Installed the pre-commit hook in $repo."
+if [ $wrote = 1 ]; then
+  echo "Next: commit .pre-commit-config.yaml on a branch and open a pull request."
+fi
