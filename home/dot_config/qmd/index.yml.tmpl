@@ -1,0 +1,22 @@
+# Managed by chezmoi: one collection per ~/cortex/* repository. Re-run
+# `chezmoi apply` after adding a repository; the timer then indexes it.
+# Context lines come from each repository's INTENT.md title, so no project
+# detail is stored in this public source.
+{{- $cortex := joinPath .chezmoi.homeDir "cortex" }}
+global_context: "Cortex knowledge repositories: project intent, status, tasks and decisions."
+collections:
+{{- range glob (joinPath $cortex "*") }}
+{{- if and (stat .).isDir (not (hasPrefix "." (base .))) }}
+{{- $name := base . }}
+{{- $title := "" }}
+{{- $intent := joinPath . "INTENT.md" }}
+{{- if (stat $intent) }}
+{{- $title = output "sed" "-n" "-e" "/^title:/{s/^title:[[:space:]]*//;s/^\"\\(.*\\)\"$/\\1/;p;q}" $intent | trim }}
+{{- end }}
+  {{ $name }}:
+    path: {{ . | toJson }}
+    pattern: "**/*.md"
+    context:
+      "/": {{ if $title }}{{ printf "%s: %s" $name $title | toJson }}{{ else }}{{ printf "Cortex knowledge repository %s" $name | toJson }}{{ end }}
+{{- end }}
+{{- end }}

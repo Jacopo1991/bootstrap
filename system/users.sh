@@ -33,3 +33,7 @@ chmod 0644 /etc/bootstrap/admin-{user,home}
 printf 'agent ALL=(ALL:ALL) !ALL\n' > /etc/sudoers.d/99-bootstrap-agent
 chmod 0440 /etc/sudoers.d/99-bootstrap-agent
 visudo -cf /etc/sudoers
+# Keep agent's systemd user manager running without a login so the qmd index timer fires.
+if [[ -d /run/systemd/system ]]; then
+  loginctl enable-linger agent
+fi

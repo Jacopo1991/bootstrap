@@ -33,3 +33,16 @@ npm_root="$HOME/.local/share/bootstrap/npm"
 mise exec -- npm ci --prefix "$npm_root" --no-audit --no-fund
 ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
+ln -sfn "$npm_root/node_modules/.bin/qmd" "$HOME/.local/bin/qmd"
+# qmd: models are fetched here, outside agent sessions and the Claude sandbox,
+# then the first index is built. The 15-minute user timer only reindexes.
+"$HOME/.local/bin/qmd" pull
+"$HOME/.local/bin/qmd" update
+"$HOME/.local/bin/qmd" embed
+if [[ -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
+  systemctl --user daemon-reload
+  systemctl --user start qmd-index.timer
+fi
+# Claude Code MCP server, user scope, stdio. Remove first so a re-run replaces a stale entry.
+"$HOME/.local/bin/claude" mcp remove --scope user qmd >/dev/null 2>&1 || true
+"$HOME/.local/bin/claude" mcp add --scope user qmd -- "$HOME/.local/bin/qmd" mcp
