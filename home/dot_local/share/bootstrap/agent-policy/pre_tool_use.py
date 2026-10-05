@@ -55,6 +55,7 @@ CHAIN_SEPARATORS = {";", "&&", "||", "|"}
 READ_ONLY_COMMANDS = {"cd", "echo", "printf", "true", "false", "pwd", "ls", "cat", "head",
                       "tail", "wc", "grep", "sort", "uniq", "date", "stat", "basename", "dirname"}
 STATE_DEPENDENT_GIT = {"commit", "merge"}
+MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
 CURRENT_REPO_GIT = READ_ONLY_GIT | {
@@ -626,7 +627,152 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if reason:
             return reason
     if subcommand == "commit":
+        if commit_stages_working_tree(arguments):
+            return ("git commit -a/--all/--include/--only or a pathspec commits content the secret "
+                    "scan has not seen; stage with git add first, then run a plain git commit.")
         return secret_scan(root)
+    return None
+
+
+COMMIT_VALUE_LONG = {"--message", "--file", "--reuse-message", "--reedit-message", "--template",
+                     "--author", "--date", "--cleanup", "--trailer", "--fixup", "--squash"}
+COMMIT_VALUE_SHORT = "mFCctSu"  # letters whose value is the rest of the cluster or the next argument
+
+
+def commit_stages_working_tree(arguments: list[str]) -> bool:
+    """True if the commit would take working-tree content the staged-diff scan cannot see."""
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        index += 1
+        if not argument.startswith("-") or argument in {"-", "--"}:
+            return True  # pathspec operand, or everything after -- is one
+        if argument.startswith("--"):
+            key = argument.split("=", 1)[0]
+            if any(option_name.startswith(key) and len(key) > 2
+                   for option_name in ("--all", "--include", "--only")):
+                return True
+            if key in COMMIT_VALUE_LONG and "=" not in argument:
+                index += 1
+            continue
+        for position, letter in enumerate(argument[1:], 1):
+            if letter in "aio":
+                return True
+            if letter in COMMIT_VALUE_SHORT:
+                if position == len(argument) - 1 and letter != "S" and letter != "u":
+                    index += 1  # value is the next argument
+                break
+    return False
+
+
+def sed_script_runs_commands(script: str) -> bool:
+    """Detect the sed e command and the s///e flag (also w/W, which write arbitrary files)."""
+    position = 0
+    length = len(script)
+
+    def skip_delimited(start: int, delimiter: str) -> int:
+        while start < length and script[start] != delimiter:
+            start += 2 if script[start] == "\\" else 1
+        return start + 1
+
+    while position < length:
+        while position < length and script[position] in " \t\n;{}":
+            position += 1
+        # addresses: numbers, $, /re/, \cREc, first~step, +N, ~N, commas and !
+        while position < length:
+            char = script[position]
+            if char in "0123456789$,~+! \t":
+                position += 1
+            elif char == "/":
+                position = skip_delimited(position + 1, "/")
+            elif char == "\\" and position + 1 < length:
+                position = skip_delimited(position + 2, script[position + 1])
+            else:
+                break
+            while position < length and script[position] in "IM":
+                position += 1
+        if position >= length:
+            break
+        command = script[position]
+        position += 1
+        if command in "eEwW":
+            return True
+        if command == "s":
+            if position >= length:
+                break
+            delimiter = script[position]
+            position = skip_delimited(skip_delimited(position + 1, delimiter), delimiter)
+            while position < length and script[position] not in ";\n}":
+                if script[position] in "ewW":
+                    return True
+                position += 1
+        elif command == "y":
+            if position >= length:
+                break
+            delimiter = script[position]
+            position = skip_delimited(skip_delimited(position + 1, delimiter), delimiter)
+        elif command in "aicrR:":
+            position = script.find("\n", position)
+            position = length if position < 0 else position
+        elif command in "btT":
+            while position < length and script[position] not in ";\n}":
+                position += 1
+    return False
+
+
+def sed_policy(tokens: list[str]) -> str | None:
+    scripts: list[str] = []
+    index = 1
+    positional: list[str] = []
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if token == "--":
+            positional.extend(tokens[index:])
+            break
+        if token in {"--file", "-f"} or token.startswith("--file=") or (
+                token.startswith("-f") and not token.startswith("--")):
+            return "sed script files cannot be inspected; use -e with the script inline."
+        if token == "--expression":
+            if index < len(tokens):
+                scripts.append(tokens[index])
+                index += 1
+        elif token.startswith("--expression="):
+            scripts.append(token.split("=", 1)[1])
+        elif token.startswith("-") and not token.startswith("--") and len(token) > 1:
+            cluster = token[1:]
+            if "e" in cluster:
+                rest = cluster.split("e", 1)[1]
+                if rest:
+                    scripts.append(rest)
+                elif index < len(tokens):
+                    scripts.append(tokens[index])
+                    index += 1
+            elif cluster.endswith("l") and index < len(tokens):
+                index += 1
+        elif not token.startswith("-"):
+            positional.append(token)
+    if not scripts and positional:
+        scripts.append(positional[0])
+    if any(sed_script_runs_commands(script) for script in scripts):
+        return "sed scripts using the e or w commands/flags run commands or write files and are blocked."
+    return None
+
+
+AWK_NAMES = {"awk", "gawk", "mawk", "nawk"}
+AWK_PROGRAM_RISKS = (re.compile(r"system\s*\("), re.compile(r"\|\s*&?\s*getline"),
+                     re.compile(r"getline[^;}\n]*<"), re.compile(r"(?<!\|)\|(?!\|)\s*\""),
+                     re.compile(r">>?\s*\""))
+
+
+def awk_policy(tokens: list[str]) -> str | None:
+    for token in tokens[1:]:
+        if (token in {"-f", "--file", "--exec", "-i", "--include", "-E"}
+                or token.startswith(("--file=", "--exec=", "--include="))
+                or token.startswith("-f") and not token.startswith("--")):
+            return "awk program files and includes cannot be inspected; use an inline program."
+        if any(risk.search(token) for risk in AWK_PROGRAM_RISKS):
+            return "awk programs calling system(), piping to or from commands, or writing files are blocked."
     return None
 
 
@@ -935,6 +1081,25 @@ def evaluate_command(command: str, cwd: str, root: Path,
             all_tokens.append(list(lexer))
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
+    if len(all_tokens) > 1:
+        heads: list[tuple[str, list[str]]] = []
+        for tokens in all_tokens:
+            unwrapped = unwrap_command(tokens)
+            if isinstance(unwrapped, str):
+                return unwrapped
+            heads.append((Path(unwrapped[0]).name.lower() if unwrapped else "", unwrapped))
+        if any(head in {"git", "gh"} for head, _ in heads):
+            # git/gh are excluded from the sandbox; do not let a chain smuggle anything else along.
+            for head, unwrapped in heads:
+                if head in {"git", "gh"}:
+                    continue
+                writes = any(token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+                             and (i + 1 >= len(unwrapped) or unwrapped[i + 1] not in NULL_DEVICES)
+                             for i, token in enumerate(unwrapped))
+                if head not in MIXED_CHAIN_TEXT_TOOLS or writes:
+                    return ("A chain containing git or gh may only add other git/gh commands or "
+                            "read-only text tools (grep, head, tail, wc, sort, uniq, cut, jq, cat) "
+                            "without redirects; run anything else as a separate command.")
     seen_changing = False
     for position, tokens in enumerate(all_tokens):
         piped = position > 0 and operators[position - 1] == "|"
@@ -992,6 +1157,21 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     host_reason = host_command_reason(tokens, executable)
     if host_reason:
         return host_reason
+    if executable == "sed":
+        reason = sed_policy(tokens)
+        if reason:
+            return reason
+    if executable in AWK_NAMES:
+        reason = awk_policy(tokens)
+        if reason:
+            return reason
+    if executable == "sort" and any(
+            t.startswith("--o") and "--output".startswith(t.split("=", 1)[0])
+            or t.startswith("-") and not t.startswith("--") and t[1:].isalpha() and "o" in t
+            for t in tokens[1:]):
+        return "sort -o/--output writes a file; redirect inside the repository instead."
+    if executable == "uniq" and len([t for t in tokens[1:] if not t.startswith("-")]) > 1:
+        return "uniq with an output file operand is blocked; redirect inside the repository instead."
     output_operators = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
     metadata = git_metadata(root) if executable in WRITERS | {"sed"} or any(
         token in output_operators for token in tokens) else None

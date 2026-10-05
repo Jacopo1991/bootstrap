@@ -655,9 +655,13 @@ with tempfile.TemporaryDirectory() as temp:
     # Chains (; && || |) are evaluated segment by segment with the ordinary rules;
     # env/timeout/nice/stdbuf and VAR=value prefixes evaluate the wrapped command.
     for command in ("git status && git log --oneline", "git diff | head -5", "git status; git log",
-                    "git status || true", "git status 2>/dev/null || echo none",
                     "git fetch origin && git status", "git log | grep fix | wc -l",
-                    "cat safe.txt | sort > copied2.txt", "cd nested && git status", "cd nested; ls",
+                    "cat safe.txt | sort > copied2.txt", "cd nested; ls",
+                    "git log | head -5", "git status && git diff", "git diff | sort | uniq -c | tail -3",
+                    "gh api repos/fixture | jq .name", "git log --oneline | cut -c1-7 | cat",
+                    "git status | grep -v x 2>/dev/null", "git log | wc -l > /dev/null",
+                    "git status && gh pr view | head", "timeout 5 git log | head -1",
+                    "python3 x.py && ls", "touch y && cat y | sort > z.txt",
                     "echo ok && printf done", "git status && git commit -m fixture",
                     "env FOO=1 git status", "FOO=bar git status", "FOO=bar printf safe",
                     "timeout 30 git status", "timeout -k 5 30 git status", "timeout --kill-after=5 30s git status",
@@ -718,6 +722,49 @@ with tempfile.TemporaryDirectory() as temp:
             "cd nested && rm -r ../scratch/deep ../.git", "env cd nested && ls", "cd a b && ls",
             "cd nested && git -C ../../sibling add safe.txt"):
         assert policy.evaluate(event(command), roots) is not None, command
+    # Mixed chains: git/gh (sandbox-excluded) may only be chained with git/gh and read-only text tools.
+    for command in ("git status && python3 x.py", "git add f && touch y", "git status || true",
+                    "git status 2>/dev/null || echo none", "cd nested && git status",
+                    "git log | awk '{print $1}'", "git log | sed s/a/b/", "git status && ls",
+                    "git status; rm safe.txt", "ls && git status", "python3 x.py | git status",
+                    "git log | sort > out.txt", "git log | cat >> out.txt", "git log | head > out.txt",
+                    "git status && env FOO=1 python3 x.py", "git status && FOO=1", "git status && printf x",
+                    "git log | tee out.txt", "gh pr list | xargs echo", "git status && cp safe.txt y.txt",
+                    "git log | sort -o out.txt", "git log | sort --output=out.txt", "git log | uniq in out"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    # git commit -a/--all (and --include/--only/pathspec) would commit content the staged scan never saw.
+    for command in ("git commit -a -m x", "git commit -am x", "git commit --all -m x",
+                    "git commit -m x -a", "git commit -sa -m x", "git commit --al -m x",
+                    "git commit -i safe.txt -m x", "git commit --include safe.txt -m x",
+                    "git commit --only safe.txt -m x", "git commit -m x safe.txt",
+                    "git commit -m x -- safe.txt", "git commit -o safe.txt -m x",
+                    "git status && git commit -a -m x", "/usr/bin/git commit -am x"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in ("git commit -m x", "git commit -m 'fix a and all'", "git commit -m 'fix' --no-verify",
+                    "git commit -ma", "git commit --message=-a", "git commit --amend --no-edit",
+                    "git commit --allow-empty -m x", "git commit -s -m x", "git commit -m x -S"):
+        assert policy.evaluate(event(command), roots) is None, command
+    # awk programs that run commands, pipe to/from commands or write files; sed e/w commands and flags.
+    for command in ("awk 'BEGIN{system(\"id\")}'", "awk 'BEGIN { system (\"id\") }'",
+                    "gawk 'BEGIN{\"id\" | getline x; print x}'", "awk 'BEGIN{while ((\"id\" | getline l) > 0) print l}'",
+                    "awk 'BEGIN{getline x < \"/etc/passwd\"}'", "awk '{print | \"sh\"}'",
+                    "awk '{print > \"out.txt\"}'", "awk '{print >> \"out.txt\"}'",
+                    "mawk -f prog.awk", "awk --file prog.awk", "awk -i inplace '{print}' safe.txt",
+                    "git status && awk 'BEGIN{system(\"id\")}'",
+                    "sed -e 'e id' safe.txt", "sed 'e id' safe.txt", "sed -n '1e id' safe.txt",
+                    "sed 's/a/b/e' safe.txt", "sed 's/a/b/ge' safe.txt", "sed -e 'p;e id' safe.txt",
+                    "sed -ne 'e id' safe.txt", "sed --expression='e id' safe.txt", "sed -f script.sed safe.txt",
+                    "sed '/x/e id' safe.txt", "sed 'w out.txt' safe.txt", "sed 's/a/b/w out.txt' safe.txt",
+                    "sed -e s/a/b/ -e 'e id' safe.txt", "sed -i 'e id' safe.txt", "sed '$!{e id\n}' safe.txt"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in ("awk '{print $1}' safe.txt", "awk -F, '{print $2}' safe.txt",
+                    "awk '$1==\"a\"||$2==\"b\"{print}' safe.txt", "awk 'NR>1 && $1>5' safe.txt",
+                    "awk -v n=2 'NR==n' safe.txt", "git log | head -1",
+                    "sed 's/e/E/' safe.txt", "sed -n '1,3p' safe.txt", "sed -e 's/the e of/x/' safe.txt",
+                    "sed 's/a/b/g;s/c/d/' safe.txt", "sed -n '/end/p' safe.txt", "sed 's/x/e/' safe.txt",
+                    "sed -n -e '/needle/p' safe.txt", "sed '/exit/d' safe.txt", "sed -i s/a/b/ safe.txt",
+                    "sed 'y/abc/xyz/' safe.txt", "sed -E 's/(a|b)+/c/' safe.txt"):
+        assert policy.evaluate(event(command), roots) is None, command
     # git commit/merge depend on state the hook sees before the call: they may follow
     # read-only segments only, so staging cannot dodge the secret scan or the branch guard.
     for command in ("git add safe.txt && git commit -m fixture", "git add safe.txt; git commit -m fixture",
