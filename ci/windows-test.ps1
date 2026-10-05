@@ -471,4 +471,5 @@ foreach ($case in 'blocked', 'success', 'output', 'timeout', 'copy-error') {
 
 
 & "$PSScriptRoot/inventory-test.ps1"
+& "$PSScriptRoot/founder-tasks-test.ps1"
 & "$PSScriptRoot/vscode-ssh-test.ps1"

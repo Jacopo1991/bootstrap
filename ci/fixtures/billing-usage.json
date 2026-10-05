@@ -1,0 +1,11 @@
+{
+  "timePeriod": { "year": 2026, "month": 10 },
+  "user": "fixture-user",
+  "usageItems": [
+    { "date": "2026-10-02T00:00:00Z", "product": "actions", "sku": "actions_linux", "quantity": 1000, "unitType": "Minutes", "netAmount": 0 },
+    { "date": "2026-10-03T00:00:00Z", "product": "actions", "sku": "actions_windows", "quantity": 500, "unitType": "Minutes", "netAmount": 0 },
+    { "date": "2026-10-03T00:00:00Z", "product": "actions", "sku": "actions_linux", "quantity": 100, "unitType": "Minutes", "netAmount": 0 },
+    { "date": "2026-10-03T00:00:00Z", "product": "actions", "sku": "actions_storage", "quantity": 7, "unitType": "GigabyteHours", "netAmount": 0 },
+    { "date": "2026-10-03T00:00:00Z", "product": "copilot", "sku": "copilot_premium_request", "quantity": 9000, "unitType": "Requests", "netAmount": 0 }
+  ]
+}

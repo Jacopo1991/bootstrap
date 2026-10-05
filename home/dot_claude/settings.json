@@ -138,6 +138,27 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.local/share/bootstrap/agent-policy/context_reminder.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.local/share/bootstrap/agent-policy/context_reminder.py",
+            "timeout": 10
+          }
+        ]
       }
     ]
   }

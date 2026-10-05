@@ -1,0 +1,11 @@
+[Unit]
+Description=Update the cortex-core skills daily
+
+[Timer]
+OnCalendar=daily
+# The distro is often stopped; catch up on the next start instead of skipping a day.
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

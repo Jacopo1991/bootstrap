@@ -57,4 +57,9 @@ sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/s
 # The verification pack's Chromium download and Playwright MCP registration run the same way.
 sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
   bash /home/agent/.local/share/bootstrap/verify-setup.sh
+# The cortex-core skills come from GitHub with `gh skill` (user scope, Claude Code and Codex);
+# gh-skill-update.timer keeps them current. Needs agent's gh login, so it runs outside any session.
+sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
+  XDG_RUNTIME_DIR="/run/user/$agent_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$agent_uid/bus" \
+  bash /home/agent/.local/share/bootstrap/skills-setup.sh
 echo 'Bootstrap applied. Restart this distro before the WSL boundary checks.'

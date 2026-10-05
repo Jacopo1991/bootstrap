@@ -189,6 +189,16 @@ function Test-ExpectedMaintenanceTask {
  if($null -eq $executeProperty -or $null -eq $argumentsProperty -or $null -eq $workingProperty){return $false}
  $expectedPowerShell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
  if(-not [string]::Equals([string]$executeProperty.Value,$expectedPowerShell,'OrdinalIgnoreCase')){return $false}
+ # Founder-login tasks (install-skills-task.ps1, install-minutes-watchdog-task.ps1) run protected scripts from the founder subfolder.
+ $founderDirectory='C:\ProgramData\machine-bootstrap\founder'
+ if([string]::Equals($name,'MachineBootstrap-Skills-Update','OrdinalIgnoreCase')){
+  if(-not [string]::Equals([string]$workingProperty.Value,$founderDirectory,'OrdinalIgnoreCase')){return $false}
+  return [string]$argumentsProperty.Value -ieq '-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\founder\skills-update.ps1"'
+ }
+ if([string]::Equals($name,'MachineBootstrap-Minutes-Watchdog','OrdinalIgnoreCase')){
+  if(-not [string]::Equals([string]$workingProperty.Value,$founderDirectory,'OrdinalIgnoreCase')){return $false}
+  return [string]$argumentsProperty.Value -imatch '^-NoProfile -NonInteractive -File "C:\\ProgramData\\machine-bootstrap\\founder\\minutes-watchdog\.ps1" -IncludedMinutes [1-9][0-9]{0,6}$'
+ }
  if(-not [string]::Equals([string]$workingProperty.Value,'C:\ProgramData\machine-bootstrap','OrdinalIgnoreCase')){return $false}
  if([string]::Equals($name,'MachineBootstrap-Inventory','OrdinalIgnoreCase')){
   $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory" -ExportDirectory "C:\ProgramData\machine-bootstrap\export"'

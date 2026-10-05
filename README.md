@@ -524,6 +524,42 @@ PyPI and about six for npm (its database is about 200 MB).
   it also checks that the exception passes the lock until it expires, that an expired
   copy blocks it and that the lock without the exception is blocked.
 
+## Skills, prompt reminders and the minutes watchdog
+
+- **Skills:** the skills in `Jacopo1991/cortex-core` are distributed with `gh skill`.
+  `install.sh` runs `home/dot_local/share/bootstrap/skills-setup.sh` as `agent`, outside the
+  sandbox: `gh skill install Jacopo1991/cortex-core --all --scope user` for `claude-code` and
+  `codex`, with `--force` on the first run only (it replaces the hand-copied `slim-workflow`
+  folders; a stamp in `~/.local/state/bootstrap` marks it done). It needs `gh auth login` as
+  `agent`. The user timer `gh-skill-update.timer` runs `gh-skill-update` (a plain
+  `gh skill update --all`, no agent runs) daily with `Persistent=true`; a failure is printed,
+  exits non-zero and shows in `systemctl --user --failed` and `journalctl --user -u gh-skill-update`.
+  The drift report allows `gh-skill-update` and any skill whose `SKILL.md` names
+  `Jacopo1991/cortex-core`; hand copies and other sources are `global-skill-outside-bootstrap`.
+- **Prompt reminder:** `agent-policy/context_reminder.py` is wired as a native
+  `UserPromptSubmit` hook for Claude Code and Codex (`hookSpecificOutput.additionalContext`,
+  six lines: slim-workflow, stop after two failed attempts or at the time box, report in chat and
+  the PR description, git/gh network commands on their own, verify-ui, github-ci). For Claude Code
+  it is also a `PreToolUse` hook that adds a "read the github-ci skill first" note before a
+  Write/Edit/Bash that touches `.github/workflows` or changes repository settings (`gh repo edit`,
+  `gh secret set`, `gh workflow run`, `gh api` with a write method on a settings endpoint). It
+  only adds context; it never blocks, and `pre_tool_use.py` stays the policy gate. Codex has the
+  same per-prompt reminder; only Claude Code gets the tool-call note.
+- **Windows, run by the founder** from elevated PowerShell (the founder's own gh login, tasks run
+  in the logged-in session, not S4U): `windows\install-skills-task.ps1` installs the skills for the
+  Windows-side Claude Code and Codex (`--force` once) and registers `MachineBootstrap-Skills-Update`
+  (`gh skill update --all`, daily 09:15). `windows\install-minutes-watchdog-task.ps1
+  [-IncludedMinutes 3000]` registers `MachineBootstrap-Minutes-Watchdog` (daily 09:45): it reads
+  `gh api /users/Jacopo1991/settings/billing/usage`, sums this month's Actions minutes, and shows a
+  Windows notification once at 50% and once at 80% of the allowance (state and
+  `minutes-watchdog.log` under `%LOCALAPPDATA%\machine-bootstrap`; every check is logged). Both
+  tasks run protected copies from `C:\ProgramData\machine-bootstrap\founder` and are declared in
+  the inventory's maintenance allowlist, so they are not reported as task drift.
+- **Tests:** `ci/skills-hooks-test.py` (units, setup, drift allowlist, update command with a fake
+  `gh`, hook output and wiring, Windows script shape) runs in `ci/lint.sh`;
+  `ci/founder-tasks-test.ps1` (threshold and notification logic with `ci/fixtures/billing-usage.json`
+  instead of the API, task XML, allowlist) runs in the Windows PowerShell 5.1 job.
+
 ## Pins and repeatability
 
 | Component | Pin location |

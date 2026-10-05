@@ -23,7 +23,7 @@ assert codex["sandbox_mode"] == "workspace-write"
 assert codex["sandbox_workspace_write"]["network_access"] is False
 assert codex["features"]["hooks"] is True
 codex_hooks = json.loads((ROOT / "home/dot_codex/hooks.json").read_text(encoding="utf-8"))
-assert set(codex_hooks["hooks"]) == {"PreToolUse", "PermissionRequest"}
+assert set(codex_hooks["hooks"]) == {"PreToolUse", "PermissionRequest", "UserPromptSubmit"}
 assert codex_hooks["hooks"]["PermissionRequest"][0]["matcher"] == "^Bash$"
 assert {x["matcher"] for x in codex_hooks["hooks"]["PreToolUse"]} == {"^Bash$", "^(apply_patch|Edit|Write)$"}
 

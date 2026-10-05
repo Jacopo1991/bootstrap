@@ -7,7 +7,7 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 source "$ROOT/home/.chezmoitemplates/pins.env"
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib"
 export DISABLE_AUTOUPDATER=1
-for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage qmd bws secretspec bwrap socat exiftool gitleaks lychee osv-scanner pre-commit osv-db-refresh pre-commit-enable; do
+for tool in chezmoi mise git gh jq rg fd cc c++ make node python uv claude codex ccusage qmd bws secretspec bwrap socat exiftool gitleaks lychee osv-scanner pre-commit osv-db-refresh pre-commit-enable gh-skill-update; do
   command -v "$tool" >/dev/null || { echo "Missing: $tool" >&2; exit 1; }
 done
 # Execute ExifTool as agent to verify its interpreter/runtime as well as PATH.
