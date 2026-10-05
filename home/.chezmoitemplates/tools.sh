@@ -10,6 +10,8 @@ download() {
   printf '%s  %s\n' "$2" "$3" | sha256sum --check --status
 }
 mkdir -p "$HOME/.local/bin"
+# uv's cache is the one sandbox-writable path outside the repository.
+mkdir -p "$HOME/.cache/uv" "$HOME/.npm"
 download "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
 tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
 cmp -s "$tmp/gitleaks" "$HOME/.local/bin/gitleaks" || install -m 0755 "$tmp/gitleaks" "$HOME/.local/bin/gitleaks"
@@ -33,6 +35,7 @@ npm_root="$HOME/.local/share/bootstrap/npm"
 mise exec -- npm ci --prefix "$npm_root" --no-audit --no-fund
 ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
+ln -sfn "$npm_root/node_modules/.bin/backlog" "$HOME/.local/bin/backlog"
 ln -sfn "$npm_root/node_modules/.bin/qmd" "$HOME/.local/bin/qmd"
 # qmd: models are fetched here, outside agent sessions and the Claude sandbox,
 # then the first index is built. The 15-minute user timer only reindexes.

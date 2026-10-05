@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$OutputDirectory='C:\ProgramData\machine-bootstrap\inventory',[datetime]$Now=(Get-Date))
+param([string]$OutputDirectory='C:\ProgramData\machine-bootstrap\inventory',[string]$ExportDirectory='',[datetime]$Now=(Get-Date))
 . "$PSScriptRoot/common.ps1"
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -191,7 +191,7 @@ function Test-ExpectedMaintenanceTask {
  if(-not [string]::Equals([string]$executeProperty.Value,$expectedPowerShell,'OrdinalIgnoreCase')){return $false}
  if(-not [string]::Equals([string]$workingProperty.Value,'C:\ProgramData\machine-bootstrap','OrdinalIgnoreCase')){return $false}
  if([string]::Equals($name,'MachineBootstrap-Inventory','OrdinalIgnoreCase')){
-  $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory"'
+  $expected='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\inventory.ps1" -OutputDirectory "C:\ProgramData\machine-bootstrap\inventory" -ExportDirectory "C:\ProgramData\machine-bootstrap\export"'
   return [string]::Equals([string]$argumentsProperty.Value,$expected,'OrdinalIgnoreCase')
  }
  if($name -match '^MachineBootstrap-Compact-([A-Za-z][A-Za-z0-9_-]{0,47})$'){
@@ -330,13 +330,16 @@ function Remove-ExpiredInventoryRecords {
  foreach($f in Get-ChildItem -LiteralPath $Directory -File){if($f.Name -notmatch '^\d{4}-\d{2}-\d{2}\.json$'){continue};try{$d=[datetime]::ParseExact($f.BaseName,'yyyy-MM-dd',[globalization.cultureinfo]::InvariantCulture)}catch{continue};if($d.Date -lt $cut){Remove-Item -LiteralPath $f.FullName -Force}}
 }
 function Invoke-MachineInventory {
- [CmdletBinding()]param([string]$OutputDirectory='C:\ProgramData\machine-bootstrap\inventory',[datetime]$At=(Get-Date))
+ [CmdletBinding()]param([string]$OutputDirectory='C:\ProgramData\machine-bootstrap\inventory',[string]$ExportDirectory='',[datetime]$At=(Get-Date))
  [IO.Directory]::CreateDirectory($OutputDirectory)|Out-Null
  $v=Get-MachineInventoryValue $OutputDirectory $At;$json=$v|ConvertTo-Json -Depth 8;$date=Join-Path $OutputDirectory ($At.ToString('yyyy-MM-dd')+'.json')
  Write-AtomicInventoryJson $date $json;Write-AtomicInventoryJson (Join-Path $OutputDirectory 'latest.json') $json
+ # Windows only writes this Windows-owned file. AgentDev's root timer copies it
+ # in when the distro already runs; nothing here calls wsl.exe or touches UNC.
+ if($ExportDirectory){[IO.Directory]::CreateDirectory($ExportDirectory)|Out-Null;Write-AtomicInventoryJson (Join-Path $ExportDirectory 'latest.json') $json}
  Remove-ExpiredInventoryRecords $OutputDirectory $At;Write-Output ('Inventory recorded: '+$date)
  foreach($d in @($v.distros|Where-Object{$_.GhTokenExpiryWarning -eq 'expires-within-14-days'})){
   Write-Output ('WARNING: AgentDev gh token expires within 14 days: '+$d.GhTokenExpiresAtISO)
  }
 }
-if($MyInvocation.InvocationName -ne '.') {Invoke-MachineInventory -OutputDirectory $OutputDirectory -At $Now}
+if($MyInvocation.InvocationName -ne '.') {Invoke-MachineInventory -OutputDirectory $OutputDirectory -ExportDirectory $ExportDirectory -At $Now}

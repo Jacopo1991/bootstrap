@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically copy the Windows inventory snapshot into AgentDev
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

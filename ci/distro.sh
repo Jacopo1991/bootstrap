@@ -47,9 +47,14 @@ docker run --name "$container" --rm \
       sudo -H -u agent chezmoi verify
       umask 022
       sudo -H -u agent python3 /repo/ci/git-gh-approval-test.py
+      sudo -H -u agent test -d /home/agent/.cache/uv -a -w /home/agent/.cache/uv
+      sudo -H -u agent test -d /home/agent/.npm -a -w /home/agent/.npm
+      sudo -H -u agent python3 /repo/ci/claude-managed-install-test.py
       sudo bash /repo/ci/vscode-ssh-test.sh
+      sudo python3 /repo/ci/inventory-mirror-distro-test.py
       cd /tmp
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/distro.sh
       sudo -H -u agent bash /opt/machine-bootstrap/current/checks/boundary.sh
+      bash /repo/ci/claude-mods-load-test.sh
     '\''
   '

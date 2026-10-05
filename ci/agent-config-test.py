@@ -30,11 +30,15 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     # Bare names match only argument-less calls; keep the exact approved patterns.
     "failIfUnavailable": True,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
-    "autoAllowBashIfSandboxed": False}
+    "autoAllowBashIfSandboxed": False,
+    # Package registries for `uv sync` and the one writable cache path, nothing wider.
+    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]},
+    "filesystem": {"allowWrite": ["~/.cache/uv", "~/.npm"]}}
+assert 'mkdir -p "$HOME/.cache/uv"' in (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
 assert "Bash(git merge *)" not in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
-assert "network" not in claude["sandbox"]
+assert not any("*" in d for d in claude["sandbox"]["network"]["allowedDomains"])
 # Documented Bash glob patterns cover destructive flags before and after
 # ordinary remote/branch operands. Selector/quote variants are hook-tested below.
 from fnmatch import fnmatchcase
@@ -751,7 +755,7 @@ print("PASS: founder-approved routine Git/gh, destructive denies and canonical n
 
 for path in ("home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md"):
     rules = (ROOT / path).read_text(encoding="utf-8").lower()
-    for phrase in ("claim work", "never merge", "read the affected", "secret values",
+    for phrase in ("slim-workflow", "never merge", "read the affected", "secret values",
                    "approved workspace roots", "scheduled project jobs remain deferred",
                    "customerharness and typo3"):
         assert phrase in rules, (path, phrase)

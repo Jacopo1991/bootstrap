@@ -199,10 +199,44 @@ when available, with the source date and timestamp visible in the JSON.
 
 Each running distro probe has a 60-second wall limit. Native-command stderr is
 discarded and failures use fixed status values; command diagnostics, environment
-values, and file contents are not written to inventory. The inventory stays on
-the Windows machine under the protected ProgramData directory. These values
+values, and file contents are not written to inventory. The dated records stay
+on the Windows machine under the protected ProgramData directory. These values
 describe the host at collection time and do not certify that a stopped distro's
 cached measurements are current beyond the retained record window.
+
+#### Inventory copy into AgentDev
+
+PM lanes read the newest snapshot from
+`/home/agent/project-data/inventory/latest.json`. The direction is inverted so
+that the inventory never starts AgentDev: Windows only writes the same sanitized
+`latest.json` to its own `C:\ProgramData\machine-bootstrap\export` folder (never
+the dated history), and calls neither `wsl.exe` nor `\\wsl.localhost` for it. The
+inventory task installer creates that folder with a protected ACL: SYSTEM and
+Administrators have full control and the owner account has read-only access,
+because a non-elevated token carries Administrators as deny-only. Re-run
+`.\windows\install-inventory-task.ps1` once to add `-ExportDirectory` to the task.
+
+Inside AgentDev, `system/inventory-mirror.sh` (run by `install.sh`) installs a
+root-owned `inventory-mirror.timer` that starts `inventory-mirror.service` two
+minutes after boot and every 15 minutes after. A timer only fires while the
+distro already runs, so it can never wake a stopped one. The service mounts the
+export folder read-only (`mount -t drvfs`, `uid=0,umask=077`) in its own private
+mount namespace and unmounts it afterwards, so automount stays off, the agent's
+sessions never see a Windows mount, and the boundary check still passes.
+`system/inventory-mirror.py` refuses to mount in the shared namespace.
+
+The copy runs as root but only into agent-owned directories. It refuses a
+symlink, hardlink, FIFO or other non-regular file as the source and as an
+existing `latest.json`, refuses a symlinked `project-data` or `inventory`
+directory or one not owned by `agent`, requires UTF-8 JSON that looks like an
+inventory snapshot (schema 1 or 2, at most 4 MiB), and publishes the exact bytes
+by writing a `0600` temporary file in the same directory and renaming it over
+`latest.json`. The result is owned by `agent` with mode `0600`; `project-data`
+and `inventory` are `0700`. A missing source (no inventory run yet) is not an
+error. Any refusal fails the service and leaves the previous snapshot in place.
+The agent still cannot read Windows paths. Check the timer with
+`systemctl list-timers inventory-mirror.timer` and the last run with
+`systemctl status inventory-mirror.service`.
 
 This checks the requested Linux user boundary. The Windows account that owns WSL
 can still launch the distro as root; this is not a boundary against that owner.
@@ -263,6 +297,26 @@ with Codex's `/hooks` command before relying on it. Codex skips an untrusted
 hook. Do not use a hook-trust bypass. Hooks are additional guardrails; the
 Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
 
+Claude Code mods (v2.1.287 and later) run inside Claude Code and can approve
+tool calls that a non-managed `PreToolUse` hook blocked. `install.sh` therefore
+runs `system/claude-managed.sh` as admin, which installs the root-owned drop-in
+`/etc/claude-code/managed-settings.d/50-managed-mods-only.json`. It sets
+`allowManagedModsOnly` on the built-in guard (`cc-plugin-sec-default@builtin`),
+so mods the agent installs, loads with `--plugin-dir`, or has Claude write do not
+load; built-in mods and the agent's own settings hooks are unaffected. The
+directory and file are `root:root` and not writable by the agent, and CI checks
+that. The option is read from managed settings only, so it is deliberately not
+in the agent's `~/.claude/settings.json`. `disableSideloadFlags` is not set
+because it would also reject `--agents` and `--mcp-config`. The policy hook
+itself still lives in user settings; moving it into managed settings is a
+separate follow-up. The pinned Claude Code release is 2.1.287 or later, so
+the distro job's last step (`ci/claude-mods-load-test.sh`) runs a fixture mod both
+with `--plugin-dir` and installed into the agent's plugin scope: neither answers
+`/modping` under the managed drop-in, and both do once the drop-in is moved aside
+in the disposable container, which is the control. It also requires the
+`allowManagedModsOnly` refusal in the debug log and fails if the pin is older
+than 2.1.287.
+
 Approved code roots are `/home/agent/dev_workspace/<repo>`; Cortex knowledge
 repositories belong in sibling paths under `/home/agent/cortex/<repo>`, never
 inside code repositories. Runtime data belongs under
@@ -305,6 +359,13 @@ The managed Host block uses `ProxyCommand C:\Windows\System32\wsl.exe -d AgentDe
 
 Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choose Remote-SSH: Connect to Host, then select agentdev. The first connection installs VS Code Server in the AgentDev Linux home. Open Linux projects under /home/agent/dev_workspace/<repo>. The extension host runs inside WSL without requiring Windows mounts or interop in the agent session.
 
+## Projects, registries and repository boundaries
+
+**Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `decisions.md`, `tasks/TEMPLATE.md`, `README.md` and `AGENTS.md`. Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
+
+**Package registries.** The Claude Code sandbox may reach exactly `pypi.org`, `files.pythonhosted.org` and `registry.npmjs.org`, and may write `~/.cache/uv` and `~/.npm`. Other registries are added here, by PR, when a project needs them. Codex keeps `network_access = false`: its domain-allowlist proxy does not yet resolve allowlisted hosts inside the Linux sandbox (openai/codex#22387), so a Codex lane asks for approval (`on-request`) to run an install outside the sandbox.
+
+**One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, `decisions.md` and task updates in the knowledge repository.
 ### Cortex knowledge search (qmd)
 
 [qmd](https://www.npmjs.com/package/@tobilu/qmd) (MIT) indexes the Markdown in
@@ -337,7 +398,7 @@ every `~/cortex/*` repository for local keyword and semantic search.
 | Ubuntu WSL image (24.04.5 amd64) and SHA-256 | `windows/new-distro.ps1` |
 | chezmoi, mise, Node 24 LTS, Python 3.12, uv, native Claude Code, bws, SecretSpec | `home/.chezmoitemplates/pins.env` |
 | Node/Python/uv global tools | `home/dot_config/mise/config.toml` |
-| Codex CLI, ccusage and qmd, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
+| Codex CLI, ccusage, Backlog.md and qmd, including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
 | Explicit apt package versions (held after install) | `system/apt-*.lock` |
 | Ubuntu dependency resolution | Signed Ubuntu snapshot `20260930T000000Z` |
 | apt signing key hashes | `home/.chezmoitemplates/pins.env` |
@@ -443,7 +504,10 @@ Git/gh ask rules. The existing deny list and PreToolUse hook remain active.
 The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
 Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
 and `/usr/bin/gh *`: bare names alone only match argument-less calls.
-No general domain/network allow is added. The native GitHub CLI may use its
+The only network allow is `sandbox.network.allowedDomains` of exactly `pypi.org`
+and `files.pythonhosted.org` (no wildcards), so `uv sync` works in the sandbox;
+`sandbox.filesystem.allowWrite` adds only `~/.cache/uv`, created by the tools
+script, as its writable cache. CI asserts both lists exactly. The native GitHub CLI may use its
 existing credential store; agents must never read or print credential files.
 
 Force pushes (including lease variants, short flags, force refspecs and flags

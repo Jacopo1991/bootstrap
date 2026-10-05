@@ -1,0 +1,6 @@
+{
+  "name": "ci-modping",
+  "version": "0.1.0",
+  "description": "CI fixture: answers /modping so a test can tell whether a user mod loaded",
+  "author": { "name": "Bootstrap CI" }
+}

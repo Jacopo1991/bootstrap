@@ -112,7 +112,20 @@
       "/usr/bin/git *",
       "/usr/bin/gh *"
     ],
-    "autoAllowBashIfSandboxed": false
+    "autoAllowBashIfSandboxed": false,
+    "network": {
+      "allowedDomains": [
+        "pypi.org",
+        "files.pythonhosted.org",
+        "registry.npmjs.org"
+      ]
+    },
+    "filesystem": {
+      "allowWrite": [
+        "~/.cache/uv",
+        "~/.npm"
+      ]
+    }
   },
   "hooks": {
     "PreToolUse": [

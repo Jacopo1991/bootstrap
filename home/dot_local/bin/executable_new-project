@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Create a new project the standard way (slim workflow, 2026-10-04).
+# Run by the founder or the PM from a normal shell as the agent user, never from inside an agent session
+# (the agent policy hook blocks git init there on purpose).
+#   new-project create <name> [--local-only]   code repo + cortex-kb repo, each on main with a first commit
+#   new-project publish <name>                 after the PM created both GitHub repos: add origin and push
+set -euo pipefail
+
+usage() { echo "usage: new-project create <name> [--local-only] | new-project publish <name>" >&2; exit 2; }
+[ $# -ge 2 ] || usage
+cmd=$1 name=$2 local_only=0
+[ "${3:-}" = "--local-only" ] && local_only=1
+[[ $name =~ ^[a-z0-9][a-z0-9-]{1,60}$ ]] || { echo "name must be lowercase letters, digits and hyphens" >&2; exit 2; }
+owner=${NEW_PROJECT_OWNER:-Jacopo1991}
+code="$HOME/dev_workspace/$name"
+kb="$HOME/cortex/cortex-kb-$name"
+today=$(date +%Y-%m-%d)
+
+first_commit() { git -C "$1" add -A && git -C "$1" commit -q -m "Initial project skeleton (new-project)"; }
+
+case $cmd in
+create)
+  for d in "$code" "$kb"; do [ ! -e "$d" ] || { echo "$d already exists; nothing changed" >&2; exit 1; }; done
+  mkdir -p "$code" "$kb/tasks"
+  git -C "$code" init -q -b main
+  git -C "$kb" init -q -b main
+
+  cat > "$code/README.md" <<MD
+# $name
+
+Code repository. Project knowledge (intent, status, tasks, decisions) lives in \`cortex-kb-$name\`.
+MD
+  cat > "$code/AGENTS.md" <<MD
+# Agent instructions
+
+Follow the \`slim-workflow\` skill. Read \`~/cortex/cortex-kb-$name\` (INTENT.md, STATUS.md, your task) before working.
+Commit only in this repository; report results in chat. The PM records STATUS.md, decisions.md and task updates in the knowledge repository.
+MD
+  printf '.env\n.env.*\nnode_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n' > "$code/.gitignore"
+
+  cat > "$kb/README.md" <<MD
+# cortex-kb-$name
+
+Project knowledge for \`$name\`, following the \`slim-workflow\` skill.
+Code repository: \`$name\`$( [ $local_only = 1 ] && echo " (local only, no GitHub remote)" ).
+MD
+  cat > "$kb/AGENTS.md" <<MD
+# Agent instructions
+
+Follow the \`slim-workflow\` skill. The PM keeps STATUS.md, decisions.md and tasks/ current; build lanes work in the code repository and report in chat.
+MD
+  cat > "$kb/INTENT.md" <<MD
+# Intent
+
+## Goal
+
+## Non-goals
+
+## Constraints
+MD
+  cat > "$kb/STATUS.md" <<MD
+# Status
+
+Updated: $today
+
+## Now
+Project created.
+
+## Next
+
+## Open questions
+MD
+  cat > "$kb/decisions.md" <<MD
+# Decisions
+
+- $today: Project created with \`new-project\`.
+MD
+  cat > "$kb/tasks/TEMPLATE.md" <<'MD'
+# T<n>: <title>
+
+- Outcome: what is true when this is done.
+- Scope in:
+- Scope out:
+- Acceptance (2-6 checkable criteria; founder approves for meaningful user-facing features):
+  - [ ]
+- Verification command:
+- Time box: one session
+- Stop and report if: the criteria look wrong, two attempts fail, or the time box is reached.
+MD
+  first_commit "$code"
+  first_commit "$kb"
+  echo "Created $code and $kb on main."
+  if [ $local_only = 0 ]; then
+    echo "Next (PM): create private GitHub repos $owner/$name and $owner/cortex-kb-$name, apply the standard ruleset, then run: new-project publish $name"
+  fi
+  ;;
+publish)
+  for pair in "$code:$name" "$kb:cortex-kb-$name"; do
+    dir=${pair%%:*} repo=${pair#*:}
+    [ -d "$dir/.git" ] || { echo "$dir is not a repository; run create first" >&2; exit 1; }
+    if git -C "$dir" remote get-url origin >/dev/null 2>&1; then
+      echo "$dir already has origin; skipped"
+    else
+      git -C "$dir" remote add origin "https://github.com/$owner/$repo.git"
+    fi
+    git -C "$dir" push -q -u origin main
+    echo "Pushed $repo"
+  done
+  ;;
+*) usage ;;
+esac

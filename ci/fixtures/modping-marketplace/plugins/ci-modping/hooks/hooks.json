@@ -1,0 +1,4 @@
+{
+  "description": "CI fixture hooks module",
+  "modules": ["./register.js"]
+}
