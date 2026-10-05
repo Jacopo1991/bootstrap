@@ -58,6 +58,21 @@ mise exec -- npm ci --prefix "$npm_root" --no-audit --no-fund
 ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
 ln -sfn "$npm_root/node_modules/.bin/backlog" "$HOME/.local/bin/backlog"
+# Playwright (verification pack): one pinned version and one shared browser cache that agent
+# sessions, the MCP server and test runs all use. The wrappers fix the cache path; the browser
+# is downloaded once by verify-setup.sh (install.sh, outside the sandbox), never when tests run.
+rm -f "$HOME/.local/bin/playwright" "$HOME/.local/bin/playwright-mcp"
+cat > "$HOME/.local/bin/playwright" <<'PLAYWRIGHT'
+#!/usr/bin/env bash
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+exec "$HOME/.local/share/bootstrap/npm/node_modules/.bin/playwright" "$@"
+PLAYWRIGHT
+cat > "$HOME/.local/bin/playwright-mcp" <<'PLAYWRIGHT_MCP'
+#!/usr/bin/env bash
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+exec "$HOME/.local/share/bootstrap/npm/node_modules/.bin/playwright-mcp" --browser chromium --headless --isolated "$@"
+PLAYWRIGHT_MCP
+chmod 0755 "$HOME/.local/bin/playwright" "$HOME/.local/bin/playwright-mcp"
 # qmd runs through a small wrapper so every caller (CLI, timer, MCP server) uses the GPU:
 # node-llama-cpp only detects the CUDA runtime through LD_LIBRARY_PATH and the WSL
 # driver tools on PATH, not through the backend's own $ORIGIN runpath.
