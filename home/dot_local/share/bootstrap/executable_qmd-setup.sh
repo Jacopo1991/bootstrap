@@ -28,7 +28,7 @@ qmd pull
 qmd update
 qmd embed
 
-step 'user systemd timer'
+step 'user systemd timers'
 if [[ ! -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
   echo "No user systemd bus at \$XDG_RUNTIME_DIR/bus; cannot start qmd-index.timer." >&2
   exit 1
@@ -37,6 +37,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now qmd-index.timer
 systemctl --user is-active --quiet qmd-index.timer
 systemctl --user list-timers qmd-index.timer --no-pager
+# The pre-commit gate's offline vulnerability data (osv-db-refresh) on the same user manager.
+systemctl --user enable --now osv-db-refresh.timer
+systemctl --user is-active --quiet osv-db-refresh.timer
+systemctl --user list-timers osv-db-refresh.timer --no-pager
 
 step 'Claude Code MCP server'
 claude=$HOME/.local/bin/claude

@@ -1,22 +1,42 @@
 #!/usr/bin/env bash
 # Fetch the OSV offline vulnerability databases that the osv-scanner pre-commit hook
-# reads (it never fetches at commit time). Bootstrap runs this on install; run it from a
-# normal shell to refresh. Only changed databases are downloaded.
-set -euo pipefail
+# reads (it never fetches at commit time). Bootstrap runs this on install and
+# osv-db-refresh.timer runs it weekly; run it from a normal shell to refresh by hand.
+# Only changed databases are downloaded. Every ecosystem is tried; any failure is
+# reported and makes the command (and the timer's unit) fail. Only a fully successful
+# run updates the .last-refresh stamp that the drift report checks.
+set -uo pipefail
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/osv-scalibr"
-for ecosystem in PyPI npm crates.io Go Packagist RubyGems; do
-  file="$cache/$ecosystem/all.zip"
-  mkdir -p "${file%/*}"
+failed=0
+
+refresh() {
+  local file="$cache/$1/all.zip"
+  local since=()
+  mkdir -p "${file%/*}" || return 1
   rm -f "$file.part"
-  since=()
   [ -f "$file" ] && since=(--time-cond "$file")
   curl --fail --silent --show-error --location --retry 3 --remote-time "${since[@]}" \
-    "https://osv-vulnerabilities.storage.googleapis.com/$ecosystem/all.zip" -o "$file.part"
+    "https://osv-vulnerabilities.storage.googleapis.com/$1/all.zip" -o "$file.part" || return 1
   if [ -s "$file.part" ]; then
-    unzip -tq "$file.part" >/dev/null
-    mv "$file.part" "$file"
+    unzip -tq "$file.part" >/dev/null || return 1
+    mv "$file.part" "$file" || return 1
+    echo "ok $1: updated"
   else
     rm -f "$file.part"
+    echo "ok $1: unchanged"
+  fi
+}
+
+for ecosystem in PyPI npm crates.io Go Packagist RubyGems; do
+  if ! refresh "$ecosystem"; then
+    rm -f "$cache/$ecosystem/all.zip.part"
+    echo "ERROR $ecosystem: download or zip check failed; the previous database is kept" >&2
+    failed=1
   fi
 done
+if [ $failed = 1 ]; then
+  echo "OSV offline databases NOT fully refreshed in $cache" >&2
+  exit 1
+fi
+touch "$cache/.last-refresh"
 echo "OSV offline databases current in $cache"

@@ -439,8 +439,21 @@ PyPI and about six for npm (its database is about 200 MB).
   (`pre-commit gc`) and the hook install creates it too.
 - **Vulnerability data:** `osv-db-refresh` downloads the PyPI, npm, crates.io, Go,
   Packagist and RubyGems databases (only changed files, zip-checked). The tools script
-  runs it on install. The data is not refreshed on a schedule: before relying on a
-  dependency check, run `osv-db-refresh` from a normal shell.
+  runs it on install, and the user timer `osv-db-refresh.timer` runs it weekly
+  (`OnCalendar=weekly`, `Persistent=true`, so a week missed while the distro was stopped
+  is caught up on the next start). It is a plain download with no agent runs, enabled by
+  `qmd-setup.sh` next to `qmd-index.timer`.
+- **Errors:** `osv-db-refresh` tries every ecosystem, logs `ERROR <ecosystem>` for each
+  failure, keeps that ecosystem's previous database and exits non-zero, so the unit
+  shows in `systemctl --user --failed` and `journalctl --user -u osv-db-refresh`. Only a
+  fully successful run touches `~/.cache/osv-scalibr/.last-refresh`. The drift report
+  (`checks/agent-drift.py`) reports `osv-db-never-refreshed`, or `osv-db-stale` when that
+  stamp is more than 15 days old.
+- **Accepted exceptions:** an `osv-scanner.toml` next to a lockfile can ignore one
+  advisory, with a reason and an `ignoreUntil` date; after that date the advisory blocks
+  again. Bootstrap's own npm lock ignores `GHSA-vfj7-8cjw-p6xm` (braces 3.0.3, no fixed
+  version, reached through qmd's fast-glob) until 2027-01-05
+  (`home/dot_local/share/bootstrap/npm/osv-scanner.toml`).
 - **New projects:** `new-project create` writes `.pre-commit-config.yaml` into both
   repositories and runs `pre-commit install`.
 - **Existing repositories:** the founder or the PM runs `pre-commit-enable <checkout>`
@@ -453,7 +466,12 @@ PyPI and about six for npm (its database is about 200 MB).
   link and a lockfile without an offline database are blocked, and that a clean change
   passes from a read-only store. With a local PyPI database it also checks that a known
   advisory is blocked. It also covers `pre-commit-enable`. `ci/new-project-test.sh`
-  checks the config and hook in both new repositories.
+  checks the config and hook in both new repositories. `ci/osv-db-test.py` checks the
+  npm exception (one ID, a reason, the expiry date, still matching the lock), the units
+  and their enablement, and that `osv-db-refresh` reports failures, keeps old data and
+  stamps only a full success. With osv-scanner and the offline npm database installed,
+  it also checks that the exception passes the lock until it expires, that an expired
+  copy blocks it and that the lock without the exception is blocked.
 
 ## Pins and repeatability
 

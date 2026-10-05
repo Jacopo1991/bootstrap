@@ -31,8 +31,9 @@ osv_expected=${OSV_SCANNER_URL##*/download/v}
 [[ $(osv-scanner --version) == *"osv-scanner version: ${osv_expected%%/*}"* ]]
 [[ $(pre-commit --version) == "pre-commit $(sed -n 's/^pre-commit==//p' "$ROOT/home/dot_local/share/bootstrap/pre-commit/requirements.in")" ]]
 # The gate's store and offline vulnerability data exist outside the sandbox.
-[[ -f $HOME/.cache/pre-commit/db.db && -f $HOME/.cache/osv-scalibr/PyPI/all.zip ]]
+[[ -f $HOME/.cache/pre-commit/db.db && -f $HOME/.cache/osv-scalibr/.last-refresh ]]
 bash "$ROOT/ci/pre-commit-test.sh"
+python3 "$ROOT/ci/osv-db-test.py"
 for lock in "$ROOT/system/apt-base.lock" "$ROOT/system/apt-gh.lock"; do
   while IFS='=' read -r package version; do
     [[ $(dpkg-query -W -f='${Version}' "$package") == "$version" ]] || {

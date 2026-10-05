@@ -1,0 +1,8 @@
+# osv-scanner reads this file for package-lock.json in this directory (pre-commit gate).
+# Each exception names one advisory, a reason and an expiry; after ignoreUntil the
+# advisory blocks commits that change the lock again until it is reviewed.
+
+[[IgnoredVulns]]
+id = "GHSA-vfj7-8cjw-p6xm"
+ignoreUntil = 2027-01-05
+reason = "Accepted risk: braces 3.0.3 (no fixed version) comes in through qmd's fast-glob and micromatch and only expands bootstrap's own glob patterns, never untrusted input."
