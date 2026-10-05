@@ -13,8 +13,13 @@ drift = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(drift)
 
 expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
-            "lychee", "osv-scanner", "pre-commit"}
+            "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
+            "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "verify-enable",
+            "new-project", "qmd-refresh"}
 assert drift.EXPECTED_BINARIES == expected
+# Every command the bootstrap installs into ~/.local/bin is expected, not drift.
+for script in (ROOT / "home/dot_local/bin").iterdir():
+    assert script.name.removeprefix("executable_") in expected, script.name
 assert drift.compare_sets(expected, expected) == []
 pins = drift.read_pins(ROOT / "home/.chezmoitemplates/pins.env")
 for name, (key, marker) in drift.URL_VERSIONS.items():

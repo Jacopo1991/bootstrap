@@ -115,6 +115,8 @@
     "autoAllowBashIfSandboxed": false,
     "network": {
       "allowedDomains": [
+        "github.com",
+        "api.github.com",
         "pypi.org",
         "files.pythonhosted.org",
         "registry.npmjs.org"

@@ -38,7 +38,13 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False,
     # Package registries for `uv sync` and the one writable cache path, nothing wider.
-    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]},
+    # github.com and api.github.com: a git/gh command is only unsandboxed (excludedCommands) when
+    # it is the whole command. Chains such as `git fetch | tail` or `git log && git status`
+    # (allowed by the policy hook for git/gh plus read-only text tools) run sandboxed, and
+    # failed with "CONNECT tunnel failed, response 403" until these two hosts were allowed.
+    # Manual check: `git ls-remote origin HEAD` works, `git ls-remote origin HEAD | head -1` fails.
+    "network": {"allowedDomains": ["github.com", "api.github.com", "pypi.org",
+                                   "files.pythonhosted.org", "registry.npmjs.org"]},
     "filesystem": {"allowWrite": ["~/.cache/uv", "~/.npm"]}}
 assert 'mkdir -p "$HOME/.cache/uv"' in (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]

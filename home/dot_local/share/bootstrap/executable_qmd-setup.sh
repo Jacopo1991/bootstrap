@@ -26,7 +26,14 @@ fi
 step 'models, index and embeddings'
 qmd pull
 qmd update
-qmd embed
+# Embedding is not worth aborting the install for (a GPU out of memory, a driver
+# fault): retry once on the CPU, otherwise leave it to qmd-index.timer.
+if ! qmd embed; then
+  echo 'WARNING: qmd embed failed; retrying once on the CPU (QMD_FORCE_CPU=1).' >&2
+  if ! QMD_FORCE_CPU=1 qmd embed; then
+    echo 'WARNING: qmd embed failed on the CPU too; continuing. qmd-index.timer retries every 15 minutes; vector search stays incomplete until it succeeds.' >&2
+  fi
+fi
 
 step 'user systemd timers'
 if [[ ! -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
@@ -42,12 +49,18 @@ systemctl --user enable --now osv-db-refresh.timer
 systemctl --user is-active --quiet osv-db-refresh.timer
 systemctl --user list-timers osv-db-refresh.timer --no-pager
 
+step 'shared qmd MCP server'
+# One HTTP server keeps the models loaded once; Claude Code sessions and the
+# Claude app connect to it instead of each starting a stdio server on the GPU.
+systemctl --user enable --now qmd-mcp.service
+systemctl --user is-active --quiet qmd-mcp.service
+
 step 'Claude Code MCP server'
 claude=$HOME/.local/bin/claude
 # Replace a stale entry; `mcp get` fails only when there is none.
 if "$claude" mcp get qmd >/dev/null 2>&1; then
   "$claude" mcp remove --scope user qmd
 fi
-"$claude" mcp add --scope user qmd -- "$HOME/.local/bin/qmd" mcp
+"$claude" mcp add --scope user --transport http qmd http://localhost:8181/mcp
 "$claude" mcp get qmd
 echo 'qmd setup complete.'
