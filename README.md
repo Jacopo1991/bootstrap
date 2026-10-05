@@ -578,9 +578,15 @@ the `agentdev-daily` plan). Excluded: node_modules, .venv, `__pycache__`, .cache
 `\\wsl.localhost` only answers while the distro runs, so the plan has a hook that runs
 `wsl.exe -d AgentDev -u agent -- true` before every backup and cancels the run if it fails.
 
-**Your one step:** open the web UI, create the Backrest user, and set the password on the
-`restic` repository (it creates the repository on save). The password is not in this repository;
-keep a copy in your password manager, since without it the backups cannot be read.
+**Repository password:** Backrest creates the restic repository when it starts, so the installer
+asks for the password once (typed twice, never echoed) before the first start. It is kept only
+in `%LOCALAPPDATA%\backrest\restic-password.txt`, readable by your account alone, and the repository
+points restic at it with `RESTIC_PASSWORD_FILE`; it is never in `config.json`, logs or output.
+Re-running the installer keeps an existing file and does not ask again. **Losing the password
+means losing the backups**, so also store it in your password manager. Then open the web UI and
+create the Backrest user.
+
+For a restore with the CLI, set `$env:RESTIC_PASSWORD_FILE` to that file instead of typing the password.
 
 **Restore** (Backrest UI: Repo, Snapshots, browse, Restore; or the restic CLI from a normal
 Windows shell, with the installed `%LOCALAPPDATA%\backrest\bin\restic.exe`):

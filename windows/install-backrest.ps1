@@ -7,10 +7,10 @@ param([string]$DistroName = 'AgentDev', [switch]$Force)
 # the agent's no-C:-access boundary stays intact. It reads AgentDev through
 # \\wsl.localhost\AgentDev\home\agent and writes to C:\backups\restic.
 #
-# The repository password is NOT set here: open http://127.0.0.1:9898 on first start, create the
-# Backrest user, then set the password on the "restic" repository (it is stored in Backrest's
-# config.json under your profile; keep a copy in your password manager, a lost password means
-# unreadable backups).
+# The script asks once for the repository password (typed twice) and keeps it only in
+# %LOCALAPPDATA%\backrest\restic-password.txt, readable by your account alone; the repository's env
+# points restic at it (RESTIC_PASSWORD_FILE). It never goes into config.json, logs or output.
+# Keep a copy in your password manager too: a lost password means unreadable backups.
 
 $script:BackrestVersion = 'v1.14.1'
 $script:BackrestUrl = 'https://github.com/garethgeorge/backrest/releases/download/v1.14.1/backrest_Windows_x86_64.zip'
@@ -61,13 +61,15 @@ function Get-BackrestSources {
 }
 
 function New-BackrestConfig {
-    param([Parameter(Mandatory)][string[]]$Sources, [string]$Distro = 'AgentDev', [string]$RepoPath = $script:BackrestRepoPath)
+    param([Parameter(Mandatory)][string[]]$Sources, [Parameter(Mandatory)][string]$PasswordFile,
+          [string]$Distro = 'AgentDev', [string]$RepoPath = $script:BackrestRepoPath)
     $schedule = { param($cron) [ordered]@{ cron = $cron; clock = 'CLOCK_LOCAL' } }
-    # No password on purpose: the founder sets it in the web UI. autoInitialize creates the restic
-    # repository the first time a password is saved.
+    # The password itself never goes into the config: restic reads it from the owner-only file.
+    # Backrest initializes the repository at start, so that file must exist before the first start.
     $repo = [ordered]@{
         id = 'restic'
         uri = $RepoPath
+        env = @("RESTIC_PASSWORD_FILE=$PasswordFile")
         autoInitialize = $true
         autoUnlock = $true
         prunePolicy = [ordered]@{ schedule = (& $schedule $script:BackrestPruneCron); maxUnusedPercent = 10 }
@@ -92,13 +94,23 @@ function New-BackrestConfig {
 }
 
 function Merge-BackrestConfig {
-    # Keeps whatever Backrest wrote itself (auth user, repo password, other repos and plans) and
-    # replaces only the generated plan; the repo is added if missing, otherwise left as the founder has it.
+    # Keeps whatever Backrest wrote itself (auth user, other repos and plans) and replaces only the
+    # generated plan; the repo is added if missing, otherwise kept as is except that its
+    # RESTIC_PASSWORD_FILE entry is set to the generated one.
     param([string]$ExistingJson, [Parameter(Mandatory)]$Generated)
     if ([string]::IsNullOrWhiteSpace($ExistingJson)) { return $Generated }
     $existing = $ExistingJson | ConvertFrom-Json
     $repos = @($existing.repos | Where-Object { $null -ne $_ })
-    if (-not ($repos | Where-Object id -eq 'restic')) { $repos += [pscustomobject]$Generated.repos[0] }
+    $ours = $repos | Where-Object id -eq 'restic'
+    if (-not $ours) {
+        $repos += [pscustomobject]$Generated.repos[0]
+    } else {
+        $current = $ours.PSObject.Properties['env']
+        $entries = @()
+        if ($null -ne $current) { $entries = @(@($current.Value) | Where-Object { $_ -and $_ -notlike 'RESTIC_PASSWORD_FILE=*' }) }
+        $entries += $Generated.repos[0].env[0]
+        $ours | Add-Member -NotePropertyName env -NotePropertyValue $entries -Force
+    }
     $plans = @($existing.plans | Where-Object { $null -ne $_ -and $_.id -ne 'agentdev-daily' })
     $plans += [pscustomobject]$Generated.plans[0]
     $existing | Add-Member -NotePropertyName repos -NotePropertyValue $repos -Force
@@ -109,6 +121,36 @@ function Merge-BackrestConfig {
 function ConvertTo-BackrestJson {
     param([Parameter(Mandatory)]$Config)
     return ($Config | ConvertTo-Json -Depth 12)
+}
+
+function ConvertFrom-SecureStringPlain {
+    param([Parameter(Mandatory)][securestring]$Secret)
+    $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+}
+
+function Read-ConfirmedPassword {
+    # Typed twice; never echoed, logged or returned as plain text.
+    $first = Read-Host -AsSecureString -Prompt 'Choose the backup repository password (keep a copy in your password manager)'
+    $second = Read-Host -AsSecureString -Prompt 'Type it again to confirm'
+    $a = ConvertFrom-SecureStringPlain -Secret $first
+    $b = ConvertFrom-SecureStringPlain -Secret $second
+    if ($a.Length -eq 0) { throw 'An empty password is not allowed.' }
+    if (-not [string]::Equals($a, $b, [StringComparison]::Ordinal)) { throw 'The two passwords differ; nothing written.' }
+    return $first
+}
+
+function New-ResticPasswordFile {
+    # Creates the file empty, restricts it to the current user only, and only then writes the secret.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][securestring]$Password)
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+    [IO.File]::WriteAllBytes($Path, [byte[]]@())
+    $acl = [Security.AccessControl.FileSecurity]::new()
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'))
+    Set-Acl -LiteralPath $Path -AclObject $acl
+    [IO.File]::WriteAllText($Path, (ConvertFrom-SecureStringPlain -Secret $Password), [Text.UTF8Encoding]::new($false))
 }
 
 function Expand-VerifiedZip {
@@ -188,6 +230,15 @@ function Install-Backrest {
         if (-not (Test-Path -LiteralPath $source)) { Write-Warning "Backup source not found: $source" }
     }
 
+    # Backrest initializes the repository at start, so the password must exist before the first start.
+    $passwordFile = Join-Path $base 'restic-password.txt'
+    if (Test-Path -LiteralPath $passwordFile) {
+        Write-Output "Keeping the existing repository password file: $passwordFile"
+    } else {
+        New-ResticPasswordFile -Path $passwordFile -Password (Read-ConfirmedPassword)
+        Write-Output "Repository password stored (current user only): $passwordFile"
+    }
+
     Install-BackrestBinary -InstallDirectory $binDirectory
     New-Item -ItemType Directory -Force -Path $script:BackrestRepoPath, (Join-Path $base 'data') | Out-Null
 
@@ -196,7 +247,7 @@ function Install-Backrest {
         throw "$configFile exists. Re-run with -Force to refresh only the agentdev-daily plan (a backup is kept)."
     }
     if ($existing) { Copy-Item -LiteralPath $configFile -Destination ($configFile + '.bootstrap-' + [Guid]::NewGuid().ToString('N') + '.bak') }
-    $config = Merge-BackrestConfig -ExistingJson $existing -Generated (New-BackrestConfig -Sources $sources -Distro $DistroName)
+    $config = Merge-BackrestConfig -ExistingJson $existing -Generated (New-BackrestConfig -Sources $sources -PasswordFile $passwordFile -Distro $DistroName)
     [IO.File]::WriteAllText($configFile, (ConvertTo-BackrestJson -Config $config), [Text.UTF8Encoding]::new($false))
 
     $launcher = Join-Path $base 'start-backrest.ps1'
@@ -206,6 +257,6 @@ function Install-Backrest {
     Start-ScheduledTask -TaskName $script:BackrestTaskName
 
     Write-Output "Backrest $script:BackrestVersion installed in $binDirectory; config $configFile."
-    Write-Output 'NEXT (you): open http://127.0.0.1:9898, create the Backrest user, and set the password on the "restic" repository.'
+    Write-Output 'NEXT (you): open http://127.0.0.1:9898 and create the Backrest user. Keep the repository password in your password manager too: losing it means losing the backups.'
 }
 if ($MyInvocation.InvocationName -ne '.') { Install-Backrest }

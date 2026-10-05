@@ -59,15 +59,32 @@ class ScriptShape(unittest.TestCase):
         self.assertIn("if ($Live)", live)
         self.assertIn("FATAL", live)
         self.assertIn("StatusCode", live)
+        self.assertIn("New-ResticPasswordFile", live)  # temp password file, as the installer does
+        self.assertIn("repo\\config", live)  # temp repository initialized
 
     def test_logon_start_for_the_founder_not_elevated(self):
         self.assertIn("New-ScheduledTaskTrigger -AtLogOn", SCRIPT)
         self.assertIn("-RunLevel Limited", SCRIPT)
         self.assertIn("127.0.0.1:9898", SCRIPT)  # web UI stays on loopback
 
-    def test_password_never_written(self):
+    def test_password_prompted_once_and_kept_in_owner_only_file(self):
         self.assertNotRegex(SCRIPT, r"(?i)\bpassword\s*=")
-        self.assertNotIn("RESTIC_PASSWORD", SCRIPT)
+        self.assertNotIn("RESTIC_PASSWORD=", SCRIPT.replace("RESTIC_PASSWORD_FILE=", ""))
+        self.assertIn("Read-Host -AsSecureString", SCRIPT)
+        self.assertEqual(SCRIPT.count("Read-Host"), 2)  # typed twice
+        self.assertIn("restic-password.txt", SCRIPT)
+        # skipped when the file exists, and created before the config is written and Backrest started
+        self.assertIn("if (Test-Path -LiteralPath $passwordFile)", SCRIPT)
+        install = SCRIPT[SCRIPT.index("function Install-Backrest {"):]
+        self.assertLess(install.index("New-ResticPasswordFile"), install.index("Start-ScheduledTask"))
+        self.assertLess(install.index("New-ResticPasswordFile"), install.index("WriteAllText($configFile"))
+        # ACL: file created empty, access inherited rules removed, only then the secret is written
+        helper = SCRIPT[SCRIPT.index("function New-ResticPasswordFile"):SCRIPT.index("function Expand-VerifiedZip")]
+        self.assertIn("SetAccessRuleProtection($true, $false)", helper)
+        self.assertLess(helper.index("Set-Acl"), helper.index("WriteAllText($Path"))
+        self.assertEqual(helper.count("FileSystemAccessRule"), 1)
+        # the secret is never printed
+        self.assertNotRegex(SCRIPT, r"Write-(Output|Host|Warning)[^\n]*\$(a|b|first|second|Password)\b")
 
     def test_existing_config_needs_force_and_is_backed_up(self):
         self.assertIn("-Force", SCRIPT)
@@ -92,7 +109,12 @@ class ExpectedConfig(unittest.TestCase):
 
     def test_destination_and_no_password(self):
         self.assertEqual(self.repo["uri"], "C:\\backups\\restic")
-        self.assertNotIn("password", json.dumps(FIXTURE).lower())
+        self.assertNotRegex(json.dumps(FIXTURE).lower(), r'"password"\s*:')
+
+    def test_repo_reads_password_from_file_only(self):
+        self.assertEqual(len(self.repo["env"]), 1)
+        self.assertRegex(self.repo["env"][0], r"^RESTIC_PASSWORD_FILE=.+\\backrest\\restic-password\.txt$")
+        self.assertNotIn("RESTIC_PASSWORD=", json.dumps(FIXTURE))
 
     def test_daily_0230_schedule_local_clock(self):
         self.assertEqual(self.plan["schedule"], {"cron": "30 2 * * *", "clock": "CLOCK_LOCAL"})

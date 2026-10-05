@@ -6,6 +6,7 @@
     {
       "id": "restic",
       "uri": "C:\\backups\\restic",
+      "env": ["RESTIC_PASSWORD_FILE=C:\\Users\\founder\\AppData\\Local\\backrest\\restic-password.txt"],
       "autoInitialize": true,
       "autoUnlock": true,
       "prunePolicy": {
