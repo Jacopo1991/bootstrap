@@ -35,6 +35,7 @@ bash ci/pre-commit-test.sh
 python3 ci/osv-db-test.py
 python3 ci/verification-pack-test.py
 python3 ci/skills-hooks-test.py
+python3 ci/backrest-test.py
 mapfile -t scripts < <(find . -name '*.sh' -type f -not -path './.git/*')
 scripts+=(home/dot_local/bin/executable_qmd-refresh home/dot_local/bin/executable_new-project
   home/dot_local/bin/executable_pre-commit-enable home/dot_local/bin/executable_osv-db-refresh

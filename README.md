@@ -560,6 +560,42 @@ PyPI and about six for npm (its database is about 200 MB).
   `ci/founder-tasks-test.ps1` (threshold and notification logic with `ci/fixtures/billing-usage.json`
   instead of the API, task XML, allowlist) runs in the Windows PowerShell 5.1 job.
 
+## Backups (Backrest on Windows)
+
+Backrest (restic) runs on Windows as your own process, not in AgentDev, so the agent
+still has no C: access. `windows/install-backrest.ps1` (elevated PowerShell, same account
+that owns the distro) installs the pinned, hash-checked Backrest release under
+`%LOCALAPPDATA%\backrest`, starts it at logon (web UI on `http://127.0.0.1:9898`) and writes
+its config: repository `C:\backups\restic`, plan `agentdev-daily` at 02:30, keep 7 daily /
+4 weekly / 6 monthly, prune Sundays 03:30 and check Sundays 04:30. Sources, read through
+`\\wsl.localhost\AgentDev\home\agent\`: `project-data`, `cortex`, and `dev_workspace/` limited to
+consultancy-website, customer-harness, typo3-dkm-plugin plus every repository without a GitHub
+remote (decided at install time; re-run with `-Force` after adding one, which replaces only
+the `agentdev-daily` plan). Excluded: node_modules, .venv, `__pycache__`, .cache, dist, build,
+.next, target and the qmd index.
+
+`\\wsl.localhost` only answers while the distro runs, so the plan has a hook that runs
+`wsl.exe -d AgentDev -u agent -- true` before every backup and cancels the run if it fails.
+
+**Your one step:** open the web UI, create the Backrest user, and set the password on the
+`restic` repository (it creates the repository on save). The password is not in this repository;
+keep a copy in your password manager, since without it the backups cannot be read.
+
+**Restore** (Backrest UI: Repo, Snapshots, browse, Restore; or the restic CLI from a normal
+Windows shell, with `restic.exe` from Backrest's data folder or your own install):
+
+```powershell
+$env:RESTIC_REPOSITORY = 'C:\backups\restic'          # restic asks for the password
+restic snapshots                                       # list snapshots (note the ID)
+restic ls latest --path '\\wsl.localhost\AgentDev\home\agent\project-data\typo3-dkm' | more
+restic restore latest --include '*\typo3-dkm\notes.md' --target C:\restore          # one file
+restic restore latest --include '*\project-data\typo3-dkm' --target C:\restore      # a whole project
+```
+
+Restores go to `C:\restore`, then copy what you need back into AgentDev from your own shell.
+Backups were read over a Windows network path, so Linux file modes (such as the executable bit)
+and symlinks are not preserved; re-apply `chmod` after restoring scripts.
+
 ## Pins and repeatability
 
 | Component | Pin location |
@@ -576,6 +612,7 @@ PyPI and about six for npm (its database is about 200 MB).
 | Public test model | Revision in `checks/gpu-smoke.py` |
 | ShellCheck, agent/CI Gitleaks, lychee, osv-scanner and release SHA-256 | `home/.chezmoitemplates/pins.env` |
 | pre-commit and all dependencies with hashes | `home/dot_local/share/bootstrap/pre-commit/requirements.lock` |
+| Backrest release and SHA-256 | `windows/install-backrest.ps1` |
 | GitHub Actions checkout | Full commit SHA in the workflow |
 
 Claude Code uses the official native installer with an exact release argument
