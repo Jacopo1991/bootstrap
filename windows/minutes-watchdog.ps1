@@ -83,7 +83,7 @@ function Invoke-MinutesWatchdog {
         if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json }
         $alert = Get-MinutesAlert -Level $level -Month $month -State $state
         $percent = [math]::Round($used / $Included * 100, 1)
-        Write-WatchdogLog ("OK month=$month used=$used included=$Included percent=$percent level=$level alert=$alert")
+        Write-WatchdogLog -Directory $Directory ("OK month=$month used=$used included=$Included percent=$percent level=$level alert=$alert")
         if ($alert -gt 0) {
             Show-WatchdogNotification -Title "GitHub Actions minutes: $alert% of the month used" `
                 -Message "$([math]::Round($used)) of $Included included minutes used in $month ($percent%). Stop adding workflow runs and tell the PM."
@@ -92,7 +92,7 @@ function Invoke-MinutesWatchdog {
         }
         return 0
     } catch {
-        Write-WatchdogLog ("ERROR " + $_.Exception.Message)
+        Write-WatchdogLog -Directory $Directory ("ERROR " + $_.Exception.Message)
         return 1
     }
 }
