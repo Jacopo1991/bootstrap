@@ -405,6 +405,21 @@ with tempfile.TemporaryDirectory() as temp:
                     "tee safe.txt", "printf fixture > safe.txt", "cp -t docs safe.txt"):
         assert policy.evaluate(event(command), roots) is None, command
 
+    # Ordinary folders inside the repository may be deleted; anything holding Git
+    # metadata, anything outside the repository and expanded operands may not.
+    (current / "scratch" / "deep").mkdir(parents=True)
+    (current / "scratch" / "deep" / "file.txt").write_text("fixture")
+    (current / "nested-repo").mkdir()
+    subprocess.run(["git", "init", "-q", str(current / "nested-repo")], check=True)
+    (current / "has-gitfile").mkdir()
+    (current / "has-gitfile" / ".git").write_text("gitdir: elsewhere")
+    for command in ("rm -r scratch/deep", "rm -rf scratch"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in ("rm -r .", "rm -rf nested-repo", "rm -r has-gitfile", "rm -r .git",
+                    "rm -r ../", "rm -rf scratch/*", "rm -r scra?ch", "chmod -R 755 scratch",
+                    "chown -R agent scratch"):
+        assert policy.evaluate(event(command), roots) is not None, command
+
     # Git can store metadata under a name other than .git; discover that path
     # instead of relying only on path components (same protection as worktrees).
     separate = code_base / "separate"

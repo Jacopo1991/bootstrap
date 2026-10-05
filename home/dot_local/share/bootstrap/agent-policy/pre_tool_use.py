@@ -90,6 +90,24 @@ def git_metadata(root: Path) -> tuple[Path, ...] | None:
         return None
 
 
+def folder_delete_reason(folder: Path, root: Path | None,
+                         metadata: tuple[Path, ...] | None) -> str | None:
+    """Deleting an ordinary folder inside the repository is fine; nothing that holds
+    Git metadata (the repository root, a .git entry, a nested repository or a
+    separate Git directory) may be deleted."""
+    if root is None or metadata is None:
+        return "Cannot identify the repository safely; folder deletion blocked."
+    target = folder.resolve()
+    if target == Path(root).resolve():
+        return "Deleting the repository root is blocked."
+    if any(path == target or target in path.parents for path in metadata):
+        return "Deleting Git metadata is blocked."
+    for current, dirs, files in os.walk(target):
+        if ".git" in dirs or ".git" in files:
+            return "Deleting folders that contain Git metadata is blocked."
+    return None
+
+
 def writable(path_text: str, cwd: str, root: Path, metadata: tuple[Path, ...] | None) -> bool:
     return (metadata is not None and inside(path_text, cwd, root)
             and not protected_git_path(path_text, cwd, metadata))
@@ -774,9 +792,16 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
         else:
             targets = args
         inspected = args + [t.split("=", 1)[1] for t in tokens[1:] if t.startswith("--") and "=" in t]
-        if executable in {"rm", "chmod", "chown"} and any(
-                SHELL_EXPANSION.search(t) or (Path(cwd) / t).is_dir() for t in targets):
-            return "Directory mutation commands are blocked; use explicit file paths."
+        if executable in {"rm", "chmod", "chown"}:
+            if any(SHELL_EXPANSION.search(t) for t in targets):
+                return "Expanded file operands are blocked; use explicit paths."
+            folders = [t for t in targets if (Path(cwd) / t).is_dir() and not (Path(cwd) / t).is_symlink()]
+            if folders and executable != "rm":
+                return "Recursive permission changes are blocked; use explicit file paths."
+            for folder in folders:
+                reason = folder_delete_reason(Path(cwd) / folder, root, metadata)
+                if reason:
+                    return reason
     if executable == "sed" and any(t == "-i" or t.startswith("-i") or t.startswith("--in-place")
                                   for t in tokens[1:]):
         targets = args[-1:]
