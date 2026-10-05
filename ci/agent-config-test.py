@@ -3,10 +3,16 @@
 import importlib.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import tomllib
+
+# Agent sessions export GIT_CONFIG_*/GIT_EDITOR/...; the hook (rightly) refuses them,
+# so the fixtures below need a clean Git environment.
+for name in [name for name in os.environ if name.startswith("GIT_")]:
+    del os.environ[name]
 
 ROOT = Path(__file__).resolve().parents[1]
 assert (ROOT / ".chezmoiroot").read_text(encoding="utf-8").strip() == "home"
@@ -49,8 +55,13 @@ for executable in ("git", "/usr/bin/git"):
     for tail in ("push --force origin HEAD", "push origin HEAD --force-with-lease",
                  "push origin HEAD -f", "push origin -fextra",
                  "push --delete origin branch", "push origin branch --delete",
-                 "push origin :branch"):
+                 "push origin :branch -u"):
         assert claude_denies(executable + " " + tail), tail
+    # The native grammar cannot express "last argument starts with a colon" (a trailing
+    # ':*' is the legacy prefix suffix); the hook denies that form (tested below).
+    assert not claude_denies(executable + " push origin HEAD:refs/heads/task")
+assert not any(entry.endswith(":*)") for entry in claude["permissions"]["deny"]), \
+    "a trailing ':*' is the legacy prefix suffix and is malformed after '* '"
 for executable in ("gh", "/usr/bin/gh"):
     for tail in ("repo delete fixture", "repo edit fixture", "release delete fixture",
                  "secret list", "ruleset list", "api -X DELETE repos/fixture",
@@ -339,10 +350,9 @@ with tempfile.TemporaryDirectory() as temp:
                     "git -ccore.fsmonitor=fixture status",
                     "git --config-env=core.sshCommand=FIXTURE status",
                     "git status --config-env=core.sshCommand=FIXTURE",
-                    "FOO=fixture git status", "FOO=fixture gh issue list",
                     "GIT_CONFIG_COUNT=0 git status", "GIT_CONFIG_PARAMETERS=fixture git status",
                     "GIT_DIR=.git git status", "GIT_EXEC_PATH=. git status",
-                    "env GIT_DIR=.git git status", "env FOO=fixture gh issue list"):
+                    "env GIT_DIR=.git git status", "env FOO=fixture GIT_DIR=.git gh issue list"):
         assert policy.evaluate(event(command), roots) is not None, command
 
     import unittest.mock
@@ -543,7 +553,7 @@ with tempfile.TemporaryDirectory() as temp:
                                "--config-env=core.hooksPath=FIXTURE "):
                     assert policy.evaluate(switch_event(executable + " " + prefix + "switch "
                                                         + create + " task-fixture origin/main"), roots) is not None
-                assert policy.evaluate(switch_event("FIXTURE=value " + executable + " switch "
+                assert policy.evaluate(switch_event("GIT_DIR=x " + executable + " switch "
                                                     + create + " task-fixture origin/main"), roots) is not None
                 for env in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_DIR", "GIT_EXEC_PATH"):
                     request = switch_event(executable + " switch " + create + " task-fixture origin/main")
@@ -641,6 +651,138 @@ with tempfile.TemporaryDirectory() as temp:
         assert policy.evaluate(event("gh pr create --body-file body.com"), roots) is None
         assert policy.permission_reason(event("gh pr create --body-file body.com"), roots) is None
     print("PASS: gh prose/body files accepted; real host execution and Windows paths denied")
+
+    # Chains (; && || |) are evaluated segment by segment with the ordinary rules;
+    # env/timeout/nice/stdbuf and VAR=value prefixes evaluate the wrapped command.
+    for command in ("git status && git log --oneline", "git diff | head -5", "git status; git log",
+                    "git fetch origin && git status", "git log | grep fix | wc -l",
+                    "cat safe.txt | sort > copied2.txt", "cd nested; ls",
+                    "git log | head -5", "git status && git diff", "git diff | sort | uniq -c | tail -3",
+                    "gh api repos/fixture | jq .name", "git log --oneline | cut -c1-7 | cat",
+                    "git status | grep -v x 2>/dev/null", "git log | wc -l > /dev/null",
+                    "git status && gh pr view | head", "timeout 5 git log | head -1",
+                    "python3 x.py && ls", "touch y && cat y | sort > z.txt",
+                    "echo ok && printf done", "git status && git commit -m fixture",
+                    "env FOO=1 git status", "FOO=bar git status", "FOO=bar printf safe",
+                    "timeout 30 git status", "timeout -k 5 30 git status", "timeout --kill-after=5 30s git status",
+                    "nice -n 5 git status", "nice -5 git status", "stdbuf -oL git log",
+                    "timeout 5 env FOO=1 nice git status", "env -i git status", "env -u FOO git status",
+                    "printf 'a;b|c && d||e'", "gh pr create --body 'one; two && three | four'",
+                    "gh issue list | head", "git status > /dev/null 2>&1", "git status &> /dev/null",
+                    "git push -u origin HEAD && gh pr create --fill"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in (
+            # Guards that must still hold inside a chain, behind a pipe, or behind a wrapper.
+            "echo x | tee .git/config", "git status && touch .git/config",
+            "git status; cp safe.txt .git/hooks/pre-commit", "git status && git config core.hooksPath x",
+            "git status && git push --force origin HEAD", "git status && git push origin :task",
+            "git status; git push origin +HEAD", "git status && git push --delete origin task",
+            "git status && gh pr merge 1", "git status && gh api -X DELETE repos/x",
+            "git status && gh repo delete x", "git status || wsl.exe", "git status && cat /mnt/c/x",
+            "git status && sudo true", "git status | cat > ../outside-write", "git status && rm -r .",
+            "git status && git -C ../sibling add safe.txt", "git status > /tmp/out",
+            "git status && printf x > .git/config", "git status && sed -i s/a/b/ .git/config",
+            "echo x | env touch .git/config", "ls && git clean -fd",
+            # Pipes into shells and interpreters, however wrapped.
+            "cat safe.txt | bash", "cat safe.txt | sh -s", "git status | python3", "echo x | python3 -",
+            "echo x | env bash", "echo x | timeout 5 python3 -", "echo x | /bin/bash", "echo x | node",
+            "echo x | nice perl", "bash <<< 'touch x'", "bash < safe.txt",
+            # Dynamic or ambiguous syntax stays refused.
+            "git status $(id)", "echo `id`", "git status\ngit log", "git status & git log",
+            "git status |& cat", "&& git status", "git status &&", "git status ;; git log",
+            "git status && && git log", "git status | | cat", "echo 'unterminated",
+            "(touch .git/config)", "echo ok && (touch .git/config)", "diff <(ls) <(ls)",
+            "eval 'touch x'", "export GIT_DIR=.git && git status", "source safe.txt",
+            "for f in a; do touch .git/x; done", "if true; then touch .git/x; fi", "time git status",
+            # Wrappers that stay refused, and wrapper option abuse.
+            "xargs git status", "echo x | xargs rm", "setsid git status", "nohup git status",
+            "command git status", "exec git status", "busybox sh", "env", "env -S 'git status'",
+            "env -C .. git status", "timeout git status", "timeout -x 5 git status",
+            "nice -z git status", "stdbuf -x git status", "env --split-string='git status'",
+            # Git override and loader variables, as prefixes, env operands or assignments in a chain.
+            "GIT_DIR=.git git status", "git status && GIT_DIR=x git log", "env GIT_DIR=x git status",
+            "GIT_WORK_TREE=. git status", "GIT_SSH_COMMAND=x git push origin HEAD",
+            "GIT_CONFIG_COUNT=1 git status", "GIT_ASKPASS=x git status", "GH_TOKEN=x gh issue list",
+            "PATH=. git status", "LD_PRELOAD=x git status", "BASH_ENV=x git status",
+            "PYTHONPATH=. python3 script.py", "timeout 5 env GIT_DIR=x git status",
+            "nice env PATH=. git status", "GIT_DIR=x",
+            # Wrapped dangerous commands are judged like unwrapped ones.
+            "env touch .git/config", "timeout 5 touch .git/config", "nice cp safe.txt .git/hooks/pre-commit",
+            "stdbuf -oL tee .git/config", "timeout 5 sudo true", "env FOO=1 wsl.exe",
+            "timeout 5 git push --force origin HEAD", "env git push origin :task",
+            "nice gh pr merge 1", "FOO=1 gh api -X DELETE repos/x", "env FOO=1 git config core.hooksPath x",
+            # Inline programs stay blocked (sandbox cannot deny .git writes everywhere; see note below).
+            "python3 -c 'print(1)'", "bash -c true", "bash -lc true", "sh -ec true", "node -e 1",
+            "node --eval 1", "perl -e 1", "ruby -e 1", "python3 -Ic x", "env python3 -c x",
+            "FOO=1 python3 -c x", "timeout 5 bash -c true", "nice python3 -c x", "stdbuf -oL node -e 1",
+            "git status && python3 -c 'print(1)'", "git status | bash -c true",
+            # cd is tracked: leaving the repository or branching around it is refused.
+            "cd .. && touch x", "cd ../sibling && git status", "cd /tmp && ls", "cd && ls", "cd ~ && ls",
+            "cd - && ls", "cd nested || git status", "cd nested | cat", "cd nested && touch ../.git/config",
+            "cd nested && rm -r ../scratch/deep ../.git", "env cd nested && ls", "cd a b && ls",
+            "cd nested && git -C ../../sibling add safe.txt"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    # Mixed chains: git/gh (sandbox-excluded) may only be chained with git/gh and read-only text tools.
+    for command in ("git status && python3 x.py", "git add f && touch y", "git status || true",
+                    "git status 2>/dev/null || echo none", "cd nested && git status",
+                    "git log | awk '{print $1}'", "git log | sed s/a/b/", "git status && ls",
+                    "git status; rm safe.txt", "ls && git status", "python3 x.py | git status",
+                    "git log | sort > out.txt", "git log | cat >> out.txt", "git log | head > out.txt",
+                    "git status && env FOO=1 python3 x.py", "git status && FOO=1", "git status && printf x",
+                    "git log | tee out.txt", "gh pr list | xargs echo", "git status && cp safe.txt y.txt",
+                    "git log | sort -o out.txt", "git log | sort --output=out.txt", "git log | uniq in out"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    # git commit -a/--all (and --include/--only/pathspec) would commit content the staged scan never saw.
+    for command in ("git commit -a -m x", "git commit -am x", "git commit --all -m x",
+                    "git commit -m x -a", "git commit -sa -m x", "git commit --al -m x",
+                    "git commit -i safe.txt -m x", "git commit --include safe.txt -m x",
+                    "git commit --only safe.txt -m x", "git commit -m x safe.txt",
+                    "git commit -m x -- safe.txt", "git commit -o safe.txt -m x",
+                    "git status && git commit -a -m x", "/usr/bin/git commit -am x"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in ("git commit -m x", "git commit -m 'fix a and all'", "git commit -m 'fix' --no-verify",
+                    "git commit -ma", "git commit --message=-a", "git commit --amend --no-edit",
+                    "git commit --allow-empty -m x", "git commit -s -m x", "git commit -m x -S"):
+        assert policy.evaluate(event(command), roots) is None, command
+    # awk programs that run commands, pipe to/from commands or write files; sed e/w commands and flags.
+    for command in ("awk 'BEGIN{system(\"id\")}'", "awk 'BEGIN { system (\"id\") }'",
+                    "gawk 'BEGIN{\"id\" | getline x; print x}'", "awk 'BEGIN{while ((\"id\" | getline l) > 0) print l}'",
+                    "awk 'BEGIN{getline x < \"/etc/passwd\"}'", "awk '{print | \"sh\"}'",
+                    "awk '{print > \"out.txt\"}'", "awk '{print >> \"out.txt\"}'",
+                    "mawk -f prog.awk", "awk --file prog.awk", "awk -i inplace '{print}' safe.txt",
+                    "git status && awk 'BEGIN{system(\"id\")}'",
+                    "sed -e 'e id' safe.txt", "sed 'e id' safe.txt", "sed -n '1e id' safe.txt",
+                    "sed 's/a/b/e' safe.txt", "sed 's/a/b/ge' safe.txt", "sed -e 'p;e id' safe.txt",
+                    "sed -ne 'e id' safe.txt", "sed --expression='e id' safe.txt", "sed -f script.sed safe.txt",
+                    "sed '/x/e id' safe.txt", "sed 'w out.txt' safe.txt", "sed 's/a/b/w out.txt' safe.txt",
+                    "sed -e s/a/b/ -e 'e id' safe.txt", "sed -i 'e id' safe.txt", "sed '$!{e id\n}' safe.txt"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in ("awk '{print $1}' safe.txt", "awk -F, '{print $2}' safe.txt",
+                    "awk '$1==\"a\"||$2==\"b\"{print}' safe.txt", "awk 'NR>1 && $1>5' safe.txt",
+                    "awk -v n=2 'NR==n' safe.txt", "git log | head -1",
+                    "sed 's/e/E/' safe.txt", "sed -n '1,3p' safe.txt", "sed -e 's/the e of/x/' safe.txt",
+                    "sed 's/a/b/g;s/c/d/' safe.txt", "sed -n '/end/p' safe.txt", "sed 's/x/e/' safe.txt",
+                    "sed -n -e '/needle/p' safe.txt", "sed '/exit/d' safe.txt", "sed -i s/a/b/ safe.txt",
+                    "sed 'y/abc/xyz/' safe.txt", "sed -E 's/(a|b)+/c/' safe.txt"):
+        assert policy.evaluate(event(command), roots) is None, command
+    # git commit/merge depend on state the hook sees before the call: they may follow
+    # read-only segments only, so staging cannot dodge the secret scan or the branch guard.
+    for command in ("git add safe.txt && git commit -m fixture", "git add safe.txt; git commit -m fixture",
+                    "touch fresh.txt && git commit -am fixture", "git switch -c task && git merge origin/main",
+                    "git checkout other && git merge origin/main", "git add safe.txt || git commit -m fixture",
+                    "cp safe.txt other.txt && git commit -m fixture", "git reset && git merge origin/main"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    # Chained commands never reach an unsandboxed approval request.
+    for command in ("git status && git log", "gh issue list | cat", "git push origin HEAD; git status",
+                    "git push -u origin HEAD || true"):
+        assert policy.permission_reason(event(command), roots) is not None, command
+    assert policy.permission_reason(event("git push -u origin HEAD"), roots) is None
+    # The native rules still deny the forbidden forms; the hook denies the ones native
+    # prefix grammar cannot express (a trailing ':refspec').
+    for executable in ("git", "/usr/bin/git"):
+        assert claude_denies(executable + " push origin :task -u")
+        assert policy.evaluate(event(executable + " push origin :task"), roots) is not None
+    print("PASS: chains/pipes/wrappers evaluated per segment; shells, interpreters, $(), backticks, multi-line, xargs/setsid/nohup, Git override variables, cd escapes and staging-before-commit denied")
 
     # Founder decision: ordinary Git/gh has native allow rules; forbidden
     # operations are denied independently of flag position or inherited selectors.
