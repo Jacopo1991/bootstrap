@@ -68,7 +68,7 @@ class PinTests(unittest.TestCase):
     def test_setup_script_does_every_step_and_hides_no_error(self):
         setup = (ROOT / "home/dot_local/share/bootstrap/executable_qmd-setup.sh").read_text()
         order = ["apply \"$HOME/.config/qmd/index.yml\"", "qmd pull", "qmd update", "qmd embed",
-                 "enable --now qmd-index.timer", "mcp add --scope user qmd"]
+                 "enable --now qmd-index.timer", "mcp add --scope user --transport http qmd"]
         positions = [setup.index(step) for step in order]
         self.assertEqual(positions, sorted(positions))
         self.assertNotIn("|| true\n", setup.replace("grep -E '^(CUDA|Vulkan):' || true\n", ""))
@@ -78,6 +78,23 @@ class PinTests(unittest.TestCase):
         self.assertIn("qmd-setup.sh", install)
         self.assertLess(install.index("chezmoi --source"), install.index("qmd-setup.sh"))
         self.assertIn("DBUS_SESSION_BUS_ADDRESS", install)
+
+    def test_embedding_failure_retries_on_cpu_and_never_aborts_setup(self):
+        setup = (ROOT / "home/dot_local/share/bootstrap/executable_qmd-setup.sh").read_text()
+        self.assertIn("if ! qmd embed; then", setup)
+        self.assertIn("if ! QMD_FORCE_CPU=1 qmd embed; then", setup)
+        self.assertLess(setup.index("QMD_FORCE_CPU=1 qmd embed"), setup.index("user systemd timers"))
+
+    def test_claude_code_uses_the_shared_http_server(self):
+        setup = (ROOT / "home/dot_local/share/bootstrap/executable_qmd-setup.sh").read_text()
+        self.assertIn("mcp add --scope user --transport http qmd http://localhost:8181/mcp", setup)
+        self.assertNotIn('qmd" mcp\n', setup)
+        self.assertLess(setup.index("enable --now qmd-mcp.service"), setup.index("mcp add --scope user"))
+        service = units("qmd-mcp.service")
+        lines = (UNITS / "qmd-mcp.service").read_text().splitlines()
+        self.assertIn("ExecStart=%h/.local/bin/qmd mcp --http --port 8181", lines)
+        self.assertEqual(service["Install"]["WantedBy"], "default.target")
+        self.assertEqual(service["Service"]["Restart"], "on-failure")
 
 
 @unittest.skipUnless(CHEZMOI, "chezmoi not available")

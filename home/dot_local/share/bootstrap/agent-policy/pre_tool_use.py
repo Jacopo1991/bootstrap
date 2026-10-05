@@ -1062,6 +1062,26 @@ def git_subcommand(tokens: list[str], cwd: str) -> str | None:
     return parsed[1] if parsed else None
 
 
+# git/gh run outside the sandbox only as a whole command; in a chain or pipe the whole
+# call is sandboxed, where github.com is not reachable.
+NETWORK_CHAIN_MESSAGE = ("Run git/gh network commands on their own; only then do they run "
+                         "outside the sandbox.")
+GIT_NETWORK_SUBCOMMANDS = {"fetch", "pull", "push", "ls-remote", "clone"}
+GH_OFFLINE_COMMANDS = {"config", "alias", "completion", "help", "version"}
+
+
+def network_command(head: str, tokens: list[str], cwd: str) -> bool:
+    if head == "git":
+        sub = git_subcommand(tokens, cwd)
+        if sub is None:  # unparsable options: be conservative
+            return any(token in GIT_NETWORK_SUBCOMMANDS for token in tokens[1:])
+        return sub in GIT_NETWORK_SUBCOMMANDS
+    if head == "gh":
+        words = [token for token in tokens[1:] if not token.startswith("-")]
+        return bool(words) and words[0] not in GH_OFFLINE_COMMANDS
+    return False
+
+
 def evaluate_command(command: str, cwd: str, root: Path,
                      approved_roots: tuple[Path, ...] | None) -> str | None:
     if "\n" in command or "\r" in command or "$(" in command or "`" in command:
@@ -1088,6 +1108,9 @@ def evaluate_command(command: str, cwd: str, root: Path,
             if isinstance(unwrapped, str):
                 return unwrapped
             heads.append((Path(unwrapped[0]).name.lower() if unwrapped else "", unwrapped))
+        for head, unwrapped in heads:
+            if network_command(head, unwrapped, effective):
+                return NETWORK_CHAIN_MESSAGE
         if any(head in {"git", "gh"} for head, _ in heads):
             # git/gh are excluded from the sandbox; do not let a chain smuggle anything else along.
             for head, unwrapped in heads:
