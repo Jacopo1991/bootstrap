@@ -15,6 +15,12 @@ param([string]$DistroName = 'AgentDev', [switch]$Force)
 $script:BackrestVersion = 'v1.14.1'
 $script:BackrestUrl = 'https://github.com/garethgeorge/backrest/releases/download/v1.14.1/backrest_Windows_x86_64.zip'
 $script:BackrestSha256 = '16b6d902303df77c14601325eada8656158e8a0531973d6094d22638ff45f545'
+# The Windows Backrest zip ships no restic and does not download one; pin the release Backrest
+# v1.14.1 expects (0.19.1) and point BACKREST_RESTIC_COMMAND at it.
+$script:ResticVersion = 'v0.19.1'
+$script:ResticUrl = 'https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_windows_amd64.zip'
+$script:ResticSha256 = 'da948ad707ed690426473aaba2046cd61f8f90f6f0e7dab6be0d5796531de67d'
+$script:ResticZipEntry = 'restic_0.19.1_windows_amd64.exe'
 $script:BackrestRepoPath = 'C:\backups\restic'
 $script:BackrestTaskName = 'MachineBootstrap-Backrest'
 $script:BackrestAlwaysIncluded = @('consultancy-website', 'customer-harness', 'typo3-dkm-plugin')
@@ -27,13 +33,15 @@ $script:BackrestPruneCron = '30 3 * * 0'
 $script:BackrestCheckCron = '30 4 * * 0'
 
 function Get-LocalOnlyRepoNames {
-    # Repositories under the workspace root that have no GitHub remote, plus the always-included
-    # local-only ones that exist. A .git that is not a directory (worktree) counts as no remote,
-    # which errs on the side of backing more up.
+    # Repositories (a .git DIRECTORY) under the workspace root with no GitHub remote, plus the
+    # always-included local-only ones. Worktrees (.git is a file) and plain folders are skipped:
+    # a worktree's content lives in its main repository.
     param([Parameter(Mandatory)][string]$WorkspaceRoot)
     $names = [System.Collections.Generic.List[string]]::new()
     foreach ($directory in Get-ChildItem -LiteralPath $WorkspaceRoot -Directory) {
-        $gitConfig = Join-Path (Join-Path $directory.FullName '.git') 'config'
+        $git = Join-Path $directory.FullName '.git'
+        if (-not (Test-Path -LiteralPath $git -PathType Container)) { continue }
+        $gitConfig = Join-Path $git 'config'
         $isAlways = $script:BackrestAlwaysIncluded -contains $directory.Name
         $hasGithub = $false
         if (Test-Path -LiteralPath $gitConfig -PathType Leaf) {
@@ -53,13 +61,13 @@ function Get-BackrestSources {
 }
 
 function New-BackrestConfig {
-    param([Parameter(Mandatory)][string[]]$Sources, [string]$Distro = 'AgentDev')
+    param([Parameter(Mandatory)][string[]]$Sources, [string]$Distro = 'AgentDev', [string]$RepoPath = $script:BackrestRepoPath)
     $schedule = { param($cron) [ordered]@{ cron = $cron; clock = 'CLOCK_LOCAL' } }
     # No password on purpose: the founder sets it in the web UI. autoInit creates the restic
     # repository the first time a password is saved.
     $repo = [ordered]@{
         id = 'restic'
-        uri = $script:BackrestRepoPath
+        uri = $RepoPath
         autoInit = $true
         autoUnlock = $true
         prunePolicy = [ordered]@{ schedule = (& $schedule $script:BackrestPruneCron); maxUnusedPercent = 10 }
@@ -103,18 +111,51 @@ function ConvertTo-BackrestJson {
     return ($Config | ConvertTo-Json -Depth 12)
 }
 
-function Install-BackrestBinary {
-    param([Parameter(Mandatory)][string]$InstallDirectory)
-    $zip = Join-Path $env:TEMP ('backrest-' + [Guid]::NewGuid().ToString('N') + '.zip')
+function Expand-VerifiedZip {
+    # Downloads a pinned zip, checks its SHA-256 and only then extracts it.
+    param([Parameter(Mandatory)][string]$Url, [Parameter(Mandatory)][string]$Sha256,
+          [Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string]$Label)
+    $zip = Join-Path ([IO.Path]::GetTempPath()) ('bootstrap-' + [Guid]::NewGuid().ToString('N') + '.zip')
     try {
-        Invoke-WebRequest -Uri $script:BackrestUrl -OutFile $zip -UseBasicParsing
-        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant() -ne $script:BackrestSha256) {
-            throw "Backrest download hash mismatch; nothing installed."
+        Invoke-WebRequest -Uri $Url -OutFile $zip -UseBasicParsing
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant() -ne $Sha256) {
+            throw "$Label download hash mismatch; nothing installed."
         }
-        New-Item -ItemType Directory -Force -Path $InstallDirectory | Out-Null
-        Expand-Archive -LiteralPath $zip -DestinationPath $InstallDirectory -Force
+        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+        Expand-Archive -LiteralPath $zip -DestinationPath $Destination -Force
     } finally { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
+}
+
+function Install-BackrestBinary {
+    # backrest.exe and restic.exe side by side in $InstallDirectory.
+    param([Parameter(Mandatory)][string]$InstallDirectory)
+    Expand-VerifiedZip -Url $script:BackrestUrl -Sha256 $script:BackrestSha256 -Destination $InstallDirectory -Label 'Backrest'
     if (-not (Test-Path -LiteralPath (Join-Path $InstallDirectory 'backrest.exe'))) { throw 'backrest.exe missing after extraction.' }
+    $stage = Join-Path ([IO.Path]::GetTempPath()) ('bootstrap-restic-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        Expand-VerifiedZip -Url $script:ResticUrl -Sha256 $script:ResticSha256 -Destination $stage -Label 'restic'
+        $extracted = Join-Path $stage $script:ResticZipEntry
+        if (-not (Test-Path -LiteralPath $extracted)) { throw "$script:ResticZipEntry missing from the restic zip." }
+        Copy-Item -LiteralPath $extracted -Destination (Join-Path $InstallDirectory 'restic.exe') -Force
+    } finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Get-BackrestLauncherText {
+    # Everything explicit: working directory, config, data, restic binary and bind address, so
+    # nothing resolves relative to wherever the launcher was started from.
+    param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][string]$ConfigFile,
+          [Parameter(Mandatory)][string]$BinDirectory, [string]$Port = '127.0.0.1:9898')
+    $data = Join-Path $Base 'data'
+    $backrest = Join-Path $BinDirectory 'backrest.exe'
+    $restic = Join-Path $BinDirectory 'restic.exe'
+    return @"
+Set-Location -LiteralPath '$Base'
+`$env:BACKREST_CONFIG = '$ConfigFile'
+`$env:BACKREST_DATA = '$data'
+`$env:BACKREST_RESTIC_COMMAND = '$restic'
+`$env:BACKREST_PORT = '$Port'
+& '$backrest'
+"@
 }
 
 function Register-BackrestLogonTask {
@@ -141,7 +182,9 @@ function Install-Backrest {
     Invoke-Wsl -WslArgs @('-d', $DistroName, '-u', 'agent', '--', 'true')
     if (-not (Test-Path -LiteralPath $workspaceRoot)) { throw "Cannot read $workspaceRoot from Windows." }
     $sources = Get-BackrestSources -RepoNames (Get-LocalOnlyRepoNames -WorkspaceRoot $workspaceRoot) -Distro $DistroName
+    Write-Output 'Backup sources:'
     foreach ($source in $sources) {
+        Write-Output "  $source"
         if (-not (Test-Path -LiteralPath $source)) { Write-Warning "Backup source not found: $source" }
     }
 
@@ -157,18 +200,12 @@ function Install-Backrest {
     [IO.File]::WriteAllText($configFile, (ConvertTo-BackrestJson -Config $config), [Text.UTF8Encoding]::new($false))
 
     $launcher = Join-Path $base 'start-backrest.ps1'
-    $launcherText = @"
-`$env:BACKREST_CONFIG = '$configFile'
-`$env:BACKREST_DATA = '$(Join-Path $base 'data')'
-`$env:BACKREST_PORT = '127.0.0.1:9898'
-& '$(Join-Path $binDirectory 'backrest.exe')'
-"@
+    $launcherText = Get-BackrestLauncherText -Base $base -ConfigFile $configFile -BinDirectory $binDirectory
     [IO.File]::WriteAllText($launcher, $launcherText, [Text.UTF8Encoding]::new($false))
     Register-BackrestLogonTask -Launcher $launcher
     Start-ScheduledTask -TaskName $script:BackrestTaskName
 
     Write-Output "Backrest $script:BackrestVersion installed in $binDirectory; config $configFile."
     Write-Output 'NEXT (you): open http://127.0.0.1:9898, create the Backrest user, and set the password on the "restic" repository.'
-    Write-Output "Sources: $($sources -join '; ')"
 }
 if ($MyInvocation.InvocationName -ne '.') { Install-Backrest }

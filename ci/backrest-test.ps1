@@ -1,7 +1,10 @@
+param([switch]$Live)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 (and pwsh): generates the Backrest config from a fixture workspace and
-# compares it with ci/fixtures/backrest-config.expected.json. Nothing is installed or downloaded.
+# compares it with ci/fixtures/backrest-config.expected.json. Nothing is installed or downloaded
+# unless -Live is given: that downloads the pinned Backrest and restic into a temp folder, starts
+# Backrest with the generated config on a spare port and a temp repository, and checks it stays up.
 . "$PSScriptRoot/../windows/install-backrest.ps1"
 
 function Assert-Equal {
@@ -26,6 +29,11 @@ try {
         New-Item -ItemType Directory -Force -Path $git | Out-Null
         [IO.File]::WriteAllText((Join-Path $git 'config'), $layout[$name])
     }
+    # Worktrees (.git is a file) and plain folders are never sources.
+    $worktree = Join-Path $workspace 'cortex-mining-address-redaction'
+    New-Item -ItemType Directory -Force -Path $worktree | Out-Null
+    [IO.File]::WriteAllText((Join-Path $worktree '.git'), 'gitdir: /home/agent/dev_workspace/cortex-mining/.git/worktrees/x')
+    New-Item -ItemType Directory -Force -Path (Join-Path $workspace 'plain-folder') | Out-Null
     $names = @(Get-LocalOnlyRepoNames -WorkspaceRoot $workspace)
     Assert-Equal ($names -join ',') 'consultancy-website,customer-harness,scratch-local,typo3-dkm-plugin' 'local-only discovery'
 
@@ -37,6 +45,13 @@ try {
     if ($actual -match '(?i)password') { throw 'Generated config must not contain a password field.' }
     Write-Output 'PASS: no password in generated config'
 
+    $launcher = Get-BackrestLauncherText -Base 'C:\b' -ConfigFile 'C:\b\config.json' -BinDirectory 'C:\b\bin'
+    foreach ($line in "Set-Location -LiteralPath 'C:\b'", "`$env:BACKREST_RESTIC_COMMAND = 'C:\b\bin\restic.exe'",
+                      "`$env:BACKREST_CONFIG = 'C:\b\config.json'", "`$env:BACKREST_DATA = 'C:\b\data'") {
+        if (-not $launcher.Contains($line)) { throw "Launcher lacks: $line" }
+    }
+    Write-Output 'PASS: launcher sets working directory and explicit paths'
+
     # Merge keeps the founder's repo (with a password) and auth, replaces only the generated plan.
     $existing = '{"modno":7,"auth":{"users":[{"name":"f"}]},"repos":[{"id":"restic","uri":"C:\\backups\\restic","password":"P"}],"plans":[{"id":"agentdev-daily","paths":["old"]},{"id":"mine"}]}'
     $merged = Merge-BackrestConfig -ExistingJson $existing -Generated $generated
@@ -46,3 +61,46 @@ try {
     Assert-Equal @($merged.plans | Where-Object id -eq 'agentdev-daily')[0].schedule.cron '30 2 * * *' 'merged plan is fresh'
 } finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
 Write-Output 'backrest-test.ps1 OK'
+
+if ($Live) {
+    $live = Join-Path ([IO.Path]::GetTempPath()) ('backrest-live-' + [Guid]::NewGuid().ToString('N'))
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $listener.Start(); $port = $listener.LocalEndpoint.Port; $listener.Stop()
+    $process = $null
+    try {
+        $bin = Join-Path $live 'bin'; $data = Join-Path $live 'data'; $source = Join-Path $live 'source'
+        New-Item -ItemType Directory -Force -Path $data, $source, (Join-Path $live 'repo') | Out-Null
+        Set-Content -LiteralPath (Join-Path $source 'hello.txt') -Value 'hello'
+        Install-BackrestBinary -InstallDirectory $bin
+        Write-Output 'PASS: pinned Backrest and restic downloaded, hashes verified'
+        $config = New-BackrestConfig -Sources @($source) -RepoPath (Join-Path $live 'repo')
+        $configFile = Join-Path $live 'config.json'
+        [IO.File]::WriteAllText($configFile, (ConvertTo-BackrestJson -Config $config), [Text.UTF8Encoding]::new($false))
+        $launcherFile = Join-Path $live 'start.ps1'
+        [IO.File]::WriteAllText($launcherFile, (Get-BackrestLauncherText -Base $live -ConfigFile $configFile -BinDirectory $bin -Port "127.0.0.1:$port"))
+        $log = Join-Path $live 'out.log'; $errLog = Join-Path $live 'err.log'
+        $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $process = Start-Process -FilePath $powerShell -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $launcherFile) `
+            -WorkingDirectory $env:SystemRoot -RedirectStandardOutput $log -RedirectStandardError $errLog -PassThru -WindowStyle Hidden
+        $status = $null
+        for ($i = 0; $i -lt 30 -and $null -eq $status; $i++) {
+            Start-Sleep -Seconds 1
+            if ($process.HasExited) { break }
+            try { $status = (Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 3).StatusCode } catch { }
+        }
+        Start-Sleep -Seconds 3
+        $text = ((Get-Content -LiteralPath $log -Raw -ErrorAction SilentlyContinue), (Get-Content -LiteralPath $errLog -Raw -ErrorAction SilentlyContinue)) -join "`n"
+        if ($process.HasExited) { throw "Backrest exited ($($process.ExitCode)). Log:`n$text" }
+        Assert-Equal $status 200 'web UI answers 200'
+        if ($text -match 'FATAL') { throw "FATAL in Backrest log:`n$text" }
+        Write-Output 'PASS: Backrest stayed up, no FATAL in log'
+    } finally {
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='backrest.exe'" | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($live) })) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 1
+        Remove-Item -LiteralPath $live -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Output 'backrest live smoke OK'
+}

@@ -36,6 +36,30 @@ class ScriptShape(unittest.TestCase):
         self.assertLess(SCRIPT.index("Get-FileHash"), SCRIPT.index("Expand-Archive"))
         self.assertIn("hash mismatch", SCRIPT)
 
+    def test_restic_pinned_and_installed_next_to_backrest(self):
+        self.assertRegex(constant("ResticSha256"), r"^[0-9a-f]{64}$")
+        version = constant("ResticVersion")
+        self.assertIn(f"/download/{version}/", constant("ResticUrl"))
+        self.assertIn(version.lstrip("v"), constant("ResticZipEntry"))
+        self.assertIn("'restic.exe'", SCRIPT)
+        self.assertEqual(SCRIPT.count("Get-FileHash"), 1)  # one shared verify-then-extract helper
+        self.assertEqual(SCRIPT.count("Expand-VerifiedZip -Url"), 2)
+
+    def test_launcher_is_explicit_about_paths(self):
+        for needed in ("Set-Location -LiteralPath", "BACKREST_RESTIC_COMMAND", "BACKREST_CONFIG", "BACKREST_DATA", "BACKREST_PORT"):
+            self.assertIn(needed, SCRIPT)
+
+    def test_discovery_skips_worktrees_and_prints_sources(self):
+        self.assertIn("-PathType Container", SCRIPT)
+        self.assertIn("Write-Output 'Backup sources:'", SCRIPT)
+
+    def test_live_smoke_is_opt_in(self):
+        live = (ROOT / "ci/backrest-test.ps1").read_text()
+        self.assertTrue(live.lstrip().startswith("param([switch]$Live)"))
+        self.assertIn("if ($Live)", live)
+        self.assertIn("FATAL", live)
+        self.assertIn("StatusCode", live)
+
     def test_logon_start_for_the_founder_not_elevated(self):
         self.assertIn("New-ScheduledTaskTrigger -AtLogOn", SCRIPT)
         self.assertIn("-RunLevel Limited", SCRIPT)
