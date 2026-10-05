@@ -30,6 +30,12 @@ download "$OSV_SCANNER_URL" "$OSV_SCANNER_SHA256" "$tmp/osv-scanner"
 cmp -s "$tmp/osv-scanner" "$HOME/.local/bin/osv-scanner" || install -m 0755 "$tmp/osv-scanner" "$HOME/.local/bin/osv-scanner"
 osv_expected=${OSV_SCANNER_URL##*/download/v}
 [[ $("$HOME/.local/bin/osv-scanner" --version) == *"osv-scanner version: ${osv_expected%%/*}"* ]]
+# just runs the `verify` recipe that verify-enable adds to knowledge repositories.
+download "$JUST_URL" "$JUST_SHA256" "$tmp/just.tar.gz"
+tar -xzf "$tmp/just.tar.gz" -C "$tmp" just
+cmp -s "$tmp/just" "$HOME/.local/bin/just" || install -m 0755 "$tmp/just" "$HOME/.local/bin/just"
+just_expected=${JUST_URL##*/download/}
+[[ $("$HOME/.local/bin/just" --version) == "just ${just_expected%%/*}" ]]
 pre_commit_root="$HOME/.local/share/bootstrap/pre-commit"
 mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$pre_commit_root/venv"
 mise exec -- uv pip sync --quiet --require-hashes --python "$pre_commit_root/venv/bin/python" "$pre_commit_root/requirements.lock"
@@ -58,6 +64,21 @@ mise exec -- npm ci --prefix "$npm_root" --no-audit --no-fund
 ln -sfn "$npm_root/node_modules/.bin/codex" "$HOME/.local/bin/codex"
 ln -sfn "$npm_root/node_modules/.bin/ccusage" "$HOME/.local/bin/ccusage"
 ln -sfn "$npm_root/node_modules/.bin/backlog" "$HOME/.local/bin/backlog"
+# Playwright (verification pack): one pinned version and one shared browser cache that agent
+# sessions, the MCP server and test runs all use. The wrappers fix the cache path; the browser
+# is downloaded once by verify-setup.sh (install.sh, outside the sandbox), never when tests run.
+rm -f "$HOME/.local/bin/playwright" "$HOME/.local/bin/playwright-mcp"
+cat > "$HOME/.local/bin/playwright" <<'PLAYWRIGHT'
+#!/usr/bin/env bash
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+exec "$HOME/.local/share/bootstrap/npm/node_modules/.bin/playwright" "$@"
+PLAYWRIGHT
+cat > "$HOME/.local/bin/playwright-mcp" <<'PLAYWRIGHT_MCP'
+#!/usr/bin/env bash
+export PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+exec "$HOME/.local/share/bootstrap/npm/node_modules/.bin/playwright-mcp" --browser chromium --headless --isolated "$@"
+PLAYWRIGHT_MCP
+chmod 0755 "$HOME/.local/bin/playwright" "$HOME/.local/bin/playwright-mcp"
 # qmd runs through a small wrapper so every caller (CLI, timer, MCP server) uses the GPU:
 # node-llama-cpp only detects the CUDA runtime through LD_LIBRARY_PATH and the WSL
 # driver tools on PATH, not through the backend's own $ORIGIN runpath.

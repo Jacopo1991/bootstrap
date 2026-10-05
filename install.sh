@@ -54,4 +54,7 @@ sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/s
   XDG_RUNTIME_DIR="/run/user/$agent_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$agent_uid/bus" \
   BOOTSTRAP_SOURCE=/opt/machine-bootstrap/current \
   bash /home/agent/.local/share/bootstrap/qmd-setup.sh
+# The verification pack's Chromium download and Playwright MCP registration run the same way.
+sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
+  bash /home/agent/.local/share/bootstrap/verify-setup.sh
 echo 'Bootstrap applied. Restart this distro before the WSL boundary checks.'
