@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 
 EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
@@ -78,6 +79,19 @@ def installed_names(directory: Path) -> set[str]:
     if not directory.is_dir():
         return set()
     return {entry.name for entry in directory.iterdir() if not entry.name.startswith(".")}
+
+
+OSV_DB_MAX_AGE = 15 * 24 * 3600  # weekly timer plus a missed week
+
+
+def osv_db_findings(home: Path, now: float) -> list[str]:
+    """The pre-commit gate's offline vulnerability data, refreshed by osv-db-refresh.timer."""
+    stamp = home / ".cache" / "osv-scalibr" / ".last-refresh"
+    try:
+        age = now - stamp.stat().st_mtime
+    except OSError:
+        return ["osv-db-never-refreshed"]
+    return ["osv-db-stale"] if age > OSV_DB_MAX_AGE else []
 
 
 def unexpected_global_binaries(home: Path) -> list[str]:
@@ -197,6 +211,7 @@ def scan(root: Path, home: Path) -> list[str]:
         else:
             findings.update("uv-tool-outside-bootstrap:" + name for name in uv_names)
 
+    findings.update(osv_db_findings(home, time.time()))
     extras = unexpected_global_binaries(home)
     findings.update("global-cli-outside-bootstrap:" + name for name in extras)
     for rel in (".agents/skills", ".claude/skills"):

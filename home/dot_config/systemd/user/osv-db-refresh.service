@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the OSV offline vulnerability databases for the pre-commit gate (plain download, no agent runs)
+
+[Service]
+Type=oneshot
+# osv-db-refresh tries every ecosystem, logs each failure and exits non-zero if any
+# failed, so a failed refresh shows in `systemctl --user --failed` and the journal.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/osv-db-refresh
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+TimeoutStartSec=30min

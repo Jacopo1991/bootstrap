@@ -60,4 +60,15 @@ with tempfile.TemporaryDirectory() as temp:
     tool_root.mkdir(parents=True)
     (tool_root / "foreign-uv-tool").mkdir()
     assert drift.installed_uv_tools(tool_root) == ["foreign-uv-tool"]
-print("PASS: foreign npm, uv, and global CLI installs are reported as drift")
+with tempfile.TemporaryDirectory() as temp:
+    home = Path(temp)
+    now = 2_000_000_000.0
+    assert drift.osv_db_findings(home, now) == ["osv-db-never-refreshed"]
+    stamp = home / ".cache/osv-scalibr/.last-refresh"
+    stamp.parent.mkdir(parents=True)
+    stamp.touch()
+    os.utime(stamp, (now - 8 * 86400, now - 8 * 86400))
+    assert drift.osv_db_findings(home, now) == []
+    os.utime(stamp, (now - 16 * 86400, now - 16 * 86400))
+    assert drift.osv_db_findings(home, now) == ["osv-db-stale"]
+print("PASS: foreign npm, uv, and global CLI installs and stale OSV data are reported as drift")
