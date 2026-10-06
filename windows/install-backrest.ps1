@@ -27,7 +27,7 @@ $script:BackrestPingCheck = 'backrest-backup'  # Healthchecks.io check name; key
 $script:BackrestAlwaysIncluded = @('consultancy-website', 'customer-harness', 'typo3-dkm-plugin')
 $script:BackrestExcludes = @(
     '**/node_modules', '**/.venv', '**/__pycache__', '**/.cache', '**/dist', '**/build',
-    '**/.next', '**/target', '**/qmd/*.sqlite*', '**/.qmd'
+    '**/.next', '**/target', '**/qmd/*.sqlite*', '**/.qmd', '**/uv-cache'
 )
 $script:BackrestBackupCron = '30 2 * * *'
 $script:BackrestPruneCron = '30 3 * * 0'
@@ -255,6 +255,12 @@ function Install-Backrest {
     Install-BackrestBinary -InstallDirectory $binDirectory
     New-Item -ItemType Directory -Force -Path $script:BackrestRepoPath, (Join-Path $base 'data') | Out-Null
 
+    # A running Backrest keeps its config in memory and would write it back over this change,
+    # so stop it first; the scheduled task starts it again at the end.
+    Get-Process backrest -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) } |
+        Stop-Process -Force
+    Start-Sleep -Seconds 2
     $existing = if (Test-Path -LiteralPath $configFile) { Get-Content -LiteralPath $configFile -Raw } else { $null }
     if ($existing -and -not $Force) {
         throw "$configFile exists. Re-run with -Force to refresh only the agentdev-daily plan (a backup is kept)."

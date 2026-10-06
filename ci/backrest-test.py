@@ -142,7 +142,7 @@ class ExpectedConfig(unittest.TestCase):
 
     def test_excludes(self):
         text = " ".join(self.plan["excludes"])
-        for needed in ("node_modules", ".venv", ".cache", "dist", "build", "qmd"):
+        for needed in ("node_modules", ".venv", ".cache", "dist", "build", "qmd", "uv-cache"):
             self.assertIn(needed, text)
 
     def test_distro_started_before_each_backup(self):
