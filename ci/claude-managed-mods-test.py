@@ -22,8 +22,12 @@ assert DROPIN == {"pluginConfigs": {"cc-plugin-sec-default@builtin": {
 # The guard reads this option from managed settings only; a copy in the
 # agent's own settings would be ignored and misleading.
 user_settings = (ROOT / "home/dot_claude/settings.json").read_text(encoding="utf-8")
-for key in ("pluginConfigs", "allowManagedModsOnly", "prependPlugins", "enabledPlugins"):
+for key in ("pluginConfigs", "allowManagedModsOnly", "prependPlugins"):
     assert key not in user_settings, key
+# enabledPlugins is an ordinary user setting (lean sessions, #54): it may only
+# switch plugins off, never on, so it cannot widen what loads in agent sessions.
+enabled = json.loads(user_settings).get("enabledPlugins", {})
+assert all(value is False for value in enabled.values()), enabled
 
 installer = (ROOT / "system/claude-managed.sh").read_text(encoding="utf-8")
 assert "/etc/claude-code/managed-settings.d" in installer
