@@ -54,14 +54,14 @@ def claude_denies(command):
 for executable in ("git", "/usr/bin/git"):
     for tail in ("push --force origin HEAD", "push origin HEAD --force-with-lease",
                  "push origin HEAD -f", "push origin -fextra",
-                 "push --delete origin branch", "push origin branch --delete",
-                 "push origin :branch -u"):
+                 "push --delete origin branch", "push origin branch --delete"):
         assert claude_denies(executable + " " + tail), tail
-    # The native grammar cannot express "last argument starts with a colon" (a trailing
-    # ':*' is the legacy prefix suffix); the hook denies that form (tested below).
+    # The native grammar cannot express "an argument starting with a colon", and a rule
+    # such as 'git push * :* *' prints a warning in every session. The hook denies every
+    # ':refspec' position instead (tested below), so no such native rule may exist.
     assert not claude_denies(executable + " push origin HEAD:refs/heads/task")
-assert not any(entry.endswith(":*)") for entry in claude["permissions"]["deny"]), \
-    "a trailing ':*' is the legacy prefix suffix and is malformed after '* '"
+assert not any(entry.endswith(":*)") or " :" in entry for entry in claude["permissions"]["deny"]), \
+    "refspec colon rules are enforced by the hook; native colon rules print warnings"
 for executable in ("gh", "/usr/bin/gh"):
     for tail in ("repo delete fixture", "repo edit fixture", "release delete fixture",
                  "secret list", "ruleset list", "api -X DELETE repos/fixture",
@@ -791,8 +791,19 @@ with tempfile.TemporaryDirectory() as temp:
     # The native rules still deny the forbidden forms; the hook denies the ones native
     # prefix grammar cannot express (a trailing ':refspec').
     for executable in ("git", "/usr/bin/git"):
-        assert claude_denies(executable + " push origin :task -u")
         assert policy.evaluate(event(executable + " push origin :task"), roots) is not None
+        # A refspec starting with ':' is refused in any position, quoted or not, as are
+        # --delete and -d; a destination after a colon (HEAD:refs/heads/x) stays allowed.
+        for tail in ("push origin :task -u", "push :task origin", "push origin HEAD :task",
+                     "push origin HEAD:refs/heads/ok :task", "push -u origin -- :task",
+                     "push origin ':task'", "push origin \":task\"", "push origin :refs/heads/task",
+                     "-C . push origin HEAD :task", "push --delete origin task", "push -d origin task",
+                     "push origin task -d", "push origin task --delete", "push --delete=x origin"):
+            command = executable + " " + tail
+            assert policy.evaluate(event(command), roots) is not None, command
+            assert policy.permission_reason(event(command), roots) is not None, command
+        for tail in ("push -u origin HEAD", "push origin HEAD:refs/heads/task"):
+            assert policy.evaluate(event(executable + " " + tail), roots) is None, tail
     print("PASS: chains/pipes/wrappers evaluated per segment; shells, interpreters, $(), backticks, multi-line, xargs/setsid/nohup, Git override variables, cd escapes and staging-before-commit denied")
 
     # Founder decision: ordinary Git/gh has native allow rules; forbidden

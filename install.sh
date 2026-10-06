@@ -57,6 +57,9 @@ sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/s
 # The verification pack's Chromium download and Playwright MCP registration run the same way.
 sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
   bash /home/agent/.local/share/bootstrap/verify-setup.sh
+# Context7 (current library docs) is the one remote MCP server lanes get; claude.ai connectors are off.
+sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
+  bash /home/agent/.local/share/bootstrap/context7-setup.sh
 # The cortex-core skills come from GitHub with `gh skill` (user scope, Claude Code and Codex);
 # gh-skill-update.timer keeps them current. Needs agent's gh login, so it runs outside any session.
 sudo -H -u agent env PATH=/home/agent/.local/bin:/home/agent/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin \
