@@ -99,13 +99,21 @@ class PinTests(unittest.TestCase):
 
 @unittest.skipUnless(CHEZMOI, "chezmoi not available")
 class RenderedConfigTests(unittest.TestCase):
-    def render(self, repos):
+    def render(self, repos, data=None):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
+            for relative, text in (data or {}).items():
+                path = home / "project-data" / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if isinstance(text, tuple):
+                    path.symlink_to(text[1])
+                elif text is not None:
+                    path.write_text(text)
             for name, intent in repos.items():
                 (home / "cortex" / name).mkdir(parents=True)
                 if intent is not None:
                     (home / "cortex" / name / "INTENT.md").write_text(intent)
+            (home / "cortex").mkdir(exist_ok=True)
             (home / "cortex" / "stray-file.md").write_text("not a repository")
             (home / "cortex" / ".worktrees").mkdir()
             (home / "dest").mkdir()
@@ -120,7 +128,13 @@ class RenderedConfigTests(unittest.TestCase):
                 return result.stdout
 
             index = home / "index.yml"
-            index.write_text(chezmoi(input=template))
+            rendered = subprocess.run(
+                [CHEZMOI, "--source", str(ROOT), "--destination", str(home / "dest"),
+                 "--config", str(home / "chezmoi.toml"), "execute-template"],
+                input=template, capture_output=True, text=True, env=env)
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            self.warnings = rendered.stderr
+            index.write_text(rendered.stdout)
             parsed = chezmoi(f'{{{{ output "cat" "{index}" | fromYaml | toJson }}}}')
             return str(home), json.loads(parsed)
 
@@ -163,6 +177,47 @@ class RenderedConfigTests(unittest.TestCase):
     def test_bootstrap_source_holds_no_project_descriptions(self):
         text = (ROOT / "home/dot_config/qmd/index.yml.tmpl").read_text()
         self.assertNotIn("cortex-kb-", text)
+
+    def test_reference_folder_becomes_a_read_only_collection(self):
+        home, config = self.render({"cortex-kb-demo": None}, {
+            "alpha/reference/README.md": "# Alpha notes for the PM\nmore\n",
+            "alpha/reference/notes/a.md": "x",
+            "beta/reference/x.md": "x",
+        })
+        self.assertEqual(set(config["collections"]),
+                         {"cortex-kb-demo", "alpha-reference", "beta-reference"})
+        alpha = config["collections"]["alpha-reference"]
+        self.assertEqual(alpha["path"], f"{home}/project-data/alpha/reference")
+        self.assertEqual(alpha["pattern"], "**/*.md")
+        self.assertEqual(alpha["context"]["/"], "Alpha notes for the PM")
+        self.assertEqual(config["collections"]["beta-reference"]["context"]["/"],
+                         "Reference material for beta")
+
+    def test_nothing_outside_reference_is_indexed(self):
+        home, config = self.render({}, {
+            "alpha/secrets.env": "TOKEN=x",
+            "alpha/notes.md": "private",
+            "alpha/reference/a.md": "x",
+            "gamma/notes.md": "no reference folder",
+            "delta/references/a.md": "wrong folder name",
+        })
+        self.assertEqual(set(config["collections"]), {"alpha-reference"})
+        for collection in config["collections"].values():
+            self.assertTrue(collection["path"].endswith("/reference"), collection["path"])
+
+    def test_reference_folder_with_secrets_or_symlinks_is_skipped(self):
+        _, config = self.render({}, {
+            "envy/reference/secrets.env": "TOKEN=x",
+            "envy/reference/a.md": "x",
+            "keyed/reference/deep/id.key": "k",
+            "keyed/reference/a.md": "x",
+            "linked/reference/a.md": "x",
+            "linked/reference/out.md": ("link", "/etc/hostname"),
+            "clean/reference/a.md": "x",
+        })
+        self.assertEqual(set(config["collections"]), {"clean-reference"})
+        for project in ("envy", "keyed", "linked"):
+            self.assertIn(f"{project}/reference", self.warnings)
 
     def test_hostile_title_stays_a_single_quoted_string(self):
         _, config = self.render({"cortex-kb-x": '---\ntitle: a "b": c # d\n---\n'})
