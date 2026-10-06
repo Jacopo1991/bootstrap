@@ -42,7 +42,7 @@ MD
 Follow the \`slim-workflow\` skill. Read \`~/cortex/cortex-kb-$name\` (INTENT.md, STATUS.md, your task) before working.
 Commit only in this repository; report results in chat. The PM records STATUS.md, backlog tasks and decisions in the knowledge repository.
 MD
-  printf '.env\n.env.*\nnode_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n' > "$code/.gitignore"
+  printf '.env\n.env.*\nnode_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n.work/\n' > "$code/.gitignore"
 
   cat > "$kb/README.md" <<MD
 # cortex-kb-$name

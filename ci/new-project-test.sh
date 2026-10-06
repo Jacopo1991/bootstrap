@@ -23,6 +23,8 @@ for repo in "$HOME/dev_workspace/demo-site" "$HOME/cortex/cortex-kb-demo-site"; 
   git -C "$repo" ls-files --error-unmatch .pre-commit-config.yaml >/dev/null
   grep -q pre-commit "$repo/.git/hooks/pre-commit"
 done
+# The code repository ignores .work/, the scratch folder for runtime state and pinned copies.
+grep -qx ".work/" "$HOME/dev_workspace/demo-site/.gitignore"
 kb="$HOME/cortex/cortex-kb-demo-site"
 for f in INTENT.md STATUS.md AGENTS.md README.md backlog/config.yml; do
   [ -f "$kb/$f" ]
