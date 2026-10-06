@@ -10,6 +10,11 @@ $ErrorActionPreference = 'Stop'
 
 $script:Thresholds = @(80, 50)  # highest first
 
+# Healthchecks.io ping (check windows-minutes-watchdog) when the owner-provisioned pings file has
+# its URL; see job-ping.ps1. Skipped silently otherwise.
+$jobPing = Join-Path $PSScriptRoot 'job-ping.ps1'
+if (Test-Path -LiteralPath $jobPing) { . $jobPing } else { function Send-JobPing { param($Check, $Success) } }
+
 function Get-ActionsMinutesUsed {
     param([Parameter(Mandatory)]$Usage)
     $property = $Usage.PSObject.Properties['usageItems']
@@ -97,4 +102,8 @@ function Invoke-MinutesWatchdog {
     }
 }
 
-if ($MyInvocation.InvocationName -ne '.') { exit (Invoke-MinutesWatchdog) }
+if ($MyInvocation.InvocationName -ne '.') {
+    $exitCode = Invoke-MinutesWatchdog
+    Send-JobPing -Check 'windows-minutes-watchdog' -Success ($exitCode -eq 0)
+    exit $exitCode
+}

@@ -186,6 +186,11 @@ class RefreshTests(unittest.TestCase):
         stub = bin_dir / "qmd"
         stub.write_text(f'#!/bin/sh\necho "$1" >> {self.calls}\n[ "$1" != embed ] || exit "${{QMD_STUB_EMBED_EXIT:-0}}"\n')
         stub.chmod(0o755)
+        # Record job-ping calls instead of contacting Healthchecks.io.
+        self.pings = self.temp / "pings"
+        ping = bin_dir / "job-ping"
+        ping.write_text(f'#!/bin/sh\necho "$@" >> {self.pings}\n')
+        ping.chmod(0o755)
         self.env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(self.temp),
             "QMD_CORTEX_DIR": str(self.cortex), "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -195,6 +200,7 @@ class RefreshTests(unittest.TestCase):
         # The script prepends ~/.local/bin; point HOME's one at the stub too.
         (self.temp / ".local/bin").mkdir(parents=True)
         (self.temp / ".local/bin/qmd").symlink_to(stub)
+        (self.temp / ".local/bin/job-ping").symlink_to(ping)
 
     def git(self, cwd, *args):
         return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True,
@@ -264,10 +270,20 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("ERROR gone: git fetch failed", result.stderr)
         self.assertEqual(self.calls.read_text().split(), ["update", "embed"])
+        self.assertEqual(self.pings.read_text().splitlines(), ["qmd-index 1"])
 
     def test_indexing_failure_fails_the_unit(self):
         self.env["QMD_STUB_EMBED_EXIT"] = "3"
         self.assertEqual(self.refresh().returncode, 1)
+        self.assertEqual(self.pings.read_text().splitlines(), ["qmd-index 1"])
+
+    def test_success_pings_the_check(self):
+        self.assertEqual(self.refresh().returncode, 0)
+        self.assertEqual(self.pings.read_text().splitlines(), ["qmd-index 0"])
+
+    def test_works_without_job_ping(self):
+        (self.temp / ".local/bin/job-ping").unlink()
+        self.assertEqual(self.refresh().returncode, 0)
 
 
 class UnitTests(unittest.TestCase):

@@ -151,6 +151,30 @@ class ExpectedConfig(unittest.TestCase):
         self.assertEqual(hook["onError"], "ON_ERROR_CANCEL")
         self.assertEqual(hook["actionCommand"]["command"], "wsl.exe -d AgentDev -u agent -- true")
 
+    def test_success_and_failure_ping_their_own_check(self):
+        hooks = {h["conditions"][0]: h for h in self.plan["hooks"][1:]}
+        self.assertEqual(sorted(hooks), ["CONDITION_SNAPSHOT_ERROR", "CONDITION_SNAPSHOT_SUCCESS"])
+        check = constant("BackrestPingCheck")
+        self.assertEqual(check, "backrest-backup")
+        for condition, result in (("CONDITION_SNAPSHOT_SUCCESS", "ok"), ("CONDITION_SNAPSHOT_ERROR", "fail")):
+            hook = hooks[condition]
+            self.assertEqual(hook["onError"], "ON_ERROR_IGNORE")  # a ping never changes the backup's outcome
+            command = hook["actionCommand"]["command"]
+            self.assertTrue(command.startswith("powershell.exe -NoProfile -NonInteractive -File "), command)
+            self.assertTrue(command.endswith(f"job-ping.ps1\" -Check {check} -Result {result}"), command)
+
+    def test_no_ping_url_in_the_config(self):
+        self.assertNotIn("hc-ping", json.dumps(FIXTURE))
+        self.assertNotIn("https://", json.dumps(FIXTURE["plans"][0]["hooks"]))
+        self.assertNotRegex(SCRIPT, r"hc-ping|hchk\.io")
+
+    def test_installer_copies_the_ping_script_before_writing_the_config(self):
+        install = SCRIPT[SCRIPT.index("function Install-Backrest {"):]
+        copy = install.index("Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'job-ping.ps1')")
+        self.assertLess(copy, install.index("New-BackrestConfig"))
+        self.assertLess(copy, install.index("WriteAllText($configFile"))
+        self.assertTrue((ROOT / "windows/job-ping.ps1").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

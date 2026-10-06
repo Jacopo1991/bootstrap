@@ -1,18 +1,71 @@
 #!/usr/bin/env bash
-# Update the cortex-core skills that skills-setup.sh installed with `gh skill`. Plain
-# update, no agent runs: gh-skill-update.timer runs it daily; run it by hand from a normal
-# shell to update now. Any failure is printed and makes the command (and the timer's unit)
-# fail, so it shows in `systemctl --user --failed` and the journal.
+# Keep the cortex-core skills that skills-setup.sh installed with `gh skill` current: first
+# install the skills that are new in the repository (without --force, so nothing already
+# installed is touched), then `gh skill update --all`. Plain installs and updates, no agent
+# runs: gh-skill-update.timer runs it daily; run it by hand from a normal shell to update now.
+# Any failure is printed and makes the command (and the timer's unit) fail, so it shows in
+# `systemctl --user --failed` and the journal. The result is also sent to Healthchecks.io
+# with job-ping (skipped silently without the owner-provisioned pings file).
+#
+# `gh skill install --all` cannot be used for the new ones: without --force it refuses and
+# installs nothing as soon as one skill is already present. So the repository's skills are
+# listed and each one is installed by name; "already installed" means nothing to do.
 set -uo pipefail
-output=$(gh skill update --all 2>&1)
-status=$?
-printf '%s\n' "$output"
-if [ $status -ne 0 ]; then
-  echo "ERROR gh skill update --all exited with status $status" >&2
-  exit 1
-fi
-if printf '%s\n' "$output" | grep -qiE '(^|[^a-z])(failed|error)([^a-z]|$)'; then
-  echo 'ERROR gh skill update --all reported a failure above' >&2
+repository=Jacopo1991/cortex-core
+failed=0
+
+install_new_skills() {
+  local listing name agent out status
+  # Listing goes to stdout as "name<TAB>description" when not on a terminal; progress is stderr.
+  if ! listing=$(gh skill install "$repository" 2>/dev/null </dev/null); then
+    echo "ERROR gh skill install $repository (listing the skills) failed" >&2
+    failed=1
+    return
+  fi
+  local names=()
+  while IFS=$'\t' read -r name _; do
+    [[ $name =~ ^[a-z0-9][a-z0-9._-]*$ ]] && names+=("$name")
+  done <<<"$listing"
+  if ((${#names[@]} == 0)); then
+    echo "ERROR gh skill install $repository listed no skills" >&2
+    failed=1
+    return
+  fi
+  for name in "${names[@]}"; do
+    for agent in claude-code codex; do
+      out=$(gh skill install "$repository" "$name" --agent "$agent" --scope user 2>&1 </dev/null)
+      status=$?
+      if ((status == 0)); then
+        echo "Installed new skill $name for $agent."
+      elif printf '%s\n' "$out" | grep -qi 'already installed'; then
+        :
+      else
+        printf '%s\n' "$out"
+        echo "ERROR installing new skill $name for $agent failed (status $status)" >&2
+        failed=1
+      fi
+    done
+  done
+}
+
+update_skills() {
+  local output status
+  output=$(gh skill update --all 2>&1)
+  status=$?
+  printf '%s\n' "$output"
+  if ((status != 0)); then
+    echo "ERROR gh skill update --all exited with status $status" >&2
+    failed=1
+  elif printf '%s\n' "$output" | grep -qiE '(^|[^a-z])(failed|error)([^a-z]|$)'; then
+    echo 'ERROR gh skill update --all reported a failure above' >&2
+    failed=1
+  fi
+}
+
+install_new_skills
+update_skills
+command -v job-ping >/dev/null 2>&1 && job-ping gh-skill-update "$failed"
+if ((failed)); then
   exit 1
 fi
 echo 'Skills current.'

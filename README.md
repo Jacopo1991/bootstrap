@@ -531,8 +531,14 @@ PyPI and about six for npm (its database is about 200 MB).
   sandbox: `gh skill install Jacopo1991/cortex-core --all --scope user` for `claude-code` and
   `codex`, with `--force` on the first run only (it replaces the hand-copied `slim-workflow`
   folders; a stamp in `~/.local/state/bootstrap` marks it done). It needs `gh auth login` as
-  `agent`. The user timer `gh-skill-update.timer` runs `gh-skill-update` (a plain
-  `gh skill update --all`, no agent runs) daily with `Persistent=true`; a failure is printed,
+  `agent`. The user timer `gh-skill-update.timer` runs `gh-skill-update` daily with
+  `Persistent=true` (plain installs and updates, no agent runs). It first installs the skills that
+  are new in the repository, for both agents and without `--force`, then runs `gh skill update --all`,
+  so a skill added to cortex-core reaches every seat without a manual step. New ones cannot be
+  installed with `gh skill install --all`: without `--force` that refuses and installs nothing as
+  soon as one skill is already present, so the script lists the repository's skills
+  (`gh skill install Jacopo1991/cortex-core` prints `name<TAB>description` when piped) and installs
+  each by name; "already installed" means nothing to do. A failure is printed,
   exits non-zero and shows in `systemctl --user --failed` and `journalctl --user -u gh-skill-update`.
   The drift report allows `gh-skill-update` and any skill whose `SKILL.md` names
   `Jacopo1991/cortex-core`; hand copies and other sources are `global-skill-outside-bootstrap`.
@@ -548,17 +554,65 @@ PyPI and about six for npm (its database is about 200 MB).
 - **Windows, run by the founder** from elevated PowerShell (the founder's own gh login, tasks run
   in the logged-in session, not S4U): `windows\install-skills-task.ps1` installs the skills for the
   Windows-side Claude Code and Codex (`--force` once) and registers `MachineBootstrap-Skills-Update`
-  (`gh skill update --all`, daily 09:15). `windows\install-minutes-watchdog-task.ps1
+  (daily 09:15: installs skills that are new in cortex-core without `--force`, same per-name
+  method as the Linux timer, then `gh skill update --all`). `windows\install-minutes-watchdog-task.ps1
   [-IncludedMinutes 3000]` registers `MachineBootstrap-Minutes-Watchdog` (daily 09:45): it reads
   `gh api /users/Jacopo1991/settings/billing/usage`, sums this month's Actions minutes, and shows a
   Windows notification once at 50% and once at 80% of the allowance (state and
   `minutes-watchdog.log` under `%LOCALAPPDATA%\machine-bootstrap`; every check is logged). Both
   tasks run protected copies from `C:\ProgramData\machine-bootstrap\founder` and are declared in
-  the inventory's maintenance allowlist, so they are not reported as task drift.
+  the inventory's maintenance allowlist, so they are not reported as task drift. Both installers
+  also copy `job-ping.ps1` next to them, so re-run them once to get the pings below (and the new-skill
+  installs for the skills task).
 - **Tests:** `ci/skills-hooks-test.py` (units, setup, drift allowlist, update command with a fake
   `gh`, hook output and wiring, Windows script shape) runs in `ci/lint.sh`;
   `ci/founder-tasks-test.ps1` (threshold and notification logic with `ci/fixtures/billing-usage.json`
   instead of the API, task XML, allowlist) runs in the Windows PowerShell 5.1 job.
+
+## Job monitoring (Healthchecks.io pings)
+
+Every scheduled job bootstrap manages pings its own Healthchecks.io check when it finishes: the
+check's URL on success, `<URL>/fail` on failure. There is no account in the repository and no URL
+in Git. The founder creates the checks below (the names are the check names; `job-ping` matches a
+check to its URL through the key in the last column) and puts each ping URL in an owner-provisioned
+file; a job whose key is missing skips its ping silently.
+
+| Check name | Job | Runs | Key in the pings file |
+| --- | --- | --- | --- |
+| `qmd-index` | `qmd-index.timer` (AgentDev) | every 15 minutes | `QMD_INDEX_URL` |
+| `osv-db-refresh` | `osv-db-refresh.timer` (AgentDev) | weekly | `OSV_DB_REFRESH_URL` |
+| `gh-skill-update` | `gh-skill-update.timer` (AgentDev) | daily | `GH_SKILL_UPDATE_URL` |
+| `windows-skills-update` | `MachineBootstrap-Skills-Update` task | daily 09:15 | `WINDOWS_SKILLS_UPDATE_URL` |
+| `windows-minutes-watchdog` | `MachineBootstrap-Minutes-Watchdog` task | daily 09:45 | `WINDOWS_MINUTES_WATCHDOG_URL` |
+| `backrest-backup` | Backrest plan `agentdev-daily`, via its hooks | daily 02:30 | `BACKREST_BACKUP_URL` |
+
+- **Files** (one `KEY=https://hc-ping.com/<uuid>` per line, nothing else needed): in AgentDev
+  `~/project-data/healthchecks/pings.env` (runtime data, never Git; `chmod 600`); on Windows
+  `%LOCALAPPDATA%\machine-bootstrap\pings.env` (keep it readable by your account only). AgentDev
+  needs the first three keys, Windows the last three. A ping URL is a secret: it is read at run
+  time, handed to curl on stdin and never printed, logged, put in a command line or in Backrest's
+  `config.json`. `JOB_PINGS_FILE` overrides the AgentDev path (tests use it).
+- **Never in the way:** `job-ping` (installed to `~/.local/bin`; `windows\job-ping.ps1` on
+  Windows) uses a 3 second connect and 6 second total timeout (5 seconds on Windows), no retries,
+  drops all output and always exits 0. A missing file, a missing key, a value that is not an
+  `https://` URL or an unreachable server changes nothing about the job.
+- **What a ping means:** a success ping is sent only when the job fully succeeded (`qmd-refresh`
+  after fetch, update and embed, `osv-db-refresh` after every ecosystem, `gh-skill-update` after the
+  installs and the update, the Windows tasks when their script returns 0). Backrest pings from plan
+  hooks: `CONDITION_SNAPSHOT_SUCCESS` pings the check and `CONDITION_SNAPSHOT_ERROR` pings `/fail`, both
+  through `job-ping.ps1` copied to `%LOCALAPPDATA%\backrest`. A backup the distro-start hook
+  cancels sends neither, so the check's own grace time reports it.
+- **Check settings to choose in Healthchecks.io:** match each check's period to the "Runs" column
+  and give it a grace time that covers the machine being off. The AgentDev jobs only run while the
+  distro runs; the systemd timers catch up (`Persistent=true`) when it starts, but `qmd-index` has no
+  catch-up, so give it a long grace time or expect an alert after the distro was stopped.
+- **After pulling this change:** the AgentDev side needs `chezmoi apply` (as `install.sh` does) to
+  get `job-ping`; the Windows side needs `install-skills-task.ps1`, `install-minutes-watchdog-task.ps1`
+  and `install-backrest.ps1 -Force` re-run from elevated PowerShell (copies `job-ping.ps1`, and for
+  Backrest adds the hooks to the plan). Not covered: the inventory, compaction and
+  inventory-mirror jobs, which were not part of this change.
+- **Tests:** `ci/job-ping-test.py` (which URL, silent skips, timeouts, no URL in a command line, dead
+  network) runs in `ci/lint.sh`; the Windows twin is tested in `ci/founder-tasks-test.ps1`.
 
 ## Backups (Backrest on Windows)
 
@@ -775,6 +829,9 @@ The only local merge exception is `git merge [--no-edit] origin/<default branch>
 inside the current repo on an attached non-default branch, with one effective
 GitHub origin URL and a resolvable symbolic `origin/HEAD`. Unknown/default/detached
 branches, other refs and every other merge option are denied by the shared hook.
+The one other exception is `git merge --ff-only origin/<the current branch>` (catching up
+your own task branch from GitHub): same checks, exactly that argument form, never on the
+default branch, and the remote-tracking ref must resolve uniquely.
 The locally recorded origin default must be established by authorized setup;
 the hook never contacts a remote to discover it.
 Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`

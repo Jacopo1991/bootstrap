@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Tell Healthchecks.io how a scheduled job went: job-ping <check-name> <result>.
+# <result> is 0, ok or success for a success ping to the check's own URL; anything else
+# (a non-zero exit status, fail, exit-code, timeout) pings <url>/fail.
+#
+# The URLs are in an owner-provisioned file outside Git, one KEY=URL per line, KEY being the
+# check name in capitals with - turned into _ and _URL added (qmd-index -> QMD_INDEX_URL):
+#   ${JOB_PINGS_FILE:-~/project-data/healthchecks/pings.env}
+# A missing file, a missing key or a value that is not an https:// URL is skipped silently.
+# The ping can never fail or delay the job: short timeouts, no retries, all output dropped,
+# and the exit status is always 0. The URL is handed to curl on stdin, so it never shows up
+# in a command line, and it is never printed.
+set -u
+check=${1:-}
+result=${2:-0}
+file=${JOB_PINGS_FILE:-$HOME/project-data/healthchecks/pings.env}
+
+[[ $check =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 0
+[[ -f $file && -r $file ]] || exit 0
+key=$(printf '%s' "$check" | tr 'a-z-' 'A-Z_')_URL
+
+url=
+while IFS= read -r line || [[ -n $line ]]; do
+  line=${line%$'\r'}
+  [[ $line == "$key="* ]] && url=${line#*=}
+done <"$file"
+url=${url#[\"\']}
+url=${url%[\"\']}
+url=${url%/}
+[[ $url =~ ^https://[^[:space:]\"\\]+$ ]] || exit 0
+
+case $result in
+  0|ok|success) ;;
+  *) url=$url/fail ;;
+esac
+
+printf 'url = "%s"\n' "$url" |
+  curl --silent --output /dev/null --connect-timeout 3 --max-time 6 --retry 0 --config - >/dev/null 2>&1
+exit 0

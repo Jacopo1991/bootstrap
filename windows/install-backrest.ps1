@@ -23,6 +23,7 @@ $script:ResticSha256 = 'da948ad707ed690426473aaba2046cd61f8f90f6f0e7dab6be0d5796
 $script:ResticZipEntry = 'restic_0.19.1_windows_amd64.exe'
 $script:BackrestRepoPath = 'C:\backups\restic'
 $script:BackrestTaskName = 'MachineBootstrap-Backrest'
+$script:BackrestPingCheck = 'backrest-backup'  # Healthchecks.io check name; key BACKREST_BACKUP_URL in pings.env
 $script:BackrestAlwaysIncluded = @('consultancy-website', 'customer-harness', 'typo3-dkm-plugin')
 $script:BackrestExcludes = @(
     '**/node_modules', '**/.venv', '**/__pycache__', '**/.cache', '**/dist', '**/build',
@@ -62,6 +63,7 @@ function Get-BackrestSources {
 
 function New-BackrestConfig {
     param([Parameter(Mandatory)][string[]]$Sources, [Parameter(Mandatory)][string]$PasswordFile,
+          [Parameter(Mandatory)][string]$PingScript,
           [string]$Distro = 'AgentDev', [string]$RepoPath = $script:BackrestRepoPath)
     $schedule = { param($cron) [ordered]@{ cron = $cron; clock = 'CLOCK_LOCAL' } }
     # The password itself never goes into the config: restic reads it from the owner-only file.
@@ -81,6 +83,17 @@ function New-BackrestConfig {
         onError = 'ON_ERROR_CANCEL'
         actionCommand = [ordered]@{ command = "wsl.exe -d $Distro -u agent -- true" }
     }
+    # Healthchecks.io: job-ping.ps1 reads the check URL from the owner-provisioned pings file at run
+    # time, so no URL is ever written into this config. Backrest runs hook commands in PowerShell on
+    # Windows. A ping can never fail the backup (the script always exits 0; ON_ERROR_IGNORE).
+    $ping = {
+        param($condition, $result)
+        [ordered]@{
+            conditions = @($condition)
+            onError = 'ON_ERROR_IGNORE'
+            actionCommand = [ordered]@{ command = "powershell.exe -NoProfile -NonInteractive -File `"$PingScript`" -Check $script:BackrestPingCheck -Result $result" }
+        }
+    }
     $plan = [ordered]@{
         id = 'agentdev-daily'
         repo = 'restic'
@@ -88,7 +101,7 @@ function New-BackrestConfig {
         excludes = @($script:BackrestExcludes)
         schedule = (& $schedule $script:BackrestBackupCron)
         retention = [ordered]@{ policyTimeBucketed = [ordered]@{ daily = 7; weekly = 4; monthly = 6 } }
-        hooks = @($startDistro)
+        hooks = @($startDistro, (& $ping 'CONDITION_SNAPSHOT_SUCCESS' 'ok'), (& $ping 'CONDITION_SNAPSHOT_ERROR' 'fail'))
     }
     return [ordered]@{ modno = 1; version = 6; instance = 'founder-windows'; repos = @($repo); plans = @($plan) }
 }
@@ -247,7 +260,9 @@ function Install-Backrest {
         throw "$configFile exists. Re-run with -Force to refresh only the agentdev-daily plan (a backup is kept)."
     }
     if ($existing) { Copy-Item -LiteralPath $configFile -Destination ($configFile + '.bootstrap-' + [Guid]::NewGuid().ToString('N') + '.bak') }
-    $config = Merge-BackrestConfig -ExistingJson $existing -Generated (New-BackrestConfig -Sources $sources -PasswordFile $passwordFile -Distro $DistroName)
+    $pingScript = Join-Path $base 'job-ping.ps1'
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'job-ping.ps1') -Destination $pingScript -Force
+    $config = Merge-BackrestConfig -ExistingJson $existing -Generated (New-BackrestConfig -Sources $sources -PasswordFile $passwordFile -PingScript $pingScript -Distro $DistroName)
     [IO.File]::WriteAllText($configFile, (ConvertTo-BackrestJson -Config $config), [Text.UTF8Encoding]::new($false))
 
     $launcher = Join-Path $base 'start-backrest.ps1'
