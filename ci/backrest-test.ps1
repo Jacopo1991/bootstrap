@@ -38,7 +38,8 @@ try {
     Assert-Equal ($names -join ',') 'consultancy-website,customer-harness,scratch-local,typo3-dkm-plugin' 'local-only discovery'
 
     $generated = New-BackrestConfig -Sources (Get-BackrestSources -RepoNames $names) `
-        -PasswordFile 'C:\Users\founder\AppData\Local\backrest\restic-password.txt'
+        -PasswordFile 'C:\Users\founder\AppData\Local\backrest\restic-password.txt' `
+        -PingScript 'C:\Users\founder\AppData\Local\backrest\job-ping.ps1'
     $actual = (ConvertTo-BackrestJson -Config $generated) | ConvertFrom-Json | ConvertTo-Json -Depth 12 -Compress
     $expectedFile = Join-Path $PSScriptRoot 'fixtures/backrest-config.expected.json'
     $expected = Get-Content -LiteralPath $expectedFile -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 12 -Compress
@@ -97,7 +98,7 @@ if ($Live) {
         Write-Output 'PASS: pinned Backrest and restic downloaded, hashes verified'
         $livePasswordFile = Join-Path $liveRoot 'restic-password.txt'
         New-ResticPasswordFile -Path $livePasswordFile -Password (ConvertTo-SecureString -String ([Guid]::NewGuid().ToString('N')) -AsPlainText -Force)
-        $config = New-BackrestConfig -Sources @($source) -PasswordFile $livePasswordFile -RepoPath (Join-Path $liveRoot 'repo')
+        $config = New-BackrestConfig -Sources @($source) -PasswordFile $livePasswordFile -PingScript (Join-Path $liveRoot 'job-ping.ps1') -RepoPath (Join-Path $liveRoot 'repo')
         $configFile = Join-Path $liveRoot 'config.json'
         [IO.File]::WriteAllText($configFile, (ConvertTo-BackrestJson -Config $config), [Text.UTF8Encoding]::new($false))
         $launcherFile = Join-Path $liveRoot 'start.ps1'

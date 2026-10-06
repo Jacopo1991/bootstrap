@@ -15,7 +15,7 @@ spec.loader.exec_module(drift)
 expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
             "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "verify-enable",
-            "new-project", "qmd-refresh", "gh-skill-update"}
+            "new-project", "qmd-refresh", "gh-skill-update", "job-ping"}
 assert drift.EXPECTED_BINARIES == expected
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
 for script in (ROOT / "home/dot_local/bin").iterdir():

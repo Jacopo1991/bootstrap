@@ -50,6 +50,16 @@
           "conditions": ["CONDITION_SNAPSHOT_START"],
           "onError": "ON_ERROR_CANCEL",
           "actionCommand": { "command": "wsl.exe -d AgentDev -u agent -- true" }
+        },
+        {
+          "conditions": ["CONDITION_SNAPSHOT_SUCCESS"],
+          "onError": "ON_ERROR_IGNORE",
+          "actionCommand": { "command": "powershell.exe -NoProfile -NonInteractive -File \"C:\\Users\\founder\\AppData\\Local\\backrest\\job-ping.ps1\" -Check backrest-backup -Result ok" }
+        },
+        {
+          "conditions": ["CONDITION_SNAPSHOT_ERROR"],
+          "onError": "ON_ERROR_IGNORE",
+          "actionCommand": { "command": "powershell.exe -NoProfile -NonInteractive -File \"C:\\Users\\founder\\AppData\\Local\\backrest\\job-ping.ps1\" -Check backrest-backup -Result fail" }
         }
       ]
     }

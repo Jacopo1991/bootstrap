@@ -435,7 +435,8 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
 
 
 def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
-    """Only merge the locally recorded GitHub origin default into a task branch."""
+    """Only merge the locally recorded GitHub origin default into a task branch, or
+    fast-forward a task branch to its own origin/<branch> (catching up from GitHub)."""
     try:
         def read_git(*args: str) -> str:
             return subprocess.run(
@@ -451,12 +452,20 @@ def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
         name = default[len(prefix):]
         if current == "refs/heads/" + name:
             return "Merging into the default branch is blocked; update only a task branch."
+        own = current[len("refs/heads/"):]
         wanted = "origin/" + name
-        if arguments not in ([wanted], ["--no-edit", wanted]):
-            return "Only git merge [--no-edit] origin/<default branch> is allowed."
-        read_git("rev-parse", "--verify", default + "^{commit}")
-        if read_git("rev-parse", "--symbolic-full-name", "--verify", wanted) != default:
-            return "The merge source must resolve uniquely to the origin default ref."
+        own_remote = "origin/" + own
+        if arguments == ["--ff-only", own_remote] and plain_branch_name(own):
+            source, label = prefix + own, "its own origin branch"
+        elif arguments in ([wanted], ["--no-edit", wanted]):
+            source, label = default, "the origin default ref"
+        else:
+            return ("Only git merge [--no-edit] origin/<default branch> or "
+                    "git merge --ff-only origin/<current branch> is allowed.")
+        read_git("rev-parse", "--verify", source + "^{commit}")
+        if read_git("rev-parse", "--symbolic-full-name", "--verify",
+                    "origin/" + source[len(prefix):]) != source:
+            return "The merge source must resolve uniquely to " + label + "."
         # Git applies branch mergeOptions before argv, including custom strategies.
         options = subprocess.run(
             ["git", "config", "--get-all", "branch." + current[len("refs/heads/"):] + ".mergeOptions"],

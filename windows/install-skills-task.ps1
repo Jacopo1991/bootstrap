@@ -6,7 +6,7 @@ param()
 # Run by the founder from elevated Windows PowerShell, as the account whose gh login can read
 # Jacopo1991/cortex-core: installs the skills for the Windows-side Claude Code and Codex
 # (user scope; --force once replaces hand-copied folders) and registers a daily task that
-# runs `gh skill update --all` as that account.
+# installs skills that are new in the repository and runs `gh skill update --all` as that account.
 function Install-SkillsTask {
     [CmdletBinding()]param()
     Assert-BootstrapAdministrator
@@ -30,8 +30,9 @@ function Install-SkillsTask {
 
     Initialize-FounderTaskDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'skills-update.ps1') -Destination (Join-Path $script:FounderTaskDirectory 'skills-update.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'job-ping.ps1') -Destination (Join-Path $script:FounderTaskDirectory 'job-ping.ps1') -Force
     Register-FounderTask -Name 'MachineBootstrap-Skills-Update' -ScriptFile 'skills-update.ps1' -Time '09:15' `
-        -Description 'Daily gh skill update --all for the cortex-core skills (no agent runs).'
+        -Description 'Daily install of new cortex-core skills, then gh skill update --all (no agent runs).'
     Write-Output "Daily skills update registered (09:15, runs when you are logged in, catches up after a missed start). Log: $stateDirectory\skills-update.log"
 }
 if ($MyInvocation.InvocationName -ne '.') { Install-SkillsTask }

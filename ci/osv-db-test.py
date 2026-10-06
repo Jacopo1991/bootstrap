@@ -154,8 +154,14 @@ class Refresh(unittest.TestCase):
         curl = bin_dir / "curl"
         curl.write_text(FAKE_CURL)
         curl.chmod(0o755)
+        # Record job-ping calls instead of contacting Healthchecks.io.
+        self.pings = self.temp / "pings"
+        ping = bin_dir / "job-ping"
+        ping.write_text(f'#!/bin/sh\necho "$@" >> {self.pings}\n')
+        ping.chmod(0o755)
         self.cache = self.temp / "cache" / "osv-scalibr"
         self.env = dict(os.environ, XDG_CACHE_HOME=str(self.temp / "cache"),
+                        JOB_PINGS_FILE=str(self.temp / "no-pings.env"),  # never ping for real from a test
                         PATH=f"{bin_dir}:{os.environ['PATH']}")
 
     def run_refresh(self, **fake: str) -> subprocess.CompletedProcess:
@@ -173,6 +179,7 @@ class Refresh(unittest.TestCase):
         for ecosystem in ECOSYSTEMS:
             self.assertEqual(self.zip_tag(ecosystem), ecosystem)
         self.assertTrue((self.cache / ".last-refresh").is_file())
+        self.assertEqual(self.pings.read_text().splitlines(), ["osv-db-refresh 0"])
 
     def test_failures_are_reported_others_still_refresh_and_no_stamp(self):
         self.assertEqual(self.run_refresh().returncode, 0)
@@ -188,6 +195,11 @@ class Refresh(unittest.TestCase):
         self.assertEqual(self.zip_tag("PyPI"), "PyPI-new")
         self.assertEqual(list(self.cache.glob("*/*.part")), [])
         self.assertFalse((self.cache / ".last-refresh").exists())
+        self.assertEqual(self.pings.read_text().splitlines(), ["osv-db-refresh 0", "osv-db-refresh 1"])
+
+    def test_works_without_job_ping(self):
+        (self.temp / "bin" / "job-ping").unlink()
+        self.assertEqual(self.run_refresh().returncode, 0)
 
 
 if __name__ == "__main__":

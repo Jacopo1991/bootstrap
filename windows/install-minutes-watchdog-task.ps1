@@ -11,6 +11,7 @@ function Install-MinutesWatchdogTask {
     Assert-BootstrapAdministrator
     Initialize-FounderTaskDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'minutes-watchdog.ps1') -Destination (Join-Path $script:FounderTaskDirectory 'minutes-watchdog.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'job-ping.ps1') -Destination (Join-Path $script:FounderTaskDirectory 'job-ping.ps1') -Force
     Register-FounderTask -Name 'MachineBootstrap-Minutes-Watchdog' -ScriptFile 'minutes-watchdog.ps1' `
         -ExtraArguments "-IncludedMinutes $IncludedMinutes" -Time '09:45' `
         -Description 'Daily GitHub Actions minutes check; notifies at 50% and 80% of the included minutes.'

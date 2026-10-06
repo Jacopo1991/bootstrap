@@ -37,7 +37,8 @@ with tempfile.TemporaryDirectory() as temporary:
             def event(command):
                 return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
             def allowed(command):
-                assert policy.evaluate(event(command), roots) is None, command
+                reason = policy.evaluate(event(command), roots)
+                assert reason is None, command + ": " + str(reason)
             def denied(command):
                 assert policy.evaluate(event(command), roots) is not None, command
             # Never merge into default, even when the merge would be a no-op.
@@ -58,9 +59,59 @@ with tempfile.TemporaryDirectory() as temporary:
                              "origin/" + default + " --no-edit",
                              "origin/" + default + " origin/task"):
                     denied(executable + " merge " + tail)
-                denied("FOO=fixture " + executable + " merge origin/" + default)
+                denied("GIT_SSH_COMMAND=fixture " + executable + " merge origin/" + default)
                 denied(executable + " -c core.hooksPath=fixture merge origin/" + default)
                 denied(executable + " --config-env=alias.merge=FIXTURE merge origin/" + default)
+            # Catching up the current branch from its own origin branch: fast-forward only.
+            git(repo, "update-ref", "refs/remotes/origin/task", "HEAD")
+            for executable in ("git", "/usr/bin/git"):
+                allowed(executable + " merge --ff-only origin/task")
+                allowed(executable + " -C . merge --ff-only origin/task")
+                for tail in ("origin/task", "--no-edit origin/task", "--ff origin/task",
+                             "--ff-only task", "--ff-only refs/remotes/origin/task",
+                             "--ff-only origin/task~1", "--ff-only origin/other",
+                             "--ff-only origin/HEAD", "--ff-only upstream/task",
+                             "--ff-only origin/task origin/" + default,
+                             "--ff-only --no-edit origin/task",
+                             "--no-edit --ff-only origin/task",
+                             "--ff-only --squash origin/task",
+                             "--ff-only --strategy=fixture origin/task",
+                             "--ff-only -X fixture origin/task",
+                             "--ff-only --no-verify origin/task",
+                             "--ff-only origin/task --no-edit",
+                             "--ff-only origin/*", "--ff-only origin/task^",
+                             "--ff-only origin/" + default + "..origin/task"):
+                    denied(executable + " merge " + tail)
+                denied("GIT_SSH_COMMAND=fixture " + executable + " merge --ff-only origin/task")
+                denied(executable + " -c core.hooksPath=fixture merge --ff-only origin/task")
+            # The ff-only form still needs a real remote-tracking ref for this branch.
+            git(repo, "update-ref", "-d", "refs/remotes/origin/task")
+            denied("git merge --ff-only origin/task")
+            git(repo, "update-ref", "refs/remotes/origin/task", "HEAD")
+            for shadow in ("refs/tags/origin/task", "refs/heads/origin/task"):
+                git(repo, "update-ref", shadow, "HEAD")
+                denied("git merge --ff-only origin/task")
+                git(repo, "update-ref", "-d", shadow)
+            for value in ("--strategy=fixture", "--squash", ""):
+                git(repo, "config", "branch.task.mergeOptions", value)
+                denied("git merge --ff-only origin/task")
+                git(repo, "config", "--unset-all", "branch.task.mergeOptions")
+            git(repo, "remote", "set-url", "origin", "https://example.invalid/fixture.git")
+            denied("git merge --ff-only origin/task")
+            git(repo, "remote", "set-url", "origin", "https://github.com/Jacopo1991/fixture.git")
+            allowed("git merge --ff-only origin/task")
+            git(repo, "merge", "--ff-only", "origin/task")
+            # Never on the default branch, and never for another branch's ref.
+            git(repo, "update-ref", "refs/remotes/origin/other", "HEAD")
+            denied("git merge --ff-only origin/other")
+            git(repo, "switch", "-q", default)
+            denied("git merge --ff-only origin/" + default)
+            git(repo, "switch", "-q", "task")
+            git(repo, "checkout", "-q", "--detach")
+            denied("git merge --ff-only origin/task")
+            git(repo, "switch", "-q", "task")
+            git(repo, "update-ref", "-d", "refs/remotes/origin/task")
+            git(repo, "update-ref", "-d", "refs/remotes/origin/other")
             # Short refs must not be shadowed, even at the same commit.
             for shadow in ("refs/tags/origin/", "refs/heads/origin/"):
                 git(repo, "update-ref", shadow + default, "HEAD")

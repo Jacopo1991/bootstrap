@@ -50,4 +50,6 @@ done
 
 qmd update || failed=1
 qmd embed || failed=1
+# Healthchecks.io ping (skipped silently without the owner-provisioned pings file).
+command -v job-ping >/dev/null 2>&1 && job-ping qmd-index "$failed"
 exit "$failed"

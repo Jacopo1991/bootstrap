@@ -100,7 +100,26 @@ class Install(unittest.TestCase):
             self.assertEqual(drift.unexpected_skills(skills / "missing"), [])
 
 
+# Behaves like the real `gh skill` (checked against gh with the live repository): the listing is
+# "name<TAB>description" on stdout; installing by name refuses with exit 1 when the skill is
+# already there; --all refuses as soon as any skill is present, so the script must never use it.
 FAKE_GH = """#!/usr/bin/env bash
+echo "$*" >> "$FAKE_LOG"
+case "$*" in *--all*|*--force*|*" -f"*) [ "$2 $3" = "update --all" ] || { echo "unexpected: $*" >&2; exit 64; } ;; esac
+if [ "$1 $2" = "skill install" ]; then
+  if [ $# -eq 3 ]; then
+    echo "Using ref v0.5.0 (146f526b)" >&2
+    [ "${FAKE_LIST_EXIT:-0}" = 0 ] || { echo "could not resolve version" >&2; exit "$FAKE_LIST_EXIT"; }
+    for name in $FAKE_SKILLS; do printf '%s\\tDescription of %s. Use for things.\\n' "$name" "$name"; done
+    exit 0
+  fi
+  [ "$5 $7 $8" = "--agent --scope user" ] || { echo "unexpected: $*" >&2; exit 64; }
+  key="$4 $6"
+  case " $FAKE_INSTALLED " in *" $key "*) echo "skills already installed: $4 (use --force to overwrite)" >&2; exit 1 ;; esac
+  case " $FAKE_BROKEN " in *" $key "*) echo "boom installing $4" >&2; exit 2 ;; esac
+  echo "Installed $4"
+  exit 0
+fi
 [ "$1 $2 $3" = "skill update --all" ] || { echo "unexpected: $*" >&2; exit 64; }
 printf '%s\\n' "$FAKE_OUTPUT"
 exit "${FAKE_EXIT:-0}"
@@ -108,24 +127,89 @@ exit "${FAKE_EXIT:-0}"
 
 
 class UpdateCommand(unittest.TestCase):
-    def run_update(self, output: str, code: int = 0):
+    ALL = "github-ci research slim-workflow"
+    BOTH = " ".join(f"{n} {a}" for n in ALL.split() for a in ("claude-code", "codex"))
+
+    def run_update(self, output: str = "Updated github-ci", code: int = 0, skills: str = ALL,
+                   installed: str = BOTH, **extra: str):
         temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        gh = temp / "gh"
-        gh.write_text(FAKE_GH)
-        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
-        env = dict(os.environ, PATH=f"{temp}:{os.environ['PATH']}", FAKE_OUTPUT=output, FAKE_EXIT=str(code))
+        for name, text in (("gh", FAKE_GH), ("job-ping", '#!/bin/sh\necho "$@" >> "$FAKE_PINGS"\n')):
+            tool = temp / name
+            tool.write_text(text)
+            tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+        self.log, self.pings = temp / "gh-calls", temp / "pings"
+        env = dict(os.environ, PATH=f"{temp}:{os.environ['PATH']}", FAKE_OUTPUT=output, FAKE_EXIT=str(code),
+                   FAKE_SKILLS=skills, FAKE_INSTALLED=installed, FAKE_LOG=str(self.log), FAKE_PINGS=str(self.pings),
+                   JOB_PINGS_FILE=str(temp / "no-pings.env"), **extra)
         return subprocess.run(["bash", str(UPDATE)], env=env, capture_output=True, text=True, timeout=30)
+
+    def calls(self) -> list[str]:
+        return self.log.read_text().splitlines()
+
+    def pinged(self) -> list[str]:
+        return self.pings.read_text().splitlines() if self.pings.exists() else []
 
     def test_success(self):
         result = self.run_update("Updated github-ci")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Skills current.", result.stdout)
+        self.assertEqual(self.pinged(), ["gh-skill-update 0"])
+
+    def test_nothing_new_installs_nothing_and_updates_last(self):
+        self.assertEqual(self.run_update().returncode, 0)
+        calls = self.calls()
+        self.assertEqual(calls[0], "skill install Jacopo1991/cortex-core")
+        self.assertEqual(calls[-1], "skill update --all")
+        self.assertEqual(len(calls), 1 + 3 * 2 + 1)  # listing, every skill for both agents, update
+        self.assertFalse([c for c in calls if "--all" in c and c != "skill update --all"])
+        self.assertFalse([c for c in calls if "--force" in c])
+
+    def test_new_skill_is_installed_for_both_agents_without_force_then_updated(self):
+        result = self.run_update(skills="github-ci research slim-workflow brand-new",
+                                 installed=self.BOTH)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installs = [c for c in self.calls() if c.startswith("skill install ") and "brand-new" in c]
+        self.assertEqual(installs, ["skill install Jacopo1991/cortex-core brand-new --agent claude-code --scope user",
+                                    "skill install Jacopo1991/cortex-core brand-new --agent codex --scope user"])
+        self.assertIn("Installed new skill brand-new for claude-code.", result.stdout)
+        self.assertIn("Installed new skill brand-new for codex.", result.stdout)
+        self.assertEqual(self.calls()[-1], "skill update --all")
+        self.assertEqual(self.pinged(), ["gh-skill-update 0"])
+
+    def test_skill_missing_for_one_agent_only_is_installed_for_that_agent(self):
+        installed = self.BOTH.replace("research codex", "")
+        result = self.run_update(installed=installed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Installed new skill research for codex.", result.stdout)
+        self.assertNotIn("for claude-code", result.stdout)
+
+    def test_failed_install_fails_the_run_but_the_update_still_runs(self):
+        result = self.run_update(skills="github-ci brand-new", installed="github-ci claude-code github-ci codex",
+                                 FAKE_BROKEN="brand-new codex")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR installing new skill brand-new for codex", result.stderr)
+        self.assertIn("boom installing brand-new", result.stdout)
+        self.assertEqual(self.calls()[-1], "skill update --all")
+        self.assertEqual(self.pinged(), ["gh-skill-update 1"])
+
+    def test_listing_failure_fails_the_run_but_the_update_still_runs(self):
+        result = self.run_update(FAKE_LIST_EXIT="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ERROR", result.stderr)
+        self.assertEqual(self.calls(), ["skill install Jacopo1991/cortex-core", "skill update --all"])
+        self.assertEqual(self.pinged(), ["gh-skill-update 1"])
+
+    def test_empty_listing_is_a_failure(self):
+        result = self.run_update(skills="")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("listed no skills", result.stderr)
 
     def test_nonzero_exit_fails_and_says_so(self):
         result = self.run_update("could not reach github.com", 1)
         self.assertEqual(result.returncode, 1)
         self.assertIn("ERROR", result.stderr)
         self.assertIn("could not reach github.com", result.stdout)
+        self.assertEqual(self.pinged(), ["gh-skill-update 1"])
 
     def test_reported_failure_fails_even_with_exit_zero(self):
         result = self.run_update("failed to update github-ci")
@@ -134,6 +218,17 @@ class UpdateCommand(unittest.TestCase):
 
     def test_no_failure_false_positive_on_ordinary_names(self):
         self.assertEqual(self.run_update("Updated terror-handling").returncode, 0)
+
+    def test_works_without_job_ping(self):
+        temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        gh = temp / "gh"
+        gh.write_text(FAKE_GH)
+        gh.chmod(0o755)
+        log = temp / "log"
+        env = dict(os.environ, PATH=f"{temp}:/usr/bin:/bin", FAKE_OUTPUT="ok", FAKE_SKILLS=self.ALL,
+                   FAKE_INSTALLED=self.BOTH, FAKE_LOG=str(log))
+        result = subprocess.run(["/bin/bash", str(UPDATE)], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 def hook(event: dict) -> dict | None:
@@ -236,6 +331,33 @@ class Windows(unittest.TestCase):
         self.assertIn("'claude-code', 'codex'", text)
         self.assertEqual(len(re.findall(r"^\s*& \$gh\.Source skill install .*--force", text, re.M)), 1)
         self.assertIn("skill update --all", self.read("skills-update.ps1"))
+
+    def test_daily_task_installs_new_skills_by_name_without_force_then_updates(self):
+        text = "\n".join(l for l in self.read("skills-update.ps1").splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("--force", text)
+        self.assertNotRegex(text, r"skill install[^\n]*--all")  # --all refuses once any skill is present
+        self.assertIn("skill install $script:SkillsRepository 2>$null", text)  # the listing
+        self.assertIn("skill install $script:SkillsRepository $name --agent $agent --scope user", text)
+        self.assertIn("'claude-code', 'codex'", text)
+        self.assertIn("already installed", text)
+        self.assertLess(text.index("Install-NewSkills -Gh"), text.index("skill update --all 2>&1"))
+        self.assertIn("Jacopo1991/cortex-core", text)
+
+    def test_jobs_ping_their_own_checks(self):
+        for script, check in (("skills-update.ps1", "windows-skills-update"),
+                              ("minutes-watchdog.ps1", "windows-minutes-watchdog")):
+            text = self.read(script)
+            self.assertIn(f"Send-JobPing -Check '{check}' -Success ($exitCode -eq 0)", text)
+            self.assertIn("job-ping.ps1", text)
+            self.assertIn("exit $exitCode", text)
+            self.assertLess(text.index("Send-JobPing -Check"), text.index("exit $exitCode"))
+
+    def test_installers_copy_the_ping_script_next_to_the_task_scripts(self):
+        for installer in ("install-skills-task.ps1", "install-minutes-watchdog-task.ps1"):
+            text = self.read(installer)
+            self.assertIn("(Join-Path $PSScriptRoot 'job-ping.ps1')", text)
+            self.assertIn("'job-ping.ps1') -Force", text)
+            self.assertLess(text.index("job-ping.ps1"), text.index("Register-FounderTask -Name"))
 
     def test_tests_are_chained_into_the_windows_job(self):
         self.assertIn("founder-tasks-test.ps1", (ROOT / "ci/windows-test.ps1").read_text())
