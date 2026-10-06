@@ -3,7 +3,11 @@
 # Context lines come from each repository's INTENT.md: the one-sentence
 # `qmd_context:` front matter line when present, else the title, so no project
 # detail is stored in this public source.
+# Also one read-only collection per ~/project-data/<project>/reference folder,
+# named <project>-reference. Only Markdown inside reference/ is indexed; a
+# reference folder holding secrets.env, *.key or a symlink is skipped with a warning.
 {{- $cortex := joinPath .chezmoi.homeDir "cortex" }}
+{{- $projectData := joinPath .chezmoi.homeDir "project-data" }}
 global_context: "Cortex knowledge repositories: project intent, status, tasks and decisions."
 collections:
 {{- range glob (joinPath $cortex "*") }}
@@ -21,5 +25,25 @@ collections:
     pattern: "**/*.md"
     context:
       "/": {{ if $description }}{{ $description | toJson }}{{ else if $title }}{{ printf "%s: %s" $name $title | toJson }}{{ else }}{{ printf "Cortex knowledge repository %s" $name | toJson }}{{ end }}
+{{- end }}
+{{- end }}
+{{- range glob (joinPath $projectData "*" "reference") }}
+{{- $project := base (dir .) }}
+{{- if and (stat .).isDir (not (hasPrefix "." $project)) }}
+{{- $secret := output "find" . "(" "-name" "secrets.env" "-o" "-name" "*.key" "-o" "-type" "l" ")" "-print" "-quit" | trim }}
+{{- if $secret }}
+{{- warnf "qmd: skipped %s: it contains a secret-like file or symlink (%s)" . $secret }}
+{{- else }}
+{{- $context := "" }}
+{{- $readme := joinPath . "README.md" }}
+{{- if (stat $readme) }}
+{{- $context = output "sed" "-n" "-e" "1{s/^#*[[:space:]]*//;p;q}" $readme | trim }}
+{{- end }}
+  {{ printf "%s-reference" $project }}:
+    path: {{ . | toJson }}
+    pattern: "**/*.md"
+    context:
+      "/": {{ if $context }}{{ $context | toJson }}{{ else }}{{ printf "Reference material for %s" $project | toJson }}{{ end }}
+{{- end }}
 {{- end }}
 {{- end }}

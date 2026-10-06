@@ -379,6 +379,14 @@ every `~/cortex/*` repository for local keyword and semantic search.
   `<repo>: <title>` taken from that repository's `INTENT.md` front matter at
   apply time, so no project detail lives in this public source. After adding a
   repository run `chezmoi apply`.
+- **Project reference material:** a project may put Markdown its PM should read in
+  `~/project-data/<project>/reference/`. Each such folder becomes the read-only
+  collection `<project>-reference` (mask `**/*.md`; context from the first line of
+  its `README.md`, else `Reference material for <project>`). Nothing outside
+  `reference/` is indexed, and a folder containing `secrets.env`, any `*.key` file or
+  a symlink is skipped with a warning at `chezmoi apply`. Never put secrets in
+  `reference/`. PM seats get no Filesystem access to `~/project-data`; qmd is the
+  read path. Run `chezmoi apply` after adding a reference folder.
 - **Timer:** the user timer `qmd-index.timer` (every 15 minutes, `OnCalendar=*:0/15`)
   runs `~/.local/bin/qmd-refresh`: plain indexing, no agent runs. `users.sh` enables
   lingering for `agent` so it fires without a login session.
