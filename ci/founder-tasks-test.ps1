@@ -9,7 +9,7 @@ $fixturePath = Join-Path $PSScriptRoot 'fixtures/billing-usage.json'
 & {
     . "$PSScriptRoot/../windows/minutes-watchdog.ps1"
     $usage = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
-    Assert-Equal (Get-ActionsMinutesUsed -Usage $usage) 1600.0 'only Actions minutes are summed (storage and other products ignored)'
+    Assert-Equal (Get-ActionsMinutesUsed -Usage $usage -Month '2026-10') 2100.0 'only this month''s Actions minutes count, Windows at 2x (storage, other products and September ignored)'
     Assert-Equal (Get-MinutesLevel -Used 1499 -Included 3000) 0 'below 50% is quiet'
     Assert-Equal (Get-MinutesLevel -Used 1500 -Included 3000) 50 '50% is announced'
     Assert-Equal (Get-MinutesLevel -Used 2399 -Included 3000) 50 'just below 80% stays at 50'
@@ -30,7 +30,7 @@ $fixturePath = Join-Path $PSScriptRoot 'fixtures/billing-usage.json'
         function Get-BillingUsage {
             if ($script:fail) { throw 'fixture API failure' }
             $value = Get-Content -LiteralPath $fixturePath -Raw | ConvertFrom-Json
-            $value.usageItems[0].quantity = $script:used - 600
+            $value.usageItems[0].quantity = $script:used - 1100  # other October items: 500 Windows x2 + 100 Linux
             return $value
         }
         function Show-WatchdogNotification { param([string]$Title, [string]$Message); $script:shown.Add($Title) }

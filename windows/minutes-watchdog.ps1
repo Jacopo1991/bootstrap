@@ -15,13 +15,20 @@ $script:Thresholds = @(80, 50)  # highest first
 $jobPing = Join-Path $PSScriptRoot 'job-ping.ps1'
 if (Test-Path -LiteralPath $jobPing) { . $jobPing } else { function Send-JobPing { param($Check, $Success) } }
 
+# Minutes counted against the plan's included minutes for one month (yyyy-MM). The usage
+# report can span the whole year, so items are filtered by date; Windows and macOS minutes
+# count 2x and 10x against the included minutes, as GitHub bills them.
 function Get-ActionsMinutesUsed {
-    param([Parameter(Mandatory)]$Usage)
+    param([Parameter(Mandatory)]$Usage, [Parameter(Mandatory)][string]$Month)
     $property = $Usage.PSObject.Properties['usageItems']
     if ($null -eq $property) { throw 'Billing usage has no usageItems.' }
     $total = 0.0
     foreach ($item in @($property.Value)) {
-        if ([string]$item.product -eq 'actions' -and [string]$item.unitType -eq 'Minutes') { $total += [double]$item.quantity }
+        if ([string]$item.product -ne 'actions' -or [string]$item.unitType -ne 'Minutes') { continue }
+        if (-not ([string]$item.date).StartsWith($Month)) { continue }
+        $sku = [string]$item.sku
+        $weight = if ($sku -match 'windows') { 2 } elseif ($sku -match 'mac') { 10 } else { 1 }
+        $total += [double]$item.quantity * $weight
     }
     return $total
 }
@@ -46,7 +53,7 @@ function Get-BillingUsage {
     $gh = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $gh) { throw 'gh not found on PATH.' }
     $ErrorActionPreference = 'Continue'  # Windows PowerShell 5.1 turns native stderr into terminating errors under 'Stop'
-    $text = (& $gh.Source api /users/Jacopo1991/settings/billing/usage 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    $text = (& $gh.Source api "/users/Jacopo1991/settings/billing/usage?year=$($Now.Year)&month=$($Now.Month)" 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "gh api failed ($LASTEXITCODE)." }
     return $text | ConvertFrom-Json
 }
@@ -82,7 +89,7 @@ function Invoke-MinutesWatchdog {
     $month = $Now.ToString('yyyy-MM')
     $statePath = Join-Path $Directory 'minutes-watchdog.json'
     try {
-        $used = Get-ActionsMinutesUsed -Usage (Get-BillingUsage)
+        $used = Get-ActionsMinutesUsed -Usage (Get-BillingUsage) -Month $month
         $level = Get-MinutesLevel -Used $used -Included $Included
         $state = $null
         if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json }
