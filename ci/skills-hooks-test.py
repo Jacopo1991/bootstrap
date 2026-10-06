@@ -310,7 +310,7 @@ class Windows(unittest.TestCase):
         text = self.read("minutes-watchdog.ps1")
         self.assertIn("$IncludedMinutes = 3000", text)
         self.assertIn("$script:Thresholds = @(80, 50)", text)
-        self.assertIn("gh.Source api /users/Jacopo1991/settings/billing/usage", text)
+        self.assertIn("gh.Source api \"/users/Jacopo1991/settings/billing/usage?year=", text)
         self.assertNotIn("Import-Module", text)
         self.assertNotIn("Install-Module", text)
 
@@ -364,8 +364,11 @@ class Windows(unittest.TestCase):
 
     def test_fixture_matches_the_test_expectations(self):
         usage = json.loads((ROOT / "ci/fixtures/billing-usage.json").read_text())
-        minutes = sum(i["quantity"] for i in usage["usageItems"] if i["product"] == "actions" and i["unitType"] == "Minutes")
-        self.assertEqual(minutes, 1600)
+        # Same rule as the watchdog: October only, Windows minutes count 2x, macOS 10x.
+        weight = lambda sku: 2 if "windows" in sku else 10 if "mac" in sku else 1
+        minutes = sum(i["quantity"] * weight(i.get("sku", "")) for i in usage["usageItems"]
+                      if i["product"] == "actions" and i["unitType"] == "Minutes" and i["date"].startswith("2026-10"))
+        self.assertEqual(minutes, 2100)
 
 
 if __name__ == "__main__":
