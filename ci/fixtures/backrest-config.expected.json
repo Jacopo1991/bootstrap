@@ -41,7 +41,8 @@
         "**/.next",
         "**/target",
         "**/qmd/*.sqlite*",
-        "**/.qmd"
+        "**/.qmd",
+        "**/uv-cache"
       ],
       "schedule": { "cron": "30 2 * * *", "clock": "CLOCK_LOCAL" },
       "retention": { "policyTimeBucketed": { "daily": 7, "weekly": 4, "monthly": 6 } },
