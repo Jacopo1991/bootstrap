@@ -252,15 +252,16 @@ function Install-Backrest {
         Write-Output "Repository password stored (current user only): $passwordFile"
     }
 
-    Install-BackrestBinary -InstallDirectory $binDirectory
-    New-Item -ItemType Directory -Force -Path $script:BackrestRepoPath, (Join-Path $base 'data') | Out-Null
-
-    # A running Backrest keeps its config in memory and would write it back over this change,
-    # so stop it first; the scheduled task starts it again at the end.
+    # A running Backrest locks its program files and keeps its config in memory (it would
+    # write that back over a new config), so stop it before anything is replaced; the
+    # scheduled task starts it again at the end.
     Get-Process backrest -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -and $_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) } |
         Stop-Process -Force
     Start-Sleep -Seconds 2
+    Install-BackrestBinary -InstallDirectory $binDirectory
+    New-Item -ItemType Directory -Force -Path $script:BackrestRepoPath, (Join-Path $base 'data') | Out-Null
+
     $existing = if (Test-Path -LiteralPath $configFile) { Get-Content -LiteralPath $configFile -Raw } else { $null }
     if ($existing -and -not $Force) {
         throw "$configFile exists. Re-run with -Force to refresh only the agentdev-daily plan (a backup is kept)."
