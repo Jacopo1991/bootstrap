@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -140,9 +141,33 @@ def folder_delete_reason(folder: Path, root: Path | None,
     return None
 
 
+SCRATCH_PARENT = Path("/tmp")
+
+
+def scratch_root() -> Path | None:
+    """Writable scratch outside every repository: <Claude Code $TMPDIR>/scratch, i.e.
+    /tmp/claude-<uid>/scratch. Only when /tmp/claude-<uid> is a real directory owned by
+    this user and closed to others; the rest of that directory is Claude Code's own."""
+    tmpdir = SCRATCH_PARENT / f"claude-{os.getuid()}"
+    try:
+        info = tmpdir.lstat()
+    except OSError:
+        return None
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o077):
+        return None
+    return tmpdir / "scratch"
+
+
 def writable(path_text: str, cwd: str, root: Path, metadata: tuple[Path, ...] | None) -> bool:
-    return (metadata is not None and inside(path_text, cwd, root)
-            and not protected_git_path(path_text, cwd, metadata))
+    if metadata is None:
+        return False
+    if inside(path_text, cwd, root):
+        return not protected_git_path(path_text, cwd, metadata)
+    # Unresolved scratch path: a symlink in or as scratch that leads elsewhere is refused.
+    scratch = scratch_root()
+    return (scratch is not None and inside(path_text, cwd, scratch)
+            and not protected_git_path(path_text, cwd, ()))
 
 
 def transfer_paths(tokens: list[str], executable: str, cwd: str) -> tuple[list[str], list[str]] | None:
