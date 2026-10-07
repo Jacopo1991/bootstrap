@@ -6,3 +6,18 @@
 id = "GHSA-vfj7-8cjw-p6xm"
 ignoreUntil = 2027-01-05
 reason = "Accepted risk: braces 3.0.3 (no fixed version) comes in through qmd's fast-glob and micromatch and only expands bootstrap's own glob patterns, never untrusted input."
+
+[[IgnoredVulns]]
+id = "GHSA-f88m-g3jw-g9cj"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk: sharp 0.34.5 (libvips) comes in through Desktop Commander, which uses it only to re-encode image data extracted from PDFs; fixed in sharp 0.35.0, review when Desktop Commander's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-rgj7-g3m4-5g8c"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk: sharp 0.34.5 (libheif) comes in through Desktop Commander, which uses it only to re-encode image data extracted from PDFs and never opens HEIF files; fixed in sharp 0.35.4, review when Desktop Commander's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-w5hq-g745-h8pq"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk: uuid 8.3.2 comes in through Desktop Commander's exceljs; the flaw needs v3, v5 or v6 called with a caller-supplied buffer, which the connector's spreadsheet reading does not do."

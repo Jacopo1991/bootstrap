@@ -1,0 +1,12 @@
+[Unit]
+Description=Block Desktop Commander vendor hosts in /etc/hosts (WSL regenerates the file at start)
+ConditionPathExists=/opt/machine-bootstrap/current/system/vendor-block-hosts.sh
+
+[Service]
+Type=oneshot
+User=root
+NoNewPrivileges=yes
+ExecStart=/usr/bin/bash /opt/machine-bootstrap/current/system/vendor-block-hosts.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -43,19 +43,26 @@ class IgnoreEntry(unittest.TestCase):
     def setUp(self):
         self.config = tomllib.loads((NPM / "osv-scanner.toml").read_text())
 
-    def test_exactly_one_expiring_exception_with_a_reason(self):
+    def test_every_exception_expires_and_has_a_reason(self):
         entries = self.config["IgnoredVulns"]
-        self.assertEqual(len(entries), 1)
+        self.assertEqual([entry["id"] for entry in entries],
+                         [ADVISORY, "GHSA-f88m-g3jw-g9cj", "GHSA-rgj7-g3m4-5g8c", "GHSA-w5hq-g745-h8pq"])
         entry = entries[0]
-        self.assertEqual(entry["id"], ADVISORY)
         self.assertEqual(entry["ignoreUntil"], EXPIRY)
         self.assertIn("braces 3.0.3", entry["reason"])
+        # Desktop Commander's transitive advisories: one month, reviewed when its pin moves.
+        for entry in entries[1:]:
+            self.assertEqual(str(entry["ignoreUntil"]), "2026-11-07")
+            self.assertIn("Desktop Commander", entry["reason"])
+            self.assertTrue(entry["reason"].startswith("Accepted risk:"))
         self.assertEqual(set(self.config), {"IgnoredVulns"})
 
     def test_exception_still_matches_the_lock(self):
         # When braces moves past 3.0.3 the exception is obsolete: remove it.
         lock = json.loads((NPM / "package-lock.json").read_text())
         self.assertEqual(lock["packages"]["node_modules/braces"]["version"], "3.0.3")
+        self.assertEqual(lock["packages"]["node_modules/sharp"]["version"], "0.34.5")
+        self.assertEqual(lock["packages"]["node_modules/uuid"]["version"], "8.3.2")
 
 
 @unittest.skipUnless(shutil.which("osv-scanner") and (REAL_DB / "npm/all.zip").is_file(),

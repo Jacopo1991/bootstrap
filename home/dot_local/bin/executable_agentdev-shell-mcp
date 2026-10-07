@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Starts the pinned Desktop Commander MCP server over stdio as the agent user, for PM seats in
+# the Claude app (wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-shell-mcp).
+# It opens no network port. The real boundary is AgentDev itself (agent has no sudo, no Windows
+# mounts, interop off); the blocklist below is advisory. The config is rewritten on every start
+# so nothing a session sets through set_config_value survives it.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+export DESKTOP_COMMANDER_DISABLE_TELEMETRY=1
+server=$HOME/.local/share/bootstrap/npm/node_modules/.bin/desktop-commander
+[[ -x $server ]] || { echo "Missing $server; run chezmoi apply." >&2; exit 1; }
+
+config_dir=$HOME/.claude-server-commander
+install -d -m 0700 "$config_dir"
+tmp=$(mktemp "$config_dir/config.XXXXXX")
+cat > "$tmp" <<CONFIG
+{
+  "blockedCommands": [
+    "mkfs", "format", "mount", "umount", "fdisk", "dd", "parted", "diskpart",
+    "sudo", "su", "passwd", "adduser", "useradd", "usermod", "groupadd", "chsh", "visudo",
+    "shutdown", "reboot", "halt", "poweroff", "init", "iptables", "firewall",
+    "netsh", "sfc", "bcdedit", "reg", "net", "sc", "runas", "cipher", "takeown",
+    "wsl", "wsl.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"
+  ],
+  "defaultShell": "/bin/bash",
+  "allowedDirectories": ["$HOME"],
+  "telemetryEnabled": false,
+  "pendingWelcomeOnboarding": false,
+  "welcomeOnboardingEligible": false
+}
+CONFIG
+chmod 0600 "$tmp"
+mv -f "$tmp" "$config_dir/config.json"
+
+cd "$HOME"
+exec "$server"

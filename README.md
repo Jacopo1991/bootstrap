@@ -417,6 +417,47 @@ every `~/cortex/*` repository for local keyword and semantic search.
   the units, the install wiring and `qmd-refresh` against real temporary git
   repositories; `ci/lint.sh` runs it with the pinned chezmoi.
 
+### AgentDev shell connector (Desktop Commander)
+
+PM seats in the Claude app on Windows get a Linux shell as the `agent` user through
+[Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) (MIT) running inside
+AgentDev over stdio. It replaces Windows Desktop Commander, which runs as the Windows admin. It
+covers tests, git and gh, `new-project publish`, `hermes-scratch` and checks, and runs
+long-lived processes through `start_process` and `read_process_output`.
+
+- **Pin:** `@wonderwhy-er/desktop-commander` 0.2.52 in the npm lock; tools approved by the
+  founder through the PM. The monthly pin updater does not move it; bump it by hand and re-probe.
+- **Launcher:** `~/.local/bin/agentdev-shell-mcp` sets `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1`,
+  rewrites `~/.claude-server-commander/config.json` on every start (telemetry off,
+  `allowedDirectories` the agent's home, `defaultShell` `/bin/bash`, a blocklist), changes to
+  `$HOME` and execs the pinned server. It opens no network port.
+- **Boundary:** the boundary is AgentDev itself: the agent user has no sudo, no Windows mounts and
+  interop is off (`checks/boundary.sh` is the proof). The server's blocklist (sudo, su, wsl.exe,
+  powershell.exe, pwsh, cmd.exe and the default disk and system names) is advisory: it matches
+  command names only and its own README says it can be bypassed. There is no wrapper shell and no
+  check on `/mnt` arguments. `allowedDirectories` only limits the file tools, not terminal commands.
+- **Vendor hosts:** the package phones home. Its npm postinstall sends an install ping, it fetches
+  feature flags at start and it has a remote-device channel. `system/vendor-block.sh` (run by
+  `install.sh` before `npm ci`) points `desktopcommander.app`, `telemetry.desktopcommander.app`,
+  `mcp.desktopcommander.app` and `dc-telemetry-proxy-83847352264.europe-west1.run.app` to
+  `0.0.0.0` and `::` in a marked `/etc/hosts` block, and `vendor-block.service` re-applies it at every
+  boot because WSL regenerates `/etc/hosts`. Probe with the hosts blocked (2026-10-07): the server
+  starts in under a second, lists its 26 tools and runs `echo ok` and a long-running loop through
+  `start_process` and `read_process_output`. The failed flags fetch is silent: no stderr, no
+  cached `feature-flags.json`; only `desktopcommander.app` was contacted.
+- **Claude app entry (Windows config; the PM adds it after merge, nothing in the repository
+  touches Windows files):**
+
+  ```json
+  "agentdev-shell": {
+    "command": "wsl.exe",
+    "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-shell-mcp"]
+  }
+  ```
+
+- **Tests:** `python3 ci/shell-connector-test.py` checks the pin, the hosts block (idempotent,
+  keeps other lines), the launcher's seeded config and the README entry; `ci/lint.sh` runs it.
+
 ### Verification pack (Playwright)
 
 Tooling for SPEC-0015 (independent black-box verification of a task's acceptance
@@ -672,7 +713,7 @@ and symlinks are not preserved; re-apply `chmod` after restoring scripts.
 | Ubuntu WSL image (24.04.5 amd64) and SHA-256 | `windows/new-distro.ps1` |
 | chezmoi, mise, Node 24 LTS, Python 3.12, uv, native Claude Code, bws, SecretSpec | `home/.chezmoitemplates/pins.env` |
 | Node/Python/uv global tools | `home/dot_config/mise/config.toml` |
-| Codex CLI, ccusage, Backlog.md, qmd and Playwright (test, MCP, axe-core), including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
+| Codex CLI, ccusage, Backlog.md, qmd, Desktop Commander and Playwright (test, MCP, axe-core), including npm dependency versions/integrities | `home/dot_local/share/bootstrap/npm/package-lock.json` |
 | Explicit apt package versions (held after install) | `system/apt-*.lock` |
 | Ubuntu dependency resolution | Signed Ubuntu snapshot `20260930T000000Z` |
 | apt signing key hashes | `home/.chezmoitemplates/pins.env` |
