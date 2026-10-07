@@ -1,9 +1,17 @@
-# Global git ignores for every repository of the agent user (bootstrap, chezmoi-managed;
-# git reads ~/.config/git/ignore when core.excludesFile is not set).
-#
+#!/usr/bin/env bash
+# chezmoi modify script for ~/.config/git/ignore (git reads it when core.excludesFile is unset).
+# Other tools add their own lines to this file (Claude Code adds **/.claude/.cc-writes/), so
+# bootstrap only owns the block between the markers: kept lines stay, the block is replaced.
+set -euo pipefail
+begin='# >>> bootstrap managed (do not edit inside this block) >>>'
+end='# <<< bootstrap managed <<<'
+awk -v b="$begin" -v e="$end" '$0==b{skip=1;next} $0==e{skip=0;next} !skip' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
+cat <<BLOCK
+
+$begin
 # Claude Code's sandbox protects these names: inside a sandboxed command, each one that does
 # not exist yet appears as a /dev/null placeholder in the working directory. They exist only
-# inside the sandbox, but `git status` run there lists them as untracked. Ignoring them keeps
+# inside the sandbox, but git status run there lists them as untracked. Ignoring them keeps
 # review lanes from misreading them and keeps them from ever being staged. Tracked files are
 # not affected by ignore rules.
 .bashrc
@@ -28,3 +36,5 @@
 .mcp.json
 .claude.json
 .claude
+$end
+BLOCK
