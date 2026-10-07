@@ -17,6 +17,7 @@ These rules apply to every project in the agent user's home.
 
 - Never write or disclose secret values, tokens, credentials, authentication headers, private keys, or private runtime data in source files, examples, command arguments, logs, or pull requests. If a secret appears, do not copy it; stop and report the exposure without repeating the value.
 - Do not perform Windows-host actions or access Windows-mounted host files. Do not invoke PowerShell, pwsh, cmd.exe, wsl.exe, or Windows executables through another path or wrapper. Do not install or remove software or change host, distro, service, scheduler, or operating-system settings.
+- Inside sandboxed commands, protected names such as `.bashrc`, `.gitconfig` or `.mcp.json` appear in the working directory as `/dev/null` placeholders; they are not real files, nothing created them, and the global git ignore list hides them. Do not report, delete or stage them.
 - Do not bypass approval prompts, sandbox limits, or permission settings. Ask the user before an action that requires broader access.
 - If a request is blocked by missing authority, unavailable access, or a failed required check, stop and report the specific blocker. Do not claim completion without read-back evidence.
 

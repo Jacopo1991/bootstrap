@@ -1,0 +1,30 @@
+# Global git ignores for every repository of the agent user (bootstrap, chezmoi-managed;
+# git reads ~/.config/git/ignore when core.excludesFile is not set).
+#
+# Claude Code's sandbox protects these names: inside a sandboxed command, each one that does
+# not exist yet appears as a /dev/null placeholder in the working directory. They exist only
+# inside the sandbox, but `git status` run there lists them as untracked. Ignoring them keeps
+# review lanes from misreading them and keeps them from ever being staged. Tracked files are
+# not affected by ignore rules.
+.bashrc
+.bash_profile
+.bash_login
+.bash_logout
+.bash_aliases
+.profile
+.zshrc
+.zprofile
+.zshenv
+.zlogin
+.zlogout
+.gitconfig
+.gitmodules
+.ripgreprc
+.envrc
+.idea
+.vscode
+# Claude Code project state and project-scope MCP config: never committed (gitleaks scans
+# only what is staged, so ignoring them also keeps any secret in them out of git).
+.mcp.json
+.claude.json
+.claude
