@@ -291,7 +291,10 @@ and drive automount remain disabled by the distro baseline.
 
 The policy hook blocks Windows/host commands, file-tool writes outside the
 current repository, shell writes outside that repository, and commits whose
-staged diff cannot pass the pinned Gitleaks scan. The Codex hook is user-managed:
+staged diff cannot pass the pinned Gitleaks scan. The one writable place outside
+a repository is the review scratch `/tmp/claude-<uid>/scratch/`, and only while
+`/tmp/claude-<uid>` (Claude Code's `$TMPDIR`) is a real directory owned by the
+agent and closed to others; symlinks out of it are refused. The Codex hook is user-managed:
 after first apply or any hook change, inspect and trust the exact hook definition
 with Codex's `/hooks` command before relying on it. Codex skips an untrusted
 hook. Do not use a hook-trust bypass. Hooks are additional guardrails; the

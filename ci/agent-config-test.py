@@ -444,6 +444,54 @@ with tempfile.TemporaryDirectory() as temp:
     with unittest.mock.patch.object(policy, "git_metadata", return_value=None):
         assert policy.evaluate(payload, roots) is not None, "metadata discovery must fail closed"
 
+    # Review scratch outside the repository: <parent>/claude-<uid>/scratch is writable
+    # (files, redirects, cp/mkdir/rm), nothing else outside the repository is, symlinks
+    # out of scratch are refused, cd stays inside the repository, and the scratch is
+    # off when the Claude Code tmpdir is missing, foreign-readable or a symlink.
+    tmp_parent = base / "tmp"
+    tmp_parent.mkdir()
+    tmpdir = tmp_parent / f"claude-{os.getuid()}"
+    scratch = tmpdir / "scratch"
+    real_data = base / "project-data"
+    real_data.mkdir()
+    (real_data / "data.json").write_text("{}")
+    with unittest.mock.patch.object(policy, "SCRATCH_PARENT", tmp_parent):
+        assert policy.scratch_root() is None, "missing tmpdir means no scratch"
+        tmpdir.mkdir(mode=0o700)
+        os.chmod(tmpdir, 0o700)
+        assert policy.scratch_root() == scratch
+        scratch.mkdir()
+        (scratch / "escape").symlink_to(real_data, target_is_directory=True)
+        allowed = (f"mkdir -p {scratch}/probe", f"cp safe.txt {scratch}/probe/safe.txt",
+                   f"cp {real_data}/data.json {scratch}/probe/data.json",
+                   f"printf fixture > {scratch}/probe/out.txt", f"tee {scratch}/probe/log.txt",
+                   f"rm -r {scratch}/probe", f"python3 {scratch}/probe.py")
+        for command in allowed:
+            assert policy.evaluate(event(command), roots) is None, command
+        for tool in ("Write", "Edit"):
+            payload = {"tool_name": tool, "tool_input": {"file_path": f"{scratch}/probe.py"},
+                       "cwd": str(current)}
+            assert policy.evaluate(payload, roots) is None, tool
+        refused = (f"touch {tmpdir}/other", f"printf x > {tmpdir}/x", f"mkdir {tmp_parent}/x",
+                   f"touch {real_data}/new", f"cp safe.txt {real_data}/data.json",
+                   f"touch {scratch}/escape/new", f"printf x > {scratch}/escape/data.json",
+                   f"ln -s {real_data} {scratch}/link2", f"cd {scratch}",
+                   f"mkdir {scratch}/repo/.git", "touch $TMPDIR/scratch/x",
+                   f"python3 -c 'print(1)'")
+        for command in refused:
+            assert policy.evaluate(event(command), roots) is not None, command
+        payload = {"tool_name": "Write", "tool_input": {"file_path": f"{scratch}/escape/data.json"},
+                   "cwd": str(current)}
+        assert policy.evaluate(payload, roots) is not None, "Write through a scratch symlink"
+        os.chmod(tmpdir, 0o755)
+        assert policy.scratch_root() is None, "tmpdir open to others means no scratch"
+        assert policy.evaluate(event(f"touch {scratch}/x"), roots) is not None
+        os.chmod(tmpdir, 0o700)
+        moved = tmp_parent / "real"
+        tmpdir.rename(moved)
+        tmpdir.symlink_to(moved, target_is_directory=True)
+        assert policy.scratch_root() is None, "symlinked tmpdir means no scratch"
+
     # The enclosing repository must also protect an existing nested repo's
     # custom Git directory, even when it was not returned for the current cwd.
     nested_repo = current / "nested-owner-repo"
