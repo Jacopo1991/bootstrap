@@ -459,16 +459,66 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
 
 
 
-def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
+LOCAL_DEFAULT_BRANCH = "main"
+
+
+def _read_git(target: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=target, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, check=True, timeout=3).stdout.strip()
+
+
+def _merge_options_configured(target: Path, current: str) -> bool:
+    """Git applies branch.<name>.mergeOptions before argv, including custom strategies."""
+    options = subprocess.run(
+        ["git", "config", "--get-all", "branch." + current[len("refs/heads/"):] + ".mergeOptions"],
+        cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, timeout=3)
+    return options.returncode != 1
+
+
+def local_only_merge(arguments: list[str], target: Path, current: str) -> str | None:
+    """Repositories with no remote at all (local-only projects): a task branch may merge the
+    local main branch, nothing else. Its commits were scanned when they were committed."""
+    if not current.startswith("refs/heads/"):
+        return "Cannot identify the current branch safely."
+    if current == "refs/heads/" + LOCAL_DEFAULT_BRANCH:
+        return "Merging into the default branch is blocked; update only a task branch."
+    if arguments not in ([LOCAL_DEFAULT_BRANCH], ["--no-edit", LOCAL_DEFAULT_BRANCH]):
+        return ("In a repository without a remote, only git merge [--no-edit] "
+                + LOCAL_DEFAULT_BRANCH + " is allowed.")
+    source = "refs/heads/" + LOCAL_DEFAULT_BRANCH
+    _read_git(target, "rev-parse", "--verify", source + "^{commit}")
+    if _read_git(target, "rev-parse", "--symbolic-full-name", "--verify",
+                 LOCAL_DEFAULT_BRANCH) != source:
+        return "The merge source must resolve uniquely to the local " + LOCAL_DEFAULT_BRANCH + " branch."
+    if _merge_options_configured(target, current):
+        return "Configured merge options or unreadable configuration are blocked."
+    return None
+
+
+def git_merge_preview(arguments: list[str], target: Path) -> str | None:
+    """Read-only merge preview: git merge-tree --write-tree [--name-only] HEAD <source>, where
+    <source> is what git merge would accept here (origin/<default>, or main without a remote)."""
+    names = [argument for argument in arguments if argument != "--name-only"]
+    if (len(arguments) - len(names) > 1 or len(names) != 3
+            or names[0] != "--write-tree" or names[1] != "HEAD"):
+        return "Only git merge-tree --write-tree [--name-only] HEAD <merge source> is allowed."
+    return git_default_branch_merge(["--no-edit", names[2]], target, preview=True)
+
+
+def git_default_branch_merge(arguments: list[str], target: Path,
+                             preview: bool = False) -> str | None:
     """Only merge the locally recorded GitHub origin default into a task branch, or
-    fast-forward a task branch to its own origin/<branch> (catching up from GitHub)."""
+    fast-forward a task branch to its own origin/<branch> (catching up from GitHub).
+    Without any remote (local-only projects), merge the local main into a task branch."""
     try:
         def read_git(*args: str) -> str:
-            return subprocess.run(
-                ["git", *args], cwd=target, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, check=True, timeout=3).stdout.strip()
+            return _read_git(target, *args)
         current = read_git("symbolic-ref", "--quiet", "HEAD")
+        if not read_git("remote"):
+            return local_only_merge(arguments, target, current)
         default = read_git("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
         prefix = "refs/remotes/origin/"
         if (not current.startswith("refs/heads/") or not default.startswith(prefix)
@@ -491,18 +541,16 @@ def git_default_branch_merge(arguments: list[str], target: Path) -> str | None:
         if read_git("rev-parse", "--symbolic-full-name", "--verify",
                     "origin/" + source[len(prefix):]) != source:
             return "The merge source must resolve uniquely to " + label + "."
-        # Git applies branch mergeOptions before argv, including custom strategies.
-        options = subprocess.run(
-            ["git", "config", "--get-all", "branch." + current[len("refs/heads/"):] + ".mergeOptions"],
-            cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, timeout=3)
-        if options.returncode != 1:
+        if _merge_options_configured(target, current):
             return "Configured merge options or unreadable configuration are blocked."
         urls = read_git("remote", "get-url", "--all", "origin").splitlines()
         if len(urls) != 1:
             return "Origin must have one unambiguous GitHub URL."
     except (OSError, subprocess.SubprocessError):
-        return "Cannot verify merge metadata; origin/HEAD and its commit must exist."
+        return ("Cannot verify merge metadata; origin/HEAD and its commit must exist "
+                "(or, without any remote, the local main branch).")
+    if preview:
+        return None
     return git_network_remote(["origin"], target, "fetch")
 
 
@@ -568,6 +616,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
         return git_default_branch_merge(arguments, target)
+    if subcommand == "merge-tree":
+        return git_merge_preview(arguments, target)
     if subcommand not in CURRENT_REPO_GIT:
         return "Git topology changes and unsupported write primitives require separate setup."
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.
