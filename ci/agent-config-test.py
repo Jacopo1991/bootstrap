@@ -228,7 +228,9 @@ with tempfile.TemporaryDirectory() as temp:
         (target / ".gitmodules").write_text(
             '[submodule "unsafe-child"]\n\tpath = unsafe-child\n'
             '\turl = https://example.invalid/submodule\n', encoding="utf-8")
-        subprocess.run(["git", "add", "a-before.txt", ".gitmodules"], cwd=target, check=True)
+        # -f: bootstrap's global git ignore lists .gitmodules (sandbox placeholders), and this
+        # fixture runs under the real HOME, so the deliberate fixture file must be force-added.
+        subprocess.run(["git", "add", "-f", "a-before.txt", ".gitmodules"], cwd=target, check=True)
         subprocess.run(["git", "update-index", "--add", "--cacheinfo",
                         "160000," + oid + ",unsafe-child"], cwd=target, check=True)
         subprocess.run(["git", "commit", "-q", "-m", "parent gitlink fixture"], cwd=target, check=True)
