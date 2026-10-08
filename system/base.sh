@@ -34,7 +34,8 @@ apt-get update
 apt_locked "$BOOTSTRAP_ROOT/system/apt-gh.lock"
 ln -sfn /usr/bin/fdfind /usr/local/bin/fd
 
-# Preserve unrelated distro settings while converging these five keys.
+# Preserve unrelated distro settings while converging these six keys. generateHosts=false
+# keeps WSL from rewriting /etc/hosts at boot, so the vendor block below stays.
 python3 - <<'PY'
 import configparser, pathlib
 path = pathlib.Path('/etc/wsl.conf')
@@ -44,7 +45,8 @@ if path.exists():
     config.read(path)
 for section, key, value in [('boot','systemd','true'), ('user','default','agent'),
                             ('interop','appendWindowsPath','false'),
-                            ('automount','enabled','false'), ('interop','enabled','false')]:
+                            ('automount','enabled','false'), ('interop','enabled','false'),
+                            ('network','generateHosts','false')]:
     if not config.has_section(section):
         config.add_section(section)
     config.set(section, key, value)
@@ -52,6 +54,9 @@ with path.open('w') as f:
     config.write(f, space_around_delimiters=False)
 path.chmod(0o644)
 PY
+# Desktop Commander's vendor and telemetry hosts, before chezmoi's npm ci runs its
+# postinstall install ping.
+bash "$BOOTSTRAP_ROOT/system/vendor-block-hosts.sh" /etc/hosts
 
 # Install and enable the isolated VS Code Remote-SSH endpoint.
 bash "$BOOTSTRAP_ROOT/system/ssh.sh"

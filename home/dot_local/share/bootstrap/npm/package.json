@@ -8,6 +8,7 @@
     "@playwright/mcp": "0.0.83",
     "@playwright/test": "1.64.0-alpha-1790635538000",
     "@tobilu/qmd": "2.8.3",
+    "@wonderwhy-er/desktop-commander": "0.2.52",
     "backlog.md": "1.53.0",
     "ccusage": "20.0.26",
     "playwright-core": "1.64.0-alpha-1790635538000"

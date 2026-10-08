@@ -38,11 +38,12 @@ python3 ci/verification-pack-test.py
 python3 ci/skills-hooks-test.py
 python3 ci/backrest-test.py
 python3 ci/job-ping-test.py
+python3 ci/shell-connector-test.py
 mapfile -t scripts < <(find . -name '*.sh' -type f -not -path './.git/*')
 scripts+=(home/dot_local/bin/executable_qmd-refresh home/dot_local/bin/executable_new-project
   home/dot_local/bin/executable_pre-commit-enable home/dot_local/bin/executable_osv-db-refresh
   home/dot_local/bin/executable_verify-enable home/dot_local/bin/executable_gh-skill-update
-  home/dot_local/bin/executable_job-ping)
+  home/dot_local/bin/executable_job-ping home/dot_local/bin/executable_agentdev-shell-mcp)
 "$tmp/shellcheck-v0.11.0/shellcheck" --external-sources --source-path=SCRIPTDIR "${scripts[@]}"
 # Render the actual chezmoi script too; shared pin constants are intentionally
 # unused in each individual consumer, hence only SC2034 is excluded here.
