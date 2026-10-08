@@ -50,6 +50,8 @@ docker run --name "$container" --rm \
       sudo -H -u agent test -d /home/agent/.cache/uv -a -w /home/agent/.cache/uv
       sudo -H -u agent test -d /home/agent/.npm -a -w /home/agent/.npm
       sudo -H -u agent python3 /repo/ci/claude-managed-install-test.py
+      sudo -H -u agent python3 /repo/ci/shell-connector-test.py
+      sudo -H -u agent python3 /repo/ci/shell-connector-probe.py
       sudo bash /repo/ci/vscode-ssh-test.sh
       sudo python3 /repo/ci/inventory-mirror-distro-test.py
       cd /tmp

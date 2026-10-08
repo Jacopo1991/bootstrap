@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Converges a marked block of /etc/hosts entries that send Desktop Commander's vendor hosts
-# (telemetry, feature flags, remote device channel) to 0.0.0.0. Idempotent: the block is
-# replaced, never duplicated, and everything outside it is left alone. Usage:
-# vendor-block-hosts.sh [hosts-file] (default /etc/hosts; the file is rewritten in place).
+# Converges a marked block of /etc/hosts entries that send Desktop Commander's vendor hosts to
+# 0.0.0.0 and ::, run by system/base.sh. Found in the pinned 0.2.52 dist/: desktopcommander.app
+# (feature flags, welcome page), telemetry.desktopcommander.app and its Cloud Run fallback (the
+# GA4 Measurement Protocol proxy, /mp/collect), mcp.desktopcommander.app (remote device
+# channel). Idempotent: the block is replaced, never duplicated, and everything outside it is
+# left alone. Usage: vendor-block-hosts.sh [hosts-file] (default /etc/hosts, rewritten in place).
 set -euo pipefail
 hosts_file=${1:-/etc/hosts}
 begin='# BEGIN bootstrap vendor-block'

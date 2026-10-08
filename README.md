@@ -419,34 +419,46 @@ every `~/cortex/*` repository for local keyword and semantic search.
 
 ### AgentDev shell connector (Desktop Commander)
 
-PM seats in the Claude app on Windows get a Linux shell as the `agent` user through
+PM seats in the Claude app on Windows run AgentDev commands through
 [Desktop Commander](https://github.com/wonderwhy-er/DesktopCommanderMCP) (MIT) running inside
-AgentDev over stdio. It replaces Windows Desktop Commander, which runs as the Windows admin. It
-covers tests, git and gh, `new-project publish`, `hermes-scratch` and checks, and runs
-long-lived processes through `start_process` and `read_process_output`.
+AgentDev as the `agent` user: one persistent stdio MCP server per Claude app session, started
+once through `wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-shell-mcp`, the
+same pattern as qmd. It replaces `wsl.exe -d AgentDev -u agent -- <command>` through Windows
+Desktop Commander, which started a new `wsl.exe` launcher per command and left ghost launchers
+behind when a call hung. Long-lived processes go through `start_process` and
+`read_process_output`.
 
-- **Pin:** `@wonderwhy-er/desktop-commander` 0.2.52 in the npm lock; tools approved by the
-  founder through the PM. The monthly pin updater does not move it; bump it by hand and re-probe.
-- **Launcher:** `~/.local/bin/agentdev-shell-mcp` sets `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1`,
-  rewrites `~/.claude-server-commander/config.json` on every start (telemetry off,
-  `allowedDirectories` the agent's home, `defaultShell` `/bin/bash`, a blocklist), changes to
-  `$HOME` and execs the pinned server. It opens no network port.
-- **Boundary:** the boundary is AgentDev itself: the agent user has no sudo, no Windows mounts and
-  interop is off (`checks/boundary.sh` is the proof). The server's blocklist (sudo, su, wsl.exe,
-  powershell.exe, pwsh, cmd.exe and the default disk and system names) is advisory: it matches
-  command names only and its own README says it can be bypassed. There is no wrapper shell and no
-  check on `/mnt` arguments. `allowedDirectories` only limits the file tools, not terminal commands.
-- **Vendor hosts:** the package phones home. Its npm postinstall sends an install ping, it fetches
-  feature flags at start and it has a remote-device channel. `system/vendor-block.sh` (run by
-  `install.sh` before `npm ci`) points `desktopcommander.app`, `telemetry.desktopcommander.app`,
-  `mcp.desktopcommander.app` and `dc-telemetry-proxy-83847352264.europe-west1.run.app` to
-  `0.0.0.0` and `::` in a marked `/etc/hosts` block, and `vendor-block.service` re-applies it at every
-  boot because WSL regenerates `/etc/hosts`. Probe with the hosts blocked (2026-10-07): the server
-  starts in under a second, lists its 26 tools and runs `echo ok` and a long-running loop through
-  `start_process` and `read_process_output`. The failed flags fetch is silent: no stderr, no
-  cached `feature-flags.json`; only `desktopcommander.app` was contacted.
-- **Claude app entry (Windows config; the PM adds it after merge, nothing in the repository
-  touches Windows files):**
+- **Never in agent sessions.** It bypasses the policy hook, so no Claude Code or Codex
+  configuration may start it. `ci/shell-connector-test.py` fails if a tracked agent-session config
+  references it, and `checks/agent-drift.py` reports `shell-connector-in-agent-session` for a live
+  registration in `~/.claude.json`, `~/.claude/settings.json` or `~/.codex/config.toml`.
+- **Pin:** `@wonderwhy-er/desktop-commander` 0.2.52 with its integrity in the npm lock, installed
+  by `chezmoi apply` like the other npm tools; never `npx …@latest`. Pins are reviewed by hand:
+  the monthly pin updater does not move it.
+- **Launcher:** `~/.local/bin/agentdev-shell-mcp` merges into the config file the pinned server
+  reads, `~/.claude-server-commander/config.json` (the 0.2.52 `dist/config.js`), on every start:
+  `telemetryEnabled` `false`, `defaultShell` `/bin/bash`, and `allowedDirectories`
+  `/home/agent/dev_workspace`, `/home/agent/cortex` and `/tmp/claude-1001/scratch`. Other keys are
+  kept, so a PM can change one through `set_config_value`, but telemetry is off again at the next
+  start. A first start builds on the server's own defaults with onboarding off. The launcher also
+  sets `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1`, points the server's Chrome lookup at the pinned
+  Playwright Chromium (otherwise it downloads Chrome for Testing from Google at every start for
+  its PDF tools), changes to `$HOME` and execs the server with `--no-onboarding`. It opens no
+  network port and writes nothing to stdout before the server starts.
+- **Boundary:** AgentDev itself: the agent user has no sudo, no Windows mounts, and interop is
+  off (`checks/boundary.sh`). There is no wrapper shell and no extra policy layer.
+  `allowedDirectories` limits only the file tools, and the server's `blockedCommands` list matches
+  command names only, so neither is a boundary.
+- **Vendor hosts:** found in the pinned package's `dist/`: `desktopcommander.app` (feature flags,
+  welcome page), `telemetry.desktopcommander.app` and its fallback
+  `dc-telemetry-proxy-83847352264.europe-west1.run.app` (the GA4 Measurement Protocol proxy,
+  `/mp/collect`; the npm postinstall pings it too), and `mcp.desktopcommander.app` (the opt-in
+  remote-device channel, which also fetches its Supabase settings from there). `system/base.sh`
+  points them to `0.0.0.0` and `::` in a marked `/etc/hosts` block (`system/vendor-block-hosts.sh`)
+  before chezmoi runs `npm ci`, and sets `[network] generateHosts=false` in `/etc/wsl.conf` so WSL
+  does not rewrite `/etc/hosts` at boot.
+- **Claude app entry** (Windows-side config, added by Jacopo after the install; nothing in this
+  repository touches Windows files):
 
   ```json
   "agentdev-shell": {
@@ -455,8 +467,12 @@ long-lived processes through `start_process` and `read_process_output`.
   }
   ```
 
-- **Tests:** `python3 ci/shell-connector-test.py` checks the pin, the hosts block (idempotent,
-  keeps other lines), the launcher's seeded config and the README entry; `ci/lint.sh` runs it.
+- **Tests and probe:** `python3 ci/shell-connector-test.py` (run by `ci/lint.sh`) checks the pin,
+  the hosts block, the `base.sh` wiring, the launcher's merge with a stub server, MCP over stdio
+  through the launcher, and the agent-session configs. Where the package is installed it also runs
+  the real server twice in a throwaway home. After an install, `python3 ci/shell-connector-probe.py`
+  speaks MCP to the real `~/.local/bin/agentdev-shell-mcp`, lists its tools and runs `echo ok` as
+  `agent`; the fresh-distro CI run (`ci/distro.sh`) does the same.
 
 ### Verification pack (Playwright)
 
@@ -775,7 +791,8 @@ Installer references: [chezmoi](https://www.chezmoi.io/),
 GitHub-hosted `ubuntu-24.04` runs pinned ShellCheck/Gitleaks. It imports the same
 checksum-pinned Ubuntu WSL filesystem into a disposable Docker container, creates
 an admin with an empty gh credential-file fixture, runs `install.sh` twice as
-that admin, asserts all five `/etc/wsl.conf` keys after each install, then runs
+that admin, asserts all six `/etc/wsl.conf` keys and the vendor-host block in
+`/etc/hosts` after each install, probes the AgentDev shell connector over stdio, then runs
 the distro and boundary checks as agent. Hosted lint also tests blocking controls in the agent hook and exercises a synthetic, never-reusable secret-scanner canary without storing or logging its value. The container explicitly skips the
 WSL-only runtime checks. This avoids the
 hosted runner's preinstalled PPAs and tools masking fresh-image failures. The

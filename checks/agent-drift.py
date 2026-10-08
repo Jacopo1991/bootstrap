@@ -135,6 +135,28 @@ def configured_mcp_names(home: Path) -> set[str]:
     return names
 
 
+# The AgentDev shell connector is for PM seats in the Claude app only; it bypasses the
+# policy hook, so no Claude Code or Codex configuration may start it.
+SHELL_CONNECTOR_MARKERS = ("agentdev-shell", "desktop-commander", "desktopcommander",
+                           "wonderwhy-er", "claude-server-commander")
+
+
+def shell_connector_references(home: Path) -> bool:
+    servers: list[object] = []
+    codex_path = home / ".codex" / "config.toml"
+    if codex_path.exists():
+        config = tomllib.loads(codex_path.read_text(encoding="utf-8"))
+        servers.extend((config.get("mcp_servers") or {}).items())
+    for path in (home / ".claude.json", home / ".claude" / "settings.json"):
+        if path.exists():
+            config = json.loads(path.read_text(encoding="utf-8"))
+            servers.extend((config.get("mcpServers") or {}).items())
+            for project in (config.get("projects") or {}).values():
+                servers.extend(((project or {}).get("mcpServers") or {}).items())
+    text = json.dumps(servers).lower()
+    return any(marker in text for marker in SHELL_CONNECTOR_MARKERS)
+
+
 def configured_plugin_names(home: Path) -> set[str]:
     names: set[str] = set()
     metadata_files = {"installed_plugins.json", "known_marketplaces.json"}
@@ -243,6 +265,8 @@ def scan(root: Path, home: Path) -> list[str]:
                         for name in unexpected_skills(home / rel))
     for name in configured_mcp_names(home):
         findings.add("mcp-outside-empty-baseline:" + name)
+    if shell_connector_references(home):
+        findings.add("shell-connector-in-agent-session")
     for name in configured_plugin_names(home):
         findings.add("plugin-outside-empty-baseline:" + name)
     return sorted(findings)

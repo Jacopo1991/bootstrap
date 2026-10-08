@@ -11,8 +11,6 @@ bash_cmd=/bin/bash
 sudo "$bash_cmd" "$ROOT/system/base.sh"
 sudo "$bash_cmd" "$ROOT/system/users.sh" "$(id -un)"
 sudo "$bash_cmd" "$ROOT/system/claude-managed.sh"
-# Before chezmoi runs npm ci: Desktop Commander's postinstall pings its vendor.
-sudo "$bash_cmd" "$ROOT/system/vendor-block.sh"
 sudo "$bash_cmd" "$ROOT/system/inventory-mirror.sh"
 # shellcheck source=system/common.sh
 source "$ROOT/system/common.sh"

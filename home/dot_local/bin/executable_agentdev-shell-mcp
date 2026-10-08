@@ -1,36 +1,51 @@
 #!/usr/bin/env bash
-# Starts the pinned Desktop Commander MCP server over stdio as the agent user, for PM seats in
-# the Claude app (wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-shell-mcp).
-# It opens no network port. The real boundary is AgentDev itself (agent has no sudo, no Windows
-# mounts, interop off); the blocklist below is advisory. The config is rewritten on every start
-# so nothing a session sets through set_config_value survives it.
+# Starts the pinned Desktop Commander MCP server over stdio as the agent user, one per Claude
+# app session of a PM seat (wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-shell-mcp).
+# Never for Claude Code or Codex sessions: it bypasses the policy hook. It opens no network
+# port; AgentDev itself is the boundary. stdout belongs to MCP, so this script writes only to
+# stderr before the exec.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
 export DESKTOP_COMMANDER_DISABLE_TELEMETRY=1
-server=$HOME/.local/share/bootstrap/npm/node_modules/.bin/desktop-commander
-[[ -x $server ]] || { echo "Missing $server; run chezmoi apply." >&2; exit 1; }
+package=$HOME/.local/share/bootstrap/npm/node_modules/@wonderwhy-er/desktop-commander
+[[ -f $package/dist/index.js ]] || { echo "Missing $package; run chezmoi apply." >&2; exit 1; }
 
+# The pinned 0.2.52 reads ~/.claude-server-commander/config.json (dist/config.js). Merge the
+# forced keys into it on every start and keep the rest, so a key a session sets through
+# set_config_value lasts, but telemetry, the shell and the file-tool directories do not.
 config_dir=$HOME/.claude-server-commander
 install -d -m 0700 "$config_dir"
-tmp=$(mktemp "$config_dir/config.XXXXXX")
-cat > "$tmp" <<CONFIG
-{
-  "blockedCommands": [
-    "mkfs", "format", "mount", "umount", "fdisk", "dd", "parted", "diskpart",
-    "sudo", "su", "passwd", "adduser", "useradd", "usermod", "groupadd", "chsh", "visudo",
-    "shutdown", "reboot", "halt", "poweroff", "init", "iptables", "firewall",
-    "netsh", "sfc", "bcdedit", "reg", "net", "sc", "runas", "cipher", "takeown",
-    "wsl", "wsl.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"
-  ],
-  "defaultShell": "/bin/bash",
-  "allowedDirectories": ["$HOME"],
-  "telemetryEnabled": false,
-  "pendingWelcomeOnboarding": false,
-  "welcomeOnboardingEligible": false
+node --input-type=module - "$package/dist/config-manager.js" "$config_dir/config.json" \
+  /home/agent/dev_workspace /home/agent/cortex /tmp/claude-1001/scratch <<'JS' >&2
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const [managerPath, configPath, ...allowedDirectories] = process.argv.slice(2);
+let config;
+try {
+  config = JSON.parse(readFileSync(configPath, 'utf8'));
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('not a JSON object');
+} catch (error) {
+  if (error.code !== 'ENOENT') console.error(`agentdev-shell-mcp: replacing unreadable ${configPath}: ${error.message}`);
+  // A first start gets the server's own defaults (blocklist, line limits), with onboarding off.
+  const { configManager } = await import(pathToFileURL(managerPath));
+  config = { ...configManager.getDefaultConfig(), pendingWelcomeOnboarding: false, welcomeOnboardingEligible: false };
 }
-CONFIG
-chmod 0600 "$tmp"
-mv -f "$tmp" "$config_dir/config.json"
+Object.assign(config, { telemetryEnabled: false, defaultShell: '/bin/bash', allowedDirectories });
+const temp = `${configPath}.${process.pid}.tmp`;
+writeFileSync(temp, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
+renameSync(temp, configPath);
+JS
+
+# Without a Chrome it can find, the server downloads Chrome for Testing from Google at every
+# start (dist/tools/pdf/markdown.js). Point its private cache at the pinned Playwright Chromium.
+chrome_dir=$config_dir/puppeteer-cache/chrome
+chromium=$(find -H "$HOME/.cache/ms-playwright" -mindepth 1 -maxdepth 1 -type d -name 'chromium-[0-9]*' 2>/dev/null | sort -V | tail -n 1 || true)
+if [[ -n $chromium && -x $chromium/chrome-linux64/chrome ]]; then
+  install -d -m 0700 "$chrome_dir/playwright-chromium"
+  ln -sfn "$chromium/chrome-linux64" "$chrome_dir/playwright-chromium/chrome-linux64"
+else
+  echo 'agentdev-shell-mcp: no Playwright Chromium; PDF tools may try to download Chrome.' >&2
+fi
 
 cd "$HOME"
-exec "$server"
+exec node "$package/dist/index.js" --no-onboarding
