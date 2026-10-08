@@ -21,3 +21,33 @@ reason = "Accepted risk: sharp 0.34.5 (libheif) comes in through Desktop Command
 id = "GHSA-w5hq-g745-h8pq"
 ignoreUntil = 2026-11-07
 reason = "Accepted risk: uuid 8.3.2 comes in through Desktop Commander's exceljs; the flaw needs v3, v5 or v6 called with a caller-supplied buffer, which the connector's spreadsheet reading does not do."
+
+[[IgnoredVulns]]
+id = "GHSA-wq5f-xc86-pv6w"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk (founder, 2026-10-08): sharp 0.34.5 (librsvg) comes in through Desktop Commander, which calls sharp only with raw pixel buffers decoded from PDFs (raw input), so the SVG loader is never reached; fixed in sharp 0.35.5, review when Desktop Commander's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-x6jw-m9v5-85vh"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk (founder, 2026-10-08): simple-git 3.36.0 comes in through qmd's node-llama-cpp, which calls it only with fixed arguments to clone or patch llama.cpp for source builds (we run the prebuilt CUDA binaries); the flaw needs attacker-controlled trailer.*.cmd config. Fixed in simple-git 4.0.1, review when qmd's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-858h-whjf-mvg5"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk (founder, 2026-10-08): simple-git 3.36.0 via qmd's node-llama-cpp, fixed arguments only and no push; the flaw needs attacker-influenced push options. Fixed in simple-git 4.0.0, review when qmd's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-g4wm-2vf7-vfgr"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk (founder, 2026-10-08): simple-git 3.36.0 via qmd's node-llama-cpp, fixed arguments only; the flaw needs attacker-controlled clone customArgs or environment. Fixed in simple-git 4.0.0, review when qmd's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-v5rq-49vh-5v5c"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk (founder, 2026-10-08): @simple-git/argv-parser 1.1.1 under simple-git via qmd's node-llama-cpp; the flaw needs an attacker-controlled VISUAL in the environment passed to git, and node-llama-cpp passes none. Fixed in 2.0.1, review when qmd's pin moves."
+
+[[IgnoredVulns]]
+id = "GHSA-hp3w-g68c-fv3c"
+ignoreUntil = 2026-11-07
+reason = "Accepted risk (founder, 2026-10-08): sprintf-js 1.0.3 (denial of service, no fixed version) comes in through js-yaml's argparse, which formats only its own fixed strings; the flaw needs an attacker-controlled format string. Review on the next pin bump."
