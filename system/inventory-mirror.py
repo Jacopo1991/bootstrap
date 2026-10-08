@@ -7,9 +7,12 @@ script mounts that single folder read-only inside the service's private mount
 namespace, so the agent's sessions and the boundary check never see a Windows
 mount, then publishes the file as /home/agent/project-data/inventory/latest.json
 (owner agent, mode 0600) with an atomic rename. A symlink, hardlink, FIFO or other
-non-regular file is refused at the source and at the destination.
+non-regular file is refused at the source and at the destination. A missing
+snapshot, or one whose createdAtISO is older than MAX_AGE, fails the unit so
+`systemctl --failed` shows that Windows has stopped writing it.
 """
 import argparse
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import pwd
@@ -24,6 +27,7 @@ AGENT = "agent"
 AGENT_HOME = "/home/agent"
 NAME = "latest.json"
 MAX_BYTES = 4 * 1024 * 1024
+MAX_AGE = timedelta(hours=36)
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
@@ -56,11 +60,11 @@ def open_agent_dir(parent_fd, name, uid, gid):
 
 
 def read_source(path):
-    """Return the file's bytes, or None when Windows has not written it yet."""
+    """Return the file's bytes; refuse when Windows has not written it."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except FileNotFoundError:
-        return None
+        raise Refused(f"Windows has not written {NAME}") from None
     except OSError as error:
         raise Refused("source is a symlink or unreadable") from error
     try:
@@ -78,7 +82,7 @@ def read_source(path):
     return data
 
 
-def validate(data):
+def validate(data, now):
     try:
         document = json.loads(data.decode("utf-8"))
     except ValueError as error:
@@ -86,6 +90,16 @@ def validate(data):
     if (not isinstance(document, dict) or type(document.get("schemaVersion")) is not int
             or document["schemaVersion"] not in (1, 2) or not isinstance(document.get("distros"), list)):
         raise Refused("source is not an inventory snapshot")
+    try:
+        created = datetime.fromisoformat(document.get("createdAtISO"))
+    except (TypeError, ValueError):
+        raise Refused(f"{NAME} has no valid createdAtISO") from None
+    if created.tzinfo is None:
+        raise Refused(f"{NAME} createdAtISO has no time zone")
+    age = now - created
+    if age > MAX_AGE:
+        raise Refused(f"{NAME} is stale: created {document['createdAtISO']}, "
+                      f"{age.total_seconds() / 3600:.1f} hours old (limit {MAX_AGE.total_seconds() / 3600:.0f})")
 
 
 def publish(directory_fd, data, uid, gid):
@@ -116,13 +130,11 @@ def publish(directory_fd, data, uid, gid):
         raise
 
 
-def mirror(source_file, home=AGENT_HOME, user=AGENT):
-    """Publish source_file; return False when there is nothing to copy yet."""
+def mirror(source_file, home=AGENT_HOME, user=AGENT, now=None):
+    """Publish source_file; refuse a missing or stale snapshot."""
     account = pwd.getpwnam(user)
     data = read_source(source_file)
-    if data is None:
-        return False
-    validate(data)
+    validate(data, now or datetime.now(timezone.utc))
     home_fd = os.open(home, DIR_FLAGS)
     try:
         if os.fstat(home_fd).st_uid != account.pw_uid:
@@ -138,7 +150,6 @@ def mirror(source_file, home=AGENT_HOME, user=AGENT):
             os.close(base_fd)
     finally:
         os.close(home_fd)
-    return True
 
 
 def mount_source():
@@ -166,15 +177,15 @@ def main(argv):
             mount_source()
             mounted = True
         source = args.source_file or os.path.join(MOUNT_POINT, NAME)
-        copied = mirror(source)
+        mirror(source)
     except (Refused, OSError, subprocess.SubprocessError) as error:
-        print(f"inventory-mirror: {error}", file=sys.stderr)
+        print(f"inventory-mirror: FAILED: {error}", file=sys.stderr)
         return 1
     finally:
         if mounted:
             subprocess.run(["/usr/bin/umount", MOUNT_POINT], check=False, timeout=60,
                            stdin=subprocess.DEVNULL)
-    print("inventory-mirror: copied" if copied else "inventory-mirror: no snapshot yet")
+    print("inventory-mirror: copied")
     return 0
 
 
