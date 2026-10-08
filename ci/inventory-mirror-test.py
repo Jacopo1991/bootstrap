@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Test the inventory mirror copier on temporary fixtures (no root, no mounts)."""
+import contextlib
+from datetime import datetime, timedelta
 import importlib.util
+import io
 import os
 from pathlib import Path
 import pwd
@@ -16,6 +19,8 @@ spec.loader.exec_module(mirror_module)
 
 USER = pwd.getpwuid(os.getuid()).pw_name
 SNAPSHOT = b'{"schemaVersion":2,"createdAtISO":"2026-10-03T02:30:00+02:00","distros":[]}'
+CREATED = datetime.fromisoformat("2026-10-03T02:30:00+02:00")
+NOW = CREATED + timedelta(hours=1)
 
 
 class MirrorTests(unittest.TestCase):
@@ -31,13 +36,26 @@ class MirrorTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_mirror(self):
-        return mirror_module.mirror(str(self.source), home=str(self.home), user=USER)
+    def run_mirror(self, now=NOW):
+        return mirror_module.mirror(str(self.source), home=str(self.home), user=USER, now=now)
+
+    def run_main(self, now):
+        """Run main() as the unit would; return (exit code, stdout, stderr)."""
+        real_mirror, real_geteuid = mirror_module.mirror, os.geteuid
+        mirror_module.mirror = lambda source: real_mirror(source, home=str(self.home), user=USER, now=now)
+        os.geteuid = lambda: 0
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = mirror_module.main(["--source-file", str(self.source)])
+        finally:
+            mirror_module.mirror, os.geteuid = real_mirror, real_geteuid
+        return code, out.getvalue(), err.getvalue()
 
     def test_exact_bytes_owner_and_modes(self):
         old = os.umask(0o002)
         try:
-            self.assertTrue(self.run_mirror())
+            self.run_mirror()
         finally:
             os.umask(old)
         self.assertEqual(self.latest.read_bytes(), SNAPSHOT)
@@ -49,7 +67,7 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual([p.name for p in self.latest.parent.iterdir()], ["latest.json"])
 
     def test_replace_is_atomic_and_leaves_no_staging_file(self):
-        self.run_mirror()
+        self.assertIsNone(self.run_mirror())
         newer = SNAPSHOT.replace(b"02:30", b"03:30")
         self.source.write_bytes(newer)
         inode = self.latest.stat().st_ino
@@ -58,10 +76,39 @@ class MirrorTests(unittest.TestCase):
         self.assertNotEqual(self.latest.stat().st_ino, inode)  # renamed in, never rewritten
         self.assertEqual([p.name for p in self.latest.parent.iterdir()], ["latest.json"])
 
-    def test_missing_source_is_not_an_error(self):
+    def test_missing_source_fails_with_one_line(self):
         self.source.unlink()
-        self.assertFalse(self.run_mirror())
+        with self.assertRaises(mirror_module.Refused):
+            self.run_mirror()
         self.assertFalse((self.home / "project-data").exists())
+        code, out, err = self.run_main(NOW)
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "inventory-mirror: FAILED: Windows has not written latest.json\n")
+
+    def test_stale_source_fails_with_one_line_and_keeps_previous_copy(self):
+        self.run_mirror()
+        self.source.write_bytes(SNAPSHOT.replace(b"02:30", b"03:30"))
+        later = CREATED + timedelta(hours=37, seconds=1)  # the new source is an hour newer
+        with self.assertRaises(mirror_module.Refused):
+            self.run_mirror(now=later)
+        self.assertEqual(self.latest.read_bytes(), SNAPSHOT)
+        code, out, err = self.run_main(CREATED + timedelta(hours=40))
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err.count("\n"), 1)
+        self.assertTrue(err.startswith("inventory-mirror: FAILED: latest.json is stale: "), err)
+        self.assertIn("39.0 hours old (limit 36)", err)
+
+    def test_fresh_source_succeeds(self):
+        # Windows writes .NET round-trip timestamps with seven fractional digits.
+        self.source.write_bytes(SNAPSHOT.replace(b"02:30:00+", b"02:30:00.1234567+"))
+        code, out, err = self.run_main(CREATED + timedelta(hours=35))
+        self.assertEqual((code, out, err), (0, "inventory-mirror: copied\n", ""))
+        self.assertTrue(self.latest.exists())
+        self.latest.unlink()
+        self.run_mirror(now=CREATED + timedelta(hours=36))  # exactly at the limit is still fresh
+        self.assertTrue(self.latest.exists())
 
     def test_source_symlink_hardlink_fifo_and_directory_refused(self):
         real = self.root / "real.json"
@@ -112,7 +159,7 @@ class MirrorTests(unittest.TestCase):
         alias = self.root / "alias"
         alias.symlink_to(self.home, target_is_directory=True)
         with self.assertRaises(OSError):
-            mirror_module.mirror(str(self.source), home=str(alias), user=USER)
+            mirror_module.mirror(str(self.source), home=str(alias), user=USER, now=NOW)
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_wrong_owner_refused(self):
@@ -129,7 +176,9 @@ class MirrorTests(unittest.TestCase):
     def test_non_inventory_and_oversized_source_refused(self):
         for data in (b"not json", b"\xff\xfe", b'{"schemaVersion":3,"distros":[]}',
                      b'{"schemaVersion":true,"distros":[]}', b'{"schemaVersion":2}', b"[]",
-                     b"\xef\xbb\xbf" + SNAPSHOT):
+                     b"\xef\xbb\xbf" + SNAPSHOT, b'{"schemaVersion":2,"distros":[]}',
+                     b'{"schemaVersion":2,"createdAtISO":"yesterday","distros":[]}',
+                     b'{"schemaVersion":2,"createdAtISO":"2026-10-03T02:30:00","distros":[]}'):
             self.source.write_bytes(data)
             with self.assertRaises(mirror_module.Refused, msg=data):
                 self.run_mirror()

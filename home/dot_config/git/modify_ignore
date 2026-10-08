@@ -36,5 +36,7 @@ $begin
 .mcp.json
 .claude.json
 .claude
+# Python bytecode caches written when tests import repository modules.
+__pycache__/
 $end
 BLOCK
