@@ -903,6 +903,12 @@ your own task branch from GitHub): same checks, exactly that argument form, neve
 default branch, and the remote-tracking ref must resolve uniquely.
 The locally recorded origin default must be established by authorized setup;
 the hook never contacts a remote to discover it.
+Local-only repositories (no remote configured at all) have their own exception:
+`git merge [--no-edit] main` on an attached task branch, where `main` must resolve
+uniquely to the local branch (a tag of that name blocks it) and no branch merge options
+may be configured. Adding any remote switches the repository back to the rules above.
+A read-only preview, `git merge-tree --write-tree [--name-only] HEAD <source>`, is
+allowed wherever the same `<source>` may be merged.
 Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
 so no pager runs and status cannot refresh another repository's index. Add
 `--no-textconv` to cross-repository log, show, diff and blame, and

@@ -153,4 +153,74 @@ with tempfile.TemporaryDirectory() as temporary:
             denied("gh pr merge 1")
             with patch.object(policy.subprocess, "run", side_effect=OSError("fixture")):
                 denied("git merge origin/" + default)
+    # Read-only previews take the same source as the merge itself (last fixture: default trunk).
+    for preview in ("git merge-tree --write-tree HEAD origin/" + default,
+                    "git merge-tree --write-tree --name-only HEAD origin/" + default):
+        allowed(preview)
+    for preview in ("git merge-tree HEAD origin/" + default, "git merge-tree --write-tree HEAD other",
+                    "git merge-tree --write-tree task origin/" + default,
+                    "git merge-tree --write-tree HEAD origin/" + default + " extra",
+                    "git merge-tree --write-tree --merge-base=HEAD HEAD origin/" + default,
+                    "git merge-tree --write-tree --name-only --name-only HEAD origin/" + default):
+        denied(preview)
 print("PASS: origin default merges allowed only on current task branches; unsafe forms denied")
+
+# Local-only projects have no remote at all: a task branch may merge the local main, and
+# preview that merge; everything else stays denied.
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    code = base / "dev_workspace"
+    roots = (code, base / "cortex")
+    repo = code / "local-only"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "--initial-branch=main")
+    git(repo, "config", "user.name", "CI")
+    git(repo, "config", "user.email", "ci@example.invalid")
+    (repo / "safe.txt").write_text("safe synthetic content\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "base")
+    def event(command):
+        return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)}
+    def allowed(command):
+        reason = policy.evaluate(event(command), roots)
+        assert reason is None, command + ": " + str(reason)
+    def denied(command):
+        assert policy.evaluate(event(command), roots) is not None, command
+    denied("git merge main")  # on main itself
+    denied("git merge-tree --write-tree HEAD main")
+    git(repo, "switch", "-q", "-c", "task")
+    for command in ("git merge main", "git merge --no-edit main", "/usr/bin/git merge main",
+                    "git -C . merge --no-edit main", "git merge-tree --write-tree HEAD main",
+                    "git merge-tree --write-tree --name-only HEAD main"):
+        allowed(command)
+    for tail in ("other", "HEAD", "task", "origin/main", "main~1", "refs/heads/main",
+                 "--squash main", "--edit main", "-s ours main", "--strategy=ours main",
+                 "-X theirs main", "--no-verify main", "--ff-only main", "main --no-edit",
+                 "main other", "--abort", "--continue"):
+        denied("git merge " + tail)
+    denied("git -c core.hooksPath=fixture merge main")
+    denied("GIT_DIR=fixture git merge main")
+    for value in ("--strategy=ours", "--squash", ""):
+        git(repo, "config", "branch.task.mergeOptions", value)
+        denied("git merge main")
+        git(repo, "config", "--unset-all", "branch.task.mergeOptions")
+    # A tag named main would shadow the branch; refuse rather than guess.
+    git(repo, "tag", "main")
+    denied("git merge main")
+    denied("git merge-tree --write-tree HEAD main")
+    git(repo, "tag", "-d", "main")
+    git(repo, "checkout", "-q", "--detach")
+    denied("git merge main")
+    git(repo, "switch", "-q", "task")
+    # The local rule applies only when there is no remote at all.
+    git(repo, "remote", "add", "upstream", "https://github.com/Jacopo1991/fixture.git")
+    denied("git merge main")
+    git(repo, "remote", "remove", "upstream")
+    allowed("git merge main")
+    git(repo, "merge", "--no-edit", "main")
+    git(repo, "branch", "-m", "main", "trunk")
+    denied("git merge main")
+    denied("git merge trunk")
+    with patch.object(policy.subprocess, "run", side_effect=OSError("fixture")):
+        denied("git merge main")
+print("PASS: local-only repositories merge only the local main into a task branch; previews read-only")
