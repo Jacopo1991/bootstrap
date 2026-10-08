@@ -19,6 +19,9 @@ $validRepoTask=[pscustomobject]@{Actions=@([pscustomobject]@{Execute='C:\Windows
 Assert-True (Test-ApprovedAgentTaskAction $validRepoTask) 'approved absolute WSL repo-job launcher shape'
 $badRepoTask=[pscustomobject]@{Actions=@([pscustomobject]@{Execute='C:\Windows\System32\wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/../outside/job';WorkingDirectory=''})}
 Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project task traversal rejected'
+Assert-Equal (Get-TaskExecutableName '"C:\Program Files\NVIDIA Corporation\NVIDIA App\NVIDIA App.exe"') 'NVIDIA App.exe' 'quoted Execute trimmed before GetFileName'
+$quotedRepoTask=[pscustomobject]@{Actions=@([pscustomobject]@{Execute='"C:\Windows\System32\wsl.exe"';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/sample/repo-job';WorkingDirectory=''})}
+Assert-True (Test-ApprovedAgentTaskAction $quotedRepoTask) 'quoted absolute WSL launcher recognised'
 & {
  $synthetic='fixture-argument-must-not-be-serialized'
  $powershell='C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -28,7 +31,9 @@ Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project tas
    [pscustomobject]@{TaskName='MachineBootstrap-Compact-Test';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments='-NoProfile -NonInteractive -File "C:\ProgramData\machine-bootstrap\check-compaction.ps1" -Name "Test" -LogPath "C:\ProgramData\machine-bootstrap\compact.log"';WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
    [pscustomobject]@{TaskName='MachineBootstrap-Evil';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute=$powershell;Arguments=$synthetic;WorkingDirectory='C:\ProgramData\machine-bootstrap'})},
    [pscustomobject]@{TaskName='Custom-Outside';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='powershell.exe';Arguments=$synthetic;WorkingDirectory='C:\Users\tester\Documents\Codex\repo'})},
-   [pscustomobject]@{TaskName='AgentRepoJob-Approved';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/sample/repo-job';WorkingDirectory=''})}
+   [pscustomobject]@{TaskName='AgentRepoJob-Approved';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='wsl.exe';Arguments='-d AgentDev -u agent -- /home/agent/dev_workspace/sample/repo-job';WorkingDirectory=''})},
+   [pscustomobject]@{TaskName='NvidiaApp-Quoted';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='"C:\Program Files\NVIDIA Corporation\NVIDIA App\NVIDIA App.exe"';Arguments='';WorkingDirectory=''})},
+   [pscustomobject]@{TaskName='Unparseable-Execute';TaskPath='\';State='Ready';Actions=@([pscustomobject]@{Execute='"C:\bad<|>"name.exe';Arguments='';WorkingDirectory=''})}
   )
  }
  $review=Get-ScheduledTaskReview
@@ -40,6 +45,9 @@ Assert-Equal (Test-ApprovedAgentTaskAction $badRepoTask) $false 'WSL project tas
  Assert-True ($review.Tasks[0].Findings -contains 'machine-maintenance-task-identity-or-action-mismatch') 'spoofed maintenance identity flagged'
  Assert-Equal $review.Tasks[1].WorkingRoot 'documents-codex' 'Documents Codex working directory classified'
  Assert-Equal $review.Tasks[2].ActionShape 'wsl-agent-approved-repo-job' 'approved WSL job shape recorded'
+ Assert-Equal $review.Tasks[3].Name NvidiaApp-Quoted 'quoted third-party Execute does not fail the review'
+ Assert-Equal $review.Tasks[3].ActionShape 'other' 'quoted third-party Execute classified as other'
+ Assert-Equal $review.Tasks[4].ActionShape 'other' 'unparseable Execute classified as other'
  $serialized=$review|ConvertTo-Json -Depth 8
  Assert-Equal $serialized.Contains($synthetic) $false 'scheduled task arguments never serialized'
 }

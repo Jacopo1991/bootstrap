@@ -163,6 +163,12 @@ function Get-TaskWorkingRoot {
  if($p -match '(?i)^D:\\wsl\\[^\\]+(?:\\|$)'){return 'wsl-storage'}
  'outside-approved-root'
 }
+function Get-TaskExecutableName {
+ # Third-party tasks quote Execute ("C:\Program Files\...\App.exe"); Windows PowerShell 5.1's
+ # GetFileName throws on the quotes or other illegal path characters. $null means unparseable.
+ param([string]$Execute)
+ try{[IO.Path]::GetFileName($Execute.Trim().Trim('"'))}catch{$null}
+}
 function Test-ApprovedAgentTaskAction {
  param($Task)
  $actions=@($Task.Actions)
@@ -170,7 +176,8 @@ function Test-ApprovedAgentTaskAction {
  $action=$actions[0]
  $executeProperty=$action.PSObject.Properties['Execute'];$argumentsProperty=$action.PSObject.Properties['Arguments'];$workingProperty=$action.PSObject.Properties['WorkingDirectory']
  if($null -eq $executeProperty -or $null -eq $argumentsProperty -or $null -eq $workingProperty){return $false}
- $exe=[IO.Path]::GetFileName([string]$executeProperty.Value)
+ $exe=Get-TaskExecutableName ([string]$executeProperty.Value)
+ if($null -eq $exe){return $false}
  $args=[string]$argumentsProperty.Value
  $wd=[string]$workingProperty.Value
  if(-not [string]::Equals($exe,'wsl.exe','OrdinalIgnoreCase') -or -not [string]::IsNullOrWhiteSpace($wd)){return $false}
@@ -231,7 +238,7 @@ function Get-ScheduledTaskReview {
   if($null -ne $actionsProperty){$actions=@($actionsProperty.Value)}
   $shape='other'
   if($actions.Count -eq 1){
-   $executeProperty=$actions[0].PSObject.Properties['Execute'];$exe=if($null -ne $executeProperty){[IO.Path]::GetFileName([string]$executeProperty.Value)}else{''}
+   $executeProperty=$actions[0].PSObject.Properties['Execute'];$exe=if($null -ne $executeProperty){Get-TaskExecutableName ([string]$executeProperty.Value)}else{''}
    if([string]::Equals($exe,'wsl.exe','OrdinalIgnoreCase')){
     if(Test-ApprovedAgentTaskAction ([pscustomobject]@{Actions=$actions} )){$shape='wsl-agent-approved-repo-job'}else{$shape='wsl-agent-invalid-shape'}
    }elseif([string]::Equals($exe,'powershell.exe','OrdinalIgnoreCase') -or [string]::Equals($exe,'pwsh.exe','OrdinalIgnoreCase') -or [string]::Equals($exe,'cmd.exe','OrdinalIgnoreCase')){$shape='windows-host-action'}
