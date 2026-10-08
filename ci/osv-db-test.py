@@ -46,14 +46,19 @@ class IgnoreEntry(unittest.TestCase):
     def test_every_exception_expires_and_has_a_reason(self):
         entries = self.config["IgnoredVulns"]
         self.assertEqual([entry["id"] for entry in entries],
-                         [ADVISORY, "GHSA-f88m-g3jw-g9cj", "GHSA-rgj7-g3m4-5g8c", "GHSA-w5hq-g745-h8pq"])
+                         [ADVISORY, "GHSA-f88m-g3jw-g9cj", "GHSA-rgj7-g3m4-5g8c", "GHSA-w5hq-g745-h8pq",
+                          # 2026-10-06 advisories, approved by Jacopo 2026-10-08.
+                          "GHSA-wq5f-xc86-pv6w", "GHSA-x6jw-m9v5-85vh", "GHSA-858h-whjf-mvg5",
+                          "GHSA-g4wm-2vf7-vfgr", "GHSA-v5rq-49vh-5v5c", "GHSA-hp3w-g68c-fv3c"])
         entry = entries[0]
         self.assertEqual(entry["ignoreUntil"], EXPIRY)
         self.assertIn("braces 3.0.3", entry["reason"])
-        # Desktop Commander's transitive advisories: one month, reviewed when its pin moves.
+        # Transitive advisories under Desktop Commander, qmd and js-yaml: one month, reviewed
+        # when the parent's pin moves.
         for entry in entries[1:]:
             self.assertEqual(str(entry["ignoreUntil"]), "2026-11-07")
-            self.assertIn("Desktop Commander", entry["reason"])
+            self.assertTrue(any(parent in entry["reason"]
+                                for parent in ("Desktop Commander", "qmd", "js-yaml")), entry["id"])
             self.assertTrue(entry["reason"].startswith("Accepted risk:"))
         self.assertEqual(set(self.config), {"IgnoredVulns"})
 
@@ -63,6 +68,9 @@ class IgnoreEntry(unittest.TestCase):
         self.assertEqual(lock["packages"]["node_modules/braces"]["version"], "3.0.3")
         self.assertEqual(lock["packages"]["node_modules/sharp"]["version"], "0.34.5")
         self.assertEqual(lock["packages"]["node_modules/uuid"]["version"], "8.3.2")
+        self.assertEqual(lock["packages"]["node_modules/simple-git"]["version"], "3.36.0")
+        self.assertEqual(lock["packages"]["node_modules/@simple-git/argv-parser"]["version"], "1.1.1")
+        self.assertEqual(lock["packages"]["node_modules/sprintf-js"]["version"], "1.0.3")
 
 
 @unittest.skipUnless(shutil.which("osv-scanner") and (REAL_DB / "npm/all.zip").is_file(),
