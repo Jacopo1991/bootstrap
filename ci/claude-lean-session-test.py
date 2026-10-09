@@ -8,6 +8,8 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SHARE = ROOT / "home/dot_local/share/bootstrap"
 settings = json.loads((ROOT / "home/dot_claude/settings.json").read_text(encoding="utf-8"))
+# Founder default for sessions that do not explicitly select a model (2026-10-09).
+assert settings["model"] == "haiku"
 # The deny rules are managed (root-owned drop-in, ci/managed-policy-test.py).
 deny = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text(
     encoding="utf-8"))["permissions"]["deny"]
