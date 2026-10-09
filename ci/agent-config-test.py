@@ -168,6 +168,17 @@ with tempfile.TemporaryDirectory() as temp:
         reason = policy.evaluate(event(f"task {sub} proj T-5"), roots)
         assert reason and "for the PM" in reason, (sub, reason)
     assert policy.evaluate(event("task check"), roots) is None
+    # One rejection names every missing flag and the full command (MadPlanner T-32 hit its
+    # two-failure stop learning them one per rejection), and points to a .work/ copy.
+    reason = policy.evaluate(event(f"git -C {sibling} show HEAD:file"), roots)
+    for flag in ("--no-pager", "--no-optional-locks", "--no-textconv", "--no-ext-diff", ".work/"):
+        assert reason and flag in reason, (flag, reason)
+    reason = policy.evaluate(event(f"git --no-pager -C {sibling} blame file"), roots)
+    assert reason and "missing: --no-optional-locks --no-textconv." in reason, reason
+    assert "--no-ext-diff ..." not in reason, reason
+    assert policy.evaluate(event(
+        f"git --no-pager --no-optional-locks -C {sibling} show --no-textconv --no-ext-diff HEAD:file"),
+        roots) is None
     # Fetch updates refs/objects/FETCH_HEAD, never the working tree. Its narrow
     # cross-repository exception does not require read-only pager/lock selectors.
     for executable in ("git", "/usr/bin/git"):

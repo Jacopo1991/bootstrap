@@ -253,6 +253,19 @@ def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
     return Path("/__bootstrap_outside_approved_roots__")
 
 
+CROSS_REPO_HINT = ("If the task needs another repository's files, ask the PM for a pinned copy in "
+                   "this repository's .work/ instead.")
+
+
+def cross_repo_read_message(subcommand: str, missing: list[str]) -> str:
+    """Name every missing flag at once, with the full command, so one retry is enough."""
+    tail = {"log": " --no-textconv --no-ext-diff", "show": " --no-textconv --no-ext-diff",
+            "diff": " --no-textconv --no-ext-diff", "blame": " --no-textconv"}.get(subcommand, "")
+    return (f"Reading another repository needs all of these flags, missing: {' '.join(missing)}. "
+            f"Use: `git --no-pager --no-optional-locks -C <repo> {subcommand}{tail} ...`. "
+            + CROSS_REPO_HINT)
+
+
 def same_repository(first: Path, second: Path) -> bool:
     """True when both checkouts share one Git common directory (main checkout and its worktrees)."""
     def common(path: Path) -> Path | None:
@@ -714,12 +727,12 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if subcommand == "config" and not git_config_read_only(arguments):
         return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
     if cross_repo and not sibling_fetch:
-        if not {"--no-pager", "--no-optional-locks"}.issubset(selectors):
-            return "Cross-repository reads require --no-pager and --no-optional-locks."
-        if subcommand in {"log", "show", "diff", "blame"} and "--no-textconv" not in arguments:
-            return "Cross-repository log/show/diff/blame require --no-textconv."
-        if subcommand in {"log", "show", "diff"} and "--no-ext-diff" not in arguments:
-            return "Cross-repository log/show/diff require --no-ext-diff."
+        before = [flag for flag in ("--no-pager", "--no-optional-locks") if flag not in selectors]
+        after = [flag for flag, commands in (("--no-textconv", {"log", "show", "diff", "blame"}),
+                                             ("--no-ext-diff", {"log", "show", "diff"}))
+                 if subcommand in commands and flag not in arguments]
+        if before or after:
+            return cross_repo_read_message(subcommand, before + after)
         if any(arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
                and not arg[1:].isdigit() for arg in arguments):
             return "Spell cross-repository short options separately; aggregation is blocked."
