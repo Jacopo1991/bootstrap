@@ -1149,7 +1149,16 @@ def git_subcommand(tokens: list[str], cwd: str) -> str | None:
 # git/gh run outside the sandbox only as a whole command; in a chain or pipe the whole
 # call is sandboxed, where github.com is not reachable.
 NETWORK_CHAIN_MESSAGE = ("Run git/gh network commands on their own; only then do they run "
-                         "outside the sandbox.")
+                         "outside the sandbox. Use one call per command, e.g. "
+                         "`git -C <path> push origin <branch>`, not `cd <path> && git push`.")
+MIXED_CHAIN_MESSAGE = ("A chain containing git or gh may only add other git/gh commands or read-only "
+                       "text tools (grep, head, tail, wc, sort, uniq, cut, jq, cat) without redirects. "
+                       "Run git on its own instead: use `git -C <path> <command>` rather than "
+                       "`cd <path> && git ...`, and run builds, tests and file writes as a separate call.")
+STATE_CHAIN_MESSAGE = ("git commit/merge must not follow commands that may change the index or branch "
+                       "in the same call, so the secret scan and default-branch guard see the real "
+                       "state. Run them as separate calls, e.g. `git -C <path> add <files>` and then "
+                       "`git -C <path> commit -m ...`.")
 GIT_NETWORK_SUBCOMMANDS = {"fetch", "pull", "push", "ls-remote", "clone"}
 GH_OFFLINE_COMMANDS = {"config", "alias", "completion", "help", "version"}
 
@@ -1204,9 +1213,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
                              and (i + 1 >= len(unwrapped) or unwrapped[i + 1] not in NULL_DEVICES)
                              for i, token in enumerate(unwrapped))
                 if head not in MIXED_CHAIN_TEXT_TOOLS or writes:
-                    return ("A chain containing git or gh may only add other git/gh commands or "
-                            "read-only text tools (grep, head, tail, wc, sort, uniq, cut, jq, cat) "
-                            "without redirects; run anything else as a separate command.")
+                    return MIXED_CHAIN_MESSAGE
     seen_changing = False
     for position, tokens in enumerate(all_tokens):
         piped = position > 0 and operators[position - 1] == "|"
@@ -1226,9 +1233,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
             return "Piping into a shell or interpreter is blocked."
         if (unwrapped and head == "git" and position > 0
                 and git_subcommand(unwrapped, effective) in STATE_DEPENDENT_GIT and seen_changing):
-            return ("git commit/merge must not follow commands that may change the index or "
-                    "branch in the same call; run them separately so the secret scan and "
-                    "default-branch guard see the real state.")
+            return STATE_CHAIN_MESSAGE
         reason = evaluate_segment(tokens, effective, root, approved_roots)
         if reason:
             return reason
