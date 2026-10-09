@@ -743,6 +743,39 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("git -C . status", "git -C . add safe.txt", "git -C . log --oneline -1 | head -1",
                     "git -C . add safe.txt && git -C . status"):
         assert policy.evaluate(event(command), roots) is None, command
+    # Worktrees: agents may list them; the Codex app or `claude --worktree` creates and removes them.
+    for command in ("git worktree list", "git -C . worktree list --porcelain", "git worktree list | head -3"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in ("git worktree add ../x", "git worktree remove .worktrees/a", "git worktree prune",
+                    "git worktree list --expire=now", "git worktree move a b"):
+        assert "Only `git worktree list` is allowed" in (policy.evaluate(event(command), roots) or ""), command
+    # The Codex app's own worktrees (agent on the AgentDev SSH host) are trusted only when they
+    # belong to a repository under an approved root, and only inside the worktree itself.
+    managed = base / "codex-worktrees"
+    policy.MANAGED_WORKTREE_BASES = (managed,)
+    for name, parent in (("app-src", code_base), ("app-out", base / "elsewhere")):
+        source = parent / name
+        source.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(source)], check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit",
+                        "-q", "--allow-empty", "-m", "base"], cwd=source, check=True)
+        subprocess.run(["git", "worktree", "add", "-q", "--detach", str(managed / "ab12" / name)],
+                       cwd=source, check=True)
+    app_tree = managed / "ab12" / "app-src"
+    def app_event(command, cwd=app_tree):
+        return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)}
+    for command in ("git status", "git -C . log --oneline -1", "git worktree list", "pwd"):
+        assert policy.evaluate(app_event(command), roots) is None, command
+    write = {"tool_name": "Write", "cwd": str(app_tree)}
+    assert policy.evaluate({**write, "tool_input": {"file_path": str(app_tree / "notes.txt"), "content": "x"}},
+                           roots) is None
+    for outside in (managed / "config.toml", code_base / "app-src" / "x.txt"):
+        assert policy.evaluate({**write, "tool_input": {"file_path": str(outside), "content": "x"}},
+                               roots) is not None, outside
+    assert policy.evaluate(app_event("git status", managed / "ab12" / "app-out"), roots) is not None, \
+        "a worktree of a repository outside the approved roots stays blocked"
+    assert policy.evaluate(app_event("ls", managed), roots) is not None, "the worktree base itself is not a root"
+    policy.MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
     for command in (
             # Guards that must still hold inside a chain, behind a pipe, or behind a wrapper.
             "echo x | tee .git/config", "git status && touch .git/config",

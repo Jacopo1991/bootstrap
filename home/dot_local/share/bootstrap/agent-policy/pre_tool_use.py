@@ -59,6 +59,9 @@ STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
+# Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
+MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
 CURRENT_REPO_GIT = READ_ONLY_GIT | {
     "add", "commit", "push", "fetch", "pull", "checkout", "switch", "reset",
     "restore", "clean", "rm", "mv", "branch", "tag", "remote", "stash",
@@ -242,9 +245,30 @@ def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
         Path("/home/agent/dev_workspace").resolve(),
         Path("/home/agent/cortex").resolve(),
     )
-    if not any(root == base or base in root.parents for base in approved):
-        return Path("/__bootstrap_outside_approved_roots__")
-    return root
+    if any(root == base or base in root.parents for base in approved):
+        return root
+    if managed_worktree_of_approved_repo(root, approved):
+        return root
+    return Path("/__bootstrap_outside_approved_roots__")
+
+
+def managed_worktree_of_approved_repo(root: Path, approved: tuple[Path, ...]) -> bool:
+    """A worktree the Codex app made under ~/.codex/worktrees counts as its own root when it
+    belongs to a repository under an approved root. The root stays the worktree itself."""
+    bases = [base.resolve() for base in MANAGED_WORKTREE_BASES]
+    if not any(base in root.parents for base in bases):
+        return False
+    try:
+        result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    common = Path(result.stdout.strip()).resolve()
+    if common.name != ".git" or (root / ".git").is_dir():
+        return False                      # bare repositories and independent clones do not count
+    repository = common.parent
+    return any(repository == base or base in repository.parents for base in approved)
 
 
 def inside(path_text: str, cwd: str, root: Path) -> bool:
@@ -618,6 +642,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return git_default_branch_merge(arguments, target)
     if subcommand == "merge-tree":
         return git_merge_preview(arguments, target)
+    if subcommand == "worktree":
+        # Listing is read-only. Worktrees are created and removed by the tool that runs the lane
+        # (the Codex app, `claude --worktree`) and cleaned by workspace-tidy, never by agents.
+        if arguments[:1] == ["list"] and all(a in WORKTREE_LIST_OPTIONS for a in arguments[1:]):
+            return None
+        return ("Only `git worktree list` is allowed; the Codex app or `claude --worktree` "
+                "creates and removes worktrees.")
     if subcommand not in CURRENT_REPO_GIT:
         return "Git topology changes and unsupported write primitives require separate setup."
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.
