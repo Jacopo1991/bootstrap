@@ -316,11 +316,11 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   ([settings](https://code.claude.com/docs/en/settings#settings-precedence),
   [managed settings](https://code.claude.com/docs/en/managed-settings),
   [hooks](https://code.claude.com/docs/en/hooks)). The hooks use exec form (`command` plus
-  `args`, no shell): `/usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I
-  /opt/machine-bootstrap/current/system/agent-policy/<script>.py`.
+  `args`, no shell): `/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I
+  /usr/local/lib/agent-policy/<script>.py`.
 - `system/codex-managed.sh`: `/etc/codex/requirements.toml` (from
   `system/codex-requirements.toml`) pins `[features].hooks = true`, declares the same hooks
-  under `[hooks]` (`managed_dir` is the `/opt` policy directory) and holds the forbidden/prompt
+  under `[hooks]` (`managed_dir` is `/usr/local/lib/agent-policy`) and holds the forbidden/prompt
   command rules under `[rules] prefix_rules`. Requirements cannot be overridden by user config;
   managed hooks are trusted by policy and run alongside user hooks; requirements rules merge
   with `~/.codex/rules/*.rules` and the most restrictive decision wins
@@ -332,11 +332,17 @@ Both installers refuse to run unless the policy scripts, `/usr/bin/env`, `/usr/b
 every directory above them, are owned by root and writable by nobody else. The scripts use only
 the standard library, `-I` keeps `PYTHONPATH`, user site-packages and the script directory off
 `sys.path`, and the fixed `PATH` makes the hook's `git` and `gitleaks` the root-owned ones.
-chezmoi removes the old user-level copies (`~/.codex/hooks.json`,
+`install.sh` atomically installs the policy scripts into `/usr/local/lib/agent-policy/`,
+independent of the `current` symlink. chezmoi removes the old user-level copies (`~/.codex/hooks.json`,
 `~/.local/share/bootstrap/agent-policy/*.py`), so there is one source of truth.
+`~/.codex/hooks.json` is managed by bootstrap; agents' own Codex hooks belong in the project's `.codex` folder.
 `ci/managed-policy-test.py` (lint) checks the content; `ci/claude-managed-install-test.py` and
 `ci/git-gh-approval-test.py` (distro job, as agent) check ownership, immutability and the
 installed Codex rule engine.
+
+Rollback: before installing a revision from before this change, run
+`sudo rm /etc/claude-code/managed-settings.d/10-agent-guardrails.json /etc/codex/requirements.toml`
+and `sudo rm -rf /usr/local/lib/agent-policy` first.
 
 Limits: Codex runs every hook command through the user's shell (`$SHELL -c`), so an agent that
 controls the environment Codex starts with (for example `BASH_ENV` exported from `~/.bashrc`)

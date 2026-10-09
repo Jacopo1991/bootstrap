@@ -192,6 +192,11 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event(
         f"git --no-pager --no-optional-locks -C {sibling} show --no-textconv --no-ext-diff HEAD:file"),
         roots) is None
+    # A drive letter only counts at the start of a path: PATH-style lists such as
+    # /usr/local/bin:/usr/bin are Linux paths (a Codex lane was blocked by this).
+    assert policy.evaluate(event("grep -n 'PATH=/usr/local/bin:/usr/bin:/bin' README.md"), roots) is None
+    assert policy.evaluate(event("cat C:/Windows/win.ini"), roots) is not None
+    assert policy.evaluate(event("cat --file=C:/x"), roots) is not None
     # Fetch updates refs/objects/FETCH_HEAD, never the working tree. Its narrow
     # cross-repository exception does not require read-only pager/lock selectors.
     for executable in ("git", "/usr/bin/git"):

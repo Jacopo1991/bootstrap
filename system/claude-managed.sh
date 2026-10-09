@@ -15,8 +15,8 @@ for path in "$dir" "$dropins"; do
 done
 install -d -o root -g root -m 0755 "$dir" "$dropins"
 # Guardrails: the permission deny rules and the policy hooks (root-owned scripts under
-# /opt/machine-bootstrap/current). Nothing here limits bypass or auto mode.
-install -o root -g root -m 0644 "$BOOTSTRAP_ROOT/system/claude-managed-guardrails.json" \
+# /usr/local/lib/agent-policy). Nothing here limits bypass or auto mode.
+atomic_policy_install "$BOOTSTRAP_ROOT/system/claude-managed-guardrails.json" \
   "$dropins/10-agent-guardrails.json"
-install -o root -g root -m 0644 "$BOOTSTRAP_ROOT/system/claude-managed-mods.json" \
+atomic_policy_install "$BOOTSTRAP_ROOT/system/claude-managed-mods.json" \
   "$dropins/50-managed-mods-only.json"

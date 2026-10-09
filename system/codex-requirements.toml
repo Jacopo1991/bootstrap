@@ -11,14 +11,14 @@ hooks = true
 # Managed hooks are trusted by policy and cannot be disabled from /hooks. The scripts are the
 # root-owned published revision; each runs with a fixed PATH and an isolated root interpreter.
 [hooks]
-managed_dir = "/opt/machine-bootstrap/current/system/agent-policy"
+managed_dir = "/usr/local/lib/agent-policy"
 
 [[hooks.PreToolUse]]
 matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "/usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /opt/machine-bootstrap/current/system/agent-policy/pre_tool_use.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
 timeout = 30
 
 [[hooks.PreToolUse]]
@@ -26,14 +26,14 @@ matcher = "^(apply_patch|Edit|Write)$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "/usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /opt/machine-bootstrap/current/system/agent-policy/pre_tool_use.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
 timeout = 30
 
 [[hooks.UserPromptSubmit]]
 
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
-command = "/usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /opt/machine-bootstrap/current/system/agent-policy/context_reminder.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/context_reminder.py"
 timeout = 10
 
 [[hooks.PermissionRequest]]
@@ -41,7 +41,7 @@ matcher = "^Bash$"
 
 [[hooks.PermissionRequest.hooks]]
 type = "command"
-command = "/usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /opt/machine-bootstrap/current/system/agent-policy/pre_tool_use.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
 timeout = 30
 
 # Requirements rules merge with ~/.codex/rules/*.rules and the most restrictive decision wins,

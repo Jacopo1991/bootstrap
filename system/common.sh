@@ -21,8 +21,8 @@ require_root_owned_policy() {
   [[ $BOOTSTRAP_ROOT == /opt/machine-bootstrap/current ]] || {
     echo 'Run the managed-policy installers from /opt/machine-bootstrap/current.' >&2; exit 1;
   }
-  for file in "$BOOTSTRAP_ROOT/system/agent-policy/pre_tool_use.py" \
-    "$BOOTSTRAP_ROOT/system/agent-policy/context_reminder.py" \
+  for file in /usr/local/lib/agent-policy/pre_tool_use.py \
+    /usr/local/lib/agent-policy/context_reminder.py \
     /usr/bin/env /usr/bin/python3 /usr/bin/git /usr/local/bin/gitleaks; do
     path=$(readlink -e -- "$file") || { echo "Missing managed-policy file: $file" >&2; exit 1; }
     while :; do
@@ -34,6 +34,17 @@ require_root_owned_policy() {
       path=$(dirname -- "$path")
     done
   done
+}
+
+# Replace a complete root-owned file without exposing a partial write to hooks.
+atomic_policy_install() {
+  local source=$1 target=$2 temp
+  temp=$(mktemp "$(dirname -- "$target")/.agent-policy.XXXXXX")
+  if install -o root -g root -m 0644 "$source" "$temp" && mv -f -- "$temp" "$target"; then
+    return 0
+  fi
+  rm -f -- "$temp"
+  return 1
 }
 
 download_verified() {

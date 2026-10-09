@@ -2,7 +2,7 @@
 """Fail-closed managed agent hook for workspace boundaries and staged secrets.
 
 Claude Code and Codex run it from their root-owned managed settings, as
-/usr/bin/python3 -I on the published /opt/machine-bootstrap/current revision.
+/usr/bin/python3 -I from /usr/local/lib/agent-policy/.
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
 # Inspect paths in argv, never a substring in an entire shell/body string.
 # Unquoted Windows backslashes can be consumed by shlex, so drive prefixes
 # remain blocked even after that normalization.
-WINDOWS_PATH = re.compile(r"(?i)(?:[A-Z]:[\\/](?!/)|"
+WINDOWS_PATH = re.compile(r"(?i)(?:(?<![A-Za-z0-9_])[A-Z]:[\\/](?!/)|"
                           r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:|/mnt/[a-z](?:/|$)|"
                           r"(?:^|=)(?:-[A-Za-z]+)?\\(?:\\|[A-Za-z0-9_-]))")
 HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
@@ -78,6 +78,12 @@ GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FIL
                     "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EXTERNAL_DIFF"}
 
 
+def policy_subprocess(*args, **kwargs):
+    """Keep inherited Git selectors and configuration out of policy checks."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    return subprocess.run(*args, env=env, **kwargs)
+
+
 def git_environment_override(event: dict, data: dict) -> bool:
     """Do not let inherited or per-tool environment change Git's control plane."""
     environments = [os.environ]
@@ -118,7 +124,7 @@ def protected_git_path(path_text: str, cwd: str, metadata: tuple[Path, ...]) -> 
 
 def git_metadata(root: Path) -> tuple[Path, ...] | None:
     try:
-        result = subprocess.run(
+        result = policy_subprocess(
             ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
             cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
@@ -240,7 +246,7 @@ def git_config_read_only(arguments: list[str]) -> bool:
 def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
     here = Path(cwd).resolve()
     try:
-        result = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=here,
+        result = policy_subprocess(["git", "rev-parse", "--show-toplevel"], cwd=here,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
         root = Path(result.stdout.strip()).resolve()
@@ -274,7 +280,7 @@ def same_repository(first: Path, second: Path) -> bool:
     """True when both checkouts share one Git common directory (main checkout and its worktrees)."""
     def common(path: Path) -> Path | None:
         try:
-            result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            result = policy_subprocess(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                     cwd=path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
         except (OSError, subprocess.SubprocessError):
@@ -291,7 +297,7 @@ def managed_worktree_of_approved_repo(root: Path, approved: tuple[Path, ...]) ->
     if not any(base in root.parents for base in bases):
         return False
     try:
-        result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        result = policy_subprocess(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                 cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
     except (OSError, subprocess.SubprocessError):
@@ -321,7 +327,7 @@ def deny(message: str) -> dict:
 
 def secret_scan(root: Path) -> str | None:
     try:
-        diff = subprocess.run(["git", "diff", "--cached", "--no-ext-diff", "--unified=0"],
+        diff = policy_subprocess(["git", "diff", "--cached", "--no-ext-diff", "--unified=0"],
                               cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError):
@@ -332,7 +338,7 @@ def secret_scan(root: Path) -> str | None:
     if not scanner:
         return "Pinned secret scanner unavailable; commit blocked."
     try:
-        result = subprocess.run([scanner, "stdin", "--no-banner", "--redact"],
+        result = policy_subprocess([scanner, "stdin", "--no-banner", "--redact"],
                                 cwd=root, input=diff.stdout, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, timeout=30)
     except (OSError, subprocess.SubprocessError):
@@ -401,7 +407,7 @@ def sibling_fetch_has_submodules(root: Path) -> bool:
         # Retained/inherited activation or URL config can reactivate an embedded
         # child when a freshly fetched tree reintroduces its gitlink. Inspect
         # effective configuration without collecting or printing its values.
-        configured = subprocess.run(
+        configured = policy_subprocess(
             ["git", "config", "--get-regexp", "^submodule[.]"], cwd=root,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=3)
@@ -411,19 +417,19 @@ def sibling_fetch_has_submodules(root: Path) -> bool:
         if (modules_file.exists() or modules_file.is_symlink()
                 or any((directory / "modules").exists() for directory in metadata)):
             return True
-        index = subprocess.run(["git", "ls-files", "--stage", "-z"], cwd=root,
+        index = policy_subprocess(["git", "ls-files", "--stage", "-z"], cwd=root,
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
         if any(record.startswith("160000 ") for record in index.stdout.split(chr(0))):
             return True
-        head = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+        head = policy_subprocess(["git", "rev-parse", "--verify", "--quiet", "HEAD"],
                               cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, timeout=3)
         if head.returncode == 1:
             return False  # An unborn repository has no committed gitlinks.
         if head.returncode != 0:
             return True
-        tree = subprocess.run(["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root,
+        tree = policy_subprocess(["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
         return any(record.startswith("160000 ") for record in tree.stdout.split(chr(0)))
@@ -461,7 +467,7 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
         # miss a local/non-GitHub upstream selected by Git.
         remote = "origin"
         try:
-            head = subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"],
+            head = policy_subprocess(["git", "symbolic-ref", "--quiet", "HEAD"],
                                   cwd=target, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                   text=True, timeout=3)
@@ -469,7 +475,7 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
                 reference = head.stdout.strip()
                 if not reference.startswith("refs/heads/"):
                     return "Cannot identify the default fetch branch safely; specify origin."
-                configured = subprocess.run(
+                configured = policy_subprocess(
                     ["git", "config", "--get", "branch." + reference[11:] + ".remote"],
                     cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL, text=True, timeout=3)
@@ -486,7 +492,7 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
     if subcommand == "fetch":
         # A fetch group can expand one name into multiple unchecked remotes.
         try:
-            group = subprocess.run(["git", "config", "--get-all", "remotes." + remote],
+            group = policy_subprocess(["git", "config", "--get-all", "remotes." + remote],
                                    cwd=target, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    text=True, timeout=3)
@@ -503,7 +509,7 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
     def github_url(value: str) -> bool:
         return value.startswith(("https://github.com/", "git@github.com:", "ssh://git@github.com/"))
     try:
-        result = subprocess.run(command, cwd=target, stdin=subprocess.DEVNULL,
+        result = policy_subprocess(command, cwd=target, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 text=True, check=True, timeout=3)
     except (OSError, subprocess.SubprocessError):
@@ -519,7 +525,7 @@ LOCAL_DEFAULT_BRANCH = "main"
 
 
 def _read_git(target: Path, *args: str) -> str:
-    return subprocess.run(
+    return policy_subprocess(
         ["git", *args], cwd=target, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, check=True, timeout=3).stdout.strip()
@@ -527,7 +533,7 @@ def _read_git(target: Path, *args: str) -> str:
 
 def _merge_options_configured(target: Path, current: str) -> bool:
     """Git applies branch.<name>.mergeOptions before argv, including custom strategies."""
-    options = subprocess.run(
+    options = policy_subprocess(
         ["git", "config", "--get-all", "branch." + current[len("refs/heads/"):] + ".mergeOptions"],
         cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, text=True, timeout=3)

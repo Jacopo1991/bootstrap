@@ -46,15 +46,24 @@ def root_owned_chain(path: Path) -> None:
 
 managed = json.loads((DROPINS / "10-agent-guardrails.json").read_text(encoding="utf-8"))
 requirements = tomllib.loads((CODEX_DIR / "requirements.toml").read_text(encoding="utf-8"))
+assert requirements["hooks"]["managed_dir"] == "/usr/local/lib/agent-policy"
 argvs = [[h["command"], *h["args"]] for groups in managed["hooks"].values()
          for group in groups for h in group["hooks"]]
 argvs += [h["command"].split(" ") for event, groups in requirements["hooks"].items()
           if event != "managed_dir" for group in groups for h in group["hooks"]]
-assert argvs and all(argv[:4] == ["/usr/bin/env", "PATH=/usr/local/bin:/usr/bin:/bin",
+assert argvs and all(argv[:8] == ["/usr/bin/env", "-u", "LD_PRELOAD", "-u", "LD_LIBRARY_PATH", "PATH=/usr/local/bin:/usr/bin:/bin",
                                   "/usr/bin/python3", "-I"] for argv in argvs), argvs
-for path in {*(Path(argv[4]) for argv in argvs), Path("/usr/bin/env"), Path("/usr/bin/python3"),
+for path in {*(Path(argv[8]) for argv in argvs), Path("/usr/bin/env"), Path("/usr/bin/python3"),
              Path("/usr/bin/git"), Path("/usr/local/bin/gitleaks")}:
     root_owned_chain(path)
+for argv in argvs:
+    path = Path(argv[8])
+    assert path.parent == Path("/usr/local/lib/agent-policy"), path
+    assert path.read_bytes() == (OPT / "system/agent-policy" / path.name).read_bytes()
+    info = path.lstat()
+    assert not stat.S_ISLNK(info.st_mode) and info.st_gid == 0
+    assert stat.S_IMODE(info.st_mode) == 0o644
+assert stat.S_IMODE(Path("/usr/local/lib/agent-policy").stat().st_mode) == 0o755
 
 
 def refused(action) -> bool:
@@ -74,7 +83,7 @@ for path in (DROPINS / "99-agent.json", CLAUDE_DIR / "managed-settings.json",
     assert refused(lambda: path.write_text("{}")), f"agent could create {path}"
 assert refused(lambda: (CODEX_DIR / "rules").mkdir()), "agent could add system Codex rules"
 for argv in argvs:
-    assert refused(lambda: Path(argv[4]).open("a")), f"agent could edit {argv[4]}"
+    assert refused(lambda: Path(argv[8]).open("a")), f"agent could edit {argv[8]}"
 
 # One source of truth: chezmoi removed the agent's old copies and user-level guardrails.
 home = Path.home()
@@ -85,7 +94,7 @@ user = json.loads((home / ".claude/settings.json").read_text(encoding="utf-8"))
 assert "deny" not in user["permissions"] and "hooks" not in user
 
 # The deployed managed hook, run exactly as configured, still denies blocked commands.
-pre_tool_use = next(argv for argv in argvs if argv[4].endswith("/pre_tool_use.py"))
+pre_tool_use = next(argv for argv in argvs if argv[8].endswith("/pre_tool_use.py"))
 env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 with tempfile.TemporaryDirectory() as cwd:
     for command in ("wsl.exe -d AgentDev", "sudo true"):

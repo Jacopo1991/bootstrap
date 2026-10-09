@@ -7,6 +7,7 @@ Claude Code: system/claude-managed-guardrails.json -> /etc/claude-code/managed-s
 either may limit bypass/auto mode, approval policy, sandbox choice or the user's own hooks.
 """
 import ast
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,14 +15,15 @@ import re
 import subprocess
 import tempfile
 import tomllib
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 OPT = "/opt/machine-bootstrap/current"
-SCRIPTS = OPT + "/system/agent-policy"
+SCRIPTS = "/usr/local/lib/agent-policy"
 # Exec form for Claude, the same argv as a string for Codex: absolute root-owned binaries,
 # a fixed PATH (root-owned git and gitleaks) and an isolated interpreter (-I: no PYTHON*
 # variables, user site-packages or script directory on sys.path).
-PREFIX = ["/usr/bin/env", "PATH=/usr/local/bin:/usr/bin:/bin", "/usr/bin/python3", "-I"]
+PREFIX = ["/usr/bin/env", "-u", "LD_PRELOAD", "-u", "LD_LIBRARY_PATH", "PATH=/usr/local/bin:/usr/bin:/bin", "/usr/bin/python3", "-I"]
 # Keys that would restrict modes, the sandbox choice or the user's own hooks/rules.
 RESTRICTING = {"disableBypassPermissionsMode", "disableAutoMode", "defaultMode",
                "skipDangerousModePermissionPrompt", "allowManagedHooksOnly",
@@ -44,7 +46,7 @@ def keys(value, path=()):
 
 def repo_script(path: str) -> Path:
     assert path.startswith(SCRIPTS + "/"), path
-    local = ROOT / path[len(OPT) + 1:]
+    local = ROOT / "system/agent-policy" / Path(path).name
     assert local.is_file(), local
     return local
 
@@ -73,8 +75,8 @@ for event, groups in managed["hooks"].items():
             assert set(handler) == {"type", "command", "args", "timeout"}, handler  # no shell field
             assert handler["type"] == "command"
             argv = [handler["command"], *handler["args"]]
-            assert argv[:4] == PREFIX and len(argv) == 5, argv
-            claude_hooks[(event, group.get("matcher"))] = repo_script(argv[4]).name
+            assert argv[:8] == PREFIX and len(argv) == 9, argv
+            claude_hooks[(event, group.get("matcher"))] = repo_script(argv[8]).name
 assert claude_hooks == {
     ("PreToolUse", "Bash|PowerShell|Write|Edit|MultiEdit"): "pre_tool_use.py",
     ("PreToolUse", "Bash|Write|Edit|MultiEdit"): "context_reminder.py",
@@ -96,8 +98,8 @@ for event, groups in codex_events.items():
         for handler in group["hooks"]:
             assert set(handler) == {"type", "command", "timeout"} and handler["type"] == "command"
             argv = handler["command"].split(" ")
-            assert argv[:4] == PREFIX and len(argv) == 5, argv
-            codex_hooks[(event, group.get("matcher"))] = repo_script(argv[4]).name
+            assert argv[:8] == PREFIX and len(argv) == 9, argv
+            codex_hooks[(event, group.get("matcher"))] = repo_script(argv[8]).name
 assert codex_hooks == {
     ("PreToolUse", "^Bash$"): "pre_tool_use.py",
     ("PreToolUse", "^(apply_patch|Edit|Write)$"): "pre_tool_use.py",
@@ -184,18 +186,36 @@ for text, source, target in (
         (claude_installer, "system/claude-managed-guardrails.json", '"$dropins/10-agent-guardrails.json"'),
         (codex_installer, "system/codex-requirements.toml", '"$dir/requirements.toml"')):
     assert "require_root\nrequire_root_owned_policy\n" in text
-    assert f'install -o root -g root -m 0644 "$BOOTSTRAP_ROOT/{source}" \\\n  {target}' in text, source
+    assert f'atomic_policy_install "$BOOTSTRAP_ROOT/{source}" \\\n  {target}' in text, source
 common = (ROOT / "system/common.sh").read_text(encoding="utf-8")
+assert 'mktemp "$(dirname -- "$target")/.agent-policy.XXXXXX"' in common
+assert 'install -o root -g root -m 0644 "$source" "$temp" && mv -f -- "$temp" "$target"' in common
 for path in ("/usr/bin/env", "/usr/bin/python3", "/usr/bin/git", "/usr/local/bin/gitleaks",
-             "system/agent-policy/pre_tool_use.py", "system/agent-policy/context_reminder.py"):
+             "/usr/local/lib/agent-policy/pre_tool_use.py", "/usr/local/lib/agent-policy/context_reminder.py"):
     assert path in common, path
 install = (ROOT / "install.sh").read_text(encoding="utf-8")
-published = install.index('sudo ln -sfn "$public_source" /opt/machine-bootstrap/current')
+published = install.index('sudo mv -T -- "$current_temp/current" /opt/machine-bootstrap/current')
 applied = install.index("chezmoi --source /opt/machine-bootstrap/current init --apply")
 for script in ("claude-managed.sh", "codex-managed.sh"):
     line = f'sudo "$bash_cmd" {OPT}/system/{script}'
     assert install.count(script) == 1 and published < install.index(line) < applied, script
 assert install.index("/usr/local/bin/gitleaks") < published
+assert 'sudo ln -s "$public_source" "$current_temp/current"' in install
+assert 'sudo install -d -o root -g root -m 0755 "$policy_dir"' in install
+assert 'sudo mktemp "$policy_dir/.agent-policy.XXXXXX"' in install
+assert 'sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"' in install
+assert install.index('sudo mv -f -- "$policy_temp" "$policy_dir/$script"') < published
+
+# Git environment overrides cannot redirect policy subprocesses; other environment stays.
+spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/agent-policy/pre_tool_use.py")
+policy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(policy)
+with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "POLICY_CONTROL": "kept"}):
+    with patch.object(policy.subprocess, "run") as run:
+        policy.policy_subprocess(["git", "status"], check=True)
+        assert not any(k.startswith("GIT_") for k in run.call_args.kwargs["env"])
+        assert run.call_args.kwargs["env"]["POLICY_CONTROL"] == "kept"
+        assert run.call_args.args == (["git", "status"],) and run.call_args.kwargs["check"] is True
 
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
 assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""

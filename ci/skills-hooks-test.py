@@ -293,7 +293,7 @@ class Reminder(unittest.TestCase):
 
     def test_wiring(self):
         # Both CLIs run the hooks from root-owned managed settings (ci/managed-policy-test.py).
-        script = "/opt/machine-bootstrap/current/system/agent-policy/context_reminder.py"
+        script = "/usr/local/lib/agent-policy/context_reminder.py"
         claude = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text())["hooks"]
 
         def line(handler):

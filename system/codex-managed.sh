@@ -11,5 +11,5 @@ require_root_owned_policy
 dir=/etc/codex
 [[ ! -L $dir ]] || { echo "Refusing symlinked $dir." >&2; exit 1; }
 install -d -o root -g root -m 0755 "$dir"
-install -o root -g root -m 0644 "$BOOTSTRAP_ROOT/system/codex-requirements.toml" \
+atomic_policy_install "$BOOTSTRAP_ROOT/system/codex-requirements.toml" \
   "$dir/requirements.toml"
