@@ -252,6 +252,20 @@ def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
     return Path("/__bootstrap_outside_approved_roots__")
 
 
+def same_repository(first: Path, second: Path) -> bool:
+    """True when both checkouts share one Git common directory (main checkout and its worktrees)."""
+    def common(path: Path) -> Path | None:
+        try:
+            result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                    cwd=path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return Path(result.stdout.strip()).resolve()
+    left, right = common(first), common(second)
+    return left is not None and left == right
+
+
 def managed_worktree_of_approved_repo(root: Path, approved: tuple[Path, ...]) -> bool:
     """A worktree the Codex app made under ~/.codex/worktrees counts as its own root when it
     belongs to a repository under an approved root. The root stays the worktree itself."""
@@ -630,7 +644,9 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     target_root = root_for(str(target), approved_roots)
     if str(target_root) == "/__bootstrap_outside_approved_roots__":
         return "Git target is outside approved code and knowledge roots."
-    cross_repo = target_root != root
+    # A linked worktree of the current repository (e.g. <repo>/.worktrees/<task>) is the same
+    # repository: it shares the object store, refs and secret-scanned index rules.
+    cross_repo = target_root != root and not same_repository(target_root, root)
     sibling_fetch = cross_repo and subcommand == "fetch"
     if sibling_fetch and arguments not in ([], ["origin"]):
         return "Sibling fetch permits only fetch or fetch origin; options/refspecs are blocked."
@@ -745,7 +761,7 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if commit_stages_working_tree(arguments):
             return ("git commit -a/--all/--include/--only or a pathspec commits content the secret "
                     "scan has not seen; stage with git add first, then run a plain git commit.")
-        return secret_scan(root)
+        return secret_scan(target_root)
     return None
 
 

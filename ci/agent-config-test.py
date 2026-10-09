@@ -20,7 +20,10 @@ codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
 assert codex["sandbox_mode"] == "workspace-write"
-assert codex["sandbox_workspace_write"]["network_access"] is False
+# Sandbox network is on only to reach localhost: all traffic goes through Codex's proxy,
+# which allows no domain and only local binding (tests that start a local server).
+assert codex["sandbox_workspace_write"]["network_access"] is True
+assert codex["features"]["network_proxy"] == {"enabled": True, "allow_local_binding": True, "domains": {}}
 assert codex["features"]["hooks"] is True
 codex_hooks = json.loads((ROOT / "home/dot_codex/hooks.json").read_text(encoding="utf-8"))
 assert set(codex_hooks["hooks"]) == {"PreToolUse", "PermissionRequest", "UserPromptSubmit"}
@@ -775,6 +778,25 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(app_event("git status", managed / "ab12" / "app-out"), roots) is not None, \
         "a worktree of a repository outside the approved roots stays blocked"
     assert policy.evaluate(app_event("ls", managed), roots) is not None, "the worktree base itself is not a root"
+    # A worktree inside the opened repository (<repo>/.worktrees/<task>) is the same repository:
+    # git status, add and commit there are allowed, and the commit's secret scan reads that worktree.
+    source = code_base / "app-src"
+    inner = source / ".worktrees" / "t1"
+    subprocess.run(["git", "worktree", "add", "-q", "-b", "t1", str(inner)], cwd=source, check=True)
+    (inner / "safe.txt").write_text("safe\n", encoding="utf-8")
+    def repo_event(command):
+        return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(source)}
+    for command in ("git -C .worktrees/t1 status", "git -C .worktrees/t1 add safe.txt"):
+        assert policy.evaluate(repo_event(command), roots) is None, command
+    subprocess.run(["git", "add", "safe.txt"], cwd=inner, check=True)
+    assert policy.evaluate(repo_event("git -C .worktrees/t1 commit -m safe"), roots) is None
+    token = "ghp_" + hashlib.sha256(b"worktree canary").hexdigest()[:36]
+    (inner / "leak.txt").write_text(token + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "leak.txt"], cwd=inner, check=True)
+    assert policy.evaluate(repo_event("git -C .worktrees/t1 commit -m leak"), roots) is not None, \
+        "the secret scan must read the worktree's staged changes"
+    assert policy.evaluate(repo_event(f"git -C {sibling} add x"), roots) is not None, \
+        "a genuinely different repository stays cross-repository"
     policy.MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
     for command in (
             # Guards that must still hold inside a chain, behind a pipe, or behind a wrapper.

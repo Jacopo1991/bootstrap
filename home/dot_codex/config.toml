@@ -3,7 +3,15 @@ approvals_reviewer = "user"
 sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]
-network_access = false
+# Network on inside the sandbox, but only through Codex's own proxy (below), which allows no
+# domains: tests can bind and reach 127.0.0.1, the internet stays unreachable.
+# git and gh network commands keep running outside the sandbox (policy hook).
+network_access = true
 
 [features]
 hooks = true
+
+[features.network_proxy]
+enabled = true
+allow_local_binding = true
+domains = {}
