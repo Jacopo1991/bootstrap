@@ -246,7 +246,8 @@ class Reminder(unittest.TestCase):
         text = specific["additionalContext"]
         self.assertLessEqual(len(text.splitlines()), 8)
         for needle in ("slim-workflow", "two failed attempts", "time box", "chat", "PR description",
-                       "git/gh network commands", "on their own", "verify-ui", "github-ci", ".github"):
+                       "git/gh network commands", "on their own", "git -C <path>", "verify-ui", "github-ci",
+                       ".github"):
             self.assertIn(needle, text)
 
     def test_prompt_text_is_never_echoed(self):

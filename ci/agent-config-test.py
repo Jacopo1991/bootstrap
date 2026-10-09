@@ -730,8 +730,19 @@ with tempfile.TemporaryDirectory() as temp:
                     "gh issue list | head", "git status && gh pr view | head",
                     "git push -u origin HEAD && gh pr create --fill"):
         assert policy.evaluate(event(command), roots) == policy.NETWORK_CHAIN_MESSAGE, command
-    assert policy.NETWORK_CHAIN_MESSAGE == ("Run git/gh network commands on their own; "
-                                            "only then do they run outside the sandbox.")
+    assert policy.NETWORK_CHAIN_MESSAGE.startswith("Run git/gh network commands on their own; "
+                                                   "only then do they run outside the sandbox.")
+    # Every git-chain rejection says what to do instead (MadPlanner T-30 lost a session to these).
+    for message in (policy.NETWORK_CHAIN_MESSAGE, policy.MIXED_CHAIN_MESSAGE, policy.STATE_CHAIN_MESSAGE):
+        assert "git -C <path>" in message, message
+    for command in ("cd sub && git status", "mkdir -p sub && git add sub", "npm test && git add ."):
+        assert policy.evaluate(event(command), roots) == policy.MIXED_CHAIN_MESSAGE, command
+    assert policy.evaluate(event("git add safe.txt && git commit -m fixture"), roots) == \
+        policy.STATE_CHAIN_MESSAGE
+    # ...and the recommended form is allowed.
+    for command in ("git -C . status", "git -C . add safe.txt", "git -C . log --oneline -1 | head -1",
+                    "git -C . add safe.txt && git -C . status"):
+        assert policy.evaluate(event(command), roots) is None, command
     for command in (
             # Guards that must still hold inside a chain, behind a pipe, or behind a wrapper.
             "echo x | tee .git/config", "git status && touch .git/config",

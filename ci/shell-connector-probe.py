@@ -52,7 +52,9 @@ try:
         if name not in tools:
             raise SystemExit(f"FAIL: tool {name} missing from {sorted(tools)}")
     send({"id": 3, "method": "tools/call", "params": {"name": "start_process", "arguments": {
-        "command": "echo ok; id -un", "timeout_ms": 10000}}})
+        # One write: the server may return after the first output chunk, so `echo ok; id -un`
+        # (two writes) failed about 2 runs in 5.
+        "command": "printf 'ok\\n%s\\n' \"$(id -un)\"", "timeout_ms": 10000}}})
     text = "\n".join(part.get("text", "") for part in response(3)["content"])
     lines = [line.strip() for line in text.splitlines()]
     if "ok" not in lines or user not in lines:

@@ -20,7 +20,8 @@ PROMPT_REMINDER = "\n".join((
     "- Follow the slim-workflow skill.",
     "- Stop after two failed attempts at the same problem or at the time box; report what you have.",
     "- Report in chat and in the PR description.",
-    "- Run git/gh network commands (fetch, pull, push, gh ...) on their own, never chained.",
+    "- Run git and gh on their own: `git -C <path> ...`, never `cd <path> && git`, and no builds, "
+    "tests or writes in the same call; git/gh network commands (fetch, pull, push, gh ...) never chained.",
     "- Verification: use the verify-ui skill.",
     "- Anything under .github or GitHub settings: read the github-ci skill first.",
 ))
