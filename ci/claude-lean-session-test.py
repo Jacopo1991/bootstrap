@@ -8,14 +8,19 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 SHARE = ROOT / "home/dot_local/share/bootstrap"
 settings = json.loads((ROOT / "home/dot_claude/settings.json").read_text(encoding="utf-8"))
+# Founder default for sessions that do not explicitly select a model (2026-10-09).
+assert settings["model"] == "haiku"
+# The deny rules are managed (root-owned drop-in, ci/managed-policy-test.py).
+deny = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text(
+    encoding="utf-8"))["permissions"]["deny"]
 
 # Rules with a colon after a wildcard (for example 'git push * :* *') or a trailing ':*'
 # after a space print a warning in every session; the policy hook enforces refspec
 # colons instead (ci/agent-config-test.py).
-for entry in settings["permissions"]["deny"]:
+for entry in deny:
     assert not re.search(r"\*\s+:|\s:\*|:\*\)$", entry), f"warning-prone deny rule: {entry}"
 for entry in ("Bash(git push * :* *)", "Bash(/usr/bin/git push * :* *)"):
-    assert entry not in settings["permissions"]["deny"], entry
+    assert entry not in deny, entry
 
 # claude.ai connectors (Gmail, Calendar, Drive, ...) stay out of coding sessions.
 assert settings["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"

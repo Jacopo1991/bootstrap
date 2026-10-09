@@ -1,0 +1,159 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(gh pr merge *)",
+      "Bash(powershell *)",
+      "Bash(powershell.exe *)",
+      "Bash(pwsh *)",
+      "Bash(pwsh.exe *)",
+      "Bash(cmd.exe *)",
+      "Bash(wsl.exe *)",
+      "Bash(wslconfig.exe *)",
+      "Bash(/mnt/c/Windows/**)",
+      "Bash(/mnt/c/Windows/System32/cmd.exe *)",
+      "Bash(/mnt/c/Windows/System32/wsl.exe *)",
+      "Bash(/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe *)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.docker/config.json)",
+      "Read(~/.netrc)",
+      "Read(~/.npmrc)",
+      "Read(~/.claude.json)",
+      "Read(~/.codex/auth.json)",
+      "Read(//etc/shadow)",
+      "Read(//etc/sudoers)",
+      "Read(//etc/sudoers.d/**)",
+      "Read(//mnt/c/**)",
+      "Read(//mnt/d/**)",
+      "Edit(//mnt/c/**)",
+      "Edit(//mnt/d/**)",
+      "Edit(//etc/**)",
+      "Bash(git push --force*)",
+      "Bash(git push * --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f*)",
+      "Bash(git push --delete*)",
+      "Bash(git push * --delete*)",
+      "Bash(git push -d*)",
+      "Bash(git push * -d*)",
+      "Bash(git push --mirror*)",
+      "Bash(git push * --mirror*)",
+      "Bash(git push --prune*)",
+      "Bash(git push * --prune*)",
+      "Bash(git push * +*)",
+      "Bash(/usr/bin/git push --force*)",
+      "Bash(/usr/bin/git push * --force*)",
+      "Bash(/usr/bin/git push -f*)",
+      "Bash(/usr/bin/git push * -f*)",
+      "Bash(/usr/bin/git push --delete*)",
+      "Bash(/usr/bin/git push * --delete*)",
+      "Bash(/usr/bin/git push -d*)",
+      "Bash(/usr/bin/git push * -d*)",
+      "Bash(/usr/bin/git push --mirror*)",
+      "Bash(/usr/bin/git push * --mirror*)",
+      "Bash(/usr/bin/git push --prune*)",
+      "Bash(/usr/bin/git push * --prune*)",
+      "Bash(/usr/bin/git push * +*)",
+      "Bash(gh repo delete *)",
+      "Bash(gh repo edit *)",
+      "Bash(gh release delete *)",
+      "Bash(gh secret *)",
+      "Bash(gh ruleset *)",
+      "Bash(gh api -X DELETE*)",
+      "Bash(gh api * -X DELETE*)",
+      "Bash(gh api -XDELETE*)",
+      "Bash(gh api * -XDELETE*)",
+      "Bash(gh api -X=DELETE*)",
+      "Bash(gh api * -X=DELETE*)",
+      "Bash(gh api --method DELETE*)",
+      "Bash(gh api * --method DELETE*)",
+      "Bash(gh api --method=DELETE*)",
+      "Bash(gh api * --method=DELETE*)",
+      "Bash(/usr/bin/gh repo delete *)",
+      "Bash(/usr/bin/gh repo edit *)",
+      "Bash(/usr/bin/gh release delete *)",
+      "Bash(/usr/bin/gh secret *)",
+      "Bash(/usr/bin/gh ruleset *)",
+      "Bash(/usr/bin/gh api -X DELETE*)",
+      "Bash(/usr/bin/gh api * -X DELETE*)",
+      "Bash(/usr/bin/gh api -XDELETE*)",
+      "Bash(/usr/bin/gh api * -XDELETE*)",
+      "Bash(/usr/bin/gh api -X=DELETE*)",
+      "Bash(/usr/bin/gh api * -X=DELETE*)",
+      "Bash(/usr/bin/gh api --method DELETE*)",
+      "Bash(/usr/bin/gh api * --method DELETE*)",
+      "Bash(/usr/bin/gh api --method=DELETE*)",
+      "Bash(/usr/bin/gh api * --method=DELETE*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|PowerShell|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env",
+            "args": [
+              "-u",
+              "LD_PRELOAD",
+              "-u",
+              "LD_LIBRARY_PATH",
+              "PATH=/usr/local/bin:/usr/bin:/bin",
+              "/usr/bin/python3",
+              "-I",
+              "/usr/local/lib/agent-policy/pre_tool_use.py"
+            ],
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env",
+            "args": [
+              "-u",
+              "LD_PRELOAD",
+              "-u",
+              "LD_LIBRARY_PATH",
+              "PATH=/usr/local/bin:/usr/bin:/bin",
+              "/usr/bin/python3",
+              "-I",
+              "/usr/local/lib/agent-policy/context_reminder.py"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/env",
+            "args": [
+              "-u",
+              "LD_PRELOAD",
+              "-u",
+              "LD_LIBRARY_PATH",
+              "PATH=/usr/local/bin:/usr/bin:/bin",
+              "/usr/bin/python3",
+              "-I",
+              "/usr/local/lib/agent-policy/context_reminder.py"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

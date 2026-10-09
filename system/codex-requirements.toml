@@ -1,0 +1,61 @@
+# Root-owned Codex requirements: install.sh copies this file to /etc/codex/requirements.toml.
+# Codex enforces requirements above user, project and session config; the agent account can
+# neither edit nor override them. Only the guardrails live here: the policy hooks and the
+# forbidden/prompt command rules. Approval policy, sandbox mode and the routine Git/gh allow
+# rules stay preferences in ~/.codex (no allowed_* lists, no allow_managed_hooks_only).
+
+# Hooks run even if a user config turns the hooks feature off.
+[features]
+hooks = true
+
+# Managed hooks are trusted by policy and cannot be disabled from /hooks. The scripts are the
+# root-owned published revision; each runs with a fixed PATH and an isolated root interpreter.
+[hooks]
+managed_dir = "/usr/local/lib/agent-policy"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
+timeout = 30
+
+[[hooks.PreToolUse]]
+matcher = "^(apply_patch|Edit|Write)$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
+timeout = 30
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/context_reminder.py"
+timeout = 10
+
+[[hooks.PermissionRequest]]
+matcher = "^Bash$"
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
+timeout = 30
+
+# Requirements rules merge with ~/.codex/rules/*.rules and the most restrictive decision wins,
+# so the user-level allow rules for routine Git/gh cannot lift these. Shared PreToolUse enforces
+# workspace, secrets and forbidden operations at all argv positions; literal prefixes cannot
+# cover global selectors or flags after arbitrary operands.
+[rules]
+prefix_rules = [
+  { pattern = [{ any_of = ["git", "/usr/bin/git"] }, { any_of = ["reset", "rebase", "cherry-pick", "revert"] }], decision = "prompt", justification = "Approve this destructive local history/index operation." },
+  { pattern = [{ any_of = ["git", "/usr/bin/git"] }, { token = "stash" }, { any_of = ["pop", "drop", "clear"] }], decision = "prompt", justification = "Approve this destructive stash operation." },
+  { pattern = [{ any_of = ["git", "/usr/bin/git"] }, { token = "push" }, { any_of = ["--force", "--force-with-lease", "--force-if-includes", "-f", "--delete", "-d", "--mirror", "--prune"] }], decision = "forbidden", justification = "Force pushes and remote branch deletion are forbidden; use an ordinary task-branch push." },
+  { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { token = "pr" }, { token = "merge" }], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane." },
+  { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { token = "repo" }, { any_of = ["delete", "edit"] }], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane." },
+  { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { token = "release" }, { token = "delete" }], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane." },
+  { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { any_of = ["secret", "ruleset"] }], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane." },
+  { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { token = "api" }, { any_of = ["-X", "--method"] }, { token = "DELETE" }], decision = "forbidden", justification = "GitHub API DELETE is forbidden; use read-only requests." },
+]

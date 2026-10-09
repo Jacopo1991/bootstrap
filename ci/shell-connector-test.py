@@ -291,9 +291,12 @@ def agent_session_references(path):
 
 AGENT_SESSION_CONFIGS = sorted(
     [path for base in ("home/dot_claude", "home/dot_codex", "home/dot_config")
-     for path in (ROOT / base).rglob("*") if path.is_file()]
+     # remove_ entries are empty: chezmoi deletes their targets.
+     for path in (ROOT / base).rglob("*") if path.is_file() and not path.name.startswith("remove_")]
     + list((ROOT / "home/dot_local/share/bootstrap").glob("executable_*-setup.sh"))
-    + [ROOT / "system/claude-managed.sh", ROOT / "system/claude-managed-mods.json", ROOT / "install.sh"])
+    + [ROOT / "system/claude-managed.sh", ROOT / "system/claude-managed-mods.json", ROOT / "install.sh",
+       ROOT / "system/claude-managed-guardrails.json", ROOT / "system/codex-managed.sh",
+       ROOT / "system/codex-requirements.toml"])
 
 
 class AgentSessionTests(unittest.TestCase):

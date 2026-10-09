@@ -1,19 +1,36 @@
 #!/usr/bin/env python3
-"""Check allow/prompt/forbidden with installed Codex; execute no Git/gh command."""
+"""Check allow/prompt/forbidden with installed Codex; execute no Git/gh command.
+
+The user's allow rules come from ~/.codex/rules/default.rules; the forbidden/prompt rules from
+the root-owned /etc/codex/requirements.toml. `codex execpolicy check` reads only .rules files,
+so the requirements' [rules] are rendered to the equivalent prefix_rule() calls; Codex merges
+both the same way (every matching rule counts, the most restrictive decision wins).
+"""
 import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
+import tomllib
 
 agent_home = Path.home()
 os.environ["PATH"] = f"{agent_home}/.local/bin:{agent_home}/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
 codex = agent_home / ".local/bin/codex"
 assert codex.is_file(), "pinned Codex installation missing"
 rules = agent_home / ".codex/rules/default.rules"
+requirements = tomllib.loads(Path("/etc/codex/requirements.toml").read_text(encoding="utf-8"))
+scratch = tempfile.TemporaryDirectory()  # removed when the interpreter exits
+rendered = Path(scratch.name) / "requirements.rules"
+rendered.write_text("".join(
+    "prefix_rule(pattern = {}, decision = {}, justification = {})\n".format(
+        json.dumps([token.get("token", token.get("any_of")) for token in rule["pattern"]]),
+        json.dumps(rule["decision"]), json.dumps(rule["justification"]))
+    for rule in requirements["rules"]["prefix_rules"]), encoding="utf-8")
 
 def check(command, expected):
     result = subprocess.run(
-        [str(codex), "execpolicy", "check", "--rules", str(rules), "--", *command],
+        [str(codex), "execpolicy", "check", "--rules", str(rules), "--rules", str(rendered),
+         "--", *command],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, check=True, timeout=20,
     )

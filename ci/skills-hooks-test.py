@@ -13,13 +13,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 UNITS = ROOT / "home/dot_config/systemd/user"
 UPDATE = ROOT / "home/dot_local/bin/executable_gh-skill-update"
 SETUP = ROOT / "home/dot_local/share/bootstrap/executable_skills-setup.sh"
-HOOK = ROOT / "home/dot_local/share/bootstrap/agent-policy/context_reminder.py"
+HOOK = ROOT / "system/agent-policy/context_reminder.py"
 
 
 def load(path: Path, name: str):
@@ -291,16 +292,24 @@ class Reminder(unittest.TestCase):
             self.assertEqual(result.stdout.strip(), "")
 
     def test_wiring(self):
-        command = "python3 ~/.local/share/bootstrap/agent-policy/context_reminder.py"
-        claude = json.loads((ROOT / "home/dot_claude/settings.json").read_text())["hooks"]
-        prompt = [h["command"] for entry in claude["UserPromptSubmit"] for h in entry["hooks"]]
-        self.assertEqual(prompt, [command])
-        pre = [(e["matcher"], h["command"]) for e in claude["PreToolUse"] for h in e["hooks"]]
-        self.assertIn(("Bash|Write|Edit|MultiEdit", command), pre)
-        codex = json.loads((ROOT / "home/dot_codex/hooks.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for e in codex["UserPromptSubmit"] for h in e["hooks"]], [command])
+        # Both CLIs run the hooks from root-owned managed settings (ci/managed-policy-test.py).
+        script = "/usr/local/lib/agent-policy/context_reminder.py"
+        claude = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text())["hooks"]
+
+        def line(handler):
+            return " ".join([handler["command"], *handler.get("args", [])])
+
+        prompt = [line(h) for entry in claude["UserPromptSubmit"] for h in entry["hooks"]]
+        self.assertEqual(len(prompt), 1)
+        self.assertTrue(prompt[0].endswith(" -I " + script), prompt)
+        pre = [(e["matcher"], line(h)) for e in claude["PreToolUse"] for h in e["hooks"]]
+        self.assertIn(("Bash|Write|Edit|MultiEdit", prompt[0]), pre)
+        codex = tomllib.loads((ROOT / "system/codex-requirements.toml").read_text())["hooks"]
+        codex_prompt = [h["command"] for e in codex["UserPromptSubmit"] for h in e["hooks"]]
+        self.assertEqual(codex_prompt, [prompt[0]])
+        self.assertFalse((ROOT / "home/dot_codex/hooks.json").exists())
         for events in (claude, codex):  # the policy hook is still wired for every tool event it was
-            self.assertTrue(any("pre_tool_use.py" in h["command"] for e in events["PreToolUse"] for h in e["hooks"]))
+            self.assertTrue(any("pre_tool_use.py" in line(h) for e in events["PreToolUse"] for h in e["hooks"]))
 
 
 class Windows(unittest.TestCase):

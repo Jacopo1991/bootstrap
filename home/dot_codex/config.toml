@@ -8,9 +8,7 @@ sandbox_mode = "workspace-write"
 # git and gh network commands keep running outside the sandbox (policy hook).
 network_access = true
 
-[features]
-hooks = true
-
+# The hooks feature and the policy hooks are pinned in /etc/codex/requirements.toml.
 [features.network_proxy]
 enabled = true
 allow_local_binding = true

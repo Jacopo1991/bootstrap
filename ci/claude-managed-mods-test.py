@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-HOOK = ROOT / "home/dot_local/share/bootstrap/agent-policy/pre_tool_use.py"
+HOOK = ROOT / "system/agent-policy/pre_tool_use.py"
 DROPIN = json.loads((ROOT / "system/claude-managed-mods.json").read_text(encoding="utf-8"))
 
 # Exactly the documented guard option; no wider switch (disableAllHooks would
@@ -31,7 +31,12 @@ assert all(value is False for value in enabled.values()), enabled
 
 installer = (ROOT / "system/claude-managed.sh").read_text(encoding="utf-8")
 assert "/etc/claude-code/managed-settings.d" in installer
-assert "-o root -g root -m 0644" in installer
+assert 'source "$(dirname -- "$0")/common.sh"' in installer
+assert ('atomic_policy_install "$BOOTSTRAP_ROOT/system/claude-managed-mods.json" '
+        + "\\\n" + '  "$dropins/50-managed-mods-only.json"') in installer
+common = (ROOT / "system/common.sh").read_text(encoding="utf-8")
+assert 'mktemp "$(dirname -- "$target")/.agent-policy.XXXXXX"' in common
+assert 'install -o root -g root -m 0644 "$source" "$temp" && mv -f -- "$temp" "$target"' in common
 assert "claude-managed.sh" in (ROOT / "install.sh").read_text(encoding="utf-8")
 
 

@@ -10,7 +10,6 @@ sudo -v
 bash_cmd=/bin/bash
 sudo "$bash_cmd" "$ROOT/system/base.sh"
 sudo "$bash_cmd" "$ROOT/system/users.sh" "$(id -un)"
-sudo "$bash_cmd" "$ROOT/system/claude-managed.sh"
 sudo "$bash_cmd" "$ROOT/system/inventory-mirror.sh"
 # shellcheck source=system/common.sh
 source "$ROOT/system/common.sh"
@@ -26,6 +25,12 @@ tar -xJf "$tmp/mise.tar.xz" -C "$tmp" mise/bin/mise
 if ! cmp -s "$tmp/mise/bin/mise" /usr/local/bin/mise; then
   sudo install -m 0755 "$tmp/mise/bin/mise" /usr/local/bin/mise
 fi
+# The managed policy hook's secret scanner: root-owned, found first on the hook's fixed PATH.
+download_verified "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
+tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+if ! cmp -s "$tmp/gitleaks" /usr/local/bin/gitleaks; then
+  sudo install -m 0755 "$tmp/gitleaks" /usr/local/bin/gitleaks
+fi
 
 # Publish only committed public files, never the admin's .git config or home.
 revision=$(git -C "$ROOT" rev-parse HEAD)
@@ -37,7 +42,25 @@ git -C "$ROOT" archive HEAD | sudo tar -xf - -C "$public_source"
 sudo git -C "$public_source" init --quiet --initial-branch=main --template=
 sudo chown -R root:root "$public_source"
 sudo chmod -R go-w "$public_source"
-sudo ln -sfn "$public_source" /opt/machine-bootstrap/current
+# Keep policy scripts available even when current is rolled back to an older revision.
+policy_dir=/usr/local/lib/agent-policy
+[[ ! -L $policy_dir ]] || { echo "Refusing symlinked $policy_dir." >&2; exit 1; }
+sudo install -d -o root -g root -m 0755 "$policy_dir"
+for script in pre_tool_use.py context_reminder.py; do
+  policy_temp=$(sudo mktemp "$policy_dir/.agent-policy.XXXXXX")
+  sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"
+  sudo mv -f -- "$policy_temp" "$policy_dir/$script"
+done
+current_temp=$(sudo mktemp -d /opt/machine-bootstrap/.current.XXXXXX)
+sudo ln -s "$public_source" "$current_temp/current"
+sudo mv -T -- "$current_temp/current" /opt/machine-bootstrap/current
+sudo rmdir "$current_temp"
+
+# Agent guardrails (deny rules, forbidden/prompt command rules, policy hooks) go into the
+# root-owned managed settings of Claude Code and Codex, written from the published revision
+# so the hooks run root-owned scripts. Preferences stay in the agent's own config.
+sudo "$bash_cmd" /opt/machine-bootstrap/current/system/claude-managed.sh
+sudo "$bash_cmd" /opt/machine-bootstrap/current/system/codex-managed.sh
 
 # chezmoi's existing-source init applies .chezmoiroot and prompts once for the
 # single Git identity. The source remains public and owned by root.
