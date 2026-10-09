@@ -1,0 +1,10 @@
+[Unit]
+Description=Tidy worktrees and branches once a day
+
+[Timer]
+OnCalendar=*-*-* 03:15
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

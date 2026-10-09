@@ -1,0 +1,14 @@
+[Unit]
+Description=Remove finished worktrees and merged branches; report stray folders (no agent runs)
+
+[Service]
+Type=oneshot
+# Removes only clean, unlocked, merged worktrees and merged local branches older than a
+# day; everything else is reported in ~/.local/state/workspace-tidy/report.txt.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/workspace-tidy --apply
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+TimeoutStartSec=10min

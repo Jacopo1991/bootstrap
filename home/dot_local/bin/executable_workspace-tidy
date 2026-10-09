@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""workspace-tidy: keep every project to its two repositories (code and cortex-kb).
+
+Removes only what is provably finished and nothing else:
+- hand-made worktrees inside a repository (<repo>/.worktrees/<name>, <repo>/.claude/worktrees/<name>)
+  that are clean, unlocked, not in use, idle for a day, hold no ignored files beyond rebuildable
+  caches, and whose every commit (HEAD and its reflog) is already in the default branch;
+- local branches whose commits, including their reflog, are all in the default branch.
+Everything else is reported for the PM, never changed: worktrees elsewhere, ~/project-data,
+plain folders, second checkouts. The Codex app's worktrees ($CODEX_HOME/worktrees) are left to
+the app, which snapshots and cleans them itself.
+
+Usage: workspace-tidy            report only
+       workspace-tidy --apply    also remove finished worktrees and merged branches
+The report is also written to ~/.local/state/workspace-tidy/report.txt.
+"""
+import argparse
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/agent"))
+WORKSPACE = HOME / "dev_workspace"
+CORTEX = HOME / "cortex"
+PROJECT_DATA = HOME / "project-data"
+CODEX_WORKTREES = Path(os.environ.get("CODEX_HOME") or HOME / ".codex") / "worktrees"
+STATE = HOME / ".local/state/workspace-tidy"
+DECLARATION = ".project-data"
+GRACE = 24 * 3600          # never touch anything created, moved or changed in the last day
+STALE_DAYS = 7             # report open worktrees idle longer than this
+DEFAULT_REFS = ("refs/heads/main", "refs/heads/master",
+                "refs/remotes/origin/main", "refs/remotes/origin/master")
+TIDY_DIRS = (".worktrees", ".claude/worktrees")      # the only places removal may happen
+# Ignored content that is safe to lose because a build or install recreates it.
+REBUILDABLE = {"node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
+               ".ruff_cache", ".cache", "dist", "build", ".next", ".astro", ".turbo", "coverage",
+               ".tox", ".parcel-cache", "target"}
+IN_PROGRESS = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+               "BISECT_LOG")
+
+
+def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                          timeout=120, stdin=subprocess.DEVNULL)
+
+
+def repos() -> list[Path]:
+    """Main checkouts directly under ~/dev_workspace and ~/cortex."""
+    found = []
+    for root in (WORKSPACE, CORTEX):
+        if root.is_dir():
+            found += [entry for entry in sorted(root.iterdir()) if (entry / ".git").is_dir()]
+    return found
+
+
+def inside(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def default_refs(repo: Path) -> list[str]:
+    return [ref for ref in DEFAULT_REFS
+            if git(repo, "show-ref", "--verify", "--quiet", ref).returncode == 0]
+
+
+def all_contained(repo: Path, commits: set[str], refs: list[str]) -> bool:
+    """True when every commit is reachable from a default ref (rev-list prints nothing)."""
+    commits = {commit for commit in commits if commit}
+    if not commits:
+        return True
+    result = git(repo, "rev-list", "--max-count=1", *sorted(commits), "--not", *refs)
+    return result.returncode == 0 and not result.stdout.strip()
+
+
+def reflog_commits(where: Path, ref: str) -> set[str]:
+    return set(git(where, "reflog", "show", "--format=%H", ref).stdout.split())
+
+
+def worktree_list(repo: Path) -> list[dict]:
+    """All worktrees of a repository, main checkout first (git worktree list --porcelain)."""
+    items, current = [], {}
+    for line in git(repo, "worktree", "list", "--porcelain").stdout.splitlines() + [""]:
+        if not line:
+            if current:
+                items.append(current)
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value or True
+    return items
+
+
+def last_activity(repo: Path, path: Path, gitdir: Path, head: str) -> float:
+    """Newest of: the worktree's .git file, its HEAD log (checkouts, commits) and HEAD commit.
+    Not the index: plain `git status` refreshes it."""
+    times = [candidate.stat().st_mtime for candidate in (path / ".git", gitdir / "logs/HEAD")
+             if candidate.exists()]
+    stamp = git(repo, "log", "-1", "--format=%ct", head).stdout.strip() if head else ""
+    if stamp.isdigit():
+        times.append(float(stamp))
+    return max(times) if times else time.time()
+
+
+def ref_updated(repo: Path, ref: str) -> float:
+    """When the branch last moved (its newest reflog entry), else its tip commit time."""
+    entry = git(repo, "reflog", "show", "-1", "--date=unix", "--format=%gd", ref).stdout.strip()
+    if "@{" in entry and entry.endswith("}") and entry[entry.index("@{") + 2:-1].isdigit():
+        return float(entry[entry.index("@{") + 2:-1])
+    stamp = git(repo, "log", "-1", "--format=%ct", ref).stdout.strip()
+    return float(stamp) if stamp.isdigit() else time.time()
+
+
+def paths_in_use() -> list[Path]:
+    """Working directories of running processes (an agent or editor still inside a worktree)."""
+    found = []
+    for proc in Path("/proc").iterdir():
+        if proc.name.isdigit():
+            try:
+                found.append(Path(os.readlink(proc / "cwd")))
+            except OSError:
+                continue
+    return found
+
+
+def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
+    """Why this worktree must not be removed, or None when removing it loses nothing."""
+    if any(inside(cwd, path) for cwd in in_use):
+        return "in use by a running process"
+    if any((gitdir / name).exists() for name in IN_PROGRESS):
+        return "merge, rebase, cherry-pick, revert or bisect in progress"
+    status = git(path, "--no-optional-locks", "-c", "status.showUntrackedFiles=all", "status",
+                 "--porcelain", "-z", "--untracked-files=all", "--ignore-submodules=none",
+                 "--ignored=matching")
+    if status.returncode != 0:
+        return "status unreadable"
+    for item in status.stdout.split("\0"):
+        if not item:
+            continue
+        if not item.startswith("!! "):
+            return "uncommitted or untracked changes"
+        parts = Path(item[3:].rstrip("/")).parts
+        if not any(part in REBUILDABLE for part in parts):
+            return f"ignored file that is not a rebuildable cache: {item[3:]}"
+    flags = git(path, "ls-files", "-v").stdout.splitlines()
+    sparse = git(path, "config", "--bool", "core.sparseCheckout").stdout.strip() == "true"
+    if any(line[:1].islower() or (line[:1] == "S" and not sparse) for line in flags):
+        return "files marked assume-unchanged or skip-worktree"
+    return None
+
+
+def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: list[str],
+              done: list[str]) -> None:
+    refs = default_refs(repo)
+    entries = worktree_list(repo)
+    checked_out = {entry["branch"] for entry in entries if isinstance(entry.get("branch"), str)}
+    for entry in entries[1:]:               # the first entry is the main checkout
+        path = Path(entry["worktree"])
+        branch = entry.get("branch") if isinstance(entry.get("branch"), str) else None
+        label = branch[len("refs/heads/"):] if branch else "detached"
+        if inside(path, CODEX_WORKTREES) or "locked" in entry:
+            continue                         # the Codex app's own, or a running Claude Code session
+        if "prunable" in entry:
+            report.append(f"{repo.name}: worktree folder missing: {path} ({label}); if it was moved, "
+                          f"run `git -C {repo} worktree repair <new path>`; if deleted, check, then prune")
+            continue
+        if not any(inside(path, repo / place) for place in TIDY_DIRS):
+            report.append(f"{repo.name}: worktree outside the repository: {path} ({label}); when idle: "
+                          f"git -C {repo} worktree move {path} {repo}/.worktrees/{path.name}")
+            continue
+        gitdir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or "/nonexistent")
+        head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
+        age = now - last_activity(repo, path, gitdir, head)
+        merged = bool(refs) and all_contained(repo, {head} | reflog_commits(path, "HEAD"), refs)
+        if not merged or age <= GRACE:
+            if age > STALE_DAYS * 86400:
+                state = "unmerged work" if not merged else "finished"
+                report.append(f"{repo.name}: open worktree {path} ({label}, {state}, idle {int(age // 86400)} days)")
+            continue
+        blocker = removal_blocker(path, gitdir, in_use)
+        if blocker:
+            report.append(f"{repo.name}: finished worktree kept: {path} ({label}): {blocker}")
+        elif not apply:
+            report.append(f"{repo.name}: finished worktree {path} ({label}) would be removed")
+        else:
+            result = git(repo, "worktree", "remove", str(path))
+            if result.returncode == 0:
+                done.append(f"{repo.name}: removed finished worktree {path} ({label})")
+                checked_out.discard(branch)
+            else:
+                report.append(f"{repo.name}: could not remove {path}: {result.stderr.strip()}")
+    if not refs:
+        return
+    for ref in git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/").stdout.split():
+        short = ref[len("refs/heads/"):]
+        if ref in checked_out or short in ("main", "master") or now - ref_updated(repo, ref) <= GRACE:
+            continue
+        tip = git(repo, "rev-parse", ref).stdout.strip()
+        if not all_contained(repo, {tip} | reflog_commits(repo, ref), refs):
+            continue
+        if not apply:
+            report.append(f"{repo.name}: merged branch {short} would be deleted")
+            continue
+        # Safe: the tip and every commit in the branch's reflog are reachable from a default ref.
+        result = git(repo, "branch", "-D", short)
+        if result.returncode == 0:
+            done.append(f"{repo.name}: deleted merged branch {short}")
+        else:
+            report.append(f"{repo.name}: could not delete branch {short}: {result.stderr.strip()}")
+
+
+def check_folders(report: list[str]) -> None:
+    """Only repositories belong in ~/dev_workspace and ~/cortex; a second clone of a local repo is a stray copy."""
+    for root in (WORKSPACE, CORTEX):
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if (entry / ".git").is_file():
+                continue                     # a worktree; reported with its repository
+            if not (entry / ".git").is_dir():
+                report.append(f"{root.name}/{entry.name}: not a project repository; scratch belongs in "
+                              f"/tmp/claude-1001/scratch, project files in the project's repo")
+                continue
+            origin = git(entry, "remote", "get-url", "origin").stdout.strip()
+            if origin and "://" not in origin and ":" not in origin and Path(origin).is_dir():
+                report.append(f"{root.name}/{entry.name}: second checkout of {origin}; use a worktree "
+                              f"inside that repository instead")
+
+
+def check_project_data(report: list[str]) -> None:
+    """Every ~/project-data path must be declared, with a reason, in some repo's .project-data file."""
+    if not PROJECT_DATA.is_dir():
+        return
+    declared: set[str] = set()
+    for repo in repos():
+        file = repo / DECLARATION
+        if file.is_file():
+            for line in file.read_text().splitlines():
+                path = line.split("#", 1)[0].strip().strip("/")
+                if path:
+                    declared.add(path)
+    for top in sorted(PROJECT_DATA.iterdir()):
+        if top.name in declared:
+            continue
+        children = sorted(top.iterdir()) if top.is_dir() else []
+        missing = [child.name for child in children if f"{top.name}/{child.name}" not in declared]
+        if not children or len(missing) == len(children):
+            report.append(f"project-data/{top.name}: not declared by any project")
+        elif missing:
+            report.append(f"project-data/{top.name}: undeclared {', '.join(missing)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--apply", action="store_true",
+                        help="remove finished worktrees and merged branches (otherwise report only)")
+    args = parser.parse_args()
+    now, report, done = time.time(), [], []
+    in_use = paths_in_use()
+    for repo in repos():
+        tidy_repo(repo, args.apply, now, in_use, report, done)
+    check_folders(report)
+    check_project_data(report)
+    lines = [f"workspace-tidy {time.strftime('%Y-%m-%d %H:%M')} ({'apply' if args.apply else 'report'})"]
+    lines += [f"done: {item}" for item in done] + [f"check: {item}" for item in report]
+    if not done and not report:
+        lines.append("all tidy")
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        (STATE / "report.txt").write_text(text)
+    except OSError as error:
+        print(f"workspace-tidy: cannot write the report: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
