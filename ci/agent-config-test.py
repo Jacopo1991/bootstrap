@@ -164,6 +164,10 @@ with tempfile.TemporaryDirectory() as temp:
         for subcommand in ("add", "commit", "push", "pull", "merge", "checkout", "switch", "reset", "config"):
             command = f"git -C {target} {subcommand}"
             assert policy.evaluate(event(command), roots) is not None, command
+    for sub in ("start", "merge", "close"):
+        reason = policy.evaluate(event(f"task {sub} proj T-5"), roots)
+        assert reason and "for the PM" in reason, (sub, reason)
+    assert policy.evaluate(event("task check"), roots) is None
     # Fetch updates refs/objects/FETCH_HEAD, never the working tree. Its narrow
     # cross-repository exception does not require read-only pager/lock selectors.
     for executable in ("git", "/usr/bin/git"):

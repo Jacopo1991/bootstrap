@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""task: the PM's routine steps for one task, so nobody writes gate/merge/close scripts by hand.
+
+  task start <repo> <id>             worktree <repo>/.worktrees/<name> on a new branch from the
+                                     up-to-date default branch; prints the dispatch prompt
+  task check [<repo>] [<id>]         in that worktree: clean, up to date, then `just check`
+                                     (log in .work/check.log); exit 0 only when it passes
+  task merge <repo> <id> [--keep]    brings the default branch in, runs the check, merges with a
+                                     merge commit (through the open PR if there is one), updates
+                                     the main checkout, removes the worktree and merged branch
+  task close <repo> <id> -m <text>   marks the Backlog.md task Done, ticks its criteria, sets the
+                                     final summary and commits it in cortex-kb-<repo>
+
+<repo> is a folder name in ~/dev_workspace or a path; without it, the repository of the current
+folder. <id> is a Backlog.md task (T-32, t32 or 32) or a plain name for work without a task.
+Lanes run only `task check`; start, merge and close are for the PM.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/agent"))
+WORKSPACE = HOME / "dev_workspace"
+CORTEX = HOME / "cortex"
+CHECK_TIMEOUT = int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
+SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|error)|"
+                     r"Tests?:? .*\b(passed|failed)|\d+ (passed|failed)|.*\b(PASS|FAIL)\b)")
+
+
+class Stop(Exception):
+    """A clear, expected reason to stop; printed without a traceback."""
+
+
+def git(cwd, *args, check=True):
+    result = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
+    if check and result.returncode:
+        raise Stop(f"git {' '.join(args)} failed: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def ok(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True).returncode == 0
+
+
+def is_ancestor(cwd, older, newer):
+    return ok(cwd, "merge-base", "--is-ancestor", older, newer)
+
+
+# --- where things are --------------------------------------------------------------------------
+
+def main_repo(path: Path) -> Path:
+    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(common).parent
+
+
+def resolve_repo(name):
+    if name is None:
+        try:
+            return main_repo(Path.cwd())
+        except Stop:
+            raise Stop("Not inside a repository; name it: task <command> <repo> <id>.")
+    path = Path(name).expanduser()
+    if not path.is_absolute():
+        path = WORKSPACE / name
+    if not (path / ".git").exists():
+        raise Stop(f"{path} is not a repository.")
+    return main_repo(path)
+
+
+def has_origin(repo):
+    return ok(repo, "remote", "get-url", "origin")
+
+
+def default_branch(repo):
+    head = git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
+    if head.startswith("origin/"):
+        return head[len("origin/"):]
+    for name in ("main", "master"):
+        if ok(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"):
+            return name
+    raise Stop(f"{repo}: no main or master branch.")
+
+
+def fetch(repo):
+    if has_origin(repo):
+        result = subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin"],
+                                capture_output=True, text=True)
+        if result.returncode:
+            print(f"warning: git fetch failed, using local refs: {result.stderr.strip()}")
+
+
+def base_ref(repo, branch):
+    """The newest of <branch> and origin/<branch>; refuse if they have diverged."""
+    local = f"refs/heads/{branch}"
+    remote = f"refs/remotes/origin/{branch}"
+    have_local = ok(repo, "rev-parse", "--verify", "--quiet", local)
+    have_remote = ok(repo, "rev-parse", "--verify", "--quiet", remote)
+    if have_local and have_remote:
+        if is_ancestor(repo, local, remote):
+            return f"origin/{branch}"
+        if is_ancestor(repo, remote, local):
+            return branch
+        raise Stop(f"{branch} and origin/{branch} have diverged; sort that out first.")
+    if have_remote:
+        return f"origin/{branch}"
+    return branch
+
+
+class Task:
+    """A Backlog.md task (T-32) or a plain name."""
+
+    def __init__(self, repo: Path, ident: str):
+        match = re.fullmatch(r"(?i)t?-?(\d+)", ident)
+        self.repo = repo
+        self.number = int(match.group(1)) if match else None
+        self.kb = CORTEX / f"cortex-kb-{repo.name}"
+        self.file = None
+        self.title = ""
+        if self.number is not None:
+            self.name = f"t{self.number}"
+            self.id = f"T-{self.number}"
+            tasks = self.kb / "backlog" / "tasks"
+            found = sorted(tasks.glob(f"[tT]-{self.number} - *.md")) if tasks.is_dir() else []
+            if found:
+                self.file = found[0]
+                front = re.search(r"(?m)^title:\s*['\"]?(.*?)['\"]?\s*$", self.file.read_text())
+                self.title = front.group(1) if front else ""
+        else:
+            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,40}", ident):
+                raise Stop("A task name is lowercase letters, digits, '.', '_' or '-'.")
+            self.name = self.id = ident
+        self.path = repo / ".worktrees" / self.name
+
+    def branch_name(self):
+        if self.number is None:
+            return self.name
+        words = re.findall(r"[a-z0-9]+", self.title.lower())[:4]
+        return "-".join([self.name, *words])[:40].rstrip("-")
+
+    def existing_branch(self):
+        if self.path.exists():
+            return git(self.path, "branch", "--show-current")
+        pattern = f"{self.name}-*" if self.number is not None else self.name
+        names = git(self.repo, "for-each-ref", "--format=%(refname:short)",
+                    f"refs/heads/{pattern}", f"refs/heads/{self.name}").split()
+        return names[0] if names else None
+
+
+# --- commands ----------------------------------------------------------------------------------
+
+def ensure_ignored(repo, folder):
+    """Keep tool folders (.worktrees/, .work/) out of `git status` without touching tracked files."""
+    if not ok(repo, "check-ignore", "-q", f"{folder}/x"):
+        exclude = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info/exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a") as handle:
+            handle.write(f"{folder}/\n")
+
+
+def exclude(repo, pattern):
+    """Add a pattern to the repository's local exclude file (never a tracked file)."""
+    path = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info/exclude"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text().splitlines() if path.exists() else []
+    if pattern not in lines:
+        with path.open("a") as handle:
+            handle.write(pattern + "\n")
+
+
+def editable_install(venv: Path) -> bool:
+    site = list(venv.glob("lib/python*/site-packages"))
+    return any(p.name.startswith(("__editable__", "_editable_impl_")) for d in site for p in d.iterdir())
+
+
+def prepare_environment(repo: Path, path: Path):
+    """Give the worktree the main checkout's environment so `just check` runs there as well.
+
+    node_modules and a plain .venv are shared through a symlink: tests import the worktree's own
+    code first. A .venv with the project installed in editable mode would test the main checkout's
+    code, so the worktree gets its own venv with the same packages (uv, from its cache)."""
+    for name in ("node_modules", ".venv"):
+        source, target = repo / name, path / name
+        if not source.is_dir() or target.exists() or target.is_symlink():
+            continue
+        exclude(repo, name)
+        if name == ".venv" and editable_install(source):
+            python = source / "bin/python"
+            pins = path / ".work/requirements.txt"
+            pins.parent.mkdir(exist_ok=True)
+            exclude(repo, ".work/")
+            steps = [["uv", "pip", "freeze", "--python", str(python), "--exclude-editable"],
+                     ["uv", "venv", "-q", "--python", str(python.resolve()), str(target)],
+                     ["uv", "pip", "install", "-q", "--python", str(target / "bin/python"), "-r", str(pins)],
+                     ["uv", "pip", "install", "-q", "--python", str(target / "bin/python"),
+                      "--no-deps", "-e", str(path)]]
+            for number, step in enumerate(steps):
+                result = subprocess.run(step, cwd=path, capture_output=True, text=True)
+                if result.returncode:
+                    print(f"warning: could not build {target} ({' '.join(step[:3])}): "
+                          f"{result.stderr.strip()[-300:]}")
+                    break
+                if number == 0:
+                    pins.write_text(result.stdout)
+            else:
+                print(f"Built {target} (same packages as the main checkout, project installed from the worktree).")
+        else:
+            target.symlink_to(source)
+            print(f"Linked {target} -> {source}.")
+
+
+def start(args):
+    repo = resolve_repo(args.repo)
+    task = Task(repo, args.id)
+    if task.number is not None and task.file is None:
+        raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
+    default = default_branch(repo)
+    if not task.path.exists():
+        fetch(repo)
+        base = base_ref(repo, default)
+        ensure_ignored(repo, ".worktrees")
+        branch = task.existing_branch()
+        if branch:
+            git(repo, "worktree", "add", "-q", str(task.path), branch)
+        else:
+            branch = task.branch_name()
+            git(repo, "worktree", "add", "-q", "-b", branch, str(task.path), base)
+        print(f"Created {task.path} on {branch} from {git(repo, 'rev-parse', '--short', base)}.")
+    prepare_environment(repo, task.path)
+    branch = git(task.path, "branch", "--show-current")
+    title = f" - {task.title}" if task.title else ""
+    print("\nDispatch prompt:\n")
+    print(f"{task.id}{title}")
+    print(f"Open {repo} (Claude Code, or the Codex project on the agentdev host) and work only in "
+          f".worktrees/{task.name} on branch {branch}.")
+    if task.file:
+        print(f"Task: {task.file}")
+    print("Verify with `task check` from that folder (it runs `just check`); commit on the branch, "
+          "push it if you can, and report what changed and what you verified.")
+
+
+def run_check(path, base):
+    """Run the repository's gate in <path>; return (passed, log path)."""
+    if not (path / "justfile").exists() and not (path / "Justfile").exists():
+        raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
+    ensure_ignored(path, ".work")
+    work = path / ".work"
+    work.mkdir(exist_ok=True)
+    log = work / "check.log"
+    passed = True
+    with log.open("w") as out:
+        steps = [["just", "check"]]
+        if (path / ".pre-commit-config.yaml").exists() and base:
+            steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
+        for step in steps:
+            out.write(f"$ {' '.join(step)}\n")
+            out.flush()
+            try:
+                code = subprocess.run(step, cwd=path, stdout=out, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT).returncode
+            except subprocess.TimeoutExpired:
+                out.write(f"\nTIMEOUT after {CHECK_TIMEOUT}s\n")
+                print(f"NOT FINISHED: `{' '.join(step)}` ran over {CHECK_TIMEOUT}s; see {log}")
+                return False, log
+            except FileNotFoundError:
+                raise Stop(f"`{step[0]}` is not installed.")
+            out.write(f"exit {code}\n")
+            if code:
+                passed = False
+                break
+    lines = log.read_text(errors="replace").splitlines()
+    summary = [line for line in lines if SUMMARY.match(line.strip())][-4:]
+    for line in summary if passed else lines[-20:]:
+        print("  " + line)
+    print(("PASS" if passed else "FAIL") + f" (log: {log})")
+    return passed, log
+
+
+def worktree_for(args):
+    if args.id is None:
+        top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+        repo = main_repo(top)
+        if top == repo:
+            raise Stop("Run `task check` inside the task's worktree, or name the task.")
+        return repo, top, None
+    repo = resolve_repo(args.repo)
+    task = Task(repo, args.id)
+    if not task.path.exists():
+        raise Stop(f"No worktree {task.path}; start it with `task start`.")
+    return repo, task.path, task
+
+
+def check(args):
+    repo, path, _ = worktree_for(args)
+    default = default_branch(repo)
+    base = base_ref(repo, default)
+    branch = git(path, "branch", "--show-current")
+    print(f"{path}: {branch or 'detached'} at {git(path, 'rev-parse', '--short', 'HEAD')}")
+    dirty = git(path, "status", "--porcelain", "--untracked-files=no")
+    if dirty:
+        raise Stop("Uncommitted changes; commit them first:\n" + dirty)
+    untracked = git(path, "status", "--porcelain", "--untracked-files=normal")
+    if untracked:
+        print("note: untracked files are not checked in:\n" + untracked)
+    if not is_ancestor(path, base, "HEAD"):
+        print(f"note: {base} has commits this branch lacks; `task merge` brings them in.")
+    passed, _ = run_check(path, base)
+    return 0 if passed else 1
+
+
+def main_checkouts(repo, branch):
+    """Worktrees that have <branch> checked out."""
+    found, current = [], None
+    for line in git(repo, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            current = Path(line[len("worktree "):])
+        elif line == f"branch refs/heads/{branch}":
+            found.append(current)
+    return found
+
+
+def open_pr(repo, branch):
+    try:
+        result = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open",
+                                 "--json", "number", "--jq", ".[0].number"],
+                                cwd=repo, capture_output=True, text=True, timeout=60)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def update_local_default(repo, default, commit):
+    holders = main_checkouts(repo, default)
+    if not holders:
+        git(repo, "update-ref", f"refs/heads/{default}", commit)
+        return f"{default} updated"
+    holder = holders[0]
+    if git(holder, "status", "--porcelain", "--untracked-files=no"):
+        return f"{default} not updated in {holder}: it has uncommitted changes"
+    if not is_ancestor(holder, "HEAD", commit):
+        return f"{default} not updated in {holder}: it has commits of its own"
+    git(holder, "merge", "-q", "--ff-only", commit)
+    return f"{holder} fast-forwarded"
+
+
+def merge(args):
+    repo = resolve_repo(args.repo)
+    task = Task(repo, args.id)
+    if not task.path.exists():
+        raise Stop(f"No worktree {task.path}.")
+    branch = git(task.path, "branch", "--show-current")
+    if not branch:
+        raise Stop(f"{task.path} is not on a branch.")
+    if git(task.path, "status", "--porcelain", "--untracked-files=no"):
+        raise Stop("The worktree has uncommitted changes; the lane commits first.")
+    default = default_branch(repo)
+    fetch(repo)
+    base = base_ref(repo, default)
+    if is_ancestor(repo, branch, base):
+        print(f"{branch} is already in {default}.")
+    else:
+        if not is_ancestor(task.path, base, "HEAD"):
+            result = subprocess.run(["git", "-C", str(task.path), "merge", "-q", "--no-edit", base],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                subprocess.run(["git", "-C", str(task.path), "merge", "--abort"], capture_output=True)
+                raise Stop(f"{base} does not merge cleanly into {branch}; the lane resolves it:\n"
+                           + (result.stdout + result.stderr).strip())
+            print(f"Merged {base} into {branch}.")
+        passed, _ = run_check(task.path, base)
+        if not passed:
+            raise Stop("Check failed; nothing merged.")
+        head = git(task.path, "rev-parse", "HEAD")
+        title = f": {task.title}" if task.title else ""
+        message = f"Merge {task.id}{title}\n\nBranch {branch}."
+        pr = open_pr(repo, branch) if has_origin(repo) else ""
+        if pr:
+            git(repo, "push", "-q", "origin", f"{branch}:refs/heads/{branch}")
+            result = subprocess.run(["gh", "pr", "merge", pr, "--merge", "--match-head-commit", head],
+                                    cwd=repo, capture_output=True, text=True)
+            if result.returncode:
+                raise Stop(f"gh pr merge {pr} failed: {(result.stderr or result.stdout).strip()}")
+            fetch(repo)
+            commit = git(repo, "rev-parse", f"origin/{default}")
+            print(f"Merged PR #{pr}.")
+        else:
+            tree = git(task.path, "rev-parse", "HEAD^{tree}")
+            parent = git(repo, "rev-parse", base)
+            commit = git(repo, "commit-tree", tree, "-p", parent, "-p", head, "-m", message)
+            if has_origin(repo):
+                result = subprocess.run(["git", "-C", str(repo), "push", "-q", "origin",
+                                         f"{commit}:refs/heads/{default}"], capture_output=True, text=True)
+                if result.returncode:
+                    raise Stop(f"Push to {default} was refused (protected branch or moved on): "
+                               f"{result.stderr.strip()}\nOpen a PR for {branch} and run `task merge` again.")
+                fetch(repo)
+            print(f"Merged {branch} into {default} as {commit[:7]}.")
+        print(update_local_default(repo, default, commit))
+    if args.keep:
+        return 0
+    leftovers = git(task.path, "status", "--porcelain", "--untracked-files=all")
+    if leftovers:
+        print(f"Kept {task.path}: it has untracked files:\n{leftovers}")
+        return 0
+    git(repo, "worktree", "remove", "--force", str(task.path))
+    if ok(repo, "branch", "-d", branch):
+        print(f"Removed {task.path} and branch {branch}.")
+    else:
+        print(f"Removed {task.path}; branch {branch} kept (not fully in {default} locally).")
+    return 0
+
+
+def close(args):
+    repo = resolve_repo(args.repo)
+    task = Task(repo, args.id)
+    if task.file is None:
+        raise Stop(f"No Backlog.md task {args.id} in {task.kb}.")
+    criteria = re.findall(r"(?m)^- \[[ x]\] #(\d+)", task.file.read_text())
+    command = ["backlog", "task", "edit", task.id, "-s", "Done", "--final-summary", args.message]
+    for number in criteria:
+        command += ["--check-ac", number]
+    result = subprocess.run(command, cwd=task.kb, capture_output=True, text=True)
+    if result.returncode:
+        raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
+    files = git(task.kb, "status", "--porcelain", "--", "backlog/tasks")
+    paths = [line[3:].split(" -> ")[-1].strip('"') for line in files.splitlines()]
+    if not paths:
+        print(f"{task.id} was already closed.")
+        return 0
+    git(task.kb, "add", "--", *paths)
+    git(task.kb, "commit", "-q", "-m", f"Close {task.id}: {task.title}", "--", *paths)
+    print(f"Closed {task.id} ({len(criteria)} criteria ticked) in {task.kb}.")
+    if has_origin(task.kb):
+        branch = git(task.kb, "branch", "--show-current")
+        result = subprocess.run(["git", "-C", str(task.kb), "push", "-q", "origin", branch],
+                                capture_output=True, text=True)
+        print("Pushed." if result.returncode == 0 else f"Not pushed: {result.stderr.strip()}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="task", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("start", "merge", "close"):
+        sub = commands.add_parser(name)
+        sub.add_argument("repo")
+        sub.add_argument("id")
+        if name == "merge":
+            sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
+        if name == "close":
+            sub.add_argument("-m", "--message", required=True, help="final summary")
+    sub = commands.add_parser("check")
+    sub.add_argument("args", nargs="*", metavar="[repo] [id]")
+    args = parser.parse_args(argv)
+    if args.command == "check":
+        if len(args.args) > 2:
+            parser.error("check takes at most <repo> <id>")
+        args.repo, args.id = ([None, None] + args.args)[-2:]
+    try:
+        return {"start": start, "check": check, "merge": merge, "close": close}[args.command](args) or 0
+    except Stop as stop:
+        print(f"task {args.command}: {stop}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

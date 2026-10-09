@@ -19,7 +19,7 @@ import tomllib
 EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
                      "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just",
                      "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
-                     "verify-enable", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy",
+                     "verify-enable", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task",
                      "job-ping", "agentdev-shell-mcp"}
 VERSION_COMMANDS = {
     "claude": ["claude", "--version"],

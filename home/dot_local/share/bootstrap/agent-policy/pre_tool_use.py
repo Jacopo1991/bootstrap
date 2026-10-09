@@ -59,6 +59,7 @@ STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+PM_TASK_COMMANDS = {"start", "merge", "close"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -1316,6 +1317,9 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     host_reason = host_command_reason(tokens, executable)
     if host_reason:
         return host_reason
+    if executable == "task" and len(tokens) > 1 and tokens[1] in PM_TASK_COMMANDS:
+        return ("`task start`, `task merge` and `task close` are for the PM. Run `task check` in your "
+                "worktree, commit on your branch and report.")
     if executable == "sed":
         reason = sed_policy(tokens)
         if reason:

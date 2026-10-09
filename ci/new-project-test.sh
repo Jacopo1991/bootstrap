@@ -25,6 +25,9 @@ for repo in "$HOME/dev_workspace/demo-site" "$HOME/cortex/cortex-kb-demo-site"; 
 done
 # The code repository ignores .work/, the scratch folder for runtime state and pinned copies.
 grep -qx ".work/" "$HOME/dev_workspace/demo-site/.gitignore"
+# Every code repository has the standard verification command (`just check`, used by `task check`).
+grep -qx "check:" "$HOME/dev_workspace/demo-site/justfile"
+git -C "$HOME/dev_workspace/demo-site" ls-files --error-unmatch justfile >/dev/null
 kb="$HOME/cortex/cortex-kb-demo-site"
 for f in INTENT.md STATUS.md AGENTS.md README.md backlog/config.yml; do
   [ -f "$kb/$f" ]

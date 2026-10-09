@@ -43,6 +43,12 @@ Follow the \`slim-workflow\` skill. Read \`~/cortex/cortex-kb-$name\` (INTENT.md
 Commit only in this repository; report results in chat. The PM records STATUS.md, backlog tasks and decisions in the knowledge repository.
 MD
   printf '.env\n.env.*\nnode_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n.work/\n' > "$code/.gitignore"
+  # The one verification command every lane and `task check` runs; the first task fills it in.
+  cat > "$code/justfile" <<'JUST'
+# just check is this repository's gate: tests, linters, probes.
+check:
+    @echo "No checks yet: add them to the justfile."
+JUST
 
   cat > "$kb/README.md" <<MD
 # cortex-kb-$name
