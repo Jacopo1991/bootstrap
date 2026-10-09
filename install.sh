@@ -10,7 +10,6 @@ sudo -v
 bash_cmd=/bin/bash
 sudo "$bash_cmd" "$ROOT/system/base.sh"
 sudo "$bash_cmd" "$ROOT/system/users.sh" "$(id -un)"
-sudo "$bash_cmd" "$ROOT/system/claude-managed.sh"
 sudo "$bash_cmd" "$ROOT/system/inventory-mirror.sh"
 # shellcheck source=system/common.sh
 source "$ROOT/system/common.sh"
@@ -26,6 +25,12 @@ tar -xJf "$tmp/mise.tar.xz" -C "$tmp" mise/bin/mise
 if ! cmp -s "$tmp/mise/bin/mise" /usr/local/bin/mise; then
   sudo install -m 0755 "$tmp/mise/bin/mise" /usr/local/bin/mise
 fi
+# The managed policy hook's secret scanner: root-owned, found first on the hook's fixed PATH.
+download_verified "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"
+tar -xzf "$tmp/gitleaks.tar.gz" -C "$tmp" gitleaks
+if ! cmp -s "$tmp/gitleaks" /usr/local/bin/gitleaks; then
+  sudo install -m 0755 "$tmp/gitleaks" /usr/local/bin/gitleaks
+fi
 
 # Publish only committed public files, never the admin's .git config or home.
 revision=$(git -C "$ROOT" rev-parse HEAD)
@@ -38,6 +43,12 @@ sudo git -C "$public_source" init --quiet --initial-branch=main --template=
 sudo chown -R root:root "$public_source"
 sudo chmod -R go-w "$public_source"
 sudo ln -sfn "$public_source" /opt/machine-bootstrap/current
+
+# Agent guardrails (deny rules, forbidden/prompt command rules, policy hooks) go into the
+# root-owned managed settings of Claude Code and Codex, written from the published revision
+# so the hooks run root-owned scripts. Preferences stay in the agent's own config.
+sudo "$bash_cmd" /opt/machine-bootstrap/current/system/claude-managed.sh
+sudo "$bash_cmd" /opt/machine-bootstrap/current/system/codex-managed.sh
 
 # chezmoi's existing-source init applies .chezmoiroot and prompts once for the
 # single Git identity. The source remains public and owned by root.

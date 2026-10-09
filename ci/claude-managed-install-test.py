@@ -1,27 +1,60 @@
 #!/usr/bin/env python3
-"""Run as agent after install.sh: managed drop-in is root-owned and not agent-writable."""
+"""Run as agent after install.sh: the managed guardrails are root-owned and agent-immutable.
+
+Covers the Claude Code drop-ins (/etc/claude-code/managed-settings.d), the Codex requirements
+(/etc/codex/requirements.toml), the scripts and binaries the managed hooks run, and the
+deployed hook itself. The founder can run it as agent to verify an install.
+"""
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
-import sys
 import tempfile
+import tomllib
 
 assert os.getuid() != 0, "run as the agent account"
 CLAUDE_DIR = Path("/etc/claude-code")
 DROPINS = CLAUDE_DIR / "managed-settings.d"
-FILE = DROPINS / "50-managed-mods-only.json"
-SOURCE = Path("/opt/machine-bootstrap/current/system/claude-managed-mods.json")
+CODEX_DIR = Path("/etc/codex")
+OPT = Path("/opt/machine-bootstrap/current")
+FILES = {
+    DROPINS / "10-agent-guardrails.json": OPT / "system/claude-managed-guardrails.json",
+    DROPINS / "50-managed-mods-only.json": OPT / "system/claude-managed-mods.json",
+    CODEX_DIR / "requirements.toml": OPT / "system/codex-requirements.toml",
+}
 
-for path, mode in ((CLAUDE_DIR, 0o755), (DROPINS, 0o755), (FILE, 0o644)):
+for path, mode in ((CLAUDE_DIR, 0o755), (DROPINS, 0o755), (CODEX_DIR, 0o755),
+                   *((path, 0o644) for path in FILES)):
     info = path.lstat()
     assert not stat.S_ISLNK(info.st_mode), path
     assert info.st_uid == 0 and info.st_gid == 0, path
     assert stat.S_IMODE(info.st_mode) == mode, (path, oct(stat.S_IMODE(info.st_mode)))
-assert FILE.read_bytes() == SOURCE.read_bytes()
-assert json.loads(FILE.read_text(encoding="utf-8"))["pluginConfigs"][
+for path, source in FILES.items():
+    assert path.read_bytes() == source.read_bytes(), path
+assert json.loads((DROPINS / "50-managed-mods-only.json").read_text(encoding="utf-8"))["pluginConfigs"][
     "cc-plugin-sec-default@builtin"]["options"]["allowManagedModsOnly"] is True
+
+
+def root_owned_chain(path: Path) -> None:
+    """The file and every directory above it: owned by root, writable by nobody else."""
+    path = path.resolve(strict=True)
+    for part in (path, *path.parents):
+        info = part.stat()
+        assert info.st_uid == 0 and not info.st_mode & 0o022, (part, oct(info.st_mode))
+
+
+managed = json.loads((DROPINS / "10-agent-guardrails.json").read_text(encoding="utf-8"))
+requirements = tomllib.loads((CODEX_DIR / "requirements.toml").read_text(encoding="utf-8"))
+argvs = [[h["command"], *h["args"]] for groups in managed["hooks"].values()
+         for group in groups for h in group["hooks"]]
+argvs += [h["command"].split(" ") for event, groups in requirements["hooks"].items()
+          if event != "managed_dir" for group in groups for h in group["hooks"]]
+assert argvs and all(argv[:4] == ["/usr/bin/env", "PATH=/usr/local/bin:/usr/bin:/bin",
+                                  "/usr/bin/python3", "-I"] for argv in argvs), argvs
+for path in {*(Path(argv[4]) for argv in argvs), Path("/usr/bin/env"), Path("/usr/bin/python3"),
+             Path("/usr/bin/git"), Path("/usr/local/bin/gitleaks")}:
+    root_owned_chain(path)
 
 
 def refused(action) -> bool:
@@ -32,19 +65,32 @@ def refused(action) -> bool:
     return False
 
 
-assert refused(lambda: FILE.open("a")), "agent could append to the drop-in"
-assert refused(lambda: (DROPINS / "99-agent.json").write_text("{}")), "agent could add a drop-in"
-assert refused(lambda: FILE.rename(DROPINS / "50-moved.json")), "agent could rename the drop-in"
-assert refused(lambda: FILE.unlink()), "agent could delete the drop-in"
-assert refused(lambda: (CLAUDE_DIR / "managed-settings.json").write_text("{}")), \
-    "agent could create managed-settings.json"
+for path in FILES:
+    assert refused(lambda: path.open("a")), f"agent could append to {path}"
+    assert refused(lambda: path.rename(path.with_name("moved"))), f"agent could rename {path}"
+    assert refused(lambda: path.unlink()), f"agent could delete {path}"
+for path in (DROPINS / "99-agent.json", CLAUDE_DIR / "managed-settings.json",
+             CODEX_DIR / "managed_config.toml", CODEX_DIR / "config.toml"):
+    assert refused(lambda: path.write_text("{}")), f"agent could create {path}"
+assert refused(lambda: (CODEX_DIR / "rules").mkdir()), "agent could add system Codex rules"
+for argv in argvs:
+    assert refused(lambda: Path(argv[4]).open("a")), f"agent could edit {argv[4]}"
 
-# The deployed policy hook still denies blocked commands for the agent.
-hook = Path.home() / ".local/share/bootstrap/agent-policy/pre_tool_use.py"
+# One source of truth: chezmoi removed the agent's old copies and user-level guardrails.
+home = Path.home()
+for stale in (home / ".codex/hooks.json", home / ".local/share/bootstrap/agent-policy/pre_tool_use.py",
+              home / ".local/share/bootstrap/agent-policy/context_reminder.py"):
+    assert not stale.exists(), stale
+user = json.loads((home / ".claude/settings.json").read_text(encoding="utf-8"))
+assert "deny" not in user["permissions"] and "hooks" not in user
+
+# The deployed managed hook, run exactly as configured, still denies blocked commands.
+pre_tool_use = next(argv for argv in argvs if argv[4].endswith("/pre_tool_use.py"))
+env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 with tempfile.TemporaryDirectory() as cwd:
     for command in ("wsl.exe -d AgentDev", "sudo true"):
         event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}
-        result = subprocess.run([sys.executable, str(hook)], input=json.dumps(event),
-                                capture_output=True, text=True, cwd=cwd, check=True)
+        result = subprocess.run(pre_tool_use, input=json.dumps(event), capture_output=True,
+                                text=True, cwd=cwd, env=env, check=True, timeout=30)
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", command
-print("managed drop-in is root-owned, agent-immutable, and the hook still denies")
+print("managed guardrails are root-owned and agent-immutable, and the managed hook still denies")

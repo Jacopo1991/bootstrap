@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fail-closed user-level agent hook for workspace boundaries and staged secrets."""
+"""Fail-closed managed agent hook for workspace boundaries and staged secrets.
+
+Claude Code and Codex run it from their root-owned managed settings, as
+/usr/bin/python3 -I on the published /opt/machine-bootstrap/current revision.
+"""
 from __future__ import annotations
 
 import json

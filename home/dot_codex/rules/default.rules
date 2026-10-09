@@ -1,24 +1,8 @@
-# Branch update merges are enforced by PreToolUse; gh pr merge remains forbidden.
-# Founder decision 2026-10-02: routine Git/gh runs without an approval prompt.
-# Shared PreToolUse enforces workspace, secrets and forbidden operations at all argv positions.
-# Literal prefixes cannot cover global selectors or flags after arbitrary operands.
+# Founder decision 2026-10-02: routine Git/gh runs without an approval prompt (a preference).
+# The forbidden and prompt rules are guardrails: they live in the root-owned
+# /etc/codex/requirements.toml (system/codex-requirements.toml), which Codex merges with these
+# rules using the most restrictive decision, so an allow here never lifts them.
 prefix_rule(pattern = ["git"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
 prefix_rule(pattern = ["gh"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
 prefix_rule(pattern = ["/usr/bin/git"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
 prefix_rule(pattern = ["/usr/bin/gh"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
-prefix_rule(pattern = ["git",["reset","rebase","cherry-pick","revert"]], decision = "prompt", justification = "Approve this destructive local history/index operation.")
-prefix_rule(pattern = ["git","stash",["pop","drop","clear"]], decision = "prompt", justification = "Approve this destructive stash operation.")
-prefix_rule(pattern = ["git","push",["--force","--force-with-lease","--force-if-includes","-f","--delete","-d","--mirror","--prune"]], decision = "forbidden", justification = "Force pushes and remote branch deletion are forbidden; use an ordinary task-branch push.")
-prefix_rule(pattern = ["/usr/bin/git",["reset","rebase","cherry-pick","revert"]], decision = "prompt", justification = "Approve this destructive local history/index operation.")
-prefix_rule(pattern = ["/usr/bin/git","stash",["pop","drop","clear"]], decision = "prompt", justification = "Approve this destructive stash operation.")
-prefix_rule(pattern = ["/usr/bin/git","push",["--force","--force-with-lease","--force-if-includes","-f","--delete","-d","--mirror","--prune"]], decision = "forbidden", justification = "Force pushes and remote branch deletion are forbidden; use an ordinary task-branch push.")
-prefix_rule(pattern = ["gh","pr","merge"], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["gh","repo",["delete","edit"]], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["gh","release","delete"], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["gh",["secret","ruleset"]], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["gh","api",["-X","--method"],"DELETE"], decision = "forbidden", justification = "GitHub API DELETE is forbidden; use read-only requests.")
-prefix_rule(pattern = ["/usr/bin/gh","pr","merge"], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["/usr/bin/gh","repo",["delete","edit"]], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["/usr/bin/gh","release","delete"], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["/usr/bin/gh",["secret","ruleset"]], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane.")
-prefix_rule(pattern = ["/usr/bin/gh","api",["-X","--method"],"DELETE"], decision = "forbidden", justification = "GitHub API DELETE is forbidden; use read-only requests.")

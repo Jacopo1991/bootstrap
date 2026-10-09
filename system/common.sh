@@ -14,6 +14,28 @@ require_root() {
   }
 }
 
+# The managed agent hooks run these files. Each one, and every directory above it, must be
+# owned by root and writable by nobody else, so the agent account cannot swap what runs.
+require_root_owned_policy() {
+  local file path mode
+  [[ $BOOTSTRAP_ROOT == /opt/machine-bootstrap/current ]] || {
+    echo 'Run the managed-policy installers from /opt/machine-bootstrap/current.' >&2; exit 1;
+  }
+  for file in "$BOOTSTRAP_ROOT/system/agent-policy/pre_tool_use.py" \
+    "$BOOTSTRAP_ROOT/system/agent-policy/context_reminder.py" \
+    /usr/bin/env /usr/bin/python3 /usr/bin/git /usr/local/bin/gitleaks; do
+    path=$(readlink -e -- "$file") || { echo "Missing managed-policy file: $file" >&2; exit 1; }
+    while :; do
+      mode=$(stat -c '%a' -- "$path")
+      [[ $(stat -c '%u' -- "$path") == 0 && $((8#$mode & 8#022)) == 0 ]] || {
+        echo "Not root-owned, or writable by others: $path" >&2; exit 1;
+      }
+      [[ $path != / ]] || break
+      path=$(dirname -- "$path")
+    done
+  done
+}
+
 download_verified() {
   local url=$1 checksum=$2 target=$3
   curl --fail --silent --show-error --location --retry 3 \

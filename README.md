@@ -294,11 +294,56 @@ current repository, shell writes outside that repository, and commits whose
 staged diff cannot pass the pinned Gitleaks scan. The one writable place outside
 a repository is the review scratch `/tmp/claude-<uid>/scratch/`, and only while
 `/tmp/claude-<uid>` (Claude Code's `$TMPDIR`) is a real directory owned by the
-agent and closed to others; symlinks out of it are refused. The Codex hook is user-managed:
-after first apply or any hook change, inspect and trust the exact hook definition
-with Codex's `/hooks` command before relying on it. Codex skips an untrusted
-hook. Do not use a hook-trust bypass. Hooks are additional guardrails; the
+agent and closed to others; symlinks out of it are refused. The Codex hooks are
+managed (below), so Codex trusts them by policy and `/hooks` cannot disable them;
+no hook-trust review or bypass is involved. Hooks are additional guardrails; the
 Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
+
+#### Managed guardrails
+
+The guardrails are root-owned, so an agent in any permission mode (including Claude
+`--dangerously-skip-permissions` and Codex `--dangerously-bypass-approvals-and-sandbox`)
+cannot edit or switch them off. Nothing in them limits bypass or auto mode, the approval
+policy, the sandbox choice or the agent's own extra hooks; those stay preferences in
+`~/.claude/settings.json`, `~/.codex/config.toml` and `~/.codex/rules/default.rules`.
+`install.sh` publishes the revision to `/opt/machine-bootstrap/current`, then runs, from there:
+
+- `system/claude-managed.sh`: `/etc/claude-code/managed-settings.d/10-agent-guardrails.json`
+  (from `system/claude-managed-guardrails.json`) holds the 88 `permissions.deny` rules and the
+  `PreToolUse`/`UserPromptSubmit` hooks. Managed settings rank above user, project, local and
+  `--settings` values, deny rules from any level win over allow rules, managed hooks run
+  alongside the user's own hooks, and only a managed `disableAllHooks` can turn them off
+  ([settings](https://code.claude.com/docs/en/settings#settings-precedence),
+  [managed settings](https://code.claude.com/docs/en/managed-settings),
+  [hooks](https://code.claude.com/docs/en/hooks)). The hooks use exec form (`command` plus
+  `args`, no shell): `/usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I
+  /opt/machine-bootstrap/current/system/agent-policy/<script>.py`.
+- `system/codex-managed.sh`: `/etc/codex/requirements.toml` (from
+  `system/codex-requirements.toml`) pins `[features].hooks = true`, declares the same hooks
+  under `[hooks]` (`managed_dir` is the `/opt` policy directory) and holds the forbidden/prompt
+  command rules under `[rules] prefix_rules`. Requirements cannot be overridden by user config;
+  managed hooks are trusted by policy and run alongside user hooks; requirements rules merge
+  with `~/.codex/rules/*.rules` and the most restrictive decision wins
+  ([managed configuration](https://learn.chatgpt.com/docs/enterprise/managed-configuration),
+  [hooks](https://learn.chatgpt.com/docs/hooks)).
+
+Both installers refuse to run unless the policy scripts, `/usr/bin/env`, `/usr/bin/python3`,
+`/usr/bin/git` and the root-owned `/usr/local/bin/gitleaks` (installed by `install.sh`), and
+every directory above them, are owned by root and writable by nobody else. The scripts use only
+the standard library, `-I` keeps `PYTHONPATH`, user site-packages and the script directory off
+`sys.path`, and the fixed `PATH` makes the hook's `git` and `gitleaks` the root-owned ones.
+chezmoi removes the old user-level copies (`~/.codex/hooks.json`,
+`~/.local/share/bootstrap/agent-policy/*.py`), so there is one source of truth.
+`ci/managed-policy-test.py` (lint) checks the content; `ci/claude-managed-install-test.py` and
+`ci/git-gh-approval-test.py` (distro job, as agent) check ownership, immutability and the
+installed Codex rule engine.
+
+Limits: Codex runs every hook command through the user's shell (`$SHELL -c`), so an agent that
+controls the environment Codex starts with (for example `BASH_ENV` exported from `~/.bashrc`)
+can stop the Codex hook before it runs; Codex's `[rules]` are evaluated inside Codex and are not
+affected, and Claude's exec-form hooks start no shell. The `claude` and `codex` installations
+themselves live in the agent's home and are agent-writable. Server-managed Claude settings, if
+an organization login ever delivers them, take precedence over the file-based ones.
 
 Claude Code mods (v2.1.287 and later) run inside Claude Code and can approve
 tool calls that a non-managed `PreToolUse` hook blocked. `install.sh` therefore
@@ -311,8 +356,8 @@ directory and file are `root:root` and not writable by the agent, and CI checks
 that. The option is read from managed settings only, so it is deliberately not
 in the agent's `~/.claude/settings.json`. `disableSideloadFlags` is not set
 because it would also reject `--agents` and `--mcp-config`. The policy hook
-itself still lives in user settings; moving it into managed settings is a
-separate follow-up. The pinned Claude Code release is 2.1.287 or later, so
+itself is a managed hook (above), which a mod cannot override either. The pinned
+Claude Code release is 2.1.287 or later, so
 the distro job's last step (`ci/claude-mods-load-test.sh`) runs a fixture mod both
 with `--plugin-dir` and installed into the agent's plugin scope: neither answers
 `/modping` under the managed drop-in, and both do once the drop-in is moved aside
@@ -837,7 +882,7 @@ preview; select the non-preview option only when a pull request is intended.
 
 Founder decision 2026-10-02: Claude Code uses `acceptEdits`, with explicit
 allow rules for `git *`, `gh *`, `/usr/bin/git *` and `/usr/bin/gh *`, and no
-Git/gh ask rules. The existing deny list and PreToolUse hook remain active.
+Git/gh ask rules. The deny list and PreToolUse hook remain active as managed settings.
 The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
 Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
 and `/usr/bin/gh *`: bare names alone only match argument-less calls.
@@ -858,9 +903,9 @@ checks remain in force.
 
 Codex keeps `workspace-write`, `network_access = false`, `on-request` and the
 user approval reviewer. Four native allow prefixes permit routine Git/gh to
-run outside the sandbox without a prompt. Explicit forbidden prefixes and
-the shared hook block the forbidden operations above. Native prompt rules
-cover `git reset/rebase/cherry-pick/revert` and `git stash pop/drop/clear`.
+run outside the sandbox without a prompt. Explicit forbidden prefixes (in
+`/etc/codex/requirements.toml`) and the shared hook block the forbidden operations above.
+Prompt rules there cover `git reset/rebase/cherry-pick/revert` and `git stash pop/drop/clear`.
 These approval-required forms must use a plain command without global
 selectors; the hook refuses selector variants that would otherwise miss a
 literal prefix rule. This is a bounded list of destructive primitives, not

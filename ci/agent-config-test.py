@@ -24,13 +24,23 @@ assert codex["sandbox_mode"] == "workspace-write"
 # which allows no domain and only local binding (tests that start a local server).
 assert codex["sandbox_workspace_write"]["network_access"] is True
 assert codex["features"]["network_proxy"] == {"enabled": True, "allow_local_binding": True, "domains": {}}
-assert codex["features"]["hooks"] is True
-codex_hooks = json.loads((ROOT / "home/dot_codex/hooks.json").read_text(encoding="utf-8"))
+# Guardrails live in root-owned managed config (ci/managed-policy-test.py checks the shape):
+# the hooks feature and hooks in /etc/codex/requirements.toml, none in the user config.
+assert "hooks" not in codex and "hooks" not in codex["features"]
+assert not (ROOT / "home/dot_codex/hooks.json").exists()
+requirements = tomllib.loads((ROOT / "system/codex-requirements.toml").read_text(encoding="utf-8"))
+assert requirements["features"] == {"hooks": True}
+codex_hooks = {"hooks": {k: v for k, v in requirements["hooks"].items() if k != "managed_dir"}}
 assert set(codex_hooks["hooks"]) == {"PreToolUse", "PermissionRequest", "UserPromptSubmit"}
 assert codex_hooks["hooks"]["PermissionRequest"][0]["matcher"] == "^Bash$"
 assert {x["matcher"] for x in codex_hooks["hooks"]["PreToolUse"]} == {"^Bash$", "^(apply_patch|Edit|Write)$"}
 
 claude = json.loads((ROOT / "home/dot_claude/settings.json").read_text(encoding="utf-8"))
+# The deny rules and hooks are managed (root-owned drop-in); the user file keeps preferences.
+assert "deny" not in claude["permissions"] and "hooks" not in claude
+managed = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text(encoding="utf-8"))
+claude["permissions"]["deny"] = managed["permissions"]["deny"]
+claude["hooks"] = managed["hooks"]
 assert claude["permissions"]["defaultMode"] == "acceptEdits"
 assert "ask" not in claude["permissions"]
 assert claude["permissions"]["allow"] == ["Bash(git *)", "Bash(gh *)",
@@ -76,13 +86,16 @@ for command in ("git push -u origin HEAD", "gh issue list", "gh pr create",
     assert not claude_denies(command), command
 rules = (ROOT / "home/dot_codex/rules/default.rules").read_text(encoding="utf-8")
 assert rules.count('decision = "allow"') == 4
-assert rules.count('decision = "prompt"') == 4
-assert rules.count('decision = "forbidden"') == 12
+assert rules.count('decision = "prompt"') == 0
+assert rules.count('decision = "forbidden"') == 0
+# Each requirements rule covers git and /usr/bin/git (or gh and /usr/bin/gh) at once.
+decisions = [rule["decision"] for rule in requirements["rules"]["prefix_rules"]]
+assert decisions.count("prompt") == 2 and decisions.count("forbidden") == 6, decisions
 assert "PreToolUse" in claude["hooks"]
 assert not claude.get("mcpServers") and not claude.get("plugins")
 
 spec = importlib.util.spec_from_file_location(
-    "agent_policy", ROOT / "home/dot_local/share/bootstrap/agent-policy/pre_tool_use.py")
+    "agent_policy", ROOT / "system/agent-policy/pre_tool_use.py")
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 with tempfile.TemporaryDirectory() as temp:

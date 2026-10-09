@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-HOOK = ROOT / "home/dot_local/share/bootstrap/agent-policy/pre_tool_use.py"
+HOOK = ROOT / "system/agent-policy/pre_tool_use.py"
 DROPIN = json.loads((ROOT / "system/claude-managed-mods.json").read_text(encoding="utf-8"))
 
 # Exactly the documented guard option; no wider switch (disableAllHooks would
