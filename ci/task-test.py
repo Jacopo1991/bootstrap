@@ -21,6 +21,7 @@ IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
 STUBS = {
     "just": """#!/bin/sh
 [ "$1" = check ] || exit 2
+[ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
 [ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
 echo "Ran 3 tests in 0.01s"; echo OK
 """,
@@ -127,7 +128,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(self.git(wt, "status", "--porcelain"), "", ".work stays out of status")
         self.assertIn("PASS", self.task("check", cwd=wt), "inside the worktree no arguments are needed")
         (wt / "a.txt").write_text("changed\n")
-        self.assertIn("Uncommitted changes", self.task("check", "proj", "5", code=1))
+        self.assertIn("Uncommitted", self.task("check", "proj", "5", code=1))
         self.git(wt, "checkout", "--", "a.txt")
         self.commit_in(wt, "FAIL")
         self.assertIn("FAIL", self.task("check", "proj", "5", code=1))
@@ -142,6 +143,8 @@ class TaskTool(unittest.TestCase):
         self.git(other, "push", "-q", "origin", "main")
         out = self.task("merge", "proj", "T-5")
         self.assertIn("Merged origin/main into t5-add-the-b-file", out)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main~1"), self.git(other, "rev-parse", "HEAD"),
+                         "first parent is main as it was checked")
         self.assertIn("PASS", out)
         tip = self.git(self.origin, "rev-parse", "main")
         parents = self.git(self.origin, "rev-list", "--parents", "-n", "1", tip).split()
@@ -216,6 +219,132 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         log = calls.read_text()
         self.assertIn("--exclude-editable", log)
         self.assertIn(f"--no-deps -e {wt2}", log)
+
+    def during_check(self, script):
+        hook = self.home / "during-check.sh"
+        hook.write_text("#!/bin/sh\nset -e\n" + script)
+        hook.chmod(0o755)
+
+    def other_clone_pushes(self, name):
+        other = self.home / "other"
+        if not other.exists():
+            self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.commit_in(other, name)
+        self.git(other, "push", "-q", "origin", "main")
+
+    def test_review_main_moving_during_check_is_never_reverted(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        other = self.home / "other"
+        self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.during_check(f"cd {other} && echo c > c.txt && git add c.txt && git commit -qm c "
+                          f"&& git push -q origin main && git -C {self.repo} fetch -q origin\n")
+        out = self.task("merge", "proj", "5", code=1)
+        self.assertIn("refused", out)
+        self.assertIn("c.txt", self.git(self.origin, "ls-tree", "--name-only", "main"))
+        (self.home / "during-check.sh").unlink()
+        self.task("merge", "proj", "5")  # second run merges on top of the new main
+        files = self.git(self.origin, "ls-tree", "--name-only", "main").split()
+        self.assertTrue({"b.txt", "c.txt"} <= set(files), files)
+
+    def test_review_commit_during_check_is_not_merged(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        before = self.git(self.origin, "rev-parse", "main")
+        self.during_check(f"cd {wt} && touch FAIL && git add FAIL && git commit -qm late\n")
+        out = self.task("merge", "proj", "5", code=1)
+        self.assertIn("committed while the check ran", out)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), before)
+
+    def test_review_untracked_files_block_check_and_merge(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / "helper.py").write_text("x\n")
+        self.assertIn("untracked", self.task("check", "proj", "5", code=1))
+        self.assertIn("untracked", self.task("merge", "proj", "5", code=1))
+
+    def test_review_folder_that_is_not_a_worktree_is_refused(self):
+        self.git(self.repo, "switch", "-q", "-c", "someone-wip")
+        self.commit_in(self.repo, "wip.txt")
+        (self.repo / ".worktrees/foo").mkdir(parents=True)
+        (self.repo / ".worktrees/foo/justfile").write_text("check:\n    true\n")
+        before = self.git(self.origin, "rev-parse", "main")
+        for command in (("merge", "proj", "foo"), ("check", "proj", "foo"), ("start", "proj", "foo")):
+            self.assertIn("not a worktree", self.task(*command, code=1))
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(self.git(self.repo, "log", "-1", "--format=%s"), "add wip.txt")
+
+    def test_review_ignored_results_keep_the_worktree(self):
+        wt, _ = self.started()
+        self.commit_in(wt, ".gitignore", "results/\n")
+        (wt / "results").mkdir()
+        (wt / "results/data.csv").write_text("1\n")
+        (wt / "__pycache__").mkdir()
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Kept", out)
+        self.assertTrue((wt / "results/data.csv").exists())
+
+    def test_review_unpushed_local_main_is_not_pushed(self):
+        self.commit_in(self.repo, "local-only.txt")
+        wt, out = self.started()
+        self.assertIn("not on origin", out)
+        self.assertFalse((wt / "local-only.txt").exists())
+        self.commit_in(wt, "b.txt")
+        self.task("merge", "proj", "5")
+        self.assertNotIn("local-only.txt", self.git(self.origin, "ls-tree", "--name-only", "main"))
+        self.assertTrue((self.repo / "local-only.txt").exists(), "local main is left as it was")
+
+    def test_review_pth_pointing_into_repo_counts_as_editable(self):
+        site = self.repo / ".venv/lib/python3.12/site-packages"
+        site.mkdir(parents=True)
+        (site / "proj.pth").write_text(str(self.repo / "src") + "\n")
+        (self.home / "bin/uv").write_text("#!/bin/sh\ncase \"$*\" in \"venv \"*) for a; do last=$a; done; mkdir -p \"$last\" ;; esac\n")
+        (self.home / "bin/uv").chmod(0o755)
+        wt, _ = self.started()
+        self.assertFalse((wt / ".venv").is_symlink())
+
+    def test_review_failed_check_leaves_branch_as_lane_left_it(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "FAIL")
+        lane_head = self.git(wt, "rev-parse", "HEAD")
+        self.other_clone_pushes("c.txt")
+        self.assertIn("as the lane left it", self.task("merge", "proj", "5", code=1))
+        self.assertEqual(self.git(wt, "rev-parse", "HEAD"), lane_head)
+
+    def test_review_close_commits_only_its_own_task_file(self):
+        other = self.kb / "backlog/tasks/t-6 - Other.md"
+        other.write_text("---\nid: T-6\ntitle: Other\nstatus: To Do\n---\n")
+        self.git(self.kb, "add", "-A")
+        self.git(self.kb, "commit", "-qm", "t6")
+        other.write_text(other.read_text() + "edit in progress\n")
+        self.task("close", "proj", "5", "-m", "done")
+        self.assertEqual(self.git(self.kb, "show", "--name-only", "--format=", "HEAD"),
+                         "backlog/tasks/t-5 - Add-the-b-file.md")
+        self.assertIn("t-6", self.git(self.kb, "status", "--porcelain"))
+
+    def test_review_main_checkout_blocked_is_reported_not_fatal(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.repo / "b.txt").write_text("someone's own file\n")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("not updated", out)
+        self.assertEqual((self.repo / "b.txt").read_text(), "someone's own file\n")
+
+    def test_review_default_branch_is_not_a_task_name(self):
+        self.assertIn("default branch", self.task("start", "proj", "main", code=1))
+
+    def test_review_merged_branch_is_removed_even_if_local_main_is_blocked(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.repo / "b.txt").write_text("someone's own file\n")
+        self.task("merge", "proj", "5")
+        self.assertNotIn("t5-add-the-b-file", self.git(self.repo, "branch"))
+
+    def test_check_gives_an_older_worktree_its_environment(self):
+        self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "t5-old", str(self.repo / ".worktrees/t5"), "main")
+        (self.repo / ".venv/lib/python3.12/site-packages").mkdir(parents=True)
+        self.assertIn("PASS", self.task("check", "proj", "5"))
+        self.assertTrue((self.repo / ".worktrees/t5/.venv").is_symlink())
 
     def test_plain_name_without_task(self):
         out = self.task("start", "proj", "tidy-docs")
