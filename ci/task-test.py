@@ -346,6 +346,33 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.assertIn("PASS", self.task("check", "proj", "5"))
         self.assertTrue((self.repo / ".worktrees/t5/.venv").is_symlink())
 
+    def test_github_repo_merges_through_a_pull_request(self):
+        github = self.home / "github-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.origin), str(github))
+        self.git(self.repo, "remote", "set-url", "origin", str(github))
+        self.git(self.repo, "fetch", "-q", "origin")
+        state = self.home / "pr-state"
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr list") [ -f {state} ] && cat {state}; exit 0 ;;
+  "pr create") echo 7 > {state}; echo "$*" > {self.home}/pr-create; exit 0 ;;
+  "pr merge")
+    head=$6; tmp=$(mktemp -d); git clone -q {github} $tmp
+    git -C $tmp merge -q --no-ff -m "Merge pull request #7" $head
+    git -C $tmp push -q origin HEAD:main; rm -f {state}; exit 0 ;;
+esac
+exit 1
+""")
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Opened PR #7", out)
+        self.assertIn("--title T-5: Add the b file", (self.home / "pr-create").read_text())
+        self.assertIn("b.txt", self.git(github, "ls-tree", "--name-only", "main"))
+        self.assertEqual(self.git(self.repo, "rev-parse", "main"), self.git(github, "rev-parse", "main"))
+        self.assertFalse(wt.exists(), out)
+
     def test_plain_name_without_task(self):
         out = self.task("start", "proj", "tidy-docs")
         self.assertIn("work only in .worktrees/tidy-docs on branch tidy-docs", out)

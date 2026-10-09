@@ -404,10 +404,24 @@ def update_local_default(repo, default, commit):
     return f"{holder} fast-forwarded"
 
 
+def on_github(repo):
+    return has_origin(repo) and "github" in git(repo, "remote", "get-url", "origin")
+
+
+def gh(repo, *args):
+    try:
+        result = subprocess.run(["gh", *args], cwd=repo, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        raise Stop("gh is not installed.")
+    except subprocess.TimeoutExpired:
+        raise Stop(f"gh {args[0]} {args[1]} did not answer; run `task merge` again.")
+    if result.returncode:
+        raise Stop(f"gh {' '.join(args[:2])} failed: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
 def open_pr(repo, branch):
     """The open PR number for branch, "" when none; Stop when GitHub cannot be asked."""
-    if "github" not in git(repo, "remote", "get-url", "origin"):
-        return ""
     try:
         result = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open",
                                  "--json", "number", "--jq", ".[0].number"],
@@ -462,13 +476,20 @@ def merge(args):
                 run_git(path, "reset", "-q", "--keep", before)
             raise Stop("Check failed; nothing merged and the branch is as the lane left it.")
         title = f": {task.title}" if task.title else ""
-        pr = open_pr(repo, branch) if has_origin(repo) else ""
-        if pr:
+        if on_github(repo):
+            # GitHub repositories take changes through a PR (rulesets); open one when needed and
+            # merge it pinned to the commit that was just checked.
             git(repo, "push", "-q", "origin", f"{head}:refs/heads/{branch}")
-            result = subprocess.run(["gh", "pr", "merge", pr, "--merge", "--match-head-commit", head],
-                                    cwd=repo, capture_output=True, text=True)
-            if result.returncode:
-                raise Stop(f"gh pr merge {pr} failed: {(result.stderr or result.stdout).strip()}")
+            pr = open_pr(repo, branch)
+            if not pr:
+                gh(repo, "pr", "create", "--head", branch, "--base", default,
+                   "--title", f"{task.id}{title}" if task.title else task.id,
+                   "--body", f"Branch `{branch}`; `just check` passed on {head[:7]} (`task merge`).")
+                pr = open_pr(repo, branch)
+                if not pr:
+                    raise Stop("Opened a PR but could not find it again; merge it on GitHub.")
+                print(f"Opened PR #{pr}.")
+            gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
             fetch(repo)
             commit = sha(repo, f"origin/{default}")
             print(f"Merged PR #{pr} ({commit[:7]}).")
