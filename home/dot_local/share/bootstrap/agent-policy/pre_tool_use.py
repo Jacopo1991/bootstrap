@@ -59,6 +59,7 @@ STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 CURRENT_REPO_GIT = READ_ONLY_GIT | {
     "add", "commit", "push", "fetch", "pull", "checkout", "switch", "reset",
     "restore", "clean", "rm", "mv", "branch", "tag", "remote", "stash",
@@ -618,6 +619,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return git_default_branch_merge(arguments, target)
     if subcommand == "merge-tree":
         return git_merge_preview(arguments, target)
+    if subcommand == "worktree":
+        # Listing is read-only. Worktrees are created and removed by the tool that runs the lane
+        # (the Codex app, `claude --worktree`) and cleaned by workspace-tidy, never by agents.
+        if arguments[:1] == ["list"] and all(a in WORKTREE_LIST_OPTIONS for a in arguments[1:]):
+            return None
+        return ("Only `git worktree list` is allowed; the Codex app or `claude --worktree` "
+                "creates and removes worktrees.")
     if subcommand not in CURRENT_REPO_GIT:
         return "Git topology changes and unsupported write primitives require separate setup."
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.

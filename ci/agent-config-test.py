@@ -743,6 +743,12 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("git -C . status", "git -C . add safe.txt", "git -C . log --oneline -1 | head -1",
                     "git -C . add safe.txt && git -C . status"):
         assert policy.evaluate(event(command), roots) is None, command
+    # Worktrees: agents may list them; the Codex app or `claude --worktree` creates and removes them.
+    for command in ("git worktree list", "git -C . worktree list --porcelain", "git worktree list | head -3"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in ("git worktree add ../x", "git worktree remove .worktrees/a", "git worktree prune",
+                    "git worktree list --expire=now", "git worktree move a b"):
+        assert "Only `git worktree list` is allowed" in (policy.evaluate(event(command), roots) or ""), command
     for command in (
             # Guards that must still hold inside a chain, behind a pipe, or behind a wrapper.
             "echo x | tee .git/config", "git status && touch .git/config",
