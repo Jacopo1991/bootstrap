@@ -36,6 +36,7 @@ bash ci/pre-commit-test.sh
 python3 ci/osv-db-test.py
 python3 ci/verification-pack-test.py
 python3 ci/skills-hooks-test.py
+python3 ci/workspace-tidy-test.py
 python3 ci/backrest-test.py
 python3 ci/job-ping-test.py
 python3 ci/shell-connector-test.py

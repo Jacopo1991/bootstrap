@@ -36,3 +36,5 @@ systemctl --user daemon-reload
 systemctl --user enable --now gh-skill-update.timer
 systemctl --user is-active --quiet gh-skill-update.timer
 systemctl --user list-timers gh-skill-update.timer --no-pager
+systemctl --user enable --now workspace-tidy.timer
+systemctl --user is-active --quiet workspace-tidy.timer

@@ -38,5 +38,6 @@ $begin
 .claude
 # Python bytecode caches written when tests import repository modules.
 __pycache__/
+.worktrees/
 $end
 BLOCK

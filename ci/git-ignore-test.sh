@@ -18,6 +18,7 @@ git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
 for f in .bashrc .bash_profile .profile .zshrc .zprofile .gitconfig .gitmodules .ripgreprc .idea .vscode .mcp.json .claude.json; do : > "$f"; done
 mkdir -p .claude && : > .claude/settings.local.json
 mkdir -p pkg/__pycache__ && : > pkg/__pycache__/mod.cpython-312.pyc
+mkdir -p .worktrees/t1 && : > .worktrees/t1/file.txt
 : > README.md; : > .gitignore; : > .pre-commit-config.yaml
 status=$(git status --porcelain --untracked-files=all)
 expected=$'?? .gitignore\n?? .pre-commit-config.yaml\n?? README.md'
@@ -26,4 +27,4 @@ expected=$'?? .gitignore\n?? .pre-commit-config.yaml\n?? README.md'
 git add -f .mcp.json && git -c user.name=t -c user.email=t@t commit -q -m tracked
 echo '{}' > .mcp.json
 git status --porcelain | grep -qx ' M .mcp.json' || { echo "FAIL: tracked .mcp.json change hidden"; exit 1; }
-echo "PASS: global git ignore hides sandbox placeholders, Claude Code files and __pycache__/, not project or tracked files"
+echo "PASS: global git ignore hides sandbox placeholders, Claude Code files, __pycache__/ and .worktrees/, not project or tracked files"
