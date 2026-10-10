@@ -21,6 +21,7 @@ mkdir -p "$tmp/gate-bin"
 ln -s "$tmp/pre-commit/bin/pre-commit" "$tmp/gate-bin/pre-commit"
 export PATH="$tmp:$tmp/gate-bin:$PATH"
 python3 "$ROOT/ci/gitleaks-canary.py" "$tmp/gitleaks"
+bash "$ROOT/ci/gitleaks-working-tree-test.sh"
 cd "$ROOT"
 bash ci/boundary-test.sh
 bash -n system/ssh.sh system/authorize-agent-key.sh ci/vscode-ssh-test.sh
@@ -64,4 +65,4 @@ python3 ci/git-credentials-test.py "$tmp/gitconfig"
 bash ci/git-ignore-test.sh
 python3 ci/qmd-test.py "$tmp/chezmoi"
 "$tmp/gitleaks" git --redact --no-banner .
-"$tmp/gitleaks" dir --redact --no-banner .
+bash ci/gitleaks-working-tree.sh "$tmp/gitleaks" "$ROOT" "$tmp/working-tree-scan"

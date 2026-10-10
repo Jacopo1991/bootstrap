@@ -70,6 +70,8 @@ class TaskTool(unittest.TestCase):
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY)
+        for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"):
+            self.env.pop(marker, None)
         self.gate_dir = self.home / "shared-gate"
         self.gate_dir.mkdir()
         self.env["TASK_GATE_DIR"] = str(self.gate_dir)
@@ -143,7 +145,8 @@ class TaskTool(unittest.TestCase):
         record = json.loads((state / "task.json").read_text())
         head = self.git(path, "rev-parse", "HEAD")
         state.mkdir(parents=True, exist_ok=True)
-        (state / "check.json").write_text(json.dumps({"sha": head, "record_revision": record["revision"],
+        (state / "check.json").write_text(json.dumps({"sha": head, "base_sha": self.git(self.repo, "rev-parse", "origin/main"),
+                                                       "record_revision": record["revision"], "trusted": True,
                                                        "result": "passed", "steps": [], "time": "fixture"}))
         (state / "review.md").write_text("Verdict: PASS\nReviewer: claude test\nEvidence: reviewed\n")
         judgments = {str(item["number"]): "pass" for item in record["criteria"]}
@@ -267,6 +270,55 @@ class TaskTool(unittest.TestCase):
         self.commit_in(wt, "FAIL")
         self.assertIn("FAIL", self.task("check", "proj", "5", code=1))
 
+    def test_check_with_read_only_state_is_advisory_and_writes_local_result(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        state = self.state()
+        state.chmod(0o555)
+        try:
+            out = self.raw_task("check", "proj", "5")
+            self.assertIn("advisory lane check (not evidence for merge)", out)
+            self.assertIn("PASS", out)
+            evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+            self.assertEqual(evidence["result"], "passed")
+            self.assertTrue(evidence["advisory"])
+            self.assertFalse(evidence["trusted"])
+            self.assertTrue((wt / ".work/check.log").is_file())
+            self.assertFalse((state / "check.json").exists())
+        finally:
+            state.chmod(0o755)
+
+    def test_agent_advisory_check_returns_real_failure_code(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "FAIL")
+        env = dict(self.env, CLAUDECODE="1")
+        out = self.raw_task("check", "proj", "5", env=env, code=1)
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertIn("FAIL", out)
+        evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(evidence["result"], "failed")
+        self.assertTrue(evidence["advisory"])
+
+    def test_agent_markers_skip_unavailable_shared_gate_and_status_separates_lane_result(self):
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(self.repo, "add", ".task.toml")
+        self.git(self.repo, "commit", "-qm", "enable exclusive gate")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        for index, (marker, value) in enumerate((("CLAUDECODE", "1"),
+                                                  ("CODEX_SANDBOX", "workspace-write"))):
+            env = dict(self.env, **{marker: value},
+                       TASK_GATE_DIR=str(self.home / (marker + "-missing") / "gate"))
+            args = ("check", "proj", "5", "--detach") if index == 0 else ("check", "proj", "5")
+            out = self.raw_task(*args, env=env)
+            self.assertNotIn("Started detached", out)
+            self.assertIn("advisory lane check (not evidence for merge)", out)
+            self.assertNotIn("shared gate lock unavailable", out)
+            self.assertIn("PASS", out)
+            self.assertFalse((self.state() / "check.json").exists())
+        self.assertIn("lane check: passed (advisory)", self.raw_task("status", "proj"))
+
     def test_start_rejects_redundant_just_check_verify_line(self):
         task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
         task_file.write_text(task_file.read_text().replace("Verify: `true`", "Verify: `just check   `"))
@@ -280,6 +332,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        self.assertTrue(check["trusted"])
         run_path = self.state() / "run.json"
         run_path.write_text(__import__("json").dumps({"command": "merge", "state": "running", "completed": []}))
         run_env = dict(self.env, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(run_path))
@@ -326,6 +379,22 @@ class TaskTool(unittest.TestCase):
 
     def test_merge_does_not_reuse_legacy_check_without_base_sha(self):
         self.assert_check_record_regates(lambda check: check.pop("base_sha"))
+
+    def test_merge_does_not_reuse_advisory_check(self):
+        self.assert_check_record_regates(lambda check: check.update(trusted=False, advisory=True))
+
+    def test_merge_runs_one_trusted_gate_when_no_trusted_check_exists(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.state() / "check.json").unlink()
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("Merged", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
+        gate_check = __import__("json").loads((self.state() / "gate-check.json").read_text())
+        self.assertTrue(gate_check["trusted"])
 
     def test_override_runs_gate_without_check_record_and_records_failed_gate(self):
         wt, _ = self.started()
@@ -1037,8 +1106,9 @@ exit 1
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         out = self.raw_task("merge", "proj", "5", code=1)
-        for item in ("passing task check", "recorded PASS review", "filled .work/report.md"):
+        for item in ("recorded PASS review", "filled .work/report.md"):
             self.assertIn(item, out)
+        self.assertNotIn("passing task check", out)
         out = self.raw_task("merge", "proj", "5", "--override", "urgent approved exception")
         self.assertIn("exception", out)
         self.assertIn("Needs attention", self.raw_task("status", "proj"))
