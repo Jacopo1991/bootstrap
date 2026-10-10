@@ -21,13 +21,45 @@ printf 'untracked working tree content\n' > "$repo/untracked.txt"
 cat > "$tmp/gitleaks" <<'SCANNER'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ $1 == dir && $2 == --redact && $3 == --no-banner ]]
-[[ -f $4/tracked.txt && -f $4/.gitignore && -f $4/untracked.txt ]]
-[[ -f $4/.work/tracked.log && ! -e $4/.work/lane.log ]]
-[[ -f $4/local.env ]]
-echo 'working-tree scan excludes only ignored .work and includes other ignored files'
+[[ $1 == dir ]]
+shift
+config=
+while (($# > 1)); do
+  case "$1" in
+    --redact|--no-banner) shift ;;
+    --config) config=$2; shift 2 ;;
+    *) exit 2 ;;
+  esac
+done
+scan_root=$1
+[[ -f $scan_root/tracked.txt && -f $scan_root/.gitignore && -f $scan_root/untracked.txt ]]
+[[ -f $scan_root/.work/tracked.log && ! -e $scan_root/.work/lane.log ]]
+[[ -f $scan_root/local.env ]]
+if [[ -f $scan_root/allowlisted.txt ]]; then
+  [[ $config == "$FIXTURE_REPO/.gitleaks.toml" ]]
+  grep -Fq 'FIXTURE_SECRET_ALLOWED' "$config"
+  grep -Fq 'FIXTURE_SECRET_ALLOWED' "$scan_root/allowlisted.txt"
+else
+  [[ -z $config ]]
+fi
+if grep -R -Fq 'FIXTURE_SECRET_UNALLOWLISTED' "$scan_root"; then
+  echo 'mock gitleaks: unallowlisted secret detected' >&2
+  exit 1
+fi
+echo 'mock gitleaks: no unallowlisted secret found'
 SCANNER
 chmod 0755 "$tmp/gitleaks"
 bash "$ROOT/ci/gitleaks-working-tree.sh" "$tmp/gitleaks" "$repo" "$tmp/scan"
+printf '[allowlists]\nregexes = ["FIXTURE_SECRET_ALLOWED"]\n' > "$repo/.gitleaks.toml"
+printf 'FIXTURE_SECRET_ALLOWED\n' > "$repo/allowlisted.txt"
+git -C "$repo" add .gitleaks.toml allowlisted.txt
+git -C "$repo" commit -qm 'fixture gitleaks allowlist'
+FIXTURE_REPO=$repo bash "$ROOT/ci/gitleaks-working-tree.sh" "$tmp/gitleaks" "$repo" "$tmp/allowlisted-scan"
+printf 'FIXTURE_SECRET_UNALLOWLISTED\n' > "$repo/unallowlisted.txt"
+if FIXTURE_REPO=$repo bash "$ROOT/ci/gitleaks-working-tree.sh" "$tmp/gitleaks" "$repo" "$tmp/unallowlisted-scan"; then
+  echo 'FAIL: unallowlisted secret unexpectedly passed' >&2
+  exit 1
+fi
+echo 'PASS: repository allowlist is applied and unallowlisted secrets still fail'
 grep -Fq "\"\$tmp/gitleaks\" git --redact --no-banner ." "$ROOT/ci/lint.sh"
 echo 'PASS: gitleaks git remains enabled for tracked history'

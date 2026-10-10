@@ -27,4 +27,8 @@ while IFS= read -r -d '' path; do
   copy_path
 done < <(git -C "$repo" ls-files --others --exclude-standard --ignored -z)
 
-"$scanner" dir --redact --no-banner "$scan_root"
+args=(dir --redact --no-banner)
+if [[ -f $repo/.gitleaks.toml ]]; then
+  args+=(--config "$repo/.gitleaks.toml")
+fi
+"$scanner" "${args[@]}" "$scan_root"
