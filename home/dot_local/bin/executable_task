@@ -513,6 +513,10 @@ def check_task_from_args(args):
     return Task(repo, args.id)
 
 
+def advisory_check_for(task: Task):
+    return agent_session() or not task_state_writable(task)
+
+
 def foreground_lock(args):
     global CHECK_ADVISORY
     if args.command == "check":
@@ -766,10 +770,12 @@ def start(args):
           f".worktrees/{task.name} on branch {branch}.")
     if task.file:
         print(f"Task: {task.file}")
-    print("Commit on the branch, then run `task check` from that folder, then fill `.work/report.md`; "
-          "any later commit needs a new check. In chat, reply with three lines: `changed: ...`, "
+    print("Commit on the branch, then run `task check` from that folder for advisory feedback, "
+          "then fill `.work/report.md`; any later commit needs a new check. The PM's `task merge` "
+          "runs the trusted gate, unless a matching trusted check already passed. A PM may run "
+          "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
           "`verified: ...`, and `not done: ...`, followed by `report written`. "
-          "For long gates, the lane can use `task check --detach`; the PM can use `task merge --detach`.")
+          "For long gates, the PM can use `task merge --detach`.")
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,

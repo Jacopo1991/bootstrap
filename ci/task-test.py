@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 
@@ -145,8 +146,7 @@ class TaskTool(unittest.TestCase):
         record = json.loads((state / "task.json").read_text())
         head = self.git(path, "rev-parse", "HEAD")
         state.mkdir(parents=True, exist_ok=True)
-        (state / "check.json").write_text(json.dumps({"sha": head, "base_sha": self.git(self.repo, "rev-parse", "origin/main"),
-                                                       "record_revision": record["revision"], "trusted": True,
+        (state / "check.json").write_text(json.dumps({"sha": head, "record_revision": record["revision"],
                                                        "result": "passed", "steps": [], "time": "fixture"}))
         (state / "review.md").write_text("Verdict: PASS\nReviewer: claude test\nEvidence: reviewed\n")
         judgments = {str(item["number"]): "pass" for item in record["criteria"]}
@@ -201,7 +201,8 @@ class TaskTool(unittest.TestCase):
         self.assertLess(check_at, report_at)
         self.assertLess(report_at, later_commit_at)
         for line in ("three lines: `changed: ...`, `verified: ...`, and `not done: ...`",
-                     "followed by `report written`", "lane can use `task check --detach`",
+                     "followed by `report written`", "for advisory feedback",
+                     "runs the trusted gate", "A PM may run `task check --detach`",
                      "PM can use `task merge --detach`"):
             self.assertIn(line, out)
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "", "worktrees stay out of status")
@@ -395,6 +396,27 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
         gate_check = __import__("json").loads((self.state() / "gate-check.json").read_text())
         self.assertTrue(gate_check["trusted"])
+
+    def test_merge_trusted_gate_uses_the_shared_exclusive_lock(self):
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(self.repo, "add", ".task.toml")
+        self.git(self.repo, "commit", "-qm", "enable exclusive gate")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.state() / "check.json").unlink()
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        release = threading.Timer(0.25, lambda: os.close(fd))
+        release.start()
+        try:
+            out = self.raw_task("merge", "proj", "5")
+        finally:
+            release.join(timeout=2)
+        self.assertIn("Waiting for exclusive task gate held by", out)
+        self.assertIn("Merged", out)
 
     def test_override_runs_gate_without_check_record_and_records_failed_gate(self):
         wt, _ = self.started()
@@ -1294,8 +1316,8 @@ exit 1
         self.git(wt, "merge", "--no-edit", "origin/main")
         integrated = self.git(wt, "rev-parse", "HEAD")
         out = self.raw_task("merge", "proj", "5", code=1)
-        self.assertIn("passing task check for lane head", out)
         self.assertIn("recorded PASS review for lane head", out)
+        self.assertNotIn("passing task check for lane head", out)
         self.assertNotEqual(integrated, __import__("json").loads((self.state() / "review.json").read_text())["commit"])
 
     def test_round3_lane_integrated_main_then_checked_and_reviewed_merges(self):
