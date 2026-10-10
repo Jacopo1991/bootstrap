@@ -6,6 +6,10 @@ passes unless the worktree holds a file named FAIL; `backlog task edit` applies 
 final summary the way Backlog.md does; `gh pr list` finds no PR.
 """
 import fcntl
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import os
 import shutil
 import subprocess
@@ -325,6 +329,65 @@ class TaskTool(unittest.TestCase):
         self.assertTrue(trusted["trusted"])
         self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
         self.assertIn("lane check: passed (advisory)", self.raw_task("status", "proj"))
+
+    def test_codex_marker_is_advisory_even_when_state_is_writable(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        state = self.state()
+        probe = state / "writable-probe"
+        probe.write_text("writable")
+        probe.unlink()
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CODEX_THREAD_ID="thread-test"))
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
+        self.assertFalse((state / "check.json").exists())
+
+    def test_exclude_failure_and_flock_error_degrade_without_traceback(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        exclude_path = self.repo / ".git/info/exclude"
+        exclude_path.chmod(0o444)
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertNotIn("Traceback", out)
+
+        loader = importlib.machinery.SourceFileLoader("task_tool_for_flock_test", str(TOOL))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        module.HOME = self.home
+        module.CORTEX = self.home / "cortex"
+        # A pattern that is not yet present forces a write to the read-only exclude file.
+        module.exclude(self.repo, "new-pattern-not-present/")
+        self.assertNotIn("new-pattern-not-present/", exclude_path.read_text())
+        exclude_path.chmod(0o644)
+        task = module.Task(self.repo, "T-5")
+        original_flock = module.fcntl.flock
+        module.fcntl.flock = lambda *_args: (_ for _ in ()).throw(OSError("probe failure"))
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                with module.exclusive_gate_lock(task):
+                    pass
+        finally:
+            module.fcntl.flock = original_flock
+        self.assertEqual(output.getvalue().count(
+            "shared gate lock unavailable in this sandbox; running without it"), 1)
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_shared_gate_symlink_is_refused(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable exclusive gate")
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        lock_path.symlink_to(self.home / "other-file")
+        (self.home / "other-file").touch()
+        out = self.raw_task("check", "proj", "5")
+        self.assertIn("shared gate lock unavailable in this sandbox; running without it", out)
+        lock_path.unlink()
 
     def test_start_rejects_redundant_just_check_verify_line(self):
         task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
@@ -676,6 +739,10 @@ esac
         self.assertIn("--merge --match-head-commit", (self.home / "close-pr-merge").read_text())
         close_head = (self.home / "close-match-head").read_text().strip()
         self.assertEqual(self.git(origin, "rev-parse", "task-close-t5"), close_head)
+        self.assertNotEqual(__import__("subprocess").run(
+            ["git", "-C", str(self.kb), "show-ref", "--verify", "--quiet",
+             "refs/heads/task-close-t5"], capture_output=True).returncode, 0,
+                         "successful close removes the merged local task-close branch")
         merge = self.git(origin, "rev-parse", "main")
         parents = self.git(origin, "rev-list", "--parents", "-n", "1", merge).split()
         self.assertEqual(len(parents), 3, "the PR must use a two-parent merge commit")
@@ -745,6 +812,31 @@ esac
         self.assertEqual(self.git(origin, "rev-list", "--count", "task-close-t5"), "2",
                          "merging after a failed attempt still reuses the same close commit")
 
+    def test_close_pr_with_no_changes_reports_already_closed(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text() + "\n## Review evidence\n\nAlready reviewed.\n")
+        self.git(self.kb, "add", "backlog/tasks")
+        self.git(self.kb, "commit", "-qm", "record review evidence")
+        origin = self.home / "knowledge-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
+        self.git(self.kb, "remote", "add", "origin", str(origin))
+        self.git(self.kb, "fetch", "-q", "origin")
+        self.git(self.kb, "remote", "set-head", "origin", "main")
+        (self.home / "bin/backlog").write_text("#!/bin/sh\nexit 0\n")
+        (self.home / "bin/backlog").chmod(0o755)
+        (self.home / "bin/gh").write_text("#!/bin/sh\n"
+            "if [ \"$1 $2\" = 'pr list' ]; then "
+            "echo '[{\"number\":7,\"state\":\"OPEN\",\"headRefName\":\"task-close-t5\",\"baseRefName\":\"main\"}]'; "
+            "else exit 1; fi\n")
+        (self.home / "bin/gh").chmod(0o755)
+        self.started()
+        archive = self.state()
+        (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
+        (archive / "review.md").write_text("Verdict: PASS\n#1 pass: reviewed\n")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
+        self.assertIn("T-5 was already closed.", out)
+        self.assertEqual(list((self.kb / ".worktrees").glob("task-close-*")), [])
+
     def test_exclusive_gate_serializes_checks_and_wait_does_not_use_timeout(self):
         lock_path = self.gate_dir / "agent-task-gate.lock"
         holder_path = self.gate_dir / "agent-task-gate.holder"
@@ -775,6 +867,9 @@ esac
         while __import__("time").monotonic() < deadline and not (self.home / "gate-active").exists():
             __import__("time").sleep(0.02)
         self.assertTrue((self.home / "gate-active").exists(), "first check acquired the shared gate")
+        holder = __import__("json").loads(holder_path.read_text())
+        self.assertEqual(holder["repo"], "proj")
+        self.assertEqual(holder["task"], "T-5")
         started = __import__("time").monotonic()
         second = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "other"],
                                   cwd=self.home, env=env2, stdout=subprocess.PIPE,
@@ -785,7 +880,7 @@ esac
         self.assertEqual(first.returncode, 0, out1)
         self.assertEqual(second.returncode, 0, out2)
         self.assertGreater(elapsed, 2, "the second check waited longer than its one-second check timeout")
-        self.assertIn("Waiting for exclusive task gate held by pid", out2)
+        self.assertIn("Waiting for exclusive task gate held by task T-5 in proj, pid", out2)
         self.assertIn("since ", out2)
         self.assertFalse((self.home / "gate-overlap").exists(), "checks never overlapped")
 
@@ -1233,6 +1328,35 @@ exit 1
         os.killpg(run["pgid"], 9)
         self.assertIn("interrupted", self.raw_task("status", "proj"))
 
+    def test_cancel_kills_check_descendants_that_started_new_sessions(self):
+        self.started()
+        child_pid_file = self.home / "setsid-child.pid"
+        script = ("#!/bin/sh\n"
+                  f"setsid sh -c 'echo $$ > {child_pid_file}; exec sleep 30' &\n"
+                  "wait\n")
+        just = self.home / "bin/just"
+        just.write_text(script)
+        just.chmod(0o755)
+        self.raw_task("check", "--detach", "proj", "5")
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline and not child_pid_file.exists():
+            __import__("time").sleep(0.02)
+        self.assertTrue(child_pid_file.exists(), "the check must start its setsid child")
+        child_pid = int(child_pid_file.read_text())
+        run = __import__("json").loads((self.state() / "run.json").read_text())
+        environment = Path(f"/proc/{child_pid}/environ").read_bytes().split(b"\0")
+        self.assertIn(f"TASK_RUN_ID={run['task_run_id']}".encode(), environment)
+        self.assertIn("Cancelled", self.raw_task("cancel", "proj", "5"))
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline:
+            stat = Path(f"/proc/{child_pid}/stat")
+            if not stat.exists() or stat.read_text().split(") ", 1)[1][0] == "Z":
+                break
+            __import__("time").sleep(0.05)
+        stat = Path(f"/proc/{child_pid}/stat")
+        self.assertTrue(not stat.exists() or stat.read_text().split(") ", 1)[1][0] == "Z",
+                        "cancel must terminate the setsid descendant")
+
     def test_acceptance_6_detached_merge_finishes_and_rerun_observes_merge(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
@@ -1442,6 +1566,16 @@ exit 1
         review.write_text(f"**Verdict: PASS**\nCommit: {head[:9]}\nReviewer: claude model-x\n"
                           "- #1 pass: evidence\n- #2 pass: evidence\n")
         self.assertIn("Recorded PASS", self.raw_task("review", "proj", "5", "--record", str(review)))
+
+    def test_review_record_accepts_bold_verdict_labels_and_backticked_sha(self):
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")[:9]
+        review = self.home / "review-format.txt"
+        for verdict in ("**Verdict:** PASS", "Verdict: **PASS**"):
+            review.write_text(f"{verdict}\nCommit: `{head}`\nReviewer: claude format-test\n"
+                              "#1 pass: reviewed source\n#2 pass: ran acceptance evidence\n")
+            out = self.raw_task("review", "proj", "5", "--record", str(review))
+            self.assertIn("Recorded PASS", out, verdict)
 
     def test_round2_cancel_uses_archive_and_merge_mentions_detach(self):
         self.started()

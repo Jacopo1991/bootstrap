@@ -18,6 +18,8 @@ boundary against code running as that user.
 <repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
 or a plain name for work without a task. `task start` pins criteria and Verify commands; `task
 check` runs the gate and pinned verification; review and merge are PM actions.
+Claude Code and Codex sessions are treated as advisory lanes. The PM runs `task` from the
+agentdev-shell connector, which sets neither vendor's agent markers.
 """
 import argparse
 from contextlib import contextmanager
@@ -26,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import shutil
@@ -367,7 +370,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
     lock_path = gate_dir / "agent-task-gate.lock"
     holder_path = gate_dir / "agent-task-gate.holder"
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
     except OSError:
         if not silent_unavailable:
             print("shared gate lock unavailable in this sandbox; running without it", flush=True)
@@ -385,11 +388,19 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                     waiting = True
                     try:
                         holder_record = json.loads(holder_path.read_text())
-                        detail = (f"pid {holder_record['pid']} since {holder_record['since']}")
+                        detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
+                                  f"pid {holder_record['pid']} since {holder_record['since']}")
                     except (OSError, KeyError, json.JSONDecodeError, TypeError):
                         detail = "another gate (holder details unavailable)"
                     print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
                 time.sleep(0.1)
+            except OSError:
+                if not silent_unavailable:
+                    print("shared gate lock unavailable in this sandbox; running without it", flush=True)
+                os.close(descriptor)
+                descriptor = None
+                yield
+                return
         metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
                     "repo": task.repo.name}
         try:
@@ -406,7 +417,8 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                     holder_path.unlink(missing_ok=True)
             except (OSError, json.JSONDecodeError, AttributeError):
                 pass
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def run_record_path(task: Task):
@@ -421,6 +433,38 @@ def pid_alive(pid):
         return False
     except (PermissionError, ValueError, TypeError, OSError):
         return False
+
+
+def task_run_pids(run_id):
+    """Find this user's processes carrying a check/gate run marker, including new sessions."""
+    if not run_id:
+        return []
+    marker = f"TASK_RUN_ID={run_id}".encode()
+    found = []
+    try:
+        processes = Path("/proc").iterdir()
+        for entry in processes:
+            if not entry.name.isdecimal():
+                continue
+            try:
+                if entry.stat().st_uid != os.getuid():
+                    continue
+                if marker in entry.joinpath("environ").read_bytes().split(b"\0"):
+                    found.append(int(entry.name))
+            except (OSError, PermissionError, ValueError):
+                continue
+    except OSError:
+        return []
+    return found
+
+
+def signal_task_run(run_id, signum):
+    for pid in task_run_pids(run_id):
+        if pid != os.getpid():
+            try:
+                os.kill(pid, signum)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
 
 def task_lock_status(task: Task):
@@ -470,11 +514,14 @@ def detached(args, task, path):
     command = [part for part in command if part != "--detach"]
     log = (work / "run.log").open("ab")
     archive = run_path
-    env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive))
+    run_id = secrets.token_hex(16)
+    env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive),
+               TASK_RUN_ID=run_id)
     child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                              close_fds=True)
     atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
+                           "task_run_id": run_id,
                            "state": "running", "started_at": started, "ended_at": "",
                            "completed": []})
     atomic_json(lock, {"pid": child.pid, "started_at": started, "command": args.command,
@@ -546,11 +593,13 @@ def foreground_lock(args):
         except FileExistsError:
             raise Stop("A task run is already starting; try again shortly.")
     started = utc_now()
+    run_id = os.environ.setdefault("TASK_RUN_ID", secrets.token_hex(16))
     with os.fdopen(fd, "w") as output:
         json.dump({"pid": os.getpid(), "started_at": started, "command": args.command,
-                   "mode": "foreground"}, output)
+                   "mode": "foreground", "task_run_id": run_id}, output)
     atomic_json(state / "run.json", {"command": args.command, "state": "foreground",
-                                      "pid": os.getpid(), "started_at": started, "completed": []})
+                                      "pid": os.getpid(), "started_at": started,
+                                      "task_run_id": run_id, "completed": []})
     global ACTIVE_FOREGROUND_TASK
     ACTIVE_FOREGROUND_TASK = task
     return lock
@@ -582,11 +631,15 @@ def finish_detached(code):
 def exclude(repo, pattern):
     """Add a pattern to the repository's local exclude file (never a tracked file)."""
     path = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info/exclude"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = path.read_text().splitlines() if path.exists() else []
-    if pattern not in lines:
-        with path.open("a") as handle:
-            handle.write(pattern + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = path.read_text().splitlines() if path.exists() else []
+        if pattern not in lines:
+            with path.open("a") as handle:
+                handle.write(pattern + "\n")
+    except OSError:
+        # Advisory checks must still run when the checkout's local Git metadata is read-only.
+        pass
 
 
 def editable_install(venv: Path, repo: Path) -> bool:
@@ -794,6 +847,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
     log = work / "check.log"
     passed = True
     timeout = timeout_for(path)
+    run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
     with log.open("w") as out:
         steps = [["just", "check"]]
@@ -806,8 +860,10 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             out.flush()
             started = time.monotonic()
             try:
-                process = subprocess.Popen(step, cwd=path, stdout=out, stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL, start_new_session=True)
+                child_env = dict(os.environ, TASK_RUN_ID=run_id)
+                process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
+                                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                           start_new_session=True)
                 if state:
                     set_child_group(state, process.pid)
                 try:
@@ -955,7 +1011,7 @@ def update_local_default(repo, default, commit):
         result = run_git(repo, "update-ref", f"refs/heads/{default}", commit, old or "")
         return f"local {default} updated" if result.returncode == 0 else \
             f"local {default} not updated: {result.stderr.strip()}"
-    if git(holder, "status", "--porcelain", "--untracked-files=all"):
+    if git(holder, "status", "--porcelain"):
         return f"local {default} not updated in {holder}: it has uncommitted changes"
     result = run_git(holder, "merge", "-q", "--ff-only", commit)
     if result.returncode:
@@ -1096,8 +1152,10 @@ def review(args):
         text = Path(args.record).read_text()
     except OSError as error:
         raise Stop(f"Cannot read review file {args.record}: {error}.")
-    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict:\s*(PASS|FAIL)(?:\*\*)?\s*$", text)
-    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*([0-9a-f]{7,40})(?:\*\*)?\s*$", text)
+    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict(?::\*\*|:)\s*"
+                        r"(?:\*\*)?(PASS|FAIL)(?:\*\*)?\s*$", text)
+    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*`?"
+                       r"([0-9a-f]{7,40})`?(?:\*\*)?\s*$", text)
     reviewer = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Reviewer:\s*(codex|claude)\s+(.+?)(?:\*\*)?\s*$", text)
     judgments = {int(n): (v, evidence.strip()) for n, v, evidence in re.findall(
         r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?#(\d+)\s+(pass|fail|unclear):\s*(.+?)\s*$", text)}
@@ -1496,6 +1554,13 @@ def close_commit_present(path, task):
     return git(path, "log", "-1", "--format=%s") == f"Close {task.id}: {task.title}"
 
 
+def delete_merged_close_branch(repo, branch):
+    if branch.startswith("task-close-") and ok(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+        result = run_git(repo, "branch", "-D", branch)
+        if result.returncode:
+            print(f"Close branch {branch} remains locally: {result.stderr.strip()}")
+
+
 def update_closed_knowledge_checkout(repo, default):
     if git(repo, "status", "--porcelain", "--untracked-files=all"):
         return f"local {default} not updated in {repo}: checkout has uncommitted changes"
@@ -1523,6 +1588,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         print(f"Close PR #{existing['number']} is already merged ({merge_commit[:7]}).")
         print(update_closed_knowledge_checkout(repo, default))
         remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+        delete_merged_close_branch(repo, branch)
         return 0
     if existing and str(existing.get("state", "")).upper() != "OPEN":
         raise Stop(f"Close PR #{existing.get('number')} is {existing.get('state')}; branch {branch} is preserved for inspection.")
@@ -1542,7 +1608,8 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         if not changed:
             # Nothing was committed, so there is no state to resume from: do not leave the folder behind.
             remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
-            raise Stop(f"{task.id} has no close changes to commit on {branch}.")
+            print(f"{task.id} was already closed.")
+            return 0
         head = sha(path, "HEAD")
 
     kept = f" Close worktree kept at {path} for the resume."
@@ -1588,6 +1655,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
     print(f"Merged close PR #{pr} with merge commit {merge_commit[:7]}.")
     print(update_closed_knowledge_checkout(repo, default))
     remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+    delete_merged_close_branch(repo, branch)
     return 0
 
 
@@ -1817,12 +1885,20 @@ def cancel(args):
         else:
             os.kill(int(run["pid"]), signal.SIGTERM)
     except (ProcessLookupError, OSError, KeyError, ValueError): pass
+    run_id = run.get("task_run_id")
+    signal_task_run(run_id, signal.SIGTERM)
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
-        if run.get("state") == "running":
-            try: os.killpg(int(run["pgid"]), 0)
-            except (ProcessLookupError, OSError, KeyError, ValueError): break
-        elif not pid_alive(run.get("pid")):
+        live_group = False
+        try:
+            if run.get("state") == "running":
+                os.killpg(int(run["pgid"]), 0)
+                live_group = True
+            elif pid_alive(run.get("pid")):
+                live_group = True
+        except (ProcessLookupError, OSError, KeyError, ValueError):
+            pass
+        if not live_group and not task_run_pids(run_id):
             break
         time.sleep(0.05)
     else:
@@ -1834,6 +1910,7 @@ def cancel(args):
             else:
                 os.kill(int(run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, OSError, KeyError, ValueError): pass
+    signal_task_run(run_id, signal.SIGKILL)
     run["state"] = "cancelled"
     run["ended_at"] = utc_now()
     atomic_json(run_path, run)
