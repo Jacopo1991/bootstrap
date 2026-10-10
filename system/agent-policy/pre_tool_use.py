@@ -6,6 +6,7 @@ Claude Code and Codex run it from their root-owned managed settings, as
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -1072,13 +1073,21 @@ def task_state_path(path_text: str, cwd: str) -> bool:
 
 
 def task_route(tokens: list[str]) -> tuple[str, int] | None:
-    """Find task subcommands whether invoked directly or through an interpreter/shell."""
-    for index, token in enumerate(tokens):
-        name = Path(token).name.lower()
-        if name in {"task", "executable_task", "executable_task.py"} and index + 1 < len(tokens):
-            command = tokens[index + 1]
+    """Find a task-tool invocation at command position, never a mention in arguments."""
+    unwrapped = unwrap_command(tokens)
+    if not isinstance(unwrapped, list) or not unwrapped:
+        return None
+    executable = Path(unwrapped[0]).name.lower()
+    task_names = {"task", "executable_task", "executable_task.py"}
+    if executable in task_names and len(unwrapped) > 1:
+        command = unwrapped[1]
+        if command in PM_TASK_COMMANDS or command == "check":
+            return command, 0
+    if (executable in INTERPRETERS or re.fullmatch(r"python[0-9.]+", executable)) and len(unwrapped) > 2:
+        if Path(unwrapped[1]).name.lower() in task_names:
+            command = unwrapped[2]
             if command in PM_TASK_COMMANDS or command == "check":
-                return command, index
+                return command, 1
     return None
 
 
@@ -1396,11 +1405,11 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
         return "Inline shell and interpreter programs are blocked."
     host_reason = host_command_reason(tokens, executable)
     if host_reason:
-        return host_reason
+        return Denial("host.command_boundary", host_reason)
     if executable == "task" and len(tokens) > 1 and tokens[1] in PM_TASK_COMMANDS:
-        return ("`task start`, `task merge`, `task close`, `task review`, `task cancel`, `task note` "
-                "and `task denials` are for the PM. Lanes may run `task status` and `task check` in their "
-                "worktree, commit on your branch and report.")
+        return Denial("task.pm_only", "`task start`, `task merge`, `task close`, `task review`, `task cancel`, `task note` "
+                      "and `task denials` are for the PM. Lanes may run `task status` and `task check` in their "
+                      "worktree, commit on your branch and report.")
     if executable == "sed":
         reason = sed_policy(tokens)
         if reason:
@@ -1472,9 +1481,11 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if any(SHELL_EXPANSION.search(t) or not writable(t, cwd, root, metadata) for t in targets):
         return "Shell writes outside the current repository or into Git metadata are blocked."
     if executable == "git":
-        return git_policy(tokens, cwd, root, approved_roots)
+        reason = git_policy(tokens, cwd, root, approved_roots)
+        return Denial("git.command_policy", reason) if reason else None
     if executable == "gh":
-        return gh_policy(tokens)
+        reason = gh_policy(tokens)
+        return Denial("github.command_policy", reason) if reason else None
     return None
 
 
@@ -1523,21 +1534,11 @@ def first_command_category(command: str) -> str:
     return Path(tokens[index]).name if index < len(tokens) else ""
 
 
-def event_vendor(event: dict) -> str:
-    for key in ("vendor", "agent_vendor", "client", "source", "hook_source", "agent"):
-        value = event.get(key)
-        if isinstance(value, str) and value.lower() in {"claude", "codex"}:
-            return value.lower()
-    # Claude identifies the invoking app in its event envelope; Codex exposes the
-    # hook source under its own event key. Never infer a vendor from command env.
-    for key, vendor in (("hook_event_name", "claude"), ("codex_event", "codex")):
-        if isinstance(event.get(key), str) and event[key]:
-            return vendor
-    # Do not infer identity from environment variables controlled by the command.
-    return "unknown"
+def event_vendor(event: dict, vendor: str | None = None) -> str:
+    return vendor if vendor in {"claude", "codex"} else "unknown"
 
 
-def log_denial(event: dict, denial: str | None = None):
+def log_denial(event: dict, denial: str | None = None, vendor: str | None = None):
     """Best-effort denial audit; record a command category, never its arguments."""
     try:
         data = event.get("tool_input", {})
@@ -1553,7 +1554,7 @@ def log_denial(event: dict, denial: str | None = None):
                 repo = result.stdout.strip()
         except (OSError, subprocess.SubprocessError):
             pass
-        vendor = event_vendor(event)
+        vendor = event_vendor(event, vendor)
         if denial is None:
             denial = evaluate(event)
         rule_id = getattr(denial, "rule_id", "policy.command_evaluation")
@@ -1569,7 +1570,10 @@ def log_denial(event: dict, denial: str | None = None):
         return
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--vendor", choices=("claude", "codex"))
+    options, _unknown = parser.parse_known_args(argv)
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
@@ -1580,7 +1584,8 @@ def main() -> int:
     permission_request = event.get("hook_event_name") == "PermissionRequest"
     reason = permission_reason(event) if permission_request else evaluate(event)
     if reason:
-        log_denial(event, Denial("permission.policy", reason) if permission_request else reason)
+        log_denial(event, Denial("permission.policy", reason) if permission_request else reason,
+                   options.vendor)
         response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
                     "decision": {"behavior": "deny", "message": reason}}}
                     if permission_request else deny(reason))

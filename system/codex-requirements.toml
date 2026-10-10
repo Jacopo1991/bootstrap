@@ -18,7 +18,7 @@ matcher = "^Bash$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py --vendor codex"
 timeout = 30
 
 [[hooks.PreToolUse]]
@@ -26,7 +26,7 @@ matcher = "^(apply_patch|Edit|Write)$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py --vendor codex"
 timeout = 30
 
 [[hooks.UserPromptSubmit]]
@@ -41,7 +41,7 @@ matcher = "^Bash$"
 
 [[hooks.PermissionRequest.hooks]]
 type = "command"
-command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py"
+command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py --vendor codex"
 timeout = 30
 
 # Requirements rules merge with ~/.codex/rules/*.rules and the most restrictive decision wins,

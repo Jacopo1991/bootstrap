@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """task lifecycle for one task; private evidence lives in ~/.local/state/task.
 
+Lanes and task checks run as the same Unix user. Lane scripts and the repository's justfile can
+forge private task evidence; the managed hook blocks obvious write routes but is not a security
+boundary against code running as that user.
+
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
   task check [[<repo>] <id>] [--detach]
   task review <repo> <id> [--record <file>]
@@ -40,6 +44,7 @@ SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|erro
 DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
               ".ruff_cache", ".cache", ".tox", ".next", ".astro", ".turbo", "dist", "build",
               "coverage", "target", ".parcel-cache"}
+ACTIVE_FOREGROUND_TASK = None
 
 
 class Stop(Exception):
@@ -234,6 +239,60 @@ def completed_step(task: Task, step: str):
     atomic_json(path, run)
 
 
+def task_event(task: Task, name: str):
+    path = task_state(task) / "events.json"
+    try:
+        events = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        events = {}
+    events[name] = utc_now()
+    atomic_json(path, events)
+
+
+def set_child_group(state: Path, pgid: int | None):
+    lock = state / "run.lock"
+    try:
+        data = json.loads(lock.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if pgid is None:
+        data.pop("child_pgid", None)
+    else:
+        data["child_pgid"] = pgid
+    atomic_json(lock, data)
+
+
+def handle_sighup(_signum, _frame):
+    task = ACTIVE_FOREGROUND_TASK
+    if task is not None:
+        state = task_state(task)
+        lock = state / "run.lock"
+        try:
+            lock_data = json.loads(lock.read_text())
+            child_pgid = int(lock_data.get("child_pgid", 0))
+            if child_pgid:
+                os.killpg(child_pgid, signal.SIGTERM)
+                time.sleep(0.1)
+                try:
+                    os.killpg(child_pgid, 0)
+                    os.killpg(child_pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        run_path = state / "run.json"
+        try:
+            run = json.loads(run_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            run = {}
+        if run.get("pid") == os.getpid() and run.get("state") == "foreground":
+            run["state"] = "interrupted"
+            run["ended_at"] = utc_now()
+            atomic_json(run_path, run)
+        lock.unlink(missing_ok=True)
+    raise SystemExit(129)
+
+
 def record_revision(record):
     body = {key: value for key, value in record.items() if key != "revision"}
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -274,31 +333,59 @@ def run_record_path(task: Task):
     return task_state(task) / "run.json"
 
 
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError, OSError):
+        return False
+
+
+def task_lock_status(task: Task):
+    lock = task_state(task) / "run.lock"
+    if not lock.exists():
+        return ""
+    try:
+        lock_record = json.loads(lock.read_text())
+        pid = int(lock_record["pid"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return "unknown"
+    if pid_alive(pid):
+        return "running"
+    run_path = run_record_path(task)
+    try:
+        run = json.loads(run_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        run = {}
+    active = run.get("state") in {"running", "foreground", "starting"}
+    if active:
+        run["state"] = "interrupted"
+        run["ended_at"] = utc_now()
+        atomic_json(run_path, run)
+    lock.unlink(missing_ok=True)
+    return "interrupted" if active else ""
+
+
 def detached(args, task, path):
     work = path / ".work"
     work.mkdir(exist_ok=True)
     state = task_state(task)
     state.mkdir(parents=True, exist_ok=True)
     run_path, lock = state / "run.json", state / "run.lock"
+    if lock.exists() and task_lock_status(task) == "running":
+        raise Stop("A task run is already live; wait for it or use `task cancel`.")
     if lock.exists():
-        try:
-            previous = json.loads(run_path.read_text())
-            if previous.get("state") == "foreground":
-                raise Stop("A task run is already live; wait for it before starting another run.")
-            os.killpg(int(previous["pgid"]), 0)
-            raise Stop("A task run is already live; wait for it or use `task cancel`.")
-        except ProcessLookupError:
-            previous["state"] = "interrupted"
-            previous["ended_at"] = utc_now()
-            atomic_json(run_path, previous)
-            lock.unlink(missing_ok=True)
-        except (OSError, ValueError, KeyError, json.JSONDecodeError):
-            lock.unlink(missing_ok=True)
+        raise Stop("The task run lock is unreadable; ask the PM to inspect task status.")
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
     except FileExistsError:
         raise Stop("A task run is already starting; try again shortly.")
+    started = utc_now()
+    atomic_json(lock, {"pid": os.getpid(), "started_at": started, "command": args.command,
+                       "mode": "detached-starting"})
     command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
     command = [part for part in command if part != "--detach"]
     log = (work / "run.log").open("ab")
@@ -308,8 +395,10 @@ def detached(args, task, path):
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                              close_fds=True)
     atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
-                           "state": "running", "started_at": utc_now(), "ended_at": "",
+                           "state": "running", "started_at": started, "ended_at": "",
                            "completed": []})
+    atomic_json(lock, {"pid": child.pid, "started_at": started, "command": args.command,
+                       "mode": "detached"})
     print(f"Started detached {args.command} run (pid {child.pid}); see {work / 'run.log'}.")
     return 0
 
@@ -330,11 +419,21 @@ def foreground_lock(args):
     lock = state / "run.lock"
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
     except FileExistsError:
-        raise Stop("A task run is already live; wait for it or use `task cancel`.")
+        if task_lock_status(task) == "running":
+            raise Stop("A task run is already live; wait for it or use `task cancel`.")
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            raise Stop("A task run is already starting; try again shortly.")
+    started = utc_now()
+    with os.fdopen(fd, "w") as output:
+        json.dump({"pid": os.getpid(), "started_at": started, "command": args.command,
+                   "mode": "foreground"}, output)
     atomic_json(state / "run.json", {"command": args.command, "state": "foreground",
-                                      "started_at": utc_now(), "completed": []})
+                                      "pid": os.getpid(), "started_at": started, "completed": []})
+    global ACTIVE_FOREGROUND_TASK
+    ACTIVE_FOREGROUND_TASK = task
     return lock
 
 
@@ -520,6 +619,9 @@ def start(args):
                   "verify": verify, "no_verify": args.no_verify or ""}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
+        if args.refresh:
+            for stale in (state / "exception.json", state / "review.json", state / "review.md"):
+                stale.unlink(missing_ok=True)
         report = work / "report.md"
         if not report.exists() or args.refresh and not report_is_filled(report):
             report.write_text("# Task report\n\n## What changed\n\n(fill in)\n\n## How I verified\n\n(fill in)\n\n## Criteria\n\n" +
@@ -541,7 +643,7 @@ def start(args):
           "and report that the report is written. For long gates, the PM can use `task merge --detach`.")
 
 
-def run_check(path, base, record=None, state=None):
+def run_check(path, base, record=None, state=None, evidence_name="check.json"):
     """Run the repository's gate in <path>; return True when it passes."""
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
@@ -567,6 +669,7 @@ def run_check(path, base, record=None, state=None):
             try:
                 process = subprocess.Popen(step, cwd=path, stdout=out, stderr=subprocess.STDOUT,
                                            stdin=subprocess.DEVNULL, start_new_session=True)
+                set_child_group(state, process.pid)
                 try:
                     code = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -575,25 +678,29 @@ def run_check(path, base, record=None, state=None):
                     except ProcessLookupError:
                         pass
                     process.wait()
+                    set_child_group(state, None)
                     out.write(f"\nTIMEOUT after {timeout}s\n")
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
                                     "timeout": True})
-                    atomic_json(state / "check.json", {"sha": sha(path, "HEAD"), "result": "failed",
+                    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "result": "failed",
                                                        "steps": results, "time": utc_now()})
+                    if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
                     print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {log}")
                     return False
             except subprocess.TimeoutExpired:
                 raise
             except FileNotFoundError:
                 raise Stop(f"`{step[0]}` is not installed.")
+            set_child_group(state, None)
             out.write(f"exit {code}\n")
             results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3)})
             if code:
                 passed = False
                 break
-    atomic_json(state / "check.json", {"sha": sha(path, "HEAD"), "record_revision": record.get("revision") if record else "",
+    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "record_revision": record.get("revision") if record else "",
                                        "result": "passed" if passed else "failed", "steps": results,
                                        "time": utc_now()})
+    if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
     lines = log.read_text(errors="replace").splitlines()
     summary = [line for line in lines if SUMMARY.match(line.strip())][-4:]
     for line in summary if passed else lines[-20:]:
@@ -771,6 +878,7 @@ def review(args):
             "model": reviewer.group(2), "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
             "record_revision": record["revision"], "time": utc_now()}
     atomic_json(state / "review.json", meta)
+    task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     return 0
 
@@ -791,11 +899,7 @@ def merge_gate(task, path, head):
     except (OSError, json.JSONDecodeError):
         review = {}
     reviewed_head = review.get("commit")
-    review_matches = reviewed_head == head
-    if not review_matches and reviewed_head and is_ancestor(path, reviewed_head, head):
-        parents = git(path, "rev-list", "--parents", "-n", "1", head).split()
-        review_matches = len(parents) >= 3 and parents[1] == reviewed_head
-    if (review.get("verdict") != "PASS" or not review_matches
+    if (review.get("verdict") != "PASS" or reviewed_head != head
             or review.get("record_revision") != record["revision"]
             or any(v != "pass" for v in review.get("judgments", {}).values())
             or review.get("reviewer") == record["builder"]):
@@ -956,6 +1060,171 @@ def merge(args):
     return 0
 
 
+def overlap_files(repo: Path, lane_head: str, base: str):
+    common = git(repo, "merge-base", lane_head, base)
+    lane_files = set(git(repo, "diff", "--name-only", common, lane_head).splitlines())
+    main_files = set(git(repo, "diff", "--name-only", common, base).splitlines())
+    return sorted(lane_files & main_files)
+
+
+def overlap_message(files):
+    names = ", ".join(files) if files else "files with merge conflicts"
+    return (f"main changed {names} that this task also changed; ask the lane to merge main into its "
+            "branch, then `task check` and a new review")
+
+
+def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record):
+    gate = repo / ".worktrees" / f".task-gate-{task.name}-{os.getpid()}"
+    if gate.exists():
+        raise Stop(f"Temporary gate worktree already exists: {gate}")
+    exclude(repo, ".worktrees/")
+    git(repo, "worktree", "add", "-q", "--detach", str(gate), base)
+    try:
+        result = run_git(gate, "merge", "--no-edit", "--no-ff", lane_head)
+        if result.returncode:
+            conflicts = git(gate, "diff", "--name-only", "--diff-filter=U").splitlines()
+            run_git(gate, "merge", "--abort")
+            raise Stop(overlap_message(conflicts))
+        gated_head = sha(gate, "HEAD")
+        passed = run_check(gate, base, record, task_state(task), evidence_name="gate-check.json")
+        shutil.copy2(gate / ".work/check.log", task_state(task) / "gate-check.log")
+        completed_step(task, "gate")
+        if not passed:
+            raise Stop("Gate check failed on the would-be merge result; nothing was published.")
+        return git(gate, "rev-parse", f"{gated_head}^{{tree}}")
+    finally:
+        run_git(repo, "worktree", "remove", "--force", str(gate))
+
+
+def merge(args):
+    repo = resolve_repo(args.repo)
+    task = Task(repo, args.id)
+    print(f"For long gates, use `task merge {args.repo} {task.id} --detach` and track it with `task status`.")
+    default = default_branch(repo)
+    fetch(repo)
+    base, label = base_commit(repo, default)
+    archive = task_state(task)
+    if not task.path.exists():
+        try:
+            checked = json.loads((archive / "check.json").read_text())
+            lane_head = checked.get("sha")
+        except (OSError, json.JSONDecodeError):
+            lane_head = None
+        if lane_head and is_ancestor(repo, lane_head, base):
+            print(f"{task.id} is already merged in {label}; archive is resumable and complete.")
+            return 0
+        raise Stop(f"No worktree {task.path}; start it with `task start`.")
+    path = task.worktree()
+    branch = git(path, "branch", "--show-current")
+    if not branch:
+        raise Stop(f"{path} is not on a branch.")
+    changes = untracked(path)
+    if changes:
+        raise Stop("The worktree has uncommitted or untracked files; the lane commits or deletes "
+                   "them first:\n" + "\n".join(changes))
+    lane_head = sha(path, "HEAD")
+    record = load_record(task)
+    try:
+        record = merge_gate(task, path, lane_head)
+    except Stop:
+        if not args.override:
+            raise
+        atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
+                                                   "missing_gate": True})
+        print(f"exception: merge gate overridden: {args.override}")
+    task_event(task, "merge")
+    if is_ancestor(repo, lane_head, base):
+        commit = base
+        print(f"{branch} is already in {label}.")
+    else:
+        title = f": {task.title}" if task.title else ""
+        for _attempt in range(3):
+            fetch(repo)
+            base, label = base_commit(repo, default)
+            overlap = overlap_files(repo, lane_head, base)
+            if overlap:
+                raise Stop(overlap_message(overlap))
+            tree = gate_merge_result(task, repo, lane_head, base, record)
+            if sha(path, "HEAD") != lane_head:
+                raise Stop("The lane branch changed while the gate ran; nothing was published. Run `task check` and obtain a new review.")
+            fetch(repo)
+            latest, _ = base_commit(repo, default)
+            if latest != base:
+                print(f"{label} moved during the gate; re-gating against the new tip.")
+                continue
+            if on_github(repo):
+                git(repo, "push", "-q", "origin", f"{lane_head}:refs/heads/{branch}")
+                pr = open_pr(repo, branch)
+                if not pr:
+                    gh(repo, "pr", "create", "--head", branch, "--base", default,
+                       "--title", f"{task.id}{title}" if task.title else task.id,
+                       "--body", (path / ".work/report.md").read_text())
+                    pr = open_pr(repo, branch)
+                    if not pr:
+                        raise Stop("Opened a PR but could not find it again; rerun `task merge`.")
+                    print(f"Opened PR #{pr}.")
+                fetch(repo)
+                latest, _ = base_commit(repo, default)
+                if latest != base:
+                    print(f"{label} moved before PR merge; re-gating against the new tip.")
+                    continue
+                gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", lane_head)
+                completed_step(task, "published")
+                fetch(repo)
+                commit = sha(repo, f"origin/{default}")
+                print(f"Merged PR #{pr} ({commit[:7]}) from reviewed head {lane_head[:7]}.")
+            else:
+                commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
+                             "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
+                if has_origin(repo):
+                    pushed = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
+                    if pushed.returncode:
+                        fetch(repo)
+                        latest, _ = base_commit(repo, default)
+                        if latest != base:
+                            print(f"{label} moved before publication; re-gating against the new tip.")
+                            continue
+                        raise Stop(f"Push to {default} was refused: {pushed.stderr.strip()}\n"
+                                   "Rerun `task merge`; the lane branch is unchanged and will be gated again.")
+                    fetch(repo)
+                    commit = sha(repo, f"origin/{default}")
+                completed_step(task, "published")
+                print(f"Merged {branch} into {default} as {commit[:7]} from reviewed head {lane_head[:7]}.")
+            break
+        else:
+            raise Stop(f"{default} kept moving during three gate attempts; rerun `task merge`.")
+    try:
+        review = json.loads((archive / "review.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        review = {}
+    if review:
+        print(f"Recorded review: {review.get('reviewer', '?')} {review.get('model', '?')} at "
+              f"{review.get('time', '?')} for {review.get('commit', '?')[:7]}.")
+    print(update_local_default(repo, default, commit))
+    completed_step(task, "main updated")
+    report_path = path / ".work/report.md"
+    if report_path.is_file():
+        shutil.copy2(report_path, archive / "report.md")
+    check_log = path / ".work/check.log"
+    if check_log.is_file():
+        shutil.copy2(check_log, archive / "check.log")
+    completed_step(task, "archived")
+    if args.keep:
+        return 0
+    leftovers = untracked(path) + ignored_leftovers(path)
+    if leftovers:
+        print(f"Kept {path}: it holds files that are not in the merge:\n" + "\n".join(leftovers))
+        return 0
+    git(repo, "worktree", "remove", "--force", str(path))
+    completed_step(task, "cleaned")
+    if is_ancestor(repo, lane_head, commit) and ok(repo, "branch", "-D", branch):
+        print(f"Removed {path} and branch {branch}.")
+    else:
+        print(f"Removed {path}; branch {branch} kept (not fully in local {default}).")
+    task_event(task, "merge")
+    return 0
+
+
 def close(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
@@ -1010,6 +1279,12 @@ def close(args):
     if result.returncode:
         raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
     after = task.file
+    recorded_review = archive / "review.md"
+    if recorded_review.is_file():
+        text = after.read_text()
+        if "## Review evidence" not in text:
+            text += "\n\n## Review evidence\n\n" + recorded_review.read_text().strip() + "\n"
+            after.write_text(text)
     noticed = []
     report = archive / "report.md"
     if report.exists():
@@ -1084,13 +1359,25 @@ def status(args):
             try: run = json.loads((state / "run.json").read_text())
             except (OSError, json.JSONDecodeError): pass
             run_state = run.get("state", "")
+            lock_state = task_lock_status(task)
+            if lock_state == "interrupted":
+                run_state = "interrupted"
+            elif lock_state == "running" and run_state in {"foreground", "running"}:
+                run_state = "running"
             if run_state == "running":
-                try: os.killpg(int(run["pgid"]), 0)
-                except (ProcessLookupError, OSError, KeyError, ValueError): run_state = "interrupted"
+                if run.get("state") == "running":
+                    try: os.killpg(int(run["pgid"]), 0)
+                    except (ProcessLookupError, OSError, KeyError, ValueError): run_state = "interrupted"
             check_state = run_state if run_state in {"running", "interrupted"} else check.get("result", "missing")
             report = (path / ".work/report.md").is_file()
-            last = int(run.get("ended_at_ts") or run.get("started_at_ts") or
-                       run.get("updated_at_ts") or os.stat(path).st_mtime)
+            last = int(git(path, "log", "-1", "--format=%ct", "HEAD") or os.stat(path).st_mtime)
+            try:
+                events = json.loads((state / "events.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                events = {}
+            for stamp in events.values():
+                try: last = max(last, int(datetime.fromisoformat(stamp).timestamp()))
+                except (ValueError, TypeError): pass
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
             print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} head={head[:7]} "
@@ -1147,23 +1434,56 @@ def cancel(args):
     run_path = task_state(task) / "run.json"
     try: run = json.loads(run_path.read_text())
     except (OSError, json.JSONDecodeError): raise Stop("No detached run to cancel.")
-    if run.get("state") != "running":
+    lock = run_path.parent / "run.lock"
+    lock_state = task_lock_status(task)
+    if run.get("state") in {"running", "foreground"} and not lock_state:
+        pid = run.get("pid") or run.get("pgid")
+        if not pid_alive(pid):
+            run["state"] = "interrupted"
+            run["ended_at"] = run.get("ended_at") or utc_now()
+            atomic_json(run_path, run)
+    if run.get("state") == "interrupted" or lock_state == "interrupted":
+        lock.unlink(missing_ok=True)
+        run["state"] = "interrupted"
+        run["ended_at"] = run.get("ended_at") or utc_now()
+        atomic_json(run_path, run)
+        print("Cleared interrupted run lock.")
+        return 0
+    if run.get("state") not in {"running", "foreground"} or lock_state != "running":
         raise Stop(f"Run is {run.get('state', 'unknown')}; nothing is running to cancel.")
-    try: os.killpg(int(run["pgid"]), signal.SIGTERM)
+    child_pgid = 0
+    try:
+        lock_record = json.loads(lock.read_text())
+        child_pgid = int(lock_record.get("child_pgid", 0))
+        if child_pgid:
+            os.killpg(child_pgid, signal.SIGTERM)
+        if run.get("state") == "running":
+            os.killpg(int(run["pgid"]), signal.SIGTERM)
+        else:
+            os.kill(int(run["pid"]), signal.SIGTERM)
     except (ProcessLookupError, OSError, KeyError, ValueError): pass
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
-        try: os.killpg(int(run["pgid"]), 0)
-        except (ProcessLookupError, OSError, KeyError, ValueError): break
+        if run.get("state") == "running":
+            try: os.killpg(int(run["pgid"]), 0)
+            except (ProcessLookupError, OSError, KeyError, ValueError): break
+        elif not pid_alive(run.get("pid")):
+            break
         time.sleep(0.05)
     else:
-        try: os.killpg(int(run["pgid"]), signal.SIGKILL)
+        try:
+            if child_pgid:
+                os.killpg(child_pgid, signal.SIGKILL)
+            if run.get("state") == "running":
+                os.killpg(int(run["pgid"]), signal.SIGKILL)
+            else:
+                os.kill(int(run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, OSError, KeyError, ValueError): pass
     run["state"] = "cancelled"
     run["ended_at"] = utc_now()
     atomic_json(run_path, run)
     (run_path.parent / "run.lock").unlink(missing_ok=True)
-    print("Cancelled detached run.")
+    print("Cancelled task run.")
     return 0
 
 
@@ -1229,15 +1549,25 @@ def main(argv=None):
                 path = task.worktree()
             return detached(args, task, path)
         lock = foreground_lock(args)
+        if lock:
+            signal.signal(signal.SIGHUP, handle_sighup)
+        result = 1
         try:
             result = {"start": start, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials}[args.command](args) or 0
         finally:
             if lock:
+                run_path = lock.parent / "run.json"
+                try: run = json.loads(run_path.read_text())
+                except (OSError, json.JSONDecodeError): run = {}
+                if run.get("pid") == os.getpid() and run.get("state") == "foreground":
+                    run["state"] = "passed" if result == 0 else "failed"
+                    run["ended_at"] = utc_now()
+                    atomic_json(run_path, run)
                 lock.unlink(missing_ok=True)
-                atomic_json(lock.parent / "run.json", {"command": args.command, "state": "finished",
-                                                        "ended_at": utc_now(), "completed": []})
+                global ACTIVE_FOREGROUND_TASK
+                ACTIVE_FOREGROUND_TASK = None
         finish_detached(result)
         return result
     except Stop as stop:
