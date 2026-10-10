@@ -85,10 +85,7 @@ def frontmatter_title(text):
             value = "\n".join(value_lines)
             if scalar.startswith(">"):
                 value = re.sub(r"(?<=[^\n])\n(?=[^\n])", " ", value)
-            value = value.rstrip("\n")
-            if scalar in {">", "|"} and value:
-                value += "\n"
-            return value
+            return value.rstrip("\n")
         if len(scalar) >= 2 and scalar[0] == scalar[-1] == "'":
             return scalar[1:-1].replace("''", "'")
         if len(scalar) >= 2 and scalar[0] == scalar[-1] == '"':
@@ -1158,7 +1155,7 @@ def normalize_review_line(line):
 
 def parse_review_block(block, criteria):
     """Parse the exact plain-text fields in a fenced `review` block."""
-    lines = block.splitlines()
+    lines = [line.rstrip() for line in block.splitlines() if line.strip()]
     if len(lines) < 3:
         raise ReviewParseError("review block must contain verdict, commit, and reviewer lines")
     verdict_match = re.fullmatch(r"Verdict: (PASS|FAIL)", lines[0])
@@ -1276,7 +1273,8 @@ def review(args):
         else:
             prompt.append("Criteria: none; judge the stated request above against the diff.")
         prompt.append(f"Diff range: {record['base_sha']}..{head}")
-        prompt.append("Reviewer instructions: read-only review; use `git --no-optional-locks diff`, "
+        prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
+                      "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
         if record["criteria"]:
             prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")

@@ -245,11 +245,11 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(parser("---\ntitle: >-\n  folded title\n  continues here\nstatus: Done\n---\n"),
                          "folded title continues here")
         self.assertEqual(parser("---\ntitle: >\n  folded title\n  continues here\nstatus: Done\n---\n"),
-                         "folded title continues here\n")
+                         "folded title continues here")
         self.assertEqual(parser("---\ntitle: |-\n  literal title\n  continues here\nstatus: Done\n---\n"),
                          "literal title\ncontinues here")
         self.assertEqual(parser("---\ntitle: |\n  literal title\n  continues here\nstatus: Done\n---\n"),
-                         "literal title\ncontinues here\n")
+                         "literal title\ncontinues here")
 
     def test_start_adopts_existing_branch_without_task_worktree(self):
         self.git(self.repo, "branch", "t5-preexisting", "main")
@@ -633,6 +633,7 @@ class TaskTool(unittest.TestCase):
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
+        self.assertIn(f"read {wt / '.work/report.md'} alongside the diff", prompt.read_text())
         self.assertFalse(reply.exists(), "a stale response must not be presented as the next review")
 
     def test_review_includes_direct_request_text(self):
@@ -1721,13 +1722,16 @@ Reviewer: codex gpt-6-luna
 Commit: {'0' * 40}
 Reviewer: claude ignored-fallback
 ```review
+
 Verdict: PASS
+
 Commit: {head}
 Reviewer: claude strict-model
 #1 pass: first criterion evidence
+
 #2 unclear: second criterion evidence
 ```
-""")
+""".replace("Verdict: PASS\n\nCommit:", "Verdict: PASS  \n\nCommit:", 1))
         self.raw_task("review", "proj", "5", "--record", str(review))
         metadata = __import__("json").loads((self.state() / "review.json").read_text())
         self.assertEqual(metadata["verdict"], "PASS")
