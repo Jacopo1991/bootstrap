@@ -23,6 +23,7 @@ for script in (ROOT / "home/dot_local/bin").iterdir():
     assert script.name.removeprefix("executable_") in expected, script.name
 assert drift.compare_sets(expected, expected) == []
 pins = drift.read_pins(ROOT / "home/.chezmoitemplates/pins.env")
+assert pins["CLAUDE_VERSION"] == "2.1.296", "Claude Code alias routing requires the pinned 2.1.296 release"
 for name, (key, marker) in drift.URL_VERSIONS.items():
     version = pins[key].split(marker, 1)[1].split("/", 1)[0]
     assert drift.version_matches(version, f"{name} {version}"), name

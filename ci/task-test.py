@@ -5,12 +5,18 @@
 passes unless the worktree holds a file named FAIL; `backlog task edit` applies status, ticks and
 final summary the way Backlog.md does; `gh pr list` finds no PR.
 """
+import fcntl
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
 
@@ -69,6 +75,11 @@ class TaskTool(unittest.TestCase):
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY)
+        for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"):
+            self.env.pop(marker, None)
+        self.gate_dir = self.home / "shared-gate"
+        self.gate_dir.mkdir()
+        self.env["TASK_GATE_DIR"] = str(self.gate_dir)
         self.origin = self.home / "origin.git"
         self.git(self.home, "init", "-q", "--bare", "-b", "main", str(self.origin))
         self.repo = self.home / "dev_workspace/proj"
@@ -194,7 +205,8 @@ class TaskTool(unittest.TestCase):
         self.assertLess(check_at, report_at)
         self.assertLess(report_at, later_commit_at)
         for line in ("three lines: `changed: ...`, `verified: ...`, and `not done: ...`",
-                     "followed by `report written`", "lane can use `task check --detach`",
+                     "followed by `report written`", "for advisory feedback",
+                     "runs the trusted gate", "A PM may run `task check --detach`",
                      "PM can use `task merge --detach`"):
             self.assertIn(line, out)
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "", "worktrees stay out of status")
@@ -263,6 +275,120 @@ class TaskTool(unittest.TestCase):
         self.commit_in(wt, "FAIL")
         self.assertIn("FAIL", self.task("check", "proj", "5", code=1))
 
+    def test_check_with_read_only_state_is_advisory_and_writes_local_result(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        state = self.state()
+        state.chmod(0o555)
+        try:
+            out = self.raw_task("check", "proj", "5")
+            self.assertIn("advisory lane check (not evidence for merge)", out)
+            self.assertIn("PASS", out)
+            evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+            self.assertEqual(evidence["result"], "passed")
+            self.assertTrue(evidence["advisory"])
+            self.assertFalse(evidence["trusted"])
+            self.assertTrue((wt / ".work/check.log").is_file())
+            self.assertFalse((state / "check.json").exists())
+        finally:
+            state.chmod(0o755)
+
+    def test_agent_advisory_check_returns_real_failure_code(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "FAIL")
+        env = dict(self.env, CLAUDECODE="1")
+        out = self.raw_task("check", "proj", "5", env=env, code=1)
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertIn("FAIL", out)
+        evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(evidence["result"], "failed")
+        self.assertTrue(evidence["advisory"])
+
+    def test_agent_markers_skip_unavailable_shared_gate_and_status_separates_lane_result(self):
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(self.repo, "add", ".task.toml")
+        self.git(self.repo, "commit", "-qm", "enable exclusive gate")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        for index, (marker, value) in enumerate((("CLAUDECODE", "1"),
+                                                  ("CODEX_SANDBOX", "workspace-write"))):
+            env = dict(self.env, **{marker: value},
+                       TASK_GATE_DIR=str(self.home / (marker + "-missing") / "gate"))
+            args = ("check", "proj", "5", "--detach") if index == 0 else ("check", "proj", "5")
+            out = self.raw_task(*args, env=env)
+            self.assertNotIn("Started detached", out)
+            self.assertIn("advisory lane check (not evidence for merge)", out)
+            self.assertNotIn("shared gate lock unavailable", out)
+            self.assertIn("PASS", out)
+            self.assertFalse((self.state() / "check.json").exists())
+        lane_result = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertTrue(lane_result["advisory"])
+        self.raw_task("check", "proj", "5")
+        trusted = __import__("json").loads((self.state() / "check.json").read_text())
+        self.assertTrue(trusted["trusted"])
+        self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
+        self.assertIn("lane check: passed (advisory)", self.raw_task("status", "proj"))
+
+    def test_codex_marker_is_advisory_even_when_state_is_writable(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        state = self.state()
+        probe = state / "writable-probe"
+        probe.write_text("writable")
+        probe.unlink()
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CODEX_THREAD_ID="thread-test"))
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
+        self.assertFalse((state / "check.json").exists())
+
+    def test_exclude_failure_and_flock_error_degrade_without_traceback(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        exclude_path = self.repo / ".git/info/exclude"
+        exclude_path.chmod(0o444)
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertNotIn("Traceback", out)
+
+        loader = importlib.machinery.SourceFileLoader("task_tool_for_flock_test", str(TOOL))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        module.HOME = self.home
+        module.CORTEX = self.home / "cortex"
+        # A pattern that is not yet present forces a write to the read-only exclude file.
+        module.exclude(self.repo, "new-pattern-not-present/")
+        self.assertNotIn("new-pattern-not-present/", exclude_path.read_text())
+        exclude_path.chmod(0o644)
+        task = module.Task(self.repo, "T-5")
+        original_flock = module.fcntl.flock
+        module.fcntl.flock = lambda *_args: (_ for _ in ()).throw(OSError("probe failure"))
+        output = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(output):
+                with module.exclusive_gate_lock(task):
+                    pass
+        finally:
+            module.fcntl.flock = original_flock
+        self.assertEqual(output.getvalue().count(
+            "shared gate lock unavailable in this sandbox; running without it"), 1)
+        self.assertNotIn("Traceback", output.getvalue())
+
+    def test_shared_gate_symlink_is_refused(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable exclusive gate")
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        lock_path.symlink_to(self.home / "other-file")
+        (self.home / "other-file").touch()
+        out = self.raw_task("check", "proj", "5")
+        self.assertIn("shared gate lock unavailable in this sandbox; running without it", out)
+        lock_path.unlink()
+
     def test_start_rejects_redundant_just_check_verify_line(self):
         task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
         task_file.write_text(task_file.read_text().replace("Verify: `true`", "Verify: `just check   `"))
@@ -276,6 +402,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        self.assertTrue(check["trusted"])
         run_path = self.state() / "run.json"
         run_path.write_text(__import__("json").dumps({"command": "merge", "state": "running", "completed": []}))
         run_env = dict(self.env, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(run_path))
@@ -322,6 +449,43 @@ class TaskTool(unittest.TestCase):
 
     def test_merge_does_not_reuse_legacy_check_without_base_sha(self):
         self.assert_check_record_regates(lambda check: check.pop("base_sha"))
+
+    def test_merge_does_not_reuse_advisory_check(self):
+        self.assert_check_record_regates(lambda check: check.update(trusted=False, advisory=True))
+
+    def test_merge_runs_one_trusted_gate_when_no_trusted_check_exists(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.state() / "check.json").unlink()
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("Merged", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
+        gate_check = __import__("json").loads((self.state() / "gate-check.json").read_text())
+        self.assertTrue(gate_check["trusted"])
+
+    def test_merge_trusted_gate_uses_the_shared_exclusive_lock(self):
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(self.repo, "add", ".task.toml")
+        self.git(self.repo, "commit", "-qm", "enable exclusive gate")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.state() / "check.json").unlink()
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        release = threading.Timer(0.25, lambda: os.close(fd))
+        release.start()
+        try:
+            out = self.raw_task("merge", "proj", "5")
+        finally:
+            release.join(timeout=2)
+        self.assertIn("Waiting for exclusive task gate held by", out)
+        self.assertIn("Merged", out)
 
     def test_override_runs_gate_without_check_record_and_records_failed_gate(self):
         wt, _ = self.started()
@@ -419,7 +583,7 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn("claude -p --model haiku --effort high <", out)
+        self.assertIn("claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)' <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         self.assertIn("Worktree:", prompt.read_text())
@@ -427,6 +591,15 @@ class TaskTool(unittest.TestCase):
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
         self.assertFalse(reply.exists(), "a stale response must not be presented as the next review")
+
+    def test_review_includes_direct_request_text(self):
+        self.task("start", "proj", "direct-request", "--builder", "codex")
+        request = self.home / "request.md"
+        request.write_text("Preserve the user's uncommitted files and explain the behavior change.")
+        out = self.raw_task("review", "proj", "direct-request", "--request", str(request))
+        prompt = self.state("direct-request") / "review-prompt.md"
+        self.assertIn("Preserve the user's uncommitted files and explain the behavior change.", prompt.read_text())
+        self.assertIn("--allowedTools Read Grep Glob", out)
 
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
         self.raw_task("start", "proj", "5", "--builder", "claude")
@@ -521,6 +694,255 @@ class TaskTool(unittest.TestCase):
         self.assertIn("Slow startup", (self.kb / "improvements.md").read_text())
         self.assertIn("improvements.md", self.git(self.kb, "show", "--name-only", "--format=", "HEAD"))
         self.assertEqual(self.git(self.kb, "status", "--porcelain"), "")
+
+    def test_close_with_origin_uses_resumable_pr_and_merge_commit(self):
+        origin = self.home / "knowledge-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
+        self.git(self.kb, "remote", "add", "origin", str(origin))
+        self.git(self.kb, "fetch", "-q", "origin")
+        self.git(self.kb, "remote", "set-head", "origin", "main")
+        status = self.home / "close-pr.json"
+        merge_sha = self.home / "close-merge-sha"
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr list") [ -f {status} ] && cat {status} || echo '[]' ;;
+  "pr create") echo '[{{"number":7,"state":"OPEN","mergeCommit":null,"headRefName":"task-close-t5","baseRefName":"main"}}]' > {status}; echo "$*" > {self.home}/close-pr-create ;;
+  "pr merge")
+    test "$4" = --merge
+    test "$5" = --match-head-commit
+    head=$6
+    tmp=$(mktemp -d)
+    git clone -q {origin} "$tmp/repo"
+    git -C "$tmp/repo" fetch -q origin task-close-t5
+    git -C "$tmp/repo" merge -q --no-ff -m "Merge pull request #7" FETCH_HEAD
+    git -C "$tmp/repo" push -q origin HEAD:main
+    git -C "$tmp/repo" rev-parse HEAD > {merge_sha}
+    printf '[{{"number":7,"state":"MERGED","mergeCommit":{{"oid":"%s"}},"headRefName":"task-close-t5","baseRefName":"main"}}]\\n' "$(cat {merge_sha})" > {status}
+    echo "$head" > {self.home}/close-match-head
+    echo "$*" > {self.home}/close-pr-merge
+    rm -rf "$tmp" ;;
+  "pr view") printf '{{"state":"MERGED","mergeCommit":{{"oid":"%s"}}}}\\n' "$(cat {merge_sha})" ;;
+  *) exit 1 ;;
+esac
+""")
+        (self.home / "bin/gh").chmod(0o755)
+        wt, _ = self.started()
+        archive = self.state()
+        (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
+        (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
+        close_dirs = self.kb / ".worktrees"
+        close_dirs_existed = close_dirs.exists()
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
+        self.assertIn("Opened close PR #7", out)
+        self.assertIn("Merged close PR #7 with merge commit", out)
+        self.assertIn("--merge --match-head-commit", (self.home / "close-pr-merge").read_text())
+        close_head = (self.home / "close-match-head").read_text().strip()
+        self.assertEqual(self.git(origin, "rev-parse", "task-close-t5"), close_head)
+        self.assertNotEqual(__import__("subprocess").run(
+            ["git", "-C", str(self.kb), "show-ref", "--verify", "--quiet",
+             "refs/heads/task-close-t5"], capture_output=True).returncode, 0,
+                         "successful close removes the merged local task-close branch")
+        merge = self.git(origin, "rev-parse", "main")
+        parents = self.git(origin, "rev-list", "--parents", "-n", "1", merge).split()
+        self.assertEqual(len(parents), 3, "the PR must use a two-parent merge commit")
+        self.assertEqual(parents[2], close_head)
+        self.assertEqual(self.git(self.kb, "rev-parse", "main"), merge, "clean checkout fast-forwards")
+        contents = sorted(path.name for path in close_dirs.iterdir()) if close_dirs.exists() else []
+        close_paths = list(close_dirs.glob("task-close-*")) if close_dirs.exists() else []
+        self.assertEqual(close_paths, [],
+                         f"assert close removes its own temporary worktree; directory listing: {contents!r}\n{out}")
+        self.assertEqual(close_dirs.exists(), close_dirs_existed,
+                         "close removes .worktrees only when it created the now-empty folder")
+        before_count = self.git(origin, "rev-list", "--count", "main")
+        close_dirs.mkdir(exist_ok=True)
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
+        self.assertIn("already merged", out)
+        self.assertTrue(close_dirs.is_dir(), "close must preserve a pre-existing .worktrees folder")
+        self.assertEqual(list(close_dirs.iterdir()), [], "the pre-existing folder stays empty")
+        self.assertEqual(self.git(origin, "rev-list", "--count", "main"), before_count,
+                         "rerunning close must not create a second commit")
+
+    def test_close_resumes_after_pr_creation_failure_without_duplicate_commit(self):
+        origin = self.home / "knowledge-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
+        self.git(self.kb, "remote", "add", "origin", str(origin))
+        self.git(self.kb, "fetch", "-q", "origin")
+        self.git(self.kb, "remote", "set-head", "origin", "main")
+        state = self.home / "close-state"
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+case "$1 $2" in
+  "pr list") [ -f {state} ] && cat {state} || echo '[]' ;;
+  "pr create")
+    if [ ! -f {state}.failed ]; then touch {state}.failed; echo 'creation refused' >&2; exit 1; fi
+    echo '[{{"number":8,"state":"OPEN","mergeCommit":null,"headRefName":"task-close-t5","baseRefName":"main"}}]' > {state} ;;
+  "pr merge")
+    if [ ! -f {state}.merge-failed ]; then touch {state}.merge-failed; exit 1; fi
+    tmp=$(mktemp -d)
+    git clone -q {origin} "$tmp/repo"
+    git -C "$tmp/repo" fetch -q origin task-close-t5
+    git -C "$tmp/repo" merge -q --no-ff -m "Merge pull request #8" FETCH_HEAD
+    git -C "$tmp/repo" push -q origin HEAD:main
+    git -C "$tmp/repo" rev-parse HEAD > {state}.merge-sha
+    printf '[{{"number":8,"state":"MERGED","mergeCommit":{{"oid":"%s"}},"headRefName":"task-close-t5","baseRefName":"main"}}]\\n' "$(cat {state}.merge-sha)" > {state}
+    rm -rf "$tmp" ;;
+  "pr view") printf '{{"state":"MERGED","mergeCommit":{{"oid":"%s"}}}}\\n' "$(cat {state}.merge-sha)" ;;
+  *) exit 1 ;;
+esac
+""")
+        (self.home / "bin/gh").chmod(0o755)
+        self.started()
+        archive = self.state()
+        (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
+        (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine", code=1)
+        self.assertIn("PR creation failed", out)
+        self.assertIn("Close worktree kept at", out, "a deliberately kept worktree must be announced")
+        self.assertEqual(len(list((self.kb / ".worktrees").glob("task-close-*"))), 1)
+        self.assertEqual(self.git(origin, "rev-list", "--count", "task-close-t5"), "2")
+        self.assertEqual(self.git(self.kb, "rev-parse", "main"), self.git(origin, "rev-parse", "main"),
+                         "PR workflow leaves the main checkout alone before merge")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine", code=1)
+        self.assertIn("remains open", out)
+        self.assertEqual(self.git(origin, "rev-list", "--count", "task-close-t5"), "2",
+                         "resume reuses the close commit")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
+        self.assertIn("Merged close PR #8", out)
+        self.assertFalse((self.kb / ".worktrees").exists(), "the resumed close removes the worktree it created")
+        self.assertEqual(self.git(origin, "rev-list", "--count", "task-close-t5"), "2",
+                         "merging after a failed attempt still reuses the same close commit")
+
+    def test_close_pr_with_no_changes_reports_already_closed(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text() + "\n## Review evidence\n\nAlready reviewed.\n")
+        self.git(self.kb, "add", "backlog/tasks")
+        self.git(self.kb, "commit", "-qm", "record review evidence")
+        origin = self.home / "knowledge-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
+        self.git(self.kb, "remote", "add", "origin", str(origin))
+        self.git(self.kb, "fetch", "-q", "origin")
+        self.git(self.kb, "remote", "set-head", "origin", "main")
+        (self.home / "bin/backlog").write_text("#!/bin/sh\nexit 0\n")
+        (self.home / "bin/backlog").chmod(0o755)
+        (self.home / "bin/gh").write_text("#!/bin/sh\n"
+            "if [ \"$1 $2\" = 'pr list' ]; then "
+            "echo '[{\"number\":7,\"state\":\"OPEN\",\"headRefName\":\"task-close-t5\",\"baseRefName\":\"main\"}]'; "
+            "else exit 1; fi\n")
+        (self.home / "bin/gh").chmod(0o755)
+        self.started()
+        archive = self.state()
+        (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
+        (archive / "review.md").write_text("Verdict: PASS\n#1 pass: reviewed\n")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
+        self.assertIn("T-5 was already closed.", out)
+        self.assertEqual(list((self.kb / ".worktrees").glob("task-close-*")), [])
+
+    def test_exclusive_gate_serializes_checks_and_wait_does_not_use_timeout(self):
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        holder_path = self.gate_dir / "agent-task-gate.holder"
+        self.addCleanup(lambda: holder_path.unlink(missing_ok=True))
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\ncheck_timeout = 3\n")
+        self.git(self.repo, "add", ".task.toml")
+        self.git(self.repo, "commit", "-qm", "enable exclusive gate")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        self.started()
+        other = self.repo / ".worktrees/other"
+        self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "other", str(other), "main")
+        (other / ".task.toml").write_text("exclusive_gate = true\ncheck_timeout = 1\n")
+        self.git(other, "add", ".task.toml")
+        self.git(other, "commit", "-qm", "short check timeout")
+        (self.home / "during-check.sh").write_text(
+            "#!/bin/sh\n"
+            "if [ -e \"$HOME/gate-active\" ]; then echo overlap > \"$HOME/gate-overlap\"; exit 9; fi\n"
+            "echo $$ > \"$HOME/gate-active\"\n"
+            "sleep \"${TASK_CHECK_SLEEP:-0.05}\"\n"
+            "rm -f \"$HOME/gate-active\"\n")
+        (self.home / "during-check.sh").chmod(0o755)
+        env1 = dict(self.env, TASK_CHECK_SLEEP="2.2")
+        env2 = dict(self.env, TASK_CHECK_SLEEP="0.05")
+        first = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "5"],
+                                 cwd=self.home, env=env1, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True)
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline and not (self.home / "gate-active").exists():
+            __import__("time").sleep(0.02)
+        self.assertTrue((self.home / "gate-active").exists(), "first check acquired the shared gate")
+        holder = __import__("json").loads(holder_path.read_text())
+        self.assertEqual(holder["repo"], "proj")
+        self.assertEqual(holder["task"], "T-5")
+        started = __import__("time").monotonic()
+        second = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "other"],
+                                  cwd=self.home, env=env2, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+        out1, _ = first.communicate(timeout=8)
+        out2, _ = second.communicate(timeout=8)
+        elapsed = __import__("time").monotonic() - started
+        self.assertEqual(first.returncode, 0, out1)
+        self.assertEqual(second.returncode, 0, out2)
+        self.assertGreater(elapsed, 2, "the second check waited longer than its one-second check timeout")
+        self.assertIn("Waiting for exclusive task gate held by task T-5 in proj, pid", out2)
+        self.assertIn("since ", out2)
+        self.assertFalse((self.home / "gate-overlap").exists(), "checks never overlapped")
+
+        dead_holder = self.home / "dead-gate-holder.py"
+        dead_holder.write_text(
+            "import fcntl, os\n"
+            f"fd = os.open({str(lock_path)!r}, os.O_CREAT | os.O_RDWR, 0o666)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n")
+        subprocess.run([sys.executable, str(dead_holder)], check=True, timeout=5)
+        out = self.raw_task("check", "proj", "other")
+        self.assertIn("PASS", out, "kernel releases the gate lock when its process exits")
+
+        nonexclusive = self.repo / ".worktrees/nonexclusive"
+        self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "nonexclusive",
+                 str(nonexclusive), "main")
+        (nonexclusive / ".task.toml").write_text("check_timeout = 1\n")
+        self.git(nonexclusive, "add", ".task.toml")
+        self.git(nonexclusive, "commit", "-qm", "leave gate opt-in off")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            begin = __import__("time").monotonic()
+            out = self.raw_task("check", "proj", "nonexclusive")
+            self.assertLess(__import__("time").monotonic() - begin, 1)
+            self.assertIn("PASS", out)
+            self.assertNotIn("Waiting for exclusive task gate", out)
+        finally:
+            os.close(fd)
+
+    def test_exclusive_gate_unavailable_prints_notice_and_runs_check(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable exclusive gate")
+        env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
+        out = self.raw_task("check", "proj", "5", env=env)
+        self.assertEqual(out.count("shared gate lock unavailable in this sandbox; running without it"), 1)
+        self.assertIn("PASS", out)
+
+    def test_close_pr_worktree_is_inside_knowledge_repo(self):
+        origin = self.home / "knowledge-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
+        self.git(self.kb, "remote", "add", "origin", str(origin))
+        self.git(self.kb, "fetch", "-q", "origin")
+        self.git(self.kb, "remote", "set-head", "origin", "main")
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+case "$1 $2" in
+  "pr list") echo '[]' ;;
+  "pr create") echo 'creation refused' >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+""")
+        (self.home / "bin/gh").chmod(0o755)
+        self.started()
+        archive = self.state()
+        (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
+        (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine", code=1)
+        self.assertIn("PR creation failed", out)
+        close_worktrees = list((self.kb / ".worktrees").glob("task-close-*"))
+        self.assertEqual(len(close_worktrees), 1)
+        self.assertTrue(close_worktrees[0].resolve().is_relative_to(self.kb.resolve()))
 
     def test_start_shares_or_rebuilds_the_environment(self):
         venv = self.repo / ".venv/lib/python3.12/site-packages"
@@ -633,6 +1055,12 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         (self.home / "bin/uv").chmod(0o755)
         wt, _ = self.started()
         self.assertFalse((wt / ".venv").is_symlink())
+
+    def test_start_repairs_missing_origin_head(self):
+        self.git(self.repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        self.task("start", "proj", "T-5", "--builder", "codex")
+        self.assertEqual(self.git(self.repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"),
+                         "origin/main")
 
     def test_review_failed_check_leaves_branch_as_lane_left_it(self):
         wt, _ = self.started()
@@ -801,8 +1229,9 @@ exit 1
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         out = self.raw_task("merge", "proj", "5", code=1)
-        for item in ("passing task check", "recorded PASS review", "filled .work/report.md"):
+        for item in ("recorded PASS review", "filled .work/report.md"):
             self.assertIn(item, out)
+        self.assertNotIn("passing task check", out)
         out = self.raw_task("merge", "proj", "5", "--override", "urgent approved exception")
         self.assertIn("exception", out)
         self.assertIn("Needs attention", self.raw_task("status", "proj"))
@@ -899,6 +1328,35 @@ exit 1
         os.killpg(run["pgid"], 9)
         self.assertIn("interrupted", self.raw_task("status", "proj"))
 
+    def test_cancel_kills_check_descendants_that_started_new_sessions(self):
+        self.started()
+        child_pid_file = self.home / "setsid-child.pid"
+        script = ("#!/bin/sh\n"
+                  f"setsid sh -c 'echo $$ > {child_pid_file}; exec sleep 30' &\n"
+                  "wait\n")
+        just = self.home / "bin/just"
+        just.write_text(script)
+        just.chmod(0o755)
+        self.raw_task("check", "--detach", "proj", "5")
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline and not child_pid_file.exists():
+            __import__("time").sleep(0.02)
+        self.assertTrue(child_pid_file.exists(), "the check must start its setsid child")
+        child_pid = int(child_pid_file.read_text())
+        run = __import__("json").loads((self.state() / "run.json").read_text())
+        environment = Path(f"/proc/{child_pid}/environ").read_bytes().split(b"\0")
+        self.assertIn(f"TASK_RUN_ID={run['task_run_id']}".encode(), environment)
+        self.assertIn("Cancelled", self.raw_task("cancel", "proj", "5"))
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline:
+            stat = Path(f"/proc/{child_pid}/stat")
+            if not stat.exists() or stat.read_text().split(") ", 1)[1][0] == "Z":
+                break
+            __import__("time").sleep(0.05)
+        stat = Path(f"/proc/{child_pid}/stat")
+        self.assertTrue(not stat.exists() or stat.read_text().split(") ", 1)[1][0] == "Z",
+                        "cancel must terminate the setsid descendant")
+
     def test_acceptance_6_detached_merge_finishes_and_rerun_observes_merge(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
@@ -988,8 +1446,8 @@ exit 1
         self.git(wt, "merge", "--no-edit", "origin/main")
         integrated = self.git(wt, "rev-parse", "HEAD")
         out = self.raw_task("merge", "proj", "5", code=1)
-        self.assertIn("passing task check for lane head", out)
         self.assertIn("recorded PASS review for lane head", out)
+        self.assertNotIn("passing task check for lane head", out)
         self.assertNotEqual(integrated, __import__("json").loads((self.state() / "review.json").read_text())["commit"])
 
     def test_round3_lane_integrated_main_then_checked_and_reviewed_merges(self):
@@ -1108,6 +1566,16 @@ exit 1
         review.write_text(f"**Verdict: PASS**\nCommit: {head[:9]}\nReviewer: claude model-x\n"
                           "- #1 pass: evidence\n- #2 pass: evidence\n")
         self.assertIn("Recorded PASS", self.raw_task("review", "proj", "5", "--record", str(review)))
+
+    def test_review_record_accepts_bold_verdict_labels_and_backticked_sha(self):
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")[:9]
+        review = self.home / "review-format.txt"
+        for verdict in ("**Verdict:** PASS", "Verdict: **PASS**"):
+            review.write_text(f"{verdict}\nCommit: `{head}`\nReviewer: claude format-test\n"
+                              "#1 pass: reviewed source\n#2 pass: ran acceptance evidence\n")
+            out = self.raw_task("review", "proj", "5", "--record", str(review))
+            self.assertIn("Recorded PASS", out, verdict)
 
     def test_round2_cancel_uses_archive_and_merge_mentions_detach(self):
         self.started()

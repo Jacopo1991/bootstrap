@@ -48,6 +48,17 @@ grep -Eqi '^(task_prefix|taskPrefix): "?T"?$' "$config"
 [ "$(git -C "$kb" rev-list --count HEAD)" = 1 ]
 git -C "$kb" clean -fdq
 grep -q "local only" "$HOME/cortex/cortex-kb-demo-site/README.md"
+# Publishing records origin/HEAD for both repositories after pushing main.
+bash "$cmd" create demo-publish >/dev/null
+for pair in "dev_workspace/demo-publish:code" "cortex/cortex-kb-demo-publish:knowledge"; do
+  remote="$tmp/${pair#*:}.git"
+  git -C "$HOME/${pair%%:*}" init -q --bare --initial-branch=main "$remote"
+  git -C "$HOME/${pair%%:*}" remote add origin "$remote"
+done
+bash "$cmd" publish demo-publish
+for repo in "$HOME/dev_workspace/demo-publish" "$HOME/cortex/cortex-kb-demo-publish"; do
+  [ "$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD)" = origin/main ]
+done
 if bash "$cmd" create demo-site >/dev/null 2>&1; then echo "FAIL: overwrite allowed"; exit 1; fi
 if bash "$cmd" create Bad_Name >/dev/null 2>&1; then echo "FAIL: bad name accepted"; exit 1; fi
 echo "PASS: new-project creates both repositories on main with the pre-commit gate and refuses overwrites and bad names"

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Hosted synthetic metadata tests; no remote connection or PR merge."""
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 from unittest.mock import patch
+
+# Agent sessions export Git overrides; the policy hook correctly refuses them.
+for name in [name for name in os.environ if name.startswith("GIT_")]:
+    del os.environ[name]
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(
@@ -223,4 +228,18 @@ with tempfile.TemporaryDirectory() as temporary:
     denied("git merge trunk")
     with patch.object(policy.subprocess, "run", side_effect=OSError("fixture")):
         denied("git merge main")
-print("PASS: local-only repositories merge only the local main into a task branch; previews read-only")
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    repo = base / "dev_workspace" / "master-only"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "--initial-branch=master")
+    git(repo, "config", "user.name", "CI")
+    git(repo, "config", "user.email", "ci@example.invalid")
+    (repo / "safe.txt").write_text("safe synthetic content\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "base")
+    git(repo, "switch", "-q", "-c", "task")
+    event = {"tool_name": "Bash", "tool_input": {"command": "git merge master"}, "cwd": str(repo)}
+    reason = policy.evaluate(event, (base / "dev_workspace", base / "cortex"))
+    assert reason and "rename the default branch to main" in reason, reason
+print("PASS: local-only repositories merge only the local main into a task branch; master gets rename guidance")

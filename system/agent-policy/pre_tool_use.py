@@ -556,6 +556,17 @@ def local_only_merge(arguments: list[str], target: Path, current: str) -> str | 
     local main branch, nothing else. Its commits were scanned when they were committed."""
     if not current.startswith("refs/heads/"):
         return "Cannot identify the current branch safely."
+    local_main = policy_subprocess(
+        ["git", "rev-parse", "--verify", "--quiet", "refs/heads/main^{commit}"],
+        cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, timeout=3)
+    if local_main.returncode:
+        local_master = policy_subprocess(
+            ["git", "rev-parse", "--verify", "--quiet", "refs/heads/master^{commit}"],
+            cwd=target, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, timeout=3)
+        if local_master.returncode == 0:
+            return "This local-only repository uses master; rename the default branch to main."
     if current == "refs/heads/" + LOCAL_DEFAULT_BRANCH:
         return "Merging into the default branch is blocked; update only a task branch."
     if arguments not in ([LOCAL_DEFAULT_BRANCH], ["--no-edit", LOCAL_DEFAULT_BRANCH]):

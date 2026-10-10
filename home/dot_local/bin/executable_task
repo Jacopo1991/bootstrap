@@ -7,7 +7,7 @@ boundary against code running as that user.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
   task check [[<repo>] <id>] [--detach]
-  task review <repo> <id> [--record <file>]
+  task review <repo> <id> [--request <file>] [--record <file>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial]
@@ -18,18 +18,25 @@ boundary against code running as that user.
 <repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
 or a plain name for work without a task. `task start` pins criteria and Verify commands; `task
 check` runs the gate and pinned verification; review and merge are PM actions.
+Claude Code and Codex sessions are treated as advisory lanes. The PM runs `task` from the
+agentdev-shell connector, which sets neither vendor's agent markers.
 """
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,6 +52,7 @@ DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", 
               ".ruff_cache", ".cache", ".tox", ".next", ".astro", ".turbo", "dist", "build",
               "coverage", "target", ".parcel-cache"}
 ACTIVE_FOREGROUND_TASK = None
+CHECK_ADVISORY = None
 
 
 class Stop(Exception):
@@ -109,6 +117,19 @@ def fetch(repo):
         result = run_git(repo, "fetch", "-q", "origin")
         if result.returncode:
             raise Stop(f"git fetch origin failed: {result.stderr.strip()}")
+
+
+def ensure_origin_head(repo):
+    """Record origin's advertised default branch when a remote has no origin/HEAD yet."""
+    if not has_origin(repo) or ok(repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"):
+        return
+    fetch(repo)
+    result = run_git(repo, "remote", "set-head", "origin", "--auto")
+    if result.returncode:
+        raise Stop(f"Could not set origin/HEAD automatically: {result.stderr.strip()}")
+    head = run_git(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if head.returncode or not head.stdout.strip().startswith("origin/"):
+        raise Stop("git remote set-head origin --auto did not record origin/HEAD.")
 
 
 def base_commit(repo, default):
@@ -331,6 +352,75 @@ def timeout_for(path: Path):
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
+def exclusive_gate_enabled(path: Path) -> bool:
+    config = path / ".task.toml"
+    if not config.is_file():
+        return False
+    try:
+        values = tomllib.loads(config.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Stop(f"Cannot read {config}: {error}.")
+    return values.get("exclusive_gate") is True
+
+
+@contextmanager
+def exclusive_gate_lock(task: Task, silent_unavailable=False):
+    """Serialize opted-in checks across the host and Codex sandboxes sharing /tmp."""
+    gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    lock_path = gate_dir / "agent-task-gate.lock"
+    holder_path = gate_dir / "agent-task-gate.holder"
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    except OSError:
+        if not silent_unavailable:
+            print("shared gate lock unavailable in this sandbox; running without it", flush=True)
+        yield
+        return
+    holder_record = None
+    try:
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not waiting:
+                    waiting = True
+                    try:
+                        holder_record = json.loads(holder_path.read_text())
+                        detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
+                                  f"pid {holder_record['pid']} since {holder_record['since']}")
+                    except (OSError, KeyError, json.JSONDecodeError, TypeError):
+                        detail = "another gate (holder details unavailable)"
+                    print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
+                time.sleep(0.1)
+            except OSError:
+                if not silent_unavailable:
+                    print("shared gate lock unavailable in this sandbox; running without it", flush=True)
+                os.close(descriptor)
+                descriptor = None
+                yield
+                return
+        metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
+                    "repo": task.repo.name}
+        try:
+            atomic_json(holder_path, metadata)
+            holder_record = metadata
+        except OSError:
+            holder_record = None
+        yield
+    finally:
+        if holder_record and holder_record.get("pid") == os.getpid():
+            try:
+                current = json.loads(holder_path.read_text())
+                if current.get("pid") == os.getpid():
+                    holder_path.unlink(missing_ok=True)
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def run_record_path(task: Task):
     return task_state(task) / "run.json"
 
@@ -343,6 +433,38 @@ def pid_alive(pid):
         return False
     except (PermissionError, ValueError, TypeError, OSError):
         return False
+
+
+def task_run_pids(run_id):
+    """Find this user's processes carrying a check/gate run marker, including new sessions."""
+    if not run_id:
+        return []
+    marker = f"TASK_RUN_ID={run_id}".encode()
+    found = []
+    try:
+        processes = Path("/proc").iterdir()
+        for entry in processes:
+            if not entry.name.isdecimal():
+                continue
+            try:
+                if entry.stat().st_uid != os.getuid():
+                    continue
+                if marker in entry.joinpath("environ").read_bytes().split(b"\0"):
+                    found.append(int(entry.name))
+            except (OSError, PermissionError, ValueError):
+                continue
+    except OSError:
+        return []
+    return found
+
+
+def signal_task_run(run_id, signum):
+    for pid in task_run_pids(run_id):
+        if pid != os.getpid():
+            try:
+                os.kill(pid, signum)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
 
 def task_lock_status(task: Task):
@@ -392,11 +514,14 @@ def detached(args, task, path):
     command = [part for part in command if part != "--detach"]
     log = (work / "run.log").open("ab")
     archive = run_path
-    env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive))
+    run_id = secrets.token_hex(16)
+    env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive),
+               TASK_RUN_ID=run_id)
     child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                              close_fds=True)
     atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
+                           "task_run_id": run_id,
                            "state": "running", "started_at": started, "ended_at": "",
                            "completed": []})
     atomic_json(lock, {"pid": child.pid, "started_at": started, "command": args.command,
@@ -405,17 +530,56 @@ def detached(args, task, path):
     return 0
 
 
-def foreground_lock(args):
-    if args.command not in {"check", "merge"} or os.environ.get("TASK_RUN_RECORD"):
-        return None
-    if args.command == "merge":
-        task = Task(resolve_repo(args.repo), args.id)
-    elif args.id is not None:
-        repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
-        task = Task(repo, args.id)
-    else:
+def agent_session():
+    return any(os.environ.get(name) for name in
+               ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"))
+
+
+def task_state_writable(task: Task):
+    state = task_state(task)
+    probe = None
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        descriptor, probe_name = tempfile.mkstemp(prefix=".task-write-probe-", dir=state)
+        probe = Path(probe_name)
+        os.close(descriptor)
+        probe.unlink()
+        return True
+    except OSError:
+        if probe is not None:
+            try: probe.unlink(missing_ok=True)
+            except OSError: pass
+        return False
+
+
+def check_task_from_args(args):
+    if args.id is None:
         top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
-        task = Task(main_repo(top), top.name)
+        return Task(main_repo(top), top.name)
+    repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+    return Task(repo, args.id)
+
+
+def advisory_check_for(task: Task):
+    return agent_session() or not task_state_writable(task)
+
+
+def foreground_lock(args):
+    global CHECK_ADVISORY
+    if args.command == "check":
+        if args.id is None:
+            top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+            task = Task(main_repo(top), top.name)
+        else:
+            repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+            task = Task(repo, args.id)
+        CHECK_ADVISORY = agent_session() or not task_state_writable(task)
+        if CHECK_ADVISORY or os.environ.get("TASK_RUN_RECORD"):
+            return None
+    elif args.command == "merge" and not os.environ.get("TASK_RUN_RECORD"):
+        task = Task(resolve_repo(args.repo), args.id)
+    else:
+        return None
     state = task_state(task)
     state.mkdir(parents=True, exist_ok=True)
     lock = state / "run.lock"
@@ -429,11 +593,13 @@ def foreground_lock(args):
         except FileExistsError:
             raise Stop("A task run is already starting; try again shortly.")
     started = utc_now()
+    run_id = os.environ.setdefault("TASK_RUN_ID", secrets.token_hex(16))
     with os.fdopen(fd, "w") as output:
         json.dump({"pid": os.getpid(), "started_at": started, "command": args.command,
-                   "mode": "foreground"}, output)
+                   "mode": "foreground", "task_run_id": run_id}, output)
     atomic_json(state / "run.json", {"command": args.command, "state": "foreground",
-                                      "pid": os.getpid(), "started_at": started, "completed": []})
+                                      "pid": os.getpid(), "started_at": started,
+                                      "task_run_id": run_id, "completed": []})
     global ACTIVE_FOREGROUND_TASK
     ACTIVE_FOREGROUND_TASK = task
     return lock
@@ -465,11 +631,15 @@ def finish_detached(code):
 def exclude(repo, pattern):
     """Add a pattern to the repository's local exclude file (never a tracked file)."""
     path = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "info/exclude"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = path.read_text().splitlines() if path.exists() else []
-    if pattern not in lines:
-        with path.open("a") as handle:
-            handle.write(pattern + "\n")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = path.read_text().splitlines() if path.exists() else []
+        if pattern not in lines:
+            with path.open("a") as handle:
+                handle.write(pattern + "\n")
+    except OSError:
+        # Advisory checks must still run when the checkout's local Git metadata is read-only.
+        pass
 
 
 def editable_install(venv: Path, repo: Path) -> bool:
@@ -535,6 +705,7 @@ def prepare_environment(repo: Path, path: Path):
 
 def start(args):
     repo = resolve_repo(args.repo)
+    ensure_origin_head(repo)
     task = Task(repo, args.id)
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
@@ -652,24 +823,31 @@ def start(args):
           f".worktrees/{task.name} on branch {branch}.")
     if task.file:
         print(f"Task: {task.file}")
-    print("Commit on the branch, then run `task check` from that folder, then fill `.work/report.md`; "
-          "any later commit needs a new check. In chat, reply with three lines: `changed: ...`, "
+    print("Commit on the branch, then run `task check` from that folder for advisory feedback, "
+          "then fill `.work/report.md`; any later commit needs a new check. The PM's `task merge` "
+          "runs the trusted gate, unless a matching trusted check already passed. A PM may run "
+          "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
           "`verified: ...`, and `not done: ...`, followed by `report written`. "
-          "For long gates, the lane can use `task check --detach`; the PM can use `task merge --detach`.")
+          "For long gates, the PM can use `task merge --detach`.")
 
 
-def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None):
+def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
+              advisory=False):
     """Run the repository's gate in <path>; return True when it passes."""
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
     work = path / ".work"
     work.mkdir(exist_ok=True)
-    state = state or task_state(Task(main_repo(path), path.name))
-    state.mkdir(parents=True, exist_ok=True)
+    if not advisory:
+        state = state or task_state(Task(main_repo(path), path.name))
+        state.mkdir(parents=True, exist_ok=True)
+    else:
+        state = None
     log = work / "check.log"
     passed = True
     timeout = timeout_for(path)
+    run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
     with log.open("w") as out:
         steps = [["just", "check"]]
@@ -682,9 +860,12 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             out.flush()
             started = time.monotonic()
             try:
-                process = subprocess.Popen(step, cwd=path, stdout=out, stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL, start_new_session=True)
-                set_child_group(state, process.pid)
+                child_env = dict(os.environ, TASK_RUN_ID=run_id)
+                process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
+                                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                           start_new_session=True)
+                if state:
+                    set_child_group(state, process.pid)
                 try:
                     code = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
@@ -693,31 +874,46 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
                     except ProcessLookupError:
                         pass
                     process.wait()
-                    set_child_group(state, None)
+                    if state:
+                        set_child_group(state, None)
                     out.write(f"\nTIMEOUT after {timeout}s\n")
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
                                     "timeout": True})
-                    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "base_sha": base or "",
-                                                       "result": "failed",
-                                                       "steps": results, "time": utc_now()})
-                    if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
+                    evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
+                                "record_revision": record.get("revision") if record else "",
+                                "result": "failed", "steps": results, "time": utc_now(),
+                                "trusted": state is not None, "advisory": state is None}
+                    if evidence_name == "check.json" and state is None:
+                        atomic_json(work / "check.json", evidence)
+                    if state:
+                        atomic_json(state / evidence_name, evidence)
+                        if evidence_name == "check.json":
+                            try: task_event(Task(main_repo(path), path.name), "check")
+                            except OSError: pass
                     print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {display_log or log}")
                     return False
             except subprocess.TimeoutExpired:
                 raise
             except FileNotFoundError:
                 raise Stop(f"`{step[0]}` is not installed.")
-            set_child_group(state, None)
+            if state:
+                set_child_group(state, None)
             out.write(f"exit {code}\n")
             results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3)})
             if code:
                 passed = False
                 break
-    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "base_sha": base or "",
-                                       "record_revision": record.get("revision") if record else "",
-                                       "result": "passed" if passed else "failed", "steps": results,
-                                       "time": utc_now()})
-    if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
+    evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
+                "record_revision": record.get("revision") if record else "",
+                "result": "passed" if passed else "failed", "steps": results,
+                "time": utc_now(), "trusted": state is not None, "advisory": state is None}
+    if evidence_name == "check.json" and state is None:
+        atomic_json(work / "check.json", evidence)
+    if state:
+        atomic_json(state / evidence_name, evidence)
+        if evidence_name == "check.json":
+            try: task_event(Task(main_repo(path), path.name), "check")
+            except OSError: pass
     lines = log.read_text(errors="replace").splitlines()
     summary = [line for line in lines if SUMMARY.match(line.strip())][-4:]
     for line in summary if passed else lines[-20:]:
@@ -731,6 +927,7 @@ def untracked(path):
 
 
 def check(args):
+    global CHECK_ADVISORY
     if args.id is None:
         top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
         repo = main_repo(top)
@@ -741,6 +938,7 @@ def check(args):
         repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
         path = Task(repo, args.id).worktree()
     task = Task(repo, path.name)
+    advisory = CHECK_ADVISORY if CHECK_ADVISORY is not None else advisory_check_for(task)
     tracked_work = git(path, "ls-files", "--", ".work")
     if tracked_work:
         raise Stop("Tracked files under .work/ are forbidden; remove them from the index and keep evidence out of the repository.")
@@ -758,7 +956,16 @@ def check(args):
     prepare_environment(repo, path)
     if record and record.get("no_verify"):
         print(f"exception: verification omitted: {record['no_verify']}")
-    return 0 if run_check(path, base, record, task_state(task)) else 1
+    if exclusive_gate_enabled(path):
+        with exclusive_gate_lock(task, silent_unavailable=advisory):
+            passed = run_check(path, base, record, None if advisory else task_state(task),
+                               advisory=advisory)
+    else:
+        passed = run_check(path, base, record, None if advisory else task_state(task),
+                           advisory=advisory)
+    if advisory:
+        print("advisory lane check (not evidence for merge)")
+    return 0 if passed else 1
 
 
 def ignored_leftovers(path):
@@ -804,7 +1011,7 @@ def update_local_default(repo, default, commit):
         result = run_git(repo, "update-ref", f"refs/heads/{default}", commit, old or "")
         return f"local {default} updated" if result.returncode == 0 else \
             f"local {default} not updated: {result.stderr.strip()}"
-    if git(holder, "status", "--porcelain", "--untracked-files=no"):
+    if git(holder, "status", "--porcelain"):
         return f"local {default} not updated in {holder}: it has uncommitted changes"
     result = run_git(holder, "merge", "-q", "--ff-only", commit)
     if result.returncode:
@@ -893,11 +1100,21 @@ def review(args):
     record = load_record(task)
     head = sha(path, "HEAD")
     task_text = task.file.read_text() if task.file else ""
+    request_text = ""
+    if args.request:
+        try:
+            request_text = Path(args.request).read_text()
+        except OSError as error:
+            raise Stop(f"Cannot read request file {args.request}: {error}.")
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
         prompt = [f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
+        if request_text:
+            prompt.extend(["Direct request:", request_text.rstrip()])
+        if record.get("verify"):
+            prompt.append("Pinned verification commands: " + " ; ".join(record["verify"]))
         if record["criteria"]:
             prompt.append("Criteria:")
             for item in record["criteria"]:
@@ -924,7 +1141,7 @@ def review(args):
         reply_file.unlink(missing_ok=True)
         print(prompt_text, end="")
         if record["builder"] == "codex":
-            command = "claude -p --model haiku --effort high"
+            command = "claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'"
         else:
             command = "GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -"
         print("Headless reviewer command (run from the task worktree):")
@@ -935,8 +1152,10 @@ def review(args):
         text = Path(args.record).read_text()
     except OSError as error:
         raise Stop(f"Cannot read review file {args.record}: {error}.")
-    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict:\s*(PASS|FAIL)(?:\*\*)?\s*$", text)
-    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*([0-9a-f]{7,40})(?:\*\*)?\s*$", text)
+    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict(?::\*\*|:)\s*"
+                        r"(?:\*\*)?(PASS|FAIL)(?:\*\*)?\s*$", text)
+    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*`?"
+                       r"([0-9a-f]{7,40})`?(?:\*\*)?\s*$", text)
     reviewer = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Reviewer:\s*(codex|claude)\s+(.+?)(?:\*\*)?\s*$", text)
     judgments = {int(n): (v, evidence.strip()) for n, v, evidence in re.findall(
         r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?#(\d+)\s+(pass|fail|unclear):\s*(.+?)\s*$", text)}
@@ -970,13 +1189,6 @@ def merge_gate(task, path, head):
     missing = []
     record = load_record(task)
     state = task_state(task)
-    check_path = state / "check.json"
-    try:
-        check = json.loads(check_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        check = {}
-    if check.get("result") != "passed" or check.get("sha") != head or check.get("record_revision") != record["revision"]:
-        missing.append("passing task check for lane head")
     try:
         review = json.loads((state / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -1015,7 +1227,8 @@ def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, reco
         checked = json.loads((task_state(task) / "check.json").read_text())
     except (OSError, json.JSONDecodeError):
         return False
-    return (checked.get("result") == "passed" and checked.get("sha") == lane_head
+    return (checked.get("trusted") is True and checked.get("result") == "passed"
+            and checked.get("sha") == lane_head
             and checked.get("record_revision") == record.get("revision")
             and checked.get("base_sha") == base and is_ancestor(repo, base, lane_head))
 
@@ -1063,8 +1276,13 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
         prepare_environment(repo, gate)
         gated_head = sha(gate, "HEAD")
         archived_log = task_state(task) / "gate-check.log"
-        passed = run_check(gate, base, record, task_state(task), evidence_name="gate-check.json",
-                           display_log=archived_log)
+        if exclusive_gate_enabled(gate):
+            with exclusive_gate_lock(task):
+                passed = run_check(gate, base, record, task_state(task),
+                                   evidence_name="gate-check.json", display_log=archived_log)
+        else:
+            passed = run_check(gate, base, record, task_state(task),
+                               evidence_name="gate-check.json", display_log=archived_log)
         shutil.copy2(gate / ".work/check.log", archived_log)
         completed_step(task, "gate")
         return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
@@ -1233,6 +1451,214 @@ def merge(args):
     return 0
 
 
+def apply_close_update(kb, task, before, archive, criteria, status, summary):
+    """Apply only this task's close records in the supplied knowledge checkout."""
+    before = kb / before.relative_to(task.kb)
+    command = ["backlog", "task", "edit", task.id, "-s", status, "--final-summary", summary]
+    for number in criteria:
+        command += ["--check-ac", number]
+    result = subprocess.run(command, cwd=kb, capture_output=True, text=True)
+    if result.returncode:
+        raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
+    task_number = re.fullmatch(r"(?i)t?-?(\d+)", task.id)
+    after = next(iter(sorted((kb / "backlog/tasks").glob(
+        f"[tT]-{task_number.group(1)} - *.md"))), None)
+    if after is None:
+        raise Stop(f"Backlog task {task.id} disappeared from {kb} while closing.")
+    recorded_review = archive / "review.md"
+    if recorded_review.is_file():
+        text = after.read_text()
+        if "## Review evidence" not in text:
+            text += "\n\n## Review evidence\n\n" + recorded_review.read_text().strip() + "\n"
+            after.write_text(text)
+    noticed = []
+    report = archive / "report.md"
+    if report.exists():
+        match = re.search(r"(?ms)^## Noticed, not done\s*\n(.*?)(?=^## |\Z)", report.read_text())
+        if match and match.group(1).strip().lower() not in {"(none)", "none", "-", "n/a"}:
+            noticed = [line.strip(" -*\t") for line in match.group(1).splitlines() if line.strip()]
+    if noticed:
+        with (kb / "improvements.md").open("a") as out:
+            for item in noticed:
+                out.write(f"\n- {utc_now()[:10]} | {task.id} | report | {item} | open\n")
+    paths = sorted({str(p.relative_to(kb)) for p in (before, after) if p})
+    if noticed:
+        paths.append("improvements.md")
+    git(kb, "add", "-A", "--", *paths)
+    if ok(kb, "diff", "--cached", "--quiet", "--", *paths):
+        return False
+    git(kb, "commit", "-q", "-m", f"Close {task.id}: {task.title}", "--", *paths)
+    return True
+
+
+def close_pr(repo, branch):
+    output = gh(repo, "pr", "list", "--head", branch, "--state", "all",
+                "--json", "number,state,mergeCommit,headRefName,baseRefName", "--limit", "1")
+    try:
+        entries = json.loads(output or "[]")
+    except json.JSONDecodeError:
+        raise Stop(f"gh returned invalid PR data for close branch {branch}; rerun `task close` to resume.")
+    return entries[0] if entries else None
+
+
+def close_worktree_path(repo, branch):
+    digest = hashlib.sha256(f"{repo.resolve()}:{branch}".encode()).hexdigest()[:12]
+    return repo.resolve() / ".worktrees" / f"task-close-{digest}"
+
+
+def close_worktree(repo, branch, default):
+    path = close_worktree_path(repo, branch)
+    if path.exists():
+        if not real_worktree(repo, path) or git(path, "branch", "--show-current") != branch:
+            raise Stop(f"Close worktree path {path} exists but is not the expected task-close worktree.")
+        return path
+    exclude(repo, ".worktrees/")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if ok(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+        for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
+            lines = block.splitlines()
+            checked = next((line[len("branch refs/heads/"):] for line in lines
+                            if line.startswith("branch refs/heads/")), None)
+            if checked == branch:
+                location = next(line[len("worktree "):] for line in lines if line.startswith("worktree "))
+                raise Stop(f"Close branch {branch} is already checked out at {location}; rerun after it is free.")
+        git(repo, "worktree", "add", "-q", str(path), branch)
+    elif ok(repo, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"):
+        git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(path), f"origin/{branch}")
+    else:
+        git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(path), f"origin/{default}")
+    return path
+
+
+def remove_completed_close_worktree(repo, branch, remove_parent=False):
+    path = close_worktree_path(repo, branch)
+    if not path.exists():
+        pass
+    elif not real_worktree(repo, path) or git(path, "branch", "--show-current") != branch:
+        return
+    else:
+        # This deterministic path is owned by task close; after a verified merge, remove it
+        # even if files were left behind in the temporary worktree.
+        removed = run_git(repo, "worktree", "remove", "--force", str(path))
+        if removed.returncode:
+            print(f"Close worktree kept at {path}: {removed.stderr.strip()}")
+            return
+    if remove_parent:
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
+
+
+def close_commit_present(path, task):
+    return git(path, "log", "-1", "--format=%s") == f"Close {task.id}: {task.title}"
+
+
+def delete_merged_close_branch(repo, branch):
+    if branch.startswith("task-close-") and ok(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+        result = run_git(repo, "branch", "-D", branch)
+        if result.returncode:
+            print(f"Close branch {branch} remains locally: {result.stderr.strip()}")
+
+
+def update_closed_knowledge_checkout(repo, default):
+    if git(repo, "status", "--porcelain", "--untracked-files=all"):
+        return f"local {default} not updated in {repo}: checkout has uncommitted changes"
+    return update_local_default(repo, default, sha(repo, f"origin/{default}"))
+
+
+def close_with_pr(task, before, archive, args, criteria, status, summary):
+    repo = task.kb
+    ensure_origin_head(repo)
+    default = default_branch(repo)
+    branch = f"task-close-{task.name.replace('/', '-')}"
+    close_path = close_worktree_path(repo, branch)
+    # .worktrees counts as ours when it is absent, or when only a kept close worktree from an earlier run is in it.
+    kept_alone = {close_path} if close_path.exists() else None
+    worktree_parent_existed = close_path.parent.exists() and set(close_path.parent.iterdir()) != kept_alone
+    fetch(repo)
+    existing = close_pr(repo, branch)
+    if existing and str(existing.get("state", "")).upper() == "MERGED":
+        merge_commit = (existing.get("mergeCommit") or {}).get("oid")
+        if not merge_commit:
+            raise Stop(f"Close PR #{existing.get('number')} is merged but has no reported merge commit.")
+        fetch(repo)
+        if not is_ancestor(repo, merge_commit, f"origin/{default}"):
+            raise Stop(f"Close PR #{existing.get('number')} reports merge {merge_commit[:7]}, not present on origin/{default}.")
+        print(f"Close PR #{existing['number']} is already merged ({merge_commit[:7]}).")
+        print(update_closed_knowledge_checkout(repo, default))
+        remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+        delete_merged_close_branch(repo, branch)
+        return 0
+    if existing and str(existing.get("state", "")).upper() != "OPEN":
+        raise Stop(f"Close PR #{existing.get('number')} is {existing.get('state')}; branch {branch} is preserved for inspection.")
+    if existing and (existing.get("headRefName") != branch or existing.get("baseRefName") != default):
+        raise Stop(f"Close PR #{existing.get('number')} does not target {branch} into {default}; branch is preserved for inspection.")
+
+    path = close_worktree(repo, branch, default)
+    head = sha(path, "HEAD")
+    base = sha(repo, f"origin/{default}")
+    if not close_commit_present(path, task):
+        if head != base:
+            raise Stop(f"Close branch {branch} at {head[:7]} has an unexpected commit; preserved at {path}.")
+        if git(path, "status", "--porcelain", "--untracked-files=all"):
+            git(path, "reset", "--hard", "HEAD")
+            git(path, "clean", "-fd")
+        changed = apply_close_update(path, task, before, archive, criteria, status, summary)
+        if not changed:
+            # Nothing was committed, so there is no state to resume from: do not leave the folder behind.
+            remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+            print(f"{task.id} was already closed.")
+            return 0
+        head = sha(path, "HEAD")
+
+    kept = f" Close worktree kept at {path} for the resume."
+    pushed = run_git(path, "push", "-q", "-u", "origin", branch)
+    if pushed.returncode:
+        raise Stop(f"Close branch {branch} at {head[:7]} remains locally at {path}; push failed: {pushed.stderr.strip()}. Rerun `task close` to resume.")
+    readback = run_git(repo, "ls-remote", "origin", f"refs/heads/{branch}")
+    remote_head = readback.stdout.split()[0] if readback.returncode == 0 and readback.stdout.split() else ""
+    if remote_head != head:
+        raise Stop(f"Close branch push read back as {remote_head[:7] or 'missing'}, expected {head[:7]}; branch {branch} remains for resume.{kept}")
+
+    existing = close_pr(repo, branch)
+    if not existing:
+        try:
+            gh(repo, "pr", "create", "--head", branch, "--base", default,
+               "--title", f"Close {task.id}: {task.title}", "--body", summary)
+        except Stop as error:
+            raise Stop(f"Close branch {branch} is pushed at {head[:7]}, but PR creation failed: {error}. Rerun `task close` to resume.{kept}")
+        existing = close_pr(repo, branch)
+        if (not existing or str(existing.get("state", "")).upper() != "OPEN"
+                or existing.get("headRefName") != branch or existing.get("baseRefName") != default):
+            raise Stop(f"Close branch {branch} is pushed at {head[:7]}, but no open PR could be read back; rerun `task close` to resume.{kept}")
+        print(f"Opened close PR #{existing['number']}.")
+    pr = str(existing["number"])
+    try:
+        gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
+    except Stop as error:
+        raise Stop(f"Close PR #{pr} for branch {branch} at {head[:7]} remains open; merge failed: {error}. Rerun `task close` to resume.{kept}")
+    try:
+        merged = json.loads(gh(repo, "pr", "view", pr, "--json", "state,mergeCommit"))
+        merge_commit = (merged.get("mergeCommit") or {}).get("oid")
+        if str(merged.get("state", "")).upper() != "MERGED" or not merge_commit:
+            raise Stop(f"Close PR #{pr} merge was not verified; branch {branch} at {head[:7]} is preserved. Rerun `task close` to resume.{kept}")
+    except (json.JSONDecodeError, AttributeError) as error:
+        raise Stop(f"Close PR #{pr} merged but its read-back was invalid ({error}); rerun `task close` to resume.")
+    fetch(repo)
+    if not is_ancestor(repo, merge_commit, f"origin/{default}"):
+        raise Stop(f"Close PR #{pr} merge {merge_commit[:7]} is not present on origin/{default}; branch {branch} remains for inspection.")
+    parents = git(repo, "rev-list", "--parents", "-n", "1", merge_commit).split()
+    if len(parents) != 3 or parents[2] != head:
+        raise Stop(f"Close PR #{pr} did not create a two-parent merge commit for head {head[:7]}; "
+                   f"merge {merge_commit[:7]} remains on origin for inspection.")
+    print(f"Merged close PR #{pr} with merge commit {merge_commit[:7]}.")
+    print(update_closed_knowledge_checkout(repo, default))
+    remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+    delete_merged_close_branch(repo, branch)
+    return 0
+
+
 def close(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
@@ -1280,43 +1706,13 @@ def close(args):
         except (OSError, json.JSONDecodeError):
             exception_reason = "unspecified override"
         summary += f"\n\nException: merge override — {exception_reason}"
-    command = ["backlog", "task", "edit", task.id, "-s", status, "--final-summary", summary]
-    for number in criteria:
-        command += ["--check-ac", number]
-    result = subprocess.run(command, cwd=task.kb, capture_output=True, text=True)
-    if result.returncode:
-        raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
-    after = task.file
-    recorded_review = archive / "review.md"
-    if recorded_review.is_file():
-        text = after.read_text()
-        if "## Review evidence" not in text:
-            text += "\n\n## Review evidence\n\n" + recorded_review.read_text().strip() + "\n"
-            after.write_text(text)
-    noticed = []
-    report = archive / "report.md"
-    if report.exists():
-        match = re.search(r"(?ms)^## Noticed, not done\s*\n(.*?)(?=^## |\Z)", report.read_text())
-        if match and match.group(1).strip().lower() not in {"(none)", "none", "-", "n/a"}:
-            noticed = [line.strip(" -*\t") for line in match.group(1).splitlines() if line.strip()]
-    if noticed:
-        improvements = task.kb / "improvements.md"
-        with improvements.open("a") as out:
-            for item in noticed:
-                out.write(f"\n- {utc_now()[:10]} | {task.id} | report | {item} | open\n")
-    paths = sorted({str(p.relative_to(task.kb)) for p in (before, after) if p})
-    if noticed:
-        paths.append("improvements.md")
-    git(task.kb, "add", "-A", "--", *paths)
-    if ok(task.kb, "diff", "--cached", "--quiet", "--", *paths):
+    if has_origin(task.kb):
+        return close_with_pr(task, before, archive, args, criteria, status, summary)
+    changed = apply_close_update(task.kb, task, before, archive, criteria, status, summary)
+    if not changed:
         print(f"{task.id} was already closed.")
         return 0
-    git(task.kb, "commit", "-q", "-m", f"Close {task.id}: {task.title}", "--", *paths)
     print(f"Closed {task.id} ({len(criteria)} criteria ticked) in {task.kb}.")
-    if has_origin(task.kb):
-        branch = git(task.kb, "branch", "--show-current")
-        pushed = run_git(task.kb, "push", "-q", "origin", branch)
-        print("Pushed." if pushed.returncode == 0 else f"Not pushed: {pushed.stderr.strip()}")
     return 0
 
 
@@ -1366,6 +1762,9 @@ def status(args):
                     data = {}
                 if key == "check": check = data
                 else: review_data = data
+            lane_check = {}
+            try: lane_check = json.loads((path / ".work/check.json").read_text())
+            except (OSError, json.JSONDecodeError): pass
             run = {}
             try: run = json.loads((state / "run.json").read_text())
             except (OSError, json.JSONDecodeError): pass
@@ -1398,6 +1797,12 @@ def status(args):
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
                   f"report={'present' if report else 'missing'} idle={idle_label} branch={branch}")
+            if lane_check.get("advisory"):
+                lane_result = lane_check.get("result", "unknown")
+                current = (lane_check.get("sha") == head and record
+                           and lane_check.get("record_revision") == record.get("revision"))
+                freshness = "" if current else ", stale"
+                print(f"    lane check: {lane_result} (advisory{freshness})")
             if (state / "exception.json").is_file():
                 attention.append(f"{path.name}: exception")
             if check.get("result") == "failed":
@@ -1480,12 +1885,20 @@ def cancel(args):
         else:
             os.kill(int(run["pid"]), signal.SIGTERM)
     except (ProcessLookupError, OSError, KeyError, ValueError): pass
+    run_id = run.get("task_run_id")
+    signal_task_run(run_id, signal.SIGTERM)
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:
-        if run.get("state") == "running":
-            try: os.killpg(int(run["pgid"]), 0)
-            except (ProcessLookupError, OSError, KeyError, ValueError): break
-        elif not pid_alive(run.get("pid")):
+        live_group = False
+        try:
+            if run.get("state") == "running":
+                os.killpg(int(run["pgid"]), 0)
+                live_group = True
+            elif pid_alive(run.get("pid")):
+                live_group = True
+        except (ProcessLookupError, OSError, KeyError, ValueError):
+            pass
+        if not live_group and not task_run_pids(run_id):
             break
         time.sleep(0.05)
     else:
@@ -1497,6 +1910,7 @@ def cancel(args):
             else:
                 os.kill(int(run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, OSError, KeyError, ValueError): pass
+    signal_task_run(run_id, signal.SIGKILL)
     run["state"] = "cancelled"
     run["ended_at"] = utc_now()
     atomic_json(run_path, run)
@@ -1529,6 +1943,7 @@ def main(argv=None):
             sub.add_argument("--partial", action="store_true")
         if name == "review":
             sub.add_argument("--record", metavar="FILE")
+            sub.add_argument("--request", metavar="FILE")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
@@ -1554,20 +1969,23 @@ def main(argv=None):
                 args.category = ""
             args.text = " ".join(args.text)
         if args.command in {"check", "merge"} and args.detach:
-            if args.command == "check":
-                if args.id is None:
-                    path = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
-                    repo = main_repo(path)
-                    task = Task(repo, path.name)
+            if args.command == "check" and advisory_check_for(check_task_from_args(args)):
+                args.detach = False
+            else:
+                if args.command == "check":
+                    if args.id is None:
+                        path = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+                        repo = main_repo(path)
+                        task = Task(repo, path.name)
+                    else:
+                        repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+                        task = Task(repo, args.id)
+                        path = task.worktree()
                 else:
-                    repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+                    repo = resolve_repo(args.repo)
                     task = Task(repo, args.id)
                     path = task.worktree()
-            else:
-                repo = resolve_repo(args.repo)
-                task = Task(repo, args.id)
-                path = task.worktree()
-            return detached(args, task, path)
+                return detached(args, task, path)
         lock = foreground_lock(args)
         if lock:
             signal.signal(signal.SIGHUP, handle_interruption)
