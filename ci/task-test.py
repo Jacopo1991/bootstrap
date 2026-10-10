@@ -1635,7 +1635,7 @@ exit 1
             "haiku-2.md": ([1, 2, 3, 4, 5], "FAIL", "298aed910b35f0da8f54052574b567ce9c03b640", "claude",
                            {1: "pass", 2: "pass", 3: "pass", 4: "pass", 5: "pass"}),
             "luna-1.md": (list(range(1, 9)), "FAIL", "c3c5dac9f337d6f5ad37bc677ecaf6c9d596a1de", "codex",
-                          {2: "pass", 3: "fail", 4: "pass", 5: "pass", 6: "pass", 7: "pass", 8: "pass"}),
+                          {1: "pass", 2: "pass", 3: "fail", 4: "pass", 5: "pass", 6: "pass", 7: "pass", 8: "pass"}),
             "luna-2.md": ([1, 2, 3, 4, 5], "FAIL", "ec01a2e465ac66f92fabeb50f8230772194e61e1", "codex",
                           {1: "fail", 2: "pass", 3: "pass", 4: "pass", 5: "unclear"}),
         }
@@ -1668,12 +1668,23 @@ exit 1
         text = """Verdict: FAIL, mainly on R3.5
 Commit: abcdef0123456789
 Reviewer: codex gpt-6-luna
-1. **Pass** — numbered evidence
+1. **Pass, per report:** numbered evidence
 | 2 | fail | table evidence |
 """
         verdict, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
         self.assertEqual(verdict, "FAIL")
-        self.assertEqual(judgments, {1: ("pass", "numbered evidence"), 2: ("fail", "table evidence")})
+        self.assertEqual(judgments, {1: ("pass", "per report: numbered evidence"),
+                                     2: ("fail", "table evidence")})
+
+    def test_review_parser_requires_exact_table_judgment_cell(self):
+        text = """Verdict: FAIL
+Commit: abcdef0123456789
+Reviewer: codex gpt-6-luna
+| 1 | Fail safe default is missing | not a judgment |
+| 2 | fail | exact judgment cell |
+"""
+        _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
+        self.assertEqual(judgments, {2: ("fail", "exact judgment cell")})
 
     def test_review_parser_does_not_map_numbered_findings_when_hash_criteria_are_present(self):
         text = """Verdict: FAIL

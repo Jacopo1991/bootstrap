@@ -1139,10 +1139,17 @@ def normalize_review_line(line):
     line = line.rstrip()
     line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
     table_number = None
+    table_judgment = None
+    table_evidence = None
     if "|" in line:
         cells = [part.strip() for part in line.strip().strip("|").split("|")]
         first = re.fullmatch(r"#?(\d+)", cells[0]) if cells else None
         table_number = int(first.group(1)) if first else None
+        if table_number is not None and len(cells) > 1:
+            judgment = re.fullmatch(r"(pass|fail|unclear)", cells[1], re.I)
+            if judgment:
+                table_judgment = judgment.group(1).lower()
+                table_evidence = " ".join(cells[2:]).strip()
         line = " ".join(cells)
     numbered = re.match(r"^\s*(\d+)[.)]\s+", line)
     line = re.sub(r"^\s*(?:[-*+]\s+)+", "", line)
@@ -1150,7 +1157,8 @@ def normalize_review_line(line):
     line = line.replace("`", "").replace("**", "").replace("__", "")
     line = line.replace("*", "")
     line = re.sub(r"(?<!\w)_|_(?!\w)", "", line)
-    return line.strip(), int(numbered.group(1)) if numbered else None, table_number
+    return (line.strip(), int(numbered.group(1)) if numbered else None, table_number,
+            table_judgment, table_evidence)
 
 
 def parse_review_block(block, criteria):
@@ -1203,20 +1211,20 @@ def parse_review_reply(text, criteria):
     if block is not None:
         return parse_review_block(block, criteria)
     lines = [normalize_review_line(line) for line in text.splitlines()]
-    verdict = next((match.group(1).upper() for line, _, _ in lines
+    verdict = next((match.group(1).upper() for line, _, _, _, _ in lines
                     if (match := re.match(r"Verdict\s*:\s*(PASS|FAIL)\b", line, re.I))), None)
-    commit = next((match.group(1) for line, _, _ in lines
+    commit = next((match.group(1) for line, _, _, _, _ in lines
                    if (match := re.fullmatch(r"Commit\s*:\s*([0-9a-f]{7,40})", line, re.I))), None)
     reviewer = None
-    for line, _, _ in lines:
+    for line, _, _, _, _ in lines:
         reviewer = re.fullmatch(r"Reviewer\s*:\s*(codex|claude)\s+(.+)", line, re.I)
         if reviewer:
             reviewer = (reviewer.group(1), reviewer.group(2))
             break
     judgments = {}
     required = set(criteria)
-    has_hash_criterion_lines = any(re.match(r"#\d+\b", line) for line, _, _ in lines)
-    for line, number, table_number in lines:
+    has_hash_criterion_lines = any(re.match(r"#\d+\b", line) for line, _, _, _, _ in lines)
+    for line, number, table_number, table_judgment, table_evidence in lines:
         explicit = re.fullmatch(r"#(\d+)\s*:?[\s|]+(pass|fail|unclear)\s*:?\s*(.*)", line, re.I)
         if explicit:
             n, verdict_value, evidence = int(explicit.group(1)), explicit.group(2), explicit.group(3)
@@ -1228,21 +1236,23 @@ def parse_review_reply(text, criteria):
         criterion_number = (number or table_number) if not has_hash_criterion_lines else None
         if criterion_number in required:
             if table_number is not None:
-                table_item = re.fullmatch(rf"{table_number}\s+(pass|fail|unclear)\s+(.+)", line, re.I)
-                if table_item:
+                if table_judgment is not None:
                     if criterion_number in judgments:
                         raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
-                    judgments[criterion_number] = (table_item.group(1).lower(), table_item.group(2).strip())
-                    continue
+                    judgments[criterion_number] = (table_judgment, table_evidence or "")
+                continue
             item = re.fullmatch(
-                r"(?:\d+\s+)?(pass|fail|unclear)(?=$|:|\s+[—–-]\s)(.*)", line, re.I)
+                r"(?:\d+\s+)?(pass|fail|unclear)(?=$|:|,|\s)(.*)", line, re.I)
             if item:
-                evidence = re.fullmatch(
-                    r"\s*(?:(?:,\s*[^:]+:|:|—|–|-)\s*(.*))?", item.group(2))
-                if evidence:
-                    if criterion_number in judgments:
-                        raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
-                    judgments[criterion_number] = (item.group(1).lower(), (evidence.group(1) or "").strip())
+                remainder = item.group(2)
+                if remainder.startswith((":", ",")):
+                    evidence = remainder[1:].strip()
+                else:
+                    dash = re.match(r"\s+[—–-]\s+(.*)", remainder)
+                    evidence = dash.group(1).strip() if dash else remainder.strip()
+                if criterion_number in judgments:
+                    raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
+                judgments[criterion_number] = (item.group(1).lower(), evidence)
     return verdict, commit, reviewer, judgments
 
 
