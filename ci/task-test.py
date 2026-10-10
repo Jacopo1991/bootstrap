@@ -203,6 +203,7 @@ class TaskTool(unittest.TestCase):
         out = self.task("merge", "proj", "T-5")
         self.assertIn("Merged t5-add-the-b-file into main", out)
         self.assertIn("use `task merge proj T-5 --detach`", out)
+        self.assertEqual(out.count("For long gates"), 1)
         self.assertIn("Recorded review: claude test at fixture-time", out)
         self.assertEqual(self.git(self.origin, "rev-parse", "main~1"), base_tip,
                          "first parent is the gated main tip")
@@ -454,6 +455,7 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.git(self.repo, "remote", "set-url", "origin", str(github))
         self.git(self.repo, "fetch", "-q", "origin")
         state = self.home / "pr-state"
+        merge_sha = self.home / "merge-sha"
         (self.home / "bin/gh").write_text(f"""#!/bin/sh
 set -e
 case "$1 $2" in
@@ -462,7 +464,9 @@ case "$1 $2" in
   "pr merge")
     head=$6; tmp=$(mktemp -d); git clone -q {github} $tmp
     git -C $tmp merge -q --no-ff -m "Merge pull request #7" $head
-    git -C $tmp push -q origin HEAD:main; rm -f {state}; exit 0 ;;
+    git -C $tmp push -q origin HEAD:main; git -C $tmp rev-parse HEAD > {merge_sha}
+    rm -f {state}; exit 0 ;;
+  "pr view") printf '{{"mergeCommit":{{"oid":"%s"}}}}\n' "$(cat {merge_sha})"; exit 0 ;;
 esac
 exit 1
 """)
@@ -475,12 +479,44 @@ exit 1
         self.assertEqual(self.git(self.repo, "rev-parse", "main"), self.git(github, "rev-parse", "main"))
         self.assertFalse(wt.exists(), out)
 
+    def test_github_later_push_does_not_create_false_base_exception(self):
+        github = self.home / "github-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.origin), str(github))
+        self.git(self.repo, "remote", "set-url", "origin", str(github))
+        self.git(self.repo, "fetch", "-q", "origin")
+        state = self.home / "pr-state"
+        merge_sha = self.home / "merge-sha"
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr list") [ -f {state} ] && cat {state}; exit 0 ;;
+  "pr create") echo 7 > {state}; exit 0 ;;
+  "pr merge")
+    head=$6; tmp=$(mktemp -d); git clone -q {github} $tmp
+    git -C $tmp merge -q --no-ff -m "Merge pull request #7" $head
+    git -C $tmp push -q origin HEAD:main; git -C $tmp rev-parse HEAD > {merge_sha}
+    echo later > $tmp/later.txt; git -C $tmp add later.txt; git -C $tmp commit -qm later
+    git -C $tmp push -q origin main; rm -f {state}; exit 0 ;;
+  "pr view") printf '{{"mergeCommit":{{"oid":"%s"}}}}\n' "$(cat {merge_sha})"; exit 0 ;;
+esac
+exit 1
+""")
+        (self.home / "bin/gh").chmod(0o755)
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Merged PR #7", out)
+        self.assertNotIn("WARNING:", out)
+        self.assertFalse((self.state() / "exception.json").exists())
+        self.assertIn("later.txt", self.git(github, "ls-tree", "--name-only", "main"))
+
     def test_github_merge_base_mismatch_records_exception_without_reverting(self):
         github = self.home / "github-origin.git"
         self.git(self.home, "clone", "-q", "--bare", str(self.origin), str(github))
         self.git(self.repo, "remote", "set-url", "origin", str(github))
         self.git(self.repo, "fetch", "-q", "origin")
         state = self.home / "pr-state"
+        merge_sha = self.home / "merge-sha"
         (self.home / "bin/gh").write_text(f"""#!/bin/sh
 set -e
 case "$1 $2" in
@@ -491,7 +527,9 @@ case "$1 $2" in
     echo moved > $tmp/late.txt; git -C $tmp add late.txt; git -C $tmp commit -qm moved
     git -C $tmp push -q origin main
     git -C $tmp merge -q --no-ff -m "Merge pull request #7" $head
-    git -C $tmp push -q origin HEAD:main; rm -rf $tmp; rm -f {state}; exit 0 ;;
+    git -C $tmp push -q origin HEAD:main; git -C $tmp rev-parse HEAD > {merge_sha}
+    rm -rf $tmp; rm -f {state}; exit 0 ;;
+  "pr view") printf '{{"mergeCommit":{{"oid":"%s"}}}}\n' "$(cat {merge_sha})"; exit 0 ;;
 esac
 exit 1
 """)
@@ -804,10 +842,16 @@ exit 1
         self.started()
 
     def test_round2_review_prompt_and_parser_accept_normal_markdown_and_unique_short_sha(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text() +
+                             "\n## Outcome\n\nA real outcome from the task.\n\n"
+                             "## Scope\n\nTouch the task tool and its checks.\n")
         wt, _ = self.started()
         prompt = self.raw_task("review", "proj", "5")
         self.assertIn("Task:", prompt)
         self.assertIn("Worktree:", prompt)
+        self.assertIn("Outcome: A real outcome from the task.", prompt)
+        self.assertIn("Scope: Touch the task tool and its checks.", prompt)
         self.assertIn("Diff range:", prompt)
         head = self.git(wt, "rev-parse", "HEAD")
         review = self.home / "review.txt"
@@ -874,6 +918,8 @@ exit 1
         self.assertIn("Cancelled", out)
         self.assertFalse(gate.exists(), f"gate worktree survived cancel: {gate}")
         self.assertFalse(list((self.repo / ".worktrees").glob(".task-gate-*")))
+        run_log = (_wt / ".work/run.log").read_text()
+        self.assertEqual(run_log.count("For long gates"), 1)
 
     def test_round4_merge_prunes_killed_gate_worktree(self):
         wt, _ = self.started()
@@ -885,6 +931,27 @@ exit 1
         out = self.task("merge", "proj", "5")
         self.assertIn("Removed stale gate worktree", out)
         self.assertFalse(stale.exists())
+
+    def test_round5_status_reports_failed_cancelled_and_interrupted_merges(self):
+        wt, _ = self.started()
+        run_path = self.state() / "run.json"
+        log_path = wt / ".work/run.log"
+        log_path.write_text("gate output\n")
+        run = {"command": "merge", "state": "failed", "completed": []}
+        run_path.write_text(__import__("json").dumps(run))
+        out = self.raw_task("status", "proj")
+        self.assertIn("merge failed", out)
+        self.assertIn(f"log: {log_path}", out)
+        self.assertIn(f"t5: merge failed (log: {log_path})", out)
+        self.assertNotIn("check=", out)
+        for run_state, expected in (("cancelled", "merge cancelled"),
+                                    ("interrupted", "merge interrupted")):
+            run["state"] = run_state
+            run_path.write_text(__import__("json").dumps(run))
+            out = self.raw_task("status", "proj")
+            self.assertIn(expected, out)
+            self.assertIn(f"log: {log_path}", out)
+            self.assertNotIn("check=", out)
 
 
 if __name__ == "__main__":

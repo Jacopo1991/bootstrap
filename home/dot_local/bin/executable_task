@@ -223,7 +223,7 @@ def report_is_filled(path: Path):
 
 
 def markdown_section(text: str, heading: str) -> str:
-    match = re.search(rf"(?ms)^#{1,6} {re.escape(heading)}\s*\n(.*?)(?=^#{1,6} |\Z)", text)
+    match = re.search(rf"(?ms)^#{{1,6}} {re.escape(heading)}\s*\n(.*?)(?=^#{{1,6}} |\Z)", text)
     return match.group(1).strip() if match else ""
 
 
@@ -1189,9 +1189,16 @@ def merge(args):
                     continue
                 gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", lane_head)
                 completed_step(task, "published")
+                try:
+                    merge_info = json.loads(gh(repo, "pr", "view", pr, "--json", "mergeCommit"))
+                    pr_merge_commit = (merge_info.get("mergeCommit") or {}).get("oid")
+                except (json.JSONDecodeError, AttributeError):
+                    pr_merge_commit = None
+                if not pr_merge_commit:
+                    raise Stop(f"GitHub merged PR #{pr} but did not report its merge commit; inspect it before continuing.")
                 fetch(repo)
                 commit = sha(repo, f"origin/{default}")
-                first_parent = sha(repo, f"{commit}^1")
+                first_parent = sha(repo, f"{pr_merge_commit}^1")
                 if first_parent != base:
                     reason = (f"GitHub merged PR #{pr} on {first_parent[:7]}, not the gated base "
                               f"{base[:7]}; publication did not match the gate.")
@@ -1200,7 +1207,7 @@ def merge(args):
                                                                "gated_base": base,
                                                                "actual_first_parent": first_parent})
                     print(f"WARNING: {reason} Exception recorded; the published merge was not reverted.")
-                print(f"Merged PR #{pr} ({commit[:7]}) from reviewed head {lane_head[:7]}.")
+                print(f"Merged PR #{pr} ({pr_merge_commit[:7]}) from reviewed head {lane_head[:7]}.")
             else:
                 commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
                              "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
@@ -1400,6 +1407,8 @@ def status(args):
                     try: os.killpg(int(run["pgid"]), 0)
                     except (ProcessLookupError, OSError, KeyError, ValueError): run_state = "interrupted"
             check_state = run_state if run_state in {"running", "interrupted"} else check.get("result", "missing")
+            run_label = (f"merge {run_state}" if run.get("command") == "merge" and run_state
+                         else f"check={check_state}@{check.get('sha', '?')[:7]}")
             report = (path / ".work/report.md").is_file()
             last = int(git(path, "log", "-1", "--format=%ct", "HEAD") or os.stat(path).st_mtime)
             try:
@@ -1412,7 +1421,7 @@ def status(args):
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
             print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} head={head[:7]} "
-                  f"check={check_state}@{check.get('sha', '?')[:7]} "
+                  f"{run_label} "
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
                   f"report={'present' if report else 'missing'} idle={idle_label} branch={branch}")
@@ -1425,7 +1434,10 @@ def status(args):
             elif review_data and review_data.get("commit") != head:
                 attention.append(f"{path.name}: stale review")
             if run_state == "interrupted":
-                attention.append(f"{path.name}: interrupted run")
+                attention.append(f"{path.name}: interrupted run (log: {path / '.work/run.log'})")
+            elif run_state in {"failed", "cancelled"}:
+                attention.append(f"{path.name}: {run.get('command', 'check')} {run_state} "
+                                 f"(log: {path / '.work/run.log'})")
         if state_root.is_dir():
             for state in sorted(item for item in state_root.iterdir() if item.is_dir()):
                 if (state / "exception.json").is_file() and not any(state.name in entry for entry in attention):
