@@ -1093,47 +1093,114 @@ def open_pr(repo, branch):
     return result.stdout.strip()
 
 
+class ReviewParseError(ValueError):
+    """A review reply is malformed or contains ambiguous criterion judgments."""
+
+
 def normalize_review_line(line):
     """Remove common Markdown presentation while preserving review text and list numbering."""
     line = line.rstrip()
     line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+    table_number = None
     if "|" in line:
-        line = " ".join(part.strip() for part in line.strip().strip("|").split("|"))
+        cells = [part.strip() for part in line.strip().strip("|").split("|")]
+        first = re.fullmatch(r"#?(\d+)", cells[0]) if cells else None
+        table_number = int(first.group(1)) if first else None
+        line = " ".join(cells)
     numbered = re.match(r"^\s*(\d+)[.)]\s+", line)
     line = re.sub(r"^\s*(?:[-*+]\s+)+", "", line)
     line = re.sub(r"^\s*\d+[.)]\s+", "", line)
     line = line.replace("`", "").replace("**", "").replace("__", "")
     line = line.replace("*", "")
     line = re.sub(r"(?<!\w)_|_(?!\w)", "", line)
-    return line.strip(), int(numbered.group(1)) if numbered else None
+    return line.strip(), int(numbered.group(1)) if numbered else None, table_number
+
+
+def parse_review_block(block, criteria):
+    """Parse the exact plain-text fields in a fenced `review` block."""
+    lines = block.splitlines()
+    if len(lines) < 3:
+        raise ReviewParseError("review block must contain verdict, commit, and reviewer lines")
+    verdict_match = re.fullmatch(r"Verdict: (PASS|FAIL)", lines[0])
+    commit_match = re.fullmatch(r"Commit: ([0-9a-f]{40})", lines[1])
+    reviewer_match = re.fullmatch(r"Reviewer: (codex|claude) ([^`*_~|]+)", lines[2])
+    if not verdict_match:
+        raise ReviewParseError("review block must start with `Verdict: PASS` or `Verdict: FAIL`")
+    if not commit_match:
+        raise ReviewParseError("review block must contain a full 40-character Commit SHA")
+    if not reviewer_match:
+        raise ReviewParseError("review block must contain `Reviewer: <vendor> <model>`")
+    required = set(criteria)
+    judgments = {}
+    for line in lines[3:]:
+        match = re.fullmatch(r"#(\d+) (pass|fail|unclear): ([^`*_~|]+)", line)
+        if not match:
+            raise ReviewParseError("review block contains a malformed or Markdown criterion line")
+        number, judgment, evidence = int(match.group(1)), match.group(2), match.group(3)
+        if number in judgments:
+            raise ReviewParseError(f"duplicate judgment for criterion #{number}")
+        if number not in required:
+            raise ReviewParseError(f"review block includes unpinned criterion #{number}")
+        judgments[number] = (judgment, evidence.strip())
+    if required != set(judgments):
+        raise ReviewParseError("every pinned criterion must have exactly one judgment")
+    return verdict_match.group(1), commit_match.group(1), (reviewer_match.group(1), reviewer_match.group(2)), judgments
+
+
+def review_block(text):
+    """Return the first review block, or None only when no review fence was supplied."""
+    opening = re.search(r"(?m)^```review[ \t]*\r?\n", text)
+    if not opening:
+        return None
+    closing = re.search(r"(?m)^```[ \t]*$", text[opening.end():])
+    if not closing:
+        raise ReviewParseError("review block is missing its closing fence")
+    return text[opening.end():opening.end() + closing.start()]
 
 
 def parse_review_reply(text, criteria):
-    """Parse normalized Markdown review fields; numbered verdicts require a pinned criterion."""
+    """Prefer a strict fenced block; otherwise parse common Markdown reviewer replies."""
+    block = review_block(text)
+    if block is not None:
+        return parse_review_block(block, criteria)
     lines = [normalize_review_line(line) for line in text.splitlines()]
-    verdict = next((match.group(1).upper() for line, _ in lines
-                    if (match := re.fullmatch(r"Verdict\s*:\s*(PASS|FAIL)", line, re.I))), None)
-    commit = next((match.group(1) for line, _ in lines
+    verdict = next((match.group(1).upper() for line, _, _ in lines
+                    if (match := re.match(r"Verdict\s*:\s*(PASS|FAIL)\b", line, re.I))), None)
+    commit = next((match.group(1) for line, _, _ in lines
                    if (match := re.fullmatch(r"Commit\s*:\s*([0-9a-f]{7,40})", line, re.I))), None)
     reviewer = None
-    for line, _ in lines:
+    for line, _, _ in lines:
         reviewer = re.fullmatch(r"Reviewer\s*:\s*(codex|claude)\s+(.+)", line, re.I)
         if reviewer:
             reviewer = (reviewer.group(1), reviewer.group(2))
             break
     judgments = {}
     required = set(criteria)
-    for line, number in lines:
+    for line, number, table_number in lines:
         explicit = re.fullmatch(r"#(\d+)\s*:?[\s|]+(pass|fail|unclear)\s*:?\s*(.*)", line, re.I)
         if explicit:
             n, verdict_value, evidence = int(explicit.group(1)), explicit.group(2), explicit.group(3)
-            if n in required and n not in judgments:
+            if n in required:
+                if n in judgments:
+                    raise ReviewParseError(f"duplicate judgment for criterion #{n}")
                 judgments[n] = (verdict_value.lower(), evidence.strip())
             continue
-        if number in required:
-            item = re.fullmatch(r"(pass|fail|unclear)\s*(?:,[^:]*)?:\s*(.*)", line, re.I)
-            if item and number not in judgments:
-                judgments[number] = (item.group(1).lower(), item.group(2).strip())
+        criterion_number = number or table_number
+        if criterion_number in required:
+            if table_number is not None:
+                table_item = re.fullmatch(rf"{table_number}\s+(pass|fail|unclear)\s+(.+)", line, re.I)
+                if table_item:
+                    if criterion_number in judgments:
+                        raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
+                    judgments[criterion_number] = (table_item.group(1).lower(), table_item.group(2).strip())
+                    continue
+            item = re.fullmatch(r"(?:\d+\s+)?(pass|fail|unclear)\b(.*)", line, re.I)
+            if item:
+                evidence = re.fullmatch(r"\s*(?:,\s*[^:]+:|:|—|–|-)\s*(.*)", item.group(2))
+                if evidence:
+                    if criterion_number in judgments:
+                        raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
+                    judgments[criterion_number] = (item.group(1).lower(), evidence.group(1).strip())
     return verdict, commit, reviewer, judgments
 
 
@@ -1172,10 +1239,14 @@ def review(args):
             prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
         else:
             prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
-        prompt.append("Return: Verdict: PASS|FAIL; Commit: <sha>; Reviewer: codex|claude <model>; one line per criterion:")
+        prompt.append("Return exactly this final fenced block, with plain text only inside it:")
+        prompt.append("```review")
+        prompt.append("Verdict: PASS|FAIL")
+        prompt.append("Commit: <full sha>")
+        prompt.append("Reviewer: <vendor> <model>")
         for item in record["criteria"]:
-            prompt.append(f"#{item['number']} pass|fail|unclear: <evidence>")
-        prompt.append("Then list findings.")
+            prompt.append(f"#{item['number']} pass|fail|unclear: <one line of evidence>")
+        prompt.append("```")
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)
@@ -1200,7 +1271,10 @@ def review(args):
     except OSError as error:
         raise Stop(f"Cannot read review file {args.record}: {error}.")
     required = {item["number"] for item in record["criteria"]}
-    verdict, commit, reviewer, judgments = parse_review_reply(text, required)
+    try:
+        verdict, commit, reviewer, judgments = parse_review_reply(text, required)
+    except ReviewParseError as error:
+        raise Stop(f"Review rejected: {error}.")
     problems = []
     if not verdict: problems.append("missing Verdict: PASS|FAIL")
     resolved_review = None
