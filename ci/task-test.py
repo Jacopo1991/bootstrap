@@ -22,9 +22,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "home/dot_local/bin/executable_task"
+REVIEW_FIXTURES = ROOT / "ci/fixtures/reviews"
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+TASK_LOADER = importlib.machinery.SourceFileLoader("task_tool_for_review_test", str(TOOL))
+TASK_SPEC = importlib.util.spec_from_loader(TASK_LOADER.name, TASK_LOADER)
+TASK_MODULE = importlib.util.module_from_spec(TASK_SPEC)
+TASK_SPEC.loader.exec_module(TASK_MODULE)
 
 STUBS = {
     "just": """#!/bin/sh
@@ -583,7 +588,8 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn("claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)' <", out)
+        self.assertIn(f"claude -p --add-dir {self.kb} --permission-mode dontAsk --model haiku --effort high "
+                      "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)' <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         self.assertIn("Worktree:", prompt.read_text())
@@ -606,12 +612,19 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high - <", out)
+        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only --add-dir {self.kb} "
+                      "-m gpt-6-luna -c model_reasoning_effort=high - <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
+
+    def test_direct_review_commands_do_not_add_kb_directory_without_backlog_file(self):
+        self.raw_task("start", "proj", "direct-request", "--builder", "claude")
+        out = self.raw_task("review", "proj", "direct-request")
+        self.assertIn("codex exec --sandbox read-only", out)
+        self.assertNotIn("--add-dir", out)
 
     def test_merge_gates_merge_result_without_changing_lane_and_is_idempotent(self):
         wt, _ = self.started()
@@ -1576,6 +1589,41 @@ exit 1
                               "#1 pass: reviewed source\n#2 pass: ran acceptance evidence\n")
             out = self.raw_task("review", "proj", "5", "--record", str(review))
             self.assertIn("Recorded PASS", out, verdict)
+
+    def test_real_markdown_review_fixtures_parse_verdict_commit_and_only_stated_judgments(self):
+        cases = {
+            "haiku-1.md": ([1, 2, 3, 4, 5], "FAIL", "93b8888", "claude",
+                           {1: "pass", 2: "pass", 3: "pass", 4: "pass", 5: "fail"}),
+            "haiku-2.md": ([], "FAIL", "298aed910b35f0da8f54052574b567ce9c03b640", "claude", {}),
+            "luna-1.md": (list(range(1, 9)), "FAIL", "c3c5dac9f337d6f5ad37bc677ecaf6c9d596a1de", "codex",
+                          {1: "pass", 2: "pass", 3: "fail", 4: "pass", 5: "pass", 6: "pass", 7: "pass", 8: "pass"}),
+            "luna-2.md": ([1, 2, 3, 4, 5], "FAIL", "ec01a2e465ac66f92fabeb50f8230772194e61e1", "codex",
+                          {1: "fail", 2: "pass", 3: "pass", 4: "pass", 5: "unclear"}),
+        }
+        for filename, (criteria, expected_verdict, expected_commit, expected_vendor, expected_judgments) in cases.items():
+            with self.subTest(fixture=filename):
+                source = REVIEW_FIXTURES / filename
+                self.assertTrue(source.is_file(), f"missing copied fixture: {source}")
+                text = source.read_text()
+                verdict, commit, reviewer, judgments = TASK_MODULE.parse_review_reply(text, criteria)
+                self.assertEqual(verdict, expected_verdict)
+                self.assertEqual(commit, expected_commit)
+                self.assertEqual(reviewer[0].lower(), expected_vendor)
+                self.assertEqual({number: result for number, (result, _) in judgments.items()},
+                                 expected_judgments)
+                self.assertTrue(all(evidence for _, evidence in judgments.values()))
+
+    def test_review_parser_ignores_numbered_verdicts_without_matching_task_criteria(self):
+        text = """A prose introduction before the verdict.
+## Verdict: **FAIL**
+**Commit**: `abcdef0123456789`
+**Reviewer**: codex gpt-6-luna
+9. **Pass:** unrelated numbered finding
+| #1 | pass | table evidence |
+"""
+        verdict, commit, reviewer, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
+        self.assertEqual((verdict, commit, reviewer[0].lower()), ("FAIL", "abcdef0123456789", "codex"))
+        self.assertEqual(judgments, {1: ("pass", "table evidence")})
 
     def test_round2_cancel_uses_archive_and_merge_mentions_detach(self):
         self.started()

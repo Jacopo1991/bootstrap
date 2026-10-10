@@ -1093,6 +1093,50 @@ def open_pr(repo, branch):
     return result.stdout.strip()
 
 
+def normalize_review_line(line):
+    """Remove common Markdown presentation while preserving review text and list numbering."""
+    line = line.rstrip()
+    line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+    if "|" in line:
+        line = " ".join(part.strip() for part in line.strip().strip("|").split("|"))
+    numbered = re.match(r"^\s*(\d+)[.)]\s+", line)
+    line = re.sub(r"^\s*(?:[-*+]\s+)+", "", line)
+    line = re.sub(r"^\s*\d+[.)]\s+", "", line)
+    line = line.replace("`", "").replace("**", "").replace("__", "")
+    line = line.replace("*", "")
+    line = re.sub(r"(?<!\w)_|_(?!\w)", "", line)
+    return line.strip(), int(numbered.group(1)) if numbered else None
+
+
+def parse_review_reply(text, criteria):
+    """Parse normalized Markdown review fields; numbered verdicts require a pinned criterion."""
+    lines = [normalize_review_line(line) for line in text.splitlines()]
+    verdict = next((match.group(1).upper() for line, _ in lines
+                    if (match := re.fullmatch(r"Verdict\s*:\s*(PASS|FAIL)", line, re.I))), None)
+    commit = next((match.group(1) for line, _ in lines
+                   if (match := re.fullmatch(r"Commit\s*:\s*([0-9a-f]{7,40})", line, re.I))), None)
+    reviewer = None
+    for line, _ in lines:
+        reviewer = re.fullmatch(r"Reviewer\s*:\s*(codex|claude)\s+(.+)", line, re.I)
+        if reviewer:
+            reviewer = (reviewer.group(1), reviewer.group(2))
+            break
+    judgments = {}
+    required = set(criteria)
+    for line, number in lines:
+        explicit = re.fullmatch(r"#(\d+)\s*:?[\s|]+(pass|fail|unclear)\s*:?\s*(.*)", line, re.I)
+        if explicit:
+            n, verdict_value, evidence = int(explicit.group(1)), explicit.group(2), explicit.group(3)
+            if n in required and n not in judgments:
+                judgments[n] = (verdict_value.lower(), evidence.strip())
+            continue
+        if number in required:
+            item = re.fullmatch(r"(pass|fail|unclear)\s*(?:,[^:]*)?:\s*(.*)", line, re.I)
+            if item and number not in judgments:
+                judgments[number] = (item.group(1).lower(), item.group(2).strip())
+    return verdict, commit, reviewer, judgments
+
+
 def review(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
@@ -1140,10 +1184,13 @@ def review(args):
         prompt_file.write_text(prompt_text)
         reply_file.unlink(missing_ok=True)
         print(prompt_text, end="")
+        add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         if record["builder"] == "codex":
-            command = "claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'"
+            command = (f"claude -p {add_dir}--permission-mode dontAsk --model haiku --effort high "
+                       "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
         else:
-            command = "GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -"
+            command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+                       "-m gpt-6-luna -c model_reasoning_effort=high -")
         print("Headless reviewer command (run from the task worktree):")
         print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
         print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
@@ -1152,32 +1199,26 @@ def review(args):
         text = Path(args.record).read_text()
     except OSError as error:
         raise Stop(f"Cannot read review file {args.record}: {error}.")
-    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict(?::\*\*|:)\s*"
-                        r"(?:\*\*)?(PASS|FAIL)(?:\*\*)?\s*$", text)
-    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*`?"
-                       r"([0-9a-f]{7,40})`?(?:\*\*)?\s*$", text)
-    reviewer = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Reviewer:\s*(codex|claude)\s+(.+?)(?:\*\*)?\s*$", text)
-    judgments = {int(n): (v, evidence.strip()) for n, v, evidence in re.findall(
-        r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?#(\d+)\s+(pass|fail|unclear):\s*(.+?)\s*$", text)}
+    required = {item["number"] for item in record["criteria"]}
+    verdict, commit, reviewer, judgments = parse_review_reply(text, required)
     problems = []
     if not verdict: problems.append("missing Verdict: PASS|FAIL")
     resolved_review = None
     if commit:
-        matches = run_git(path, "rev-parse", "--verify", f"{commit.group(1)}^{{commit}}")
-        if matches.returncode == 0 and matches.stdout.strip().startswith(commit.group(1)):
+        matches = run_git(path, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if matches.returncode == 0 and matches.stdout.strip().startswith(commit):
             resolved_review = matches.stdout.strip()
     if resolved_review != head: problems.append("Commit does not match the current lane head")
     if not reviewer: problems.append("missing Reviewer: codex|claude <model>")
-    elif reviewer.group(1) == record["builder"]: problems.append("reviewer vendor must differ from builder")
-    required = {item["number"] for item in record["criteria"]}
+    elif reviewer[0].lower() == record["builder"]: problems.append("reviewer vendor must differ from builder")
     if required != set(judgments): problems.append("every pinned criterion must have exactly one judgment")
     if any(not evidence for _, evidence in judgments.values()): problems.append("every judgment needs evidence")
     if problems:
         raise Stop("Review rejected: " + "; ".join(problems) + ".")
     state = task_state(task)
     (state / "review.md").write_text(text)
-    meta = {"verdict": verdict.group(1).upper(), "commit": head, "reviewer": reviewer.group(1).lower(),
-            "model": reviewer.group(2), "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
+    meta = {"verdict": verdict, "commit": head, "reviewer": reviewer[0].lower(),
+            "model": reviewer[1], "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
             "record_revision": record["revision"], "time": utc_now()}
     atomic_json(state / "review.json", meta)
     task_event(task, "review")
