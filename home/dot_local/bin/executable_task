@@ -1155,7 +1155,7 @@ def normalize_review_line(line):
 
 def parse_review_block(block, criteria):
     """Parse the exact plain-text fields in a fenced `review` block."""
-    lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
     if len(lines) < 3:
         raise ReviewParseError("review block must contain verdict, commit, and reviewer lines")
     verdict_match = re.fullmatch(r"Verdict: (PASS|FAIL)", lines[0])
@@ -1225,7 +1225,7 @@ def parse_review_reply(text, criteria):
                     raise ReviewParseError(f"duplicate judgment for criterion #{n}")
                 judgments[n] = (verdict_value.lower(), evidence.strip())
             continue
-        criterion_number = (number if not has_hash_criterion_lines else None) or table_number
+        criterion_number = (number or table_number) if not has_hash_criterion_lines else None
         if criterion_number in required:
             if table_number is not None:
                 table_item = re.fullmatch(rf"{table_number}\s+(pass|fail|unclear)\s+(.+)", line, re.I)
@@ -1288,6 +1288,7 @@ def review(args):
         for item in record["criteria"]:
             prompt.append(f"#{item['number']} pass|fail|unclear: <one line of evidence>")
         prompt.append("```")
+        prompt.append("Then list findings.")
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)

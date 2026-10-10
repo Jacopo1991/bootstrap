@@ -629,7 +629,7 @@ class TaskTool(unittest.TestCase):
             "Return exactly this final fenced block, with plain text only inside it:\n"
             "```review\nVerdict: PASS|FAIL\nCommit: <full sha>\nReviewer: <vendor> <model>\n"
             "#1 pass|fail|unclear: <one line of evidence>\n"
-            "#2 pass|fail|unclear: <one line of evidence>\n```\n"))
+            "#2 pass|fail|unclear: <one line of evidence>\n```\nThen list findings.\n"))
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
@@ -1681,6 +1681,7 @@ Commit: abcdef0123456789
 Reviewer: codex gpt-6-luna
 #1 pass: explicit criterion evidence
 2. fail — numbered finding, not a criterion judgment
+| 2 | fail | table finding, not a criterion judgment |
 """
         _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
         self.assertEqual(judgments, {1: ("pass", "explicit criterion evidence")})
@@ -1731,7 +1732,7 @@ Reviewer: claude strict-model
 
 #2 unclear: second criterion evidence
 ```
-""".replace("Verdict: PASS\n\nCommit:", "Verdict: PASS  \n\nCommit:", 1))
+""".replace("Verdict: PASS\n\nCommit:", "  Verdict: PASS  \n\nCommit:", 1))
         self.raw_task("review", "proj", "5", "--record", str(review))
         metadata = __import__("json").loads((self.state() / "review.json").read_text())
         self.assertEqual(metadata["verdict"], "PASS")
