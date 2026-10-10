@@ -219,19 +219,43 @@ with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "
 
 # Denial logging is best-effort, records only the executable category, and cannot
 # change a deny when the state path is broken.
-assert {"review", "note", "cancel"} <= policy.PM_TASK_COMMANDS
+assert {"review", "note", "cancel", "start", "merge", "close"} <= policy.PM_TASK_COMMANDS
+assert "status" not in policy.PM_TASK_COMMANDS and "check" not in policy.PM_TASK_COMMANDS
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    for command in (
+            "task merge proj 5", "/usr/local/bin/task review proj 5",
+            "python3 /home/agent/dev_workspace/bootstrap/home/dot_local/bin/executable_task close proj 5",
+            "sh /usr/local/bin/task start proj 5", "env task note proj 5 improve x"):
+        assert policy.evaluate_command(command, temp, root, (root,)) is not None, command
+    for command in ("task status proj", "task check"):
+        assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+    state_target = str(Path.home() / ".local/state/task/proj/t5/review.json")
+    assert policy.evaluate_command(f"printf x > {state_target}", temp, root, (root,))
+    assert policy.evaluate({"tool_name": "Write", "cwd": temp,
+                            "tool_input": {"file_path": state_target}}, (root,))
 with tempfile.TemporaryDirectory() as temp:
     home = Path(temp) / "home"
     home.mkdir()
-    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
-             "tool_input": {"command": "sudo rm -rf /sensitive/argument"}, "cwd": temp}
-    with patch.object(policy.Path, "home", return_value=home):
-        policy.log_denial(event)
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "vendor": "claude",
+             "tool_input": {"command": "GITHUB_TOKEN=ghp_x sudo ls /sensitive/argument"}, "cwd": temp}
+    clean_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, clean_env, clear=True):
+        denial = policy.evaluate(event, (Path(temp),))
+        policy.log_denial(event, denial)
     log = home / ".local/state/agent-policy/denials.jsonl"
     entry = json.loads(log.read_text())
-    assert entry["category"] == "sudo" and entry["rule_id"] in {
-        "host.boundary", "git.policy", "path.boundary", "shell.policy", "secret.policy", "policy.denied"}
-    assert "/sensitive/argument" not in log.read_text() and "-rf" not in log.read_text()
+    assert entry["category"] == "sudo" and entry["vendor"] == "claude"
+    assert entry["rule_id"] == "command.unsafe_environment"
+    assert "ghp_x" not in log.read_text() and "/sensitive/argument" not in log.read_text()
+    assert policy.first_command_category("GITHUB_TOKEN=ghp_x sudo ls") == "sudo"
+    assert policy.event_vendor({"hook_event_name": "PreToolUse", "CLAUDE_CODE": "claude"}) == "claude"
+    assert policy.event_vendor({"CLAUDE_CODE": "claude"}) == "unknown"
+    task_event = {"tool_name": "Bash", "cwd": temp,
+                  "tool_input": {"command": "env task merge proj 5"}}
+    with patch.dict(os.environ, clean_env, clear=True):
+        task_denial = policy.evaluate(task_event, (Path(temp),))
+    assert task_denial.rule_id == "task.pm_only"
     broken_home = Path(temp) / "broken-home"
     broken_home.mkdir()
     (broken_home / ".local").write_text("not a directory")

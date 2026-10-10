@@ -117,24 +117,29 @@ class TaskTool(unittest.TestCase):
         self.assertTrue(wt.is_dir(), out)
         return wt, out
 
+    def state(self, name="t5"):
+        return self.home / ".local/state/task/proj" / name
+
     def prepare_merge_evidence(self, ident):
         path = self.repo / ".worktrees" / ("t" + ident.lower().removeprefix("t-").removeprefix("t"))
-        if not path.is_dir() or not (path / ".work/task.json").exists():
+        state = self.state("t" + ident.lower().removeprefix("t-").removeprefix("t"))
+        if not path.is_dir() or not (state / "task.json").exists():
             return
         content = "# Task report\n\n## What changed\n\nImplemented the task.\n\n## How I verified\n\n`task check` passed.\n\n## Criteria\n\n"
         content += "\n".join(f"#{n} met: implemented and verified" for n in (1, 2))
         content += "\n\n## Noticed, not done\n\n(none)\n"
         (path / ".work/report.md").write_text(content)
         import json
-        record = json.loads((path / ".work/task.json").read_text())
+        record = json.loads((state / "task.json").read_text())
         head = self.git(path, "rev-parse", "HEAD")
-        (path / ".work/check.json").write_text(json.dumps({"sha": head, "record_revision": record["revision"],
-                                                             "result": "passed", "steps": [], "time": "fixture"}))
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "check.json").write_text(json.dumps({"sha": head, "record_revision": record["revision"],
+                                                       "result": "passed", "steps": [], "time": "fixture"}))
         judgments = {str(item["number"]): "pass" for item in record["criteria"]}
-        (path / ".work/review.json").write_text(json.dumps({"verdict": "PASS", "commit": head,
-                                                              "reviewer": "claude", "model": "test",
-                                                              "judgments": judgments,
-                                                              "record_revision": record["revision"]}))
+        (state / "review.json").write_text(json.dumps({"verdict": "PASS", "commit": head,
+                                                        "reviewer": "claude", "model": "test",
+                                                        "judgments": judgments,
+                                                        "record_revision": record["revision"]}))
 
     def commit_in(self, wt, name, text="x\n"):
         (wt / name).write_text(text)
@@ -218,10 +223,9 @@ class TaskTool(unittest.TestCase):
 
     def test_close_marks_done_ticks_and_commits(self):
         wt, _ = self.started()
-        record = __import__("json").loads((wt / ".work/task.json").read_text())
-        archive = self.home / ".local/state/task/archive/proj/t5"
-        archive.mkdir(parents=True)
-        (archive / "task.json").write_text(__import__("json").dumps(record))
+        record = __import__("json").loads((self.state() / "task.json").read_text())
+        archive = self.state()
+        archive.mkdir(parents=True, exist_ok=True)
         (archive / "review.json").write_text(__import__("json").dumps({"judgments": {"1": "pass"}}))
         (archive / "report.md").write_text("## Noticed, not done\n\n- Slow startup could be improved\n")
         out = self.task("close", "proj", "T-5", "-m", "Built b; check green.", "--retro",
@@ -362,10 +366,9 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.git(self.kb, "commit", "-qm", "t6")
         other.write_text(other.read_text() + "edit in progress\n")
         wt, _ = self.started()
-        record = __import__("json").loads((wt / ".work/task.json").read_text())
-        archive = self.home / ".local/state/task/archive/proj/t5"
-        archive.mkdir(parents=True)
-        (archive / "task.json").write_text(__import__("json").dumps(record))
+        record = __import__("json").loads((self.state() / "task.json").read_text())
+        archive = self.state()
+        archive.mkdir(parents=True, exist_ok=True)
         (archive / "review.json").write_text(__import__("json").dumps({"judgments": {"1": "pass", "2": "pass"}}))
         self.task("close", "proj", "5", "-m", "done", "--retro", "all routine")
         self.assertEqual(self.git(self.kb, "show", "--name-only", "--format=", "HEAD"),
@@ -447,7 +450,7 @@ exit 1
         task_file.write_text(original.replace("Verify: `false`", "Verify: `true`"))
         out = self.task("check", "proj", "5", code=1)
         self.assertIn("FAIL", out)
-        check = __import__("json").loads((wt / ".work/check.json").read_text())
+        check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "false"])
         self.assertEqual(check["steps"][-1]["exit"], 1)
 
@@ -457,7 +460,7 @@ exit 1
         out = self.raw_task("start", "proj", "5", "--builder", "codex", code=1)
         self.assertIn("has no `Verify:", out)
         self.raw_task("start", "proj", "5", "--builder", "codex", "--no-verify", "manual smoke test")
-        record = __import__("json").loads((self.repo / ".worktrees/t5/.work/task.json").read_text())
+        record = __import__("json").loads((self.state() / "task.json").read_text())
         self.assertEqual(record["no_verify"], "manual smoke test")
 
     def test_acceptance_2_t22_shaped_verification_line_is_pinned(self):
@@ -466,11 +469,11 @@ exit 1
             "Verify: `true`", "Verify: `just check && just mcp-probe`"))
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
-        record = __import__("json").loads((wt / ".work/task.json").read_text())
+        record = __import__("json").loads((self.state() / "task.json").read_text())
         self.assertEqual(record["verify"], ["just check && just mcp-probe"])
         task_file.write_text(task_file.read_text().replace("just check && just mcp-probe", "false"))
         self.assertIn("PASS", self.task("check", "proj", "5"))
-        check = __import__("json").loads((wt / ".work/check.json").read_text())
+        check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "just check && just mcp-probe"])
 
     def test_acceptance_3_review_requires_head_other_vendor_and_every_criterion(self):
@@ -490,10 +493,9 @@ exit 1
     def test_acceptance_7_partial_close_requires_three_part_retro(self):
         wt, _ = self.started()
         import json
-        record = json.loads((wt / ".work/task.json").read_text())
-        archive = self.home / ".local/state/task/archive/proj/t5"
-        archive.mkdir(parents=True)
-        (archive / "task.json").write_text(json.dumps(record))
+        record = json.loads((self.state() / "task.json").read_text())
+        archive = self.state()
+        archive.mkdir(parents=True, exist_ok=True)
         (archive / "review.json").write_text(json.dumps({"judgments": {"1": "pass"}}))
         out = self.raw_task("close", "proj", "5", "-m", "partial", "--partial", "--retro",
                             "brief note", code=1)
@@ -522,12 +524,12 @@ exit 1
         self.assertIn("Started detached", out)
         out = self.raw_task("check", "--detach", "proj", "5", code=1)
         self.assertIn("already live", out)
-        run = __import__("json").loads((wt / ".work/run.json").read_text())
+        run = __import__("json").loads((self.state() / "run.json").read_text())
         self.assertEqual(run["state"], "running")
         self.assertIn("Cancelled", self.raw_task("cancel", "proj", "5"))
-        self.assertEqual(__import__("json").loads((wt / ".work/run.json").read_text())["state"], "cancelled")
+        self.assertEqual(__import__("json").loads((self.state() / "run.json").read_text())["state"], "cancelled")
         self.raw_task("check", "--detach", "proj", "5")
-        run = __import__("json").loads((wt / ".work/run.json").read_text())
+        run = __import__("json").loads((self.state() / "run.json").read_text())
         os.killpg(run["pgid"], 9)
         self.assertIn("interrupted", self.raw_task("status", "proj"))
 
@@ -537,7 +539,7 @@ exit 1
         self.prepare_merge_evidence("5")
         out = self.raw_task("merge", "proj", "5", "--detach")
         self.assertIn("Started detached merge", out)
-        archive_run = self.home / ".local/state/task/archive/proj/t5/run.json"
+        archive_run = self.state() / "run.json"
         deadline = __import__("time").monotonic() + 10
         while __import__("time").monotonic() < deadline:
             if archive_run.is_file():
@@ -547,6 +549,124 @@ exit 1
             __import__("time").sleep(0.05)
         self.assertEqual(run["state"], "passed", archive_run.read_text())
         self.assertIn("already merged", self.raw_task("merge", "proj", "5"))
+
+    def test_round2_private_state_and_tracked_work_refusal(self):
+        wt, _ = self.started()
+        self.assertTrue((self.state() / "task.json").is_file())
+        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()), ["report.md"])
+        self.assertFalse((wt / ".work/task.json").exists())
+        (wt / ".work/leak.json").write_text("{}")
+        self.git(wt, "add", "-f", ".work/leak.json")
+        self.git(wt, "commit", "-qm", "track private evidence")
+        self.assertIn("Tracked files under .work/", self.raw_task("check", "proj", "5", code=1))
+
+    def test_round2_moved_main_other_files_merges_but_same_file_requires_integrated_review(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        other = self.home / "other"
+        self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.commit_in(other, "c.txt")
+        self.git(other, "push", "-q", "origin", "main")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Merged", out)
+
+        (self.repo / "a.txt").write_text("a\nmiddle\nbase2\n")
+        self.git(self.repo, "add", "a.txt")
+        self.git(self.repo, "commit", "-qm", "prepare two line file")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        (wt / "a.txt").write_text("lane\nmiddle\nbase2\n")
+        self.git(wt, "add", "a.txt")
+        self.git(wt, "commit", "-qm", "lane edits first line")
+        (self.repo / "a.txt").write_text("a\nmiddle\nmain\n")
+        self.git(self.repo, "add", "a.txt")
+        self.git(self.repo, "commit", "-qm", "main edits second line")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        self.prepare_merge_evidence("5")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("touched lane files", out)
+        integrated = self.git(wt, "rev-parse", "HEAD")
+        evidence = self.home / "review.txt"
+        evidence.write_text(f"**Verdict: PASS**\nCommit: {integrated[:9]}\nReviewer: claude test\n"
+                            "- #1 pass: inspected integrated change\n- #2 pass: checks remain valid\n")
+        out = self.raw_task("review", "proj", "5", "--record", str(evidence))
+        self.assertIn("Recorded PASS", out)
+
+    def test_round2_refused_push_is_resumable_without_override(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        real_git = __import__("shutil").which("git")
+        wrapper = self.home / "bin/git"
+        wrapper.write_text(f"#!/bin/sh\ncase \" $* \" in *\" push \"*) "
+                           f"if [ ! -e \"$HOME/push-refused\" ]; then "
+                           "touch \"$HOME/push-refused\"; echo refused >&2; exit 1; fi;; esac\n"
+                           f"exec {real_git} \"$@\"\n")
+        wrapper.chmod(0o755)
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("Push to main was refused", out)
+        wrapper.unlink()
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("Merged", out)
+        self.assertFalse(wt.exists())
+
+    def test_round2_override_close_allows_done_but_requires_retro_and_names_exception(self):
+        self.started()
+        state = self.state()
+        (state / "exception.json").write_text('{"reason":"approved emergency"}')
+        out = self.raw_task("close", "proj", "5", "-m", "Closed under exception", "--retro",
+                            "went well: contained / went wrong: no review / change: review next time")
+        self.assertIn("0 criteria ticked", out)
+        text = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
+        self.assertIn("status: Done", text)
+        self.assertIn("Exception: merge override — approved emergency", text)
+        self.assertIn("- [ ] #1", text)
+
+    def test_round2_refresh_uses_merge_base_and_preserves_filled_report(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "lane.txt")
+        report = wt / ".work/report.md"
+        report.write_text("# Task report\n\n## What changed\n\nChanged one file.\n\n"
+                          "## How I verified\n\nChecks passed.\n\n## Criteria\n\n"
+                          "#1 met: done\n#2 met: checked\n\n## Noticed, not done\n\nNone.\n")
+        other = self.home / "other"
+        self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.commit_in(other, "main.txt")
+        self.git(other, "push", "-q", "origin", "main")
+        self.git(self.repo, "fetch", "-q", "origin")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--refresh")
+        record = __import__("json").loads((self.state() / "task.json").read_text())
+        self.assertEqual(record["base_sha"], self.git(wt, "merge-base", "HEAD", "origin/main"))
+        self.assertIn("Changed one file", report.read_text())
+
+    def test_round2_preflight_blocks_before_worktree_for_missing_command_and_allows_builtin(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text().replace("Verify: `true`", "Verify: `not-installed-task-cmd`"))
+        out = self.raw_task("start", "proj", "5", "--builder", "codex", code=1)
+        self.assertIn("not installed", out)
+        self.assertFalse((self.repo / ".worktrees/t5").exists())
+        task_file.write_text(task_file.read_text().replace("not-installed-task-cmd", "cd . && true"))
+        self.started()
+
+    def test_round2_review_prompt_and_parser_accept_normal_markdown_and_unique_short_sha(self):
+        wt, _ = self.started()
+        prompt = self.raw_task("review", "proj", "5")
+        self.assertIn("Task:", prompt)
+        self.assertIn("Worktree:", prompt)
+        self.assertIn("Diff range:", prompt)
+        head = self.git(wt, "rev-parse", "HEAD")
+        review = self.home / "review.txt"
+        review.write_text(f"**Verdict: PASS**\nCommit: {head[:9]}\nReviewer: claude model-x\n"
+                          "- #1 pass: evidence\n- #2 pass: evidence\n")
+        self.assertIn("Recorded PASS", self.raw_task("review", "proj", "5", "--record", str(review)))
+
+    def test_round2_cancel_uses_archive_and_merge_mentions_detach(self):
+        self.started()
+        run = self.state() / "run.json"
+        run.write_text(__import__("json").dumps({"state": "running", "pgid": 99999999, "completed": []}))
+        out = self.raw_task("cancel", "proj", "5")
+        self.assertIn("Cancelled", out)
+        self.assertIn("--detach", self.raw_task("merge", "proj", "5", code=1))
 
 
 if __name__ == "__main__":
