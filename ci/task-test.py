@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""task start/check/merge/close on real git repositories in a temporary HOME.
+"""task lifecycle on real git repositories in a temporary HOME.
 
 `just`, `backlog` and `gh` are small stand-ins on PATH so the test runs anywhere: `just check`
 passes unless the worktree holds a file named FAIL; `backlog task edit` applies status, ticks and
@@ -20,10 +20,14 @@ IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
 
 STUBS = {
     "just": """#!/bin/sh
-[ "$1" = check ] || exit 2
-[ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
-[ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
-echo "Ran 3 tests in 0.01s"; echo OK
+case "$1" in
+  check)
+    [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
+    [ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
+    echo "Ran 3 tests in 0.01s"; echo OK ;;
+  mcp-probe) echo "probe passed" ;;
+  *) exit 2 ;;
+esac
 """,
     "gh": """#!/bin/sh
 exit 0
@@ -83,6 +87,8 @@ class TaskTool(unittest.TestCase):
             ## Acceptance Criteria
             - [ ] #1 b exists
             - [ ] #2 checks pass
+            ## Verification and tools
+            Verify: `true`
             """))
         self.git(self.kb, "add", "-A")
         self.git(self.kb, "commit", "-qm", "kb")
@@ -93,16 +99,42 @@ class TaskTool(unittest.TestCase):
                               text=True).stdout.strip()
 
     def task(self, *args, cwd=None, code=0):
+        if args and args[0] == "start" and "--builder" not in args:
+            args = (*args, "--builder", "codex")
+        if args and args[0] == "merge":
+            self.prepare_merge_evidence(args[2])
+        return self.raw_task(*args, cwd=cwd, code=code)
+
+    def raw_task(self, *args, cwd=None, code=0):
         result = subprocess.run(["python3", str(TOOL), *args], env=self.env, cwd=cwd or self.home,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result.stdout + result.stderr
 
     def started(self):
-        out = self.task("start", "proj", "T-5")
+        out = self.task("start", "proj", "T-5", "--builder", "codex")
         wt = self.repo / ".worktrees/t5"
         self.assertTrue(wt.is_dir(), out)
         return wt, out
+
+    def prepare_merge_evidence(self, ident):
+        path = self.repo / ".worktrees" / ("t" + ident.lower().removeprefix("t-").removeprefix("t"))
+        if not path.is_dir() or not (path / ".work/task.json").exists():
+            return
+        content = "# Task report\n\n## What changed\n\nImplemented the task.\n\n## How I verified\n\n`task check` passed.\n\n## Criteria\n\n"
+        content += "\n".join(f"#{n} met: implemented and verified" for n in (1, 2))
+        content += "\n\n## Noticed, not done\n\n(none)\n"
+        (path / ".work/report.md").write_text(content)
+        import json
+        record = json.loads((path / ".work/task.json").read_text())
+        head = self.git(path, "rev-parse", "HEAD")
+        (path / ".work/check.json").write_text(json.dumps({"sha": head, "record_revision": record["revision"],
+                                                             "result": "passed", "steps": [], "time": "fixture"}))
+        judgments = {str(item["number"]): "pass" for item in record["criteria"]}
+        (path / ".work/review.json").write_text(json.dumps({"verdict": "PASS", "commit": head,
+                                                              "reviewer": "claude", "model": "test",
+                                                              "judgments": judgments,
+                                                              "record_revision": record["revision"]}))
 
     def commit_in(self, wt, name, text="x\n"):
         (wt / name).write_text(text)
@@ -115,9 +147,9 @@ class TaskTool(unittest.TestCase):
         self.assertIn("work only in .worktrees/t5 on branch t5-add-the-b-file", out)
         self.assertIn("t-5 - Add-the-b-file.md", out)
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "", "worktrees stay out of status")
-        again = self.task("start", "proj", "5")
+        again = self.task("start", "proj", "5", "--builder", "codex")
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
-        self.task("start", "proj", "T-9", code=1)  # no such task
+        self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
 
     def test_check_passes_fails_and_refuses_dirty(self):
         wt, _ = self.started()
@@ -156,6 +188,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
         self.assertFalse(wt.exists(), out)
         self.assertNotIn("t5-add-the-b-file", self.git(self.repo, "branch"))
+        self.assertIn("already merged", self.raw_task("merge", "proj", "5"))
 
     def test_failed_check_merges_nothing(self):
         wt, _ = self.started()
@@ -184,13 +217,24 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(self.git(wt, "status", "--porcelain"), "", "merge aborted cleanly")
 
     def test_close_marks_done_ticks_and_commits(self):
-        out = self.task("close", "proj", "T-5", "-m", "Built b; check green.")
-        self.assertIn("2 criteria ticked", out)
+        wt, _ = self.started()
+        record = __import__("json").loads((wt / ".work/task.json").read_text())
+        archive = self.home / ".local/state/task/archive/proj/t5"
+        archive.mkdir(parents=True)
+        (archive / "task.json").write_text(__import__("json").dumps(record))
+        (archive / "review.json").write_text(__import__("json").dumps({"judgments": {"1": "pass"}}))
+        (archive / "report.md").write_text("## Noticed, not done\n\n- Slow startup could be improved\n")
+        out = self.task("close", "proj", "T-5", "-m", "Built b; check green.", "--retro",
+                        "went well: evidence / went wrong: none / change: keep it", "--partial")
+        self.assertIn("1 criteria ticked", out)
         text = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
-        self.assertIn("status: Done", text)
-        self.assertNotIn("- [ ]", text)
+        self.assertIn("status: In Progress", text)
+        self.assertIn("- [x] #1", text)
+        self.assertIn("- [ ] #2", text)
         self.assertIn("Built b; check green.", text)
         self.assertEqual(self.git(self.kb, "log", "-1", "--format=%s"), "Close T-5: Add the b file")
+        self.assertIn("Slow startup", (self.kb / "improvements.md").read_text())
+        self.assertIn("improvements.md", self.git(self.kb, "show", "--name-only", "--format=", "HEAD"))
         self.assertEqual(self.git(self.kb, "status", "--porcelain"), "")
 
     def test_start_shares_or_rebuilds_the_environment(self):
@@ -213,7 +257,7 @@ echo "$*" >> {calls}
 case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
 """)
         (self.home / "bin/uv").chmod(0o755)
-        out = self.task("start", "proj", "tidy")
+        out = self.task("start", "proj", "tidy", "--builder", "codex")
         wt2 = self.repo / ".worktrees/tidy"
         self.assertTrue((wt2 / ".venv").is_dir() and not (wt2 / ".venv").is_symlink(), out)
         log = calls.read_text()
@@ -308,7 +352,7 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.commit_in(wt, "FAIL")
         lane_head = self.git(wt, "rev-parse", "HEAD")
         self.other_clone_pushes("c.txt")
-        self.assertIn("as the lane left it", self.task("merge", "proj", "5", code=1))
+        self.assertIn("nothing merged", self.task("merge", "proj", "5", code=1))
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), lane_head)
 
     def test_review_close_commits_only_its_own_task_file(self):
@@ -317,7 +361,13 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.git(self.kb, "add", "-A")
         self.git(self.kb, "commit", "-qm", "t6")
         other.write_text(other.read_text() + "edit in progress\n")
-        self.task("close", "proj", "5", "-m", "done")
+        wt, _ = self.started()
+        record = __import__("json").loads((wt / ".work/task.json").read_text())
+        archive = self.home / ".local/state/task/archive/proj/t5"
+        archive.mkdir(parents=True)
+        (archive / "task.json").write_text(__import__("json").dumps(record))
+        (archive / "review.json").write_text(__import__("json").dumps({"judgments": {"1": "pass", "2": "pass"}}))
+        self.task("close", "proj", "5", "-m", "done", "--retro", "all routine")
         self.assertEqual(self.git(self.kb, "show", "--name-only", "--format=", "HEAD"),
                          "backlog/tasks/t-5 - Add-the-b-file.md")
         self.assertIn("t-6", self.git(self.kb, "status", "--porcelain"))
@@ -331,7 +381,7 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.assertEqual((self.repo / "b.txt").read_text(), "someone's own file\n")
 
     def test_review_default_branch_is_not_a_task_name(self):
-        self.assertIn("default branch", self.task("start", "proj", "main", code=1))
+        self.assertIn("default branch", self.task("start", "proj", "main", "--builder", "codex", code=1))
 
     def test_review_merged_branch_is_removed_even_if_local_main_is_blocked(self):
         wt, _ = self.started()
@@ -343,6 +393,7 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
     def test_check_gives_an_older_worktree_its_environment(self):
         self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "t5-old", str(self.repo / ".worktrees/t5"), "main")
         (self.repo / ".venv/lib/python3.12/site-packages").mkdir(parents=True)
+        self.task("start", "proj", "5", "--refresh", "--builder", "codex")
         self.assertIn("PASS", self.task("check", "proj", "5"))
         self.assertTrue((self.repo / ".worktrees/t5/.venv").is_symlink())
 
@@ -374,8 +425,128 @@ exit 1
         self.assertFalse(wt.exists(), out)
 
     def test_plain_name_without_task(self):
-        out = self.task("start", "proj", "tidy-docs")
+        out = self.task("start", "proj", "tidy-docs", "--builder", "codex")
         self.assertIn("work only in .worktrees/tidy-docs on branch tidy-docs", out)
+
+    def test_acceptance_1_merge_gate_lists_missing_evidence_and_override_is_visible(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        for item in ("passing task check", "recorded PASS review", "filled .work/report.md"):
+            self.assertIn(item, out)
+        out = self.raw_task("merge", "proj", "5", "--override", "urgent approved exception")
+        self.assertIn("exception", out)
+        self.assertIn("Needs attention", self.raw_task("status", "proj"))
+
+    def test_acceptance_2_verify_is_required_pinned_and_runs_after_gate(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        original = task_file.read_text().replace("Verify: `true`", "Verify: `false`")
+        task_file.write_text(original)
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        task_file.write_text(original.replace("Verify: `false`", "Verify: `true`"))
+        out = self.task("check", "proj", "5", code=1)
+        self.assertIn("FAIL", out)
+        check = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "false"])
+        self.assertEqual(check["steps"][-1]["exit"], 1)
+
+    def test_acceptance_2_no_verify_requires_recorded_reason(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text().replace("Verify: `true`\n", ""))
+        out = self.raw_task("start", "proj", "5", "--builder", "codex", code=1)
+        self.assertIn("has no `Verify:", out)
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--no-verify", "manual smoke test")
+        record = __import__("json").loads((self.repo / ".worktrees/t5/.work/task.json").read_text())
+        self.assertEqual(record["no_verify"], "manual smoke test")
+
+    def test_acceptance_2_t22_shaped_verification_line_is_pinned(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text().replace(
+            "Verify: `true`", "Verify: `just check && just mcp-probe`"))
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        record = __import__("json").loads((wt / ".work/task.json").read_text())
+        self.assertEqual(record["verify"], ["just check && just mcp-probe"])
+        task_file.write_text(task_file.read_text().replace("just check && just mcp-probe", "false"))
+        self.assertIn("PASS", self.task("check", "proj", "5"))
+        check = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "just check && just mcp-probe"])
+
+    def test_acceptance_3_review_requires_head_other_vendor_and_every_criterion(self):
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        cases = [
+            f"Verdict: PASS\nCommit: {head}\nReviewer: claude test\n#1 pass: evidence\n",
+            f"Verdict: PASS\nCommit: {'0' * 40}\nReviewer: claude test\n#1 pass: evidence\n#2 pass: evidence\n",
+            f"Verdict: PASS\nCommit: {head}\nReviewer: codex test\n#1 pass: evidence\n#2 pass: evidence\n",
+        ]
+        review_file = self.home / "review.txt"
+        for content, expected in zip(cases, ("every pinned criterion", "Commit does not match", "vendor")):
+            review_file.write_text(content)
+            out = self.raw_task("review", "proj", "5", "--record", str(review_file), code=1)
+            self.assertIn(expected, out)
+
+    def test_acceptance_7_partial_close_requires_three_part_retro(self):
+        wt, _ = self.started()
+        import json
+        record = json.loads((wt / ".work/task.json").read_text())
+        archive = self.home / ".local/state/task/archive/proj/t5"
+        archive.mkdir(parents=True)
+        (archive / "task.json").write_text(json.dumps(record))
+        (archive / "review.json").write_text(json.dumps({"judgments": {"1": "pass"}}))
+        out = self.raw_task("close", "proj", "5", "-m", "partial", "--partial", "--retro",
+                            "brief note", code=1)
+        self.assertIn("three-part retro", out)
+        self.assertIn("status: To Do", next((self.kb / "backlog/tasks").glob("t-5 *")).read_text())
+
+    def test_acceptance_5_timeout_kills_process_group_and_repo_timeout_wins(self):
+        wt, _ = self.started()
+        sleeper = self.home / "sleeper.pid"
+        (self.home / "bin/just").write_text(f"#!/bin/sh\nsleep 30 & echo $! > {sleeper}; wait\n")
+        (self.home / "bin/just").chmod(0o755)
+        (wt / ".task.toml").write_text("check_timeout = 1\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "set task timeout")
+        out = self.task("check", "proj", "5", code=1)
+        self.assertIn("ran over 1s", out)
+        pid = int(sleeper.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_acceptance_6_detached_check_lock_cancel_and_interrupted_status(self):
+        wt, _ = self.started()
+        (self.home / "bin/just").write_text("#!/bin/sh\nsleep 30\n")
+        (self.home / "bin/just").chmod(0o755)
+        out = self.raw_task("check", "--detach", "proj", "5")
+        self.assertIn("Started detached", out)
+        out = self.raw_task("check", "--detach", "proj", "5", code=1)
+        self.assertIn("already live", out)
+        run = __import__("json").loads((wt / ".work/run.json").read_text())
+        self.assertEqual(run["state"], "running")
+        self.assertIn("Cancelled", self.raw_task("cancel", "proj", "5"))
+        self.assertEqual(__import__("json").loads((wt / ".work/run.json").read_text())["state"], "cancelled")
+        self.raw_task("check", "--detach", "proj", "5")
+        run = __import__("json").loads((wt / ".work/run.json").read_text())
+        os.killpg(run["pgid"], 9)
+        self.assertIn("interrupted", self.raw_task("status", "proj"))
+
+    def test_acceptance_6_detached_merge_finishes_and_rerun_observes_merge(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        out = self.raw_task("merge", "proj", "5", "--detach")
+        self.assertIn("Started detached merge", out)
+        archive_run = self.home / ".local/state/task/archive/proj/t5/run.json"
+        deadline = __import__("time").monotonic() + 10
+        while __import__("time").monotonic() < deadline:
+            if archive_run.is_file():
+                run = __import__("json").loads(archive_run.read_text())
+                if run.get("state") in {"passed", "failed"}:
+                    break
+            __import__("time").sleep(0.05)
+        self.assertEqual(run["state"], "passed", archive_run.read_text())
+        self.assertIn("already merged", self.raw_task("merge", "proj", "5"))
 
 
 if __name__ == "__main__":

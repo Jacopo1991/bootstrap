@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 HOST_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe",
               "wsl", "wsl.exe", "wslconfig.exe", "diskpart", "diskpart.exe", "schtasks", "schtasks.exe"}
@@ -63,7 +64,7 @@ STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
-PM_TASK_COMMANDS = {"start", "merge", "close"}
+PM_TASK_COMMANDS = {"start", "merge", "close", "review", "cancel", "note", "status", "denials"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -1341,7 +1342,9 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if host_reason:
         return host_reason
     if executable == "task" and len(tokens) > 1 and tokens[1] in PM_TASK_COMMANDS:
-        return ("`task start`, `task merge` and `task close` are for the PM. Run `task check` in your "
+        return ("`task start`, `task merge`, `task close`, `task review`, `task cancel`, `task note`, "
+                "`task status` and `task denials` "
+                "are for the PM. Run `task check` in your "
                 "worktree, commit on your branch and report.")
     if executable == "sed":
         reason = sed_policy(tokens)
@@ -1443,6 +1446,57 @@ def permission_reason(event: dict, approved_roots: tuple[Path, ...] | None = Non
     return None
 
 
+def denial_rule(reason: str) -> str:
+    """Map policy messages to stable, argument-free rule identifiers."""
+    lowered = reason.lower()
+    if "task start" in lowered or "task merge" in lowered or "task review" in lowered:
+        return "task.pm_only"
+    if "windows" in lowered or "host" in lowered:
+        return "host.boundary"
+    if "git" in lowered:
+        return "git.policy"
+    if "outside" in lowered or "repository root" in lowered:
+        return "path.boundary"
+    if "shell" in lowered or "interpreter" in lowered:
+        return "shell.policy"
+    if "secret" in lowered:
+        return "secret.policy"
+    return "policy.denied"
+
+
+def log_denial(event: dict, reason: str = ""):
+    """Best-effort denial audit; record a command category, never its arguments."""
+    try:
+        data = event.get("tool_input", {})
+        command = data.get("command", "") if isinstance(data, dict) else ""
+        try:
+            tokens = shlex.split(command) if isinstance(command, str) else []
+            category = Path(tokens[0]).name if tokens else ""
+        except ValueError:
+            category = "unparsed"
+        cwd = Path(str(event.get("cwd") or os.getcwd())).resolve()
+        repo = ""
+        try:
+            result = policy_subprocess(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True, timeout=2)
+            if result.returncode == 0:
+                repo = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        vendor = "claude" if any(key.startswith("CLAUDE") for key in os.environ) else "codex"
+        entry = {"time": datetime.now(timezone.utc).isoformat(), "vendor": vendor, "repo": repo,
+                 "tool": str(event.get("tool_name", "")), "rule_id": denial_rule(reason),
+                 "category": category}
+        target = Path.home() / ".local/state/agent-policy/denials.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:
+        # Audit failure must never change the policy decision.
+        return
+
+
 def main() -> int:
     try:
         event = json.load(sys.stdin)
@@ -1454,6 +1508,7 @@ def main() -> int:
     permission_request = event.get("hook_event_name") == "PermissionRequest"
     reason = permission_reason(event) if permission_request else evaluate(event)
     if reason:
+        log_denial(event, reason)
         response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
                     "decision": {"behavior": "deny", "message": reason}}}
                     if permission_request else deny(reason))

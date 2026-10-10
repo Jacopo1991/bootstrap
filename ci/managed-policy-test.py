@@ -217,6 +217,29 @@ with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "
         assert run.call_args.kwargs["env"]["POLICY_CONTROL"] == "kept"
         assert run.call_args.args == (["git", "status"],) and run.call_args.kwargs["check"] is True
 
+# Denial logging is best-effort, records only the executable category, and cannot
+# change a deny when the state path is broken.
+assert {"review", "note", "cancel"} <= policy.PM_TASK_COMMANDS
+with tempfile.TemporaryDirectory() as temp:
+    home = Path(temp) / "home"
+    home.mkdir()
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+             "tool_input": {"command": "sudo rm -rf /sensitive/argument"}, "cwd": temp}
+    with patch.object(policy.Path, "home", return_value=home):
+        policy.log_denial(event)
+    log = home / ".local/state/agent-policy/denials.jsonl"
+    entry = json.loads(log.read_text())
+    assert entry["category"] == "sudo" and entry["rule_id"] in {
+        "host.boundary", "git.policy", "path.boundary", "shell.policy", "secret.policy", "policy.denied"}
+    assert "/sensitive/argument" not in log.read_text() and "-rf" not in log.read_text()
+    broken_home = Path(temp) / "broken-home"
+    broken_home.mkdir()
+    (broken_home / ".local").write_text("not a directory")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {"HOME": str(broken_home)}
+    result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
+                            cwd=temp, env=env, check=True, timeout=30)
+    assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
 assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""
 stale = ROOT / "home/dot_local/share/bootstrap/agent-policy"
