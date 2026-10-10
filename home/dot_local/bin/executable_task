@@ -1123,7 +1123,7 @@ def parse_review_block(block, criteria):
         raise ReviewParseError("review block must contain verdict, commit, and reviewer lines")
     verdict_match = re.fullmatch(r"Verdict: (PASS|FAIL)", lines[0])
     commit_match = re.fullmatch(r"Commit: ([0-9a-f]{40})", lines[1])
-    reviewer_match = re.fullmatch(r"Reviewer: (codex|claude) ([^`*_~|]+)", lines[2])
+    reviewer_match = re.fullmatch(r"Reviewer: (codex|claude) (.+)", lines[2])
     if not verdict_match:
         raise ReviewParseError("review block must start with `Verdict: PASS` or `Verdict: FAIL`")
     if not commit_match:
@@ -1133,7 +1133,7 @@ def parse_review_block(block, criteria):
     required = set(criteria)
     judgments = {}
     for line in lines[3:]:
-        match = re.fullmatch(r"#(\d+) (pass|fail|unclear): ([^`*_~|]+)", line)
+        match = re.fullmatch(r"#(\d+) (pass|fail|unclear): (.+)", line)
         if not match:
             raise ReviewParseError("review block contains a malformed or Markdown criterion line")
         number, judgment, evidence = int(match.group(1)), match.group(2), match.group(3)
@@ -1141,7 +1141,9 @@ def parse_review_block(block, criteria):
             raise ReviewParseError(f"duplicate judgment for criterion #{number}")
         if number not in required:
             raise ReviewParseError(f"review block includes unpinned criterion #{number}")
-        judgments[number] = (judgment, evidence.strip())
+        if not evidence.strip():
+            raise ReviewParseError(f"review block has no evidence for criterion #{number}")
+        judgments[number] = (judgment, evidence)
     if required != set(judgments):
         raise ReviewParseError("every pinned criterion must have exactly one judgment")
     return verdict_match.group(1), commit_match.group(1), (reviewer_match.group(1), reviewer_match.group(2)), judgments
@@ -1176,6 +1178,7 @@ def parse_review_reply(text, criteria):
             break
     judgments = {}
     required = set(criteria)
+    has_hash_criterion_lines = any(re.match(r"#\d+\b", line) for line, _, _ in lines)
     for line, number, table_number in lines:
         explicit = re.fullmatch(r"#(\d+)\s*:?[\s|]+(pass|fail|unclear)\s*:?\s*(.*)", line, re.I)
         if explicit:
@@ -1185,7 +1188,7 @@ def parse_review_reply(text, criteria):
                     raise ReviewParseError(f"duplicate judgment for criterion #{n}")
                 judgments[n] = (verdict_value.lower(), evidence.strip())
             continue
-        criterion_number = number or table_number
+        criterion_number = (number if not has_hash_criterion_lines else None) or table_number
         if criterion_number in required:
             if table_number is not None:
                 table_item = re.fullmatch(rf"{table_number}\s+(pass|fail|unclear)\s+(.+)", line, re.I)

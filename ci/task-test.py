@@ -1642,6 +1642,45 @@ Reviewer: codex gpt-6-luna
         self.assertEqual(verdict, "FAIL")
         self.assertEqual(judgments, {1: ("pass", "numbered evidence"), 2: ("fail", "table evidence")})
 
+    def test_review_parser_does_not_map_numbered_findings_when_hash_criteria_are_present(self):
+        text = """Verdict: FAIL
+Commit: abcdef0123456789
+Reviewer: codex gpt-6-luna
+#1 pass: explicit criterion evidence
+2. fail — numbered finding, not a criterion judgment
+"""
+        _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
+        self.assertEqual(judgments, {1: ("pass", "explicit criterion evidence")})
+
+    def test_haiku3_fenced_fixture_records_fail_without_criteria(self):
+        fixture = REVIEW_FIXTURES / "haiku-3-fenced.md"
+        text = fixture.read_text()
+        verdict, commit, reviewer, judgments = TASK_MODULE.parse_review_reply(text, [])
+        self.assertEqual(verdict, "FAIL")
+        self.assertEqual(commit, "b85ccb9d8c26080884670ca87c2fd6cd9ae5b998")
+        self.assertEqual(reviewer, ("claude", "haiku-5-5"))
+        self.assertEqual(judgments, {})
+
+        self.raw_task("start", "proj", "haiku-3", "--builder", "codex")
+        wt = self.repo / ".worktrees/haiku-3"
+        current_head = self.git(wt, "rev-parse", "HEAD")
+        record = self.home / "haiku-3-reply.md"
+        record.write_text(text.replace(commit, current_head))
+        self.assertIn("Recorded FAIL", self.raw_task("review", "proj", "haiku-3", "--record", str(record)))
+        metadata = __import__("json").loads((self.state("haiku-3") / "review.json").read_text())
+        self.assertEqual(metadata["verdict"], "FAIL")
+        self.assertEqual(metadata["commit"], current_head)
+        self.assertEqual((metadata["reviewer"], metadata["model"]), reviewer)
+        self.assertEqual(metadata["judgments"], {})
+
+    def test_strict_review_fixture_preserves_free_text_evidence_and_reviewer(self):
+        fixture = REVIEW_FIXTURES / "strict-free-evidence.md"
+        verdict, commit, reviewer, judgments = TASK_MODULE.parse_review_reply(fixture.read_text(), [1])
+        self.assertEqual(verdict, "FAIL")
+        self.assertEqual(commit, "b85ccb9d8c26080884670ca87c2fd6cd9ae5b998")
+        self.assertEqual(reviewer, ("claude", "haiku-5-5_model|tag"))
+        self.assertEqual(judgments, {1: ("pass", "executable_task:533 `git show` **bold** _under_ | ~tilde")})
+
     def test_review_record_prefers_strict_fenced_block_and_requires_plain_content(self):
         wt, _ = self.started()
         head = self.git(wt, "rev-parse", "HEAD")
