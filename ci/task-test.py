@@ -220,7 +220,7 @@ class TaskTool(unittest.TestCase):
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
 
     def test_real_folded_backlog_title_reaches_dispatch_and_review_prompts(self):
-        source = ROOT / ".work/t48-folded-title.md"
+        source = ROOT / "ci/fixtures/t48-folded-title.md"
         task_file = next((self.kb / "backlog/tasks").glob("t-5 - *.md"))
         task_file.write_text(source.read_text())
         expected = ("Data layer phase 5 - household zone - location, module settings, "
@@ -1685,6 +1685,16 @@ Reviewer: codex gpt-6-luna
 """
         _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
         self.assertEqual(judgments, {1: ("pass", "explicit criterion evidence")})
+
+    def test_review_parser_does_not_treat_verdict_prefix_words_as_judgments(self):
+        text = """Verdict: FAIL
+Commit: abcdef0123456789
+Reviewer: codex gpt-6-luna
+1. Fail-safe default is missing
+2. fail
+"""
+        _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
+        self.assertEqual(judgments, {2: ("fail", "")})
 
     def test_haiku3_fenced_fixture_records_fail_without_criteria(self):
         fixture = REVIEW_FIXTURES / "haiku-3-fenced.md"

@@ -1234,13 +1234,15 @@ def parse_review_reply(text, criteria):
                         raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
                     judgments[criterion_number] = (table_item.group(1).lower(), table_item.group(2).strip())
                     continue
-            item = re.fullmatch(r"(?:\d+\s+)?(pass|fail|unclear)\b(.*)", line, re.I)
+            item = re.fullmatch(
+                r"(?:\d+\s+)?(pass|fail|unclear)(?=$|:|\s+[—–-]\s)(.*)", line, re.I)
             if item:
-                evidence = re.fullmatch(r"\s*(?:,\s*[^:]+:|:|—|–|-)\s*(.*)", item.group(2))
+                evidence = re.fullmatch(
+                    r"\s*(?:(?:,\s*[^:]+:|:|—|–|-)\s*(.*))?", item.group(2))
                 if evidence:
                     if criterion_number in judgments:
                         raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
-                    judgments[criterion_number] = (item.group(1).lower(), evidence.group(1).strip())
+                    judgments[criterion_number] = (item.group(1).lower(), (evidence.group(1) or "").strip())
     return verdict, commit, reviewer, judgments
 
 
