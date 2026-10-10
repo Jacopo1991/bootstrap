@@ -6,7 +6,9 @@ passes unless the worktree holds a file named FAIL; `backlog task edit` applies 
 final summary the way Backlog.md does; `gh pr list` finds no PR.
 """
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -21,9 +23,9 @@ IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
 STUBS = {
     "just": """#!/bin/sh
 case "$1 $2" in
-  "--show sync") grep -q '^sync:' justfile && { echo 'sync recipe'; exit 0; }; exit 1 ;;
+  "--show sync") echo probe >> "$HOME/sync-probe"; grep -q '^sync:' justfile && { echo 'sync recipe'; exit 0; }; exit 1 ;;
   "sync ")
-    [ -x "$HOME/during-sync.sh" ] && "$HOME/during-sync.sh"
+    if [ -x "$HOME/during-sync.sh" ]; then "$HOME/during-sync.sh" || exit $?; fi
     echo OK ;;
   "check ")
     [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
@@ -109,8 +111,8 @@ class TaskTool(unittest.TestCase):
             self.prepare_merge_evidence(args[2])
         return self.raw_task(*args, cwd=cwd, code=code)
 
-    def raw_task(self, *args, cwd=None, code=0):
-        result = subprocess.run(["python3", str(TOOL), *args], env=self.env, cwd=cwd or self.home,
+    def raw_task(self, *args, cwd=None, code=0, env=None):
+        result = subprocess.run([sys.executable, str(TOOL), *args], env=env or self.env, cwd=cwd or self.home,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result.stdout + result.stderr
@@ -146,6 +148,15 @@ class TaskTool(unittest.TestCase):
                                                         "time": "fixture-time",
                                                         "judgments": judgments,
                                                         "record_revision": record["revision"]}))
+
+    def checked_lane_with_counter(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        return wt
 
     def commit_in(self, wt, name, text="x\n"):
         (wt / name).write_text(text)
@@ -261,27 +272,22 @@ class TaskTool(unittest.TestCase):
         self.assertFalse((self.repo / ".worktrees/t5").exists())
 
     def test_merge_reuses_lane_check_when_default_has_not_moved(self):
-        wt, _ = self.started()
-        self.commit_in(wt, "b.txt")
-        self.prepare_merge_evidence("5")
-        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
-        (self.home / "during-check.sh").chmod(0o755)
-        self.raw_task("check", "proj", "5")
+        self.checked_lane_with_counter()
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
-        out = self.raw_task("merge", "proj", "5")
+        run_path = self.state() / "run.json"
+        run_path.write_text(__import__("json").dumps({"command": "merge", "state": "running", "completed": []}))
+        run_env = dict(self.env, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(run_path))
+        out = self.raw_task("merge", "proj", "5", env=run_env)
         self.assertIn("main unchanged since the lane's check; reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1,
                          "unchanged default should not rerun just check in a gate worktree")
+        self.assertIn("gate", __import__("json").loads(run_path.read_text())["completed"])
+        self.assertFalse((self.home / "sync-probe").exists(), "no dependency change should not probe or run sync")
 
     def test_merge_regates_when_default_moved_after_lane_check(self):
-        wt, _ = self.started()
-        self.commit_in(wt, "b.txt")
-        self.prepare_merge_evidence("5")
-        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
-        (self.home / "during-check.sh").chmod(0o755)
-        self.raw_task("check", "proj", "5")
+        self.checked_lane_with_counter()
         other = self.home / "other"
         self.git(self.home, "clone", "-q", str(self.origin), str(other))
         self.commit_in(other, "c.txt")
@@ -290,6 +296,32 @@ class TaskTool(unittest.TestCase):
         self.assertNotIn("main unchanged since the lane's check; reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
                          "default movement requires checking the would-be merge result")
+
+    def assert_check_record_regates(self, mutation, override=False):
+        self.checked_lane_with_counter()
+        check_path = self.state() / "check.json"
+        check = __import__("json").loads(check_path.read_text())
+        mutation(check)
+        check_path.write_text(__import__("json").dumps(check))
+        args = ["merge", "proj", "5"]
+        if override:
+            args.extend(["--override", "permit fresh gate after stale check evidence"])
+        out = self.raw_task(*args)
+        self.assertNotIn("main unchanged since the lane's check; reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
+                         "stale or failed check records must rerun the merge gate")
+
+    def test_merge_does_not_reuse_check_with_different_head(self):
+        self.assert_check_record_regates(lambda check: check.update(sha="0" * 40), override=True)
+
+    def test_merge_does_not_reuse_check_with_different_base(self):
+        self.assert_check_record_regates(lambda check: check.update(base_sha="0" * 40))
+
+    def test_merge_does_not_reuse_failed_check_record(self):
+        self.assert_check_record_regates(lambda check: check.update(result="failed"), override=True)
+
+    def test_merge_does_not_reuse_legacy_check_without_base_sha(self):
+        self.assert_check_record_regates(lambda check: check.pop("base_sha"))
 
     def test_override_runs_gate_without_check_record_and_records_failed_gate(self):
         wt, _ = self.started()
@@ -329,6 +361,58 @@ class TaskTool(unittest.TestCase):
         self.assertIn("Ran `just sync` after dependency changes: pyproject.toml", out)
         self.assertEqual((self.home / "sync-count").read_text().splitlines(), ["sync"])
         self.assertNotIn("environment is now out of date", out)
+
+    def test_merge_runs_sync_for_requirements_in_change(self):
+        justfile = self.repo / "justfile"
+        justfile.write_text(justfile.read_text() + "\nsync:\n    echo sync\n")
+        self.git(self.repo, "add", "justfile")
+        self.git(self.repo, "commit", "-qm", "add sync recipe")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "requirements-dev.in", "package\n")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-sync.sh").write_text('echo sync >> "$HOME/sync-count"\n')
+        (self.home / "during-sync.sh").chmod(0o755)
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Ran `just sync` after dependency changes: requirements-dev.in", out)
+        self.assertEqual((self.home / "sync-count").read_text().splitlines(), ["sync"])
+
+    def test_merge_reports_failed_sync_recipe_loudly(self):
+        justfile = self.repo / "justfile"
+        justfile.write_text(justfile.read_text() + "\nsync:\n    echo sync\n")
+        self.git(self.repo, "add", "justfile")
+        self.git(self.repo, "commit", "-qm", "add sync recipe")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "package.json", "{}\n")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-sync.sh").write_text('echo dependency sync failed >&2; exit 1\n')
+        (self.home / "during-sync.sh").chmod(0o755)
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: `just sync` failed", out)
+        self.assertIn("package.json", out)
+        self.assertIn("dependency sync failed", out)
+        self.assertIn("environment may be out of date", out)
+
+    def test_merge_says_just_missing_when_dependency_sync_cannot_be_checked(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
+        self.prepare_merge_evidence("5")
+        isolated_bin = self.home / "isolated-bin"
+        isolated_bin.mkdir()
+        for name in ("bash", "git", "python3"):
+            executable = shutil.which(name, path=self.env["PATH"])
+            self.assertIsNotNone(executable, f"{name} is needed by this test")
+            os.symlink(executable, isolated_bin / name)
+        os.symlink(self.home / "bin/just", isolated_bin / "just")
+        env = dict(self.env, PATH=str(isolated_bin))
+        remover = self.home / "during-check.sh"
+        remover.write_text('/bin/mv "$HOME/isolated-bin/just" "$HOME/isolated-bin/just.removed"\n')
+        remover.chmod(0o755)
+        out = self.raw_task("merge", "proj", "5", env=env)
+        self.assertIn("dependency files changed (pnpm-lock.yaml)", out)
+        self.assertIn("`just` is not installed", out)
+        self.assertNotIn("no `just sync` recipe", out)
 
     def test_review_prints_claude_headless_command_and_persisted_prompt(self):
         wt, _ = self.started()

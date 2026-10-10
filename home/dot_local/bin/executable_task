@@ -828,8 +828,14 @@ def sync_dependencies_after_merge(repo: Path, old_head: str, new_head: str, upda
     try:
         recipe = subprocess.run(["just", "--show", "sync"], cwd=repo, capture_output=True,
                                 text=True, timeout=30)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        recipe = None
+    except FileNotFoundError:
+        print(f"WARNING: dependency files changed ({files}) but `just` is not installed; "
+              "the main checkout's environment is now out of date.")
+        return
+    except subprocess.TimeoutExpired:
+        print(f"WARNING: could not determine whether `just sync` exists after dependency changes ({files}); "
+              "the main checkout's environment is now out of date.")
+        return
     if recipe and recipe.returncode == 0:
         try:
             result = subprocess.run(["just", "sync"], cwd=repo, capture_output=True,
@@ -1117,6 +1123,7 @@ def merge(args):
                 raise Stop(overlap_message(overlap))
             if can_reuse_lane_check(task, repo, lane_head, base, record):
                 print("main unchanged since the lane's check; reusing it")
+                completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
             else:
                 tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
