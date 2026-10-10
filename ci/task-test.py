@@ -318,6 +318,12 @@ class TaskTool(unittest.TestCase):
             self.assertNotIn("shared gate lock unavailable", out)
             self.assertIn("PASS", out)
             self.assertFalse((self.state() / "check.json").exists())
+        lane_result = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertTrue(lane_result["advisory"])
+        self.raw_task("check", "proj", "5")
+        trusted = __import__("json").loads((self.state() / "check.json").read_text())
+        self.assertTrue(trusted["trusted"])
+        self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
         self.assertIn("lane check: passed (advisory)", self.raw_task("status", "proj"))
 
     def test_start_rejects_redundant_just_check_verify_line(self):

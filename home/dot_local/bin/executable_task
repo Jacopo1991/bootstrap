@@ -827,7 +827,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
                                 "trusted": state is not None, "advisory": state is None}
-                    if evidence_name == "check.json":
+                    if evidence_name == "check.json" and state is None:
                         atomic_json(work / "check.json", evidence)
                     if state:
                         atomic_json(state / evidence_name, evidence)
@@ -851,7 +851,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
                 "record_revision": record.get("revision") if record else "",
                 "result": "passed" if passed else "failed", "steps": results,
                 "time": utc_now(), "trusted": state is not None, "advisory": state is None}
-    if evidence_name == "check.json":
+    if evidence_name == "check.json" and state is None:
         atomic_json(work / "check.json", evidence)
     if state:
         atomic_json(state / evidence_name, evidence)
