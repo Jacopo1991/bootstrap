@@ -1318,7 +1318,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
     for tokens in all_tokens:
         route = task_route(tokens)
         if route and route[0] in PM_TASK_COMMANDS:
-            return Denial("task.pm_only", "PM task subcommands may not be invoked from an agent command.")
+            return Denial("task.pm_only", "PM task subcommands are for the PM and may not be invoked from an agent command.")
         state_reason = task_state_write_reason(tokens, cwd)
         if state_reason:
             return Denial("task.private_state_write", state_reason)
