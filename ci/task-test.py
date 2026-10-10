@@ -668,6 +668,23 @@ exit 1
         self.assertIn("Cancelled", out)
         self.assertIn("--detach", self.raw_task("merge", "proj", "5", code=1))
 
+    def test_round2_foreground_run_holds_task_lock(self):
+        self.started()
+        (self.home / "bin/just").write_text("#!/bin/sh\nsleep 1\necho 'Ran 1 test'; echo OK\n")
+        (self.home / "bin/just").chmod(0o755)
+        process = subprocess.Popen(["python3", str(TOOL), "check", "proj", "5"],
+                                   cwd=self.home, env=self.env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+        lock = self.state() / "run.lock"
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline and not lock.exists():
+            __import__("time").sleep(0.02)
+        self.assertTrue(lock.exists(), "foreground check must acquire the task lock")
+        out = self.raw_task("check", "proj", "5", code=1)
+        self.assertIn("already live", out)
+        stdout, _ = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
