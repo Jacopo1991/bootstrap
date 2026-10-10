@@ -1096,7 +1096,7 @@ def open_pr(repo, branch):
 def normalize_review_line(line):
     """Remove common Markdown presentation while preserving review text and list numbering."""
     line = line.rstrip()
-    line = re.sub(r"^\s{0,3}#{1,6}\s*", "", line)
+    line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
     if "|" in line:
         line = " ".join(part.strip() for part in line.strip().strip("|").split("|"))
     numbered = re.match(r"^\s*(\d+)[.)]\s+", line)
