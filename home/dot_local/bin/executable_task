@@ -591,6 +591,15 @@ def start(args):
             git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
             print(f"Created {task.path} on {branch}, from origin's existing branch.")
         elif branch:
+            for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
+                lines = block.splitlines()
+                checked_out = next((line[len("worktree "):]
+                                    for line in lines if line.startswith("worktree ")), None)
+                checked_branch = next((line[len("branch refs/heads/"):]
+                                       for line in lines if line.startswith("branch refs/heads/")), None)
+                if checked_branch == branch and checked_out and Path(checked_out).resolve() != task.path.resolve():
+                    raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
+                               f"move or free that worktree before `task start` can adopt it at {task.path}.")
             git(repo, "worktree", "add", "-q", str(task.path), branch)
             print(f"Created {task.path} on the existing branch {branch}.")
         else:
@@ -640,8 +649,9 @@ def start(args):
     if task.file:
         print(f"Task: {task.file}")
     print("Commit on the branch, then run `task check` from that folder, then fill `.work/report.md`; "
-          "any later commit needs a new check. Report that the report is written. "
-          "For long gates, the PM can use `task merge --detach`.")
+          "any later commit needs a new check. In chat, reply with three lines: `changed: ...`, "
+          "`verified: ...`, and `not done: ...`, followed by `report written`. "
+          "For long gates, the lane can use `task check --detach`; the PM can use `task merge --detach`.")
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None):

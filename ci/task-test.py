@@ -178,10 +178,31 @@ class TaskTool(unittest.TestCase):
         self.assertLess(commit_at, check_at)
         self.assertLess(check_at, report_at)
         self.assertLess(report_at, later_commit_at)
+        for line in ("three lines: `changed: ...`, `verified: ...`, and `not done: ...`",
+                     "followed by `report written`", "lane can use `task check --detach`",
+                     "PM can use `task merge --detach`"):
+            self.assertIn(line, out)
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "", "worktrees stay out of status")
         again = self.task("start", "proj", "5", "--builder", "codex")
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
+
+    def test_start_adopts_existing_branch_without_task_worktree(self):
+        self.git(self.repo, "branch", "t5-preexisting", "main")
+        out = self.task("start", "proj", "5", "--builder", "codex")
+        wt = self.repo / ".worktrees/t5"
+        self.assertIn("on the existing branch t5-preexisting", out)
+        self.assertEqual(self.git(wt, "branch", "--show-current"), "t5-preexisting")
+        self.assertTrue((wt / "a.txt").is_file())
+
+    def test_start_reports_existing_branch_checked_out_elsewhere(self):
+        external = self.home / "lane-worktree"
+        self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "t5-external",
+                 str(external), "main")
+        out = self.task("start", "proj", "5", "--builder", "codex", code=1)
+        self.assertIn(f"Branch t5-external is already checked out at {external}", out)
+        self.assertNotIn("fatal:", out)
+        self.assertFalse((self.repo / ".worktrees/t5").exists())
 
     def test_check_passes_fails_and_refuses_dirty(self):
         wt, _ = self.started()
