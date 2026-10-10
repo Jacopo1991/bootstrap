@@ -31,18 +31,19 @@ while (($# > 1)); do
     *) exit 2 ;;
   esac
 done
-scan_root=$1
-[[ -f $scan_root/tracked.txt && -f $scan_root/.gitignore && -f $scan_root/untracked.txt ]]
-[[ -f $scan_root/.work/tracked.log && ! -e $scan_root/.work/lane.log ]]
-[[ -f $scan_root/local.env ]]
-if [[ -f $scan_root/allowlisted.txt ]]; then
+[[ $1 == . ]]
+[[ -f tracked.txt && -f .gitignore && -f untracked.txt ]]
+[[ -f .work/tracked.log && ! -e .work/lane.log ]]
+[[ -f local.env ]]
+if [[ -f allowlisted.txt ]]; then
   [[ $config == "$FIXTURE_REPO/.gitleaks.toml" ]]
-  grep -Fq 'FIXTURE_SECRET_ALLOWED' "$config"
-  grep -Fq 'FIXTURE_SECRET_ALLOWED' "$scan_root/allowlisted.txt"
+  grep -Fq '''^allowlisted\.txt$''' "$config"
+  grep -Fq '''^FIXTURE_SECRET_ALLOWED$''' "$config"
+  grep -Fxq 'FIXTURE_SECRET_ALLOWED' allowlisted.txt
 else
   [[ -z $config ]]
 fi
-if grep -R -Fq 'FIXTURE_SECRET_UNALLOWLISTED' "$scan_root"; then
+if grep -R -Fq 'FIXTURE_SECRET_UNALLOWLISTED' .; then
   echo 'mock gitleaks: unallowlisted secret detected' >&2
   exit 1
 fi
@@ -50,7 +51,14 @@ echo 'mock gitleaks: no unallowlisted secret found'
 SCANNER
 chmod 0755 "$tmp/gitleaks"
 bash "$ROOT/ci/gitleaks-working-tree.sh" "$tmp/gitleaks" "$repo" "$tmp/scan"
-printf '[allowlists]\nregexes = ["FIXTURE_SECRET_ALLOWED"]\n' > "$repo/.gitleaks.toml"
+cat > "$repo/.gitleaks.toml" <<'TOML'
+[[allowlists]]
+description = "fixture allowlist with a path anchored relative to the scan root"
+condition = "AND"
+paths = ['''^allowlisted\.txt$''']
+regexTarget = "match"
+regexes = ['''^FIXTURE_SECRET_ALLOWED$''']
+TOML
 printf 'FIXTURE_SECRET_ALLOWED\n' > "$repo/allowlisted.txt"
 git -C "$repo" add .gitleaks.toml allowlisted.txt
 git -C "$repo" commit -qm 'fixture gitleaks allowlist'

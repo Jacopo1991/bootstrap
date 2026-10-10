@@ -31,4 +31,4 @@ args=(dir --redact --no-banner)
 if [[ -f $repo/.gitleaks.toml ]]; then
   args+=(--config "$repo/.gitleaks.toml")
 fi
-"$scanner" "${args[@]}" "$scan_root"
+(cd -- "$scan_root" && "$scanner" "${args[@]}" .)
