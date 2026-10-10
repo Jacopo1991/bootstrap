@@ -6,6 +6,7 @@ Claude Code and Codex run it from their root-owned managed settings, as
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 HOST_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe",
               "wsl", "wsl.exe", "wslconfig.exe", "diskpart", "diskpart.exe", "schtasks", "schtasks.exe"}
@@ -63,7 +65,7 @@ STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
-PM_TASK_COMMANDS = {"start", "merge", "close"}
+PM_TASK_COMMANDS = {"start", "merge", "close", "review", "cancel", "note", "denials"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -323,6 +325,15 @@ def inside(path_text: str, cwd: str, root: Path) -> bool:
 def deny(message: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
             "permissionDecision": "deny", "permissionDecisionReason": message}}
+
+
+class Denial(str):
+    """A user-facing denial message with the identifier of the rule that emitted it."""
+
+    def __new__(cls, rule_id: str, message: str):
+        value = super().__new__(cls, message)
+        value.rule_id = rule_id
+        return value
 
 
 def secret_scan(root: Path) -> str | None:
@@ -1048,42 +1059,88 @@ def host_command_reason(tokens: list[str], executable: str) -> str | None:
     return None
 
 
+def task_state_path(path_text: str, cwd: str) -> bool:
+    """True for an operand inside the PM's private task-state directory."""
+    target = Path(path_text).expanduser()
+    if not target.is_absolute():
+        target = Path(cwd) / target
+    try:
+        root = (Path.home() / ".local/state/task").resolve()
+        resolved = target.resolve(strict=False)
+        return resolved == root or root in resolved.parents
+    except (OSError, ValueError):
+        return ".local/state/task" in path_text.replace("\\", "/")
+
+
+def task_route(tokens: list[str]) -> tuple[str, int] | None:
+    """Find a task-tool invocation at command position, never a mention in arguments."""
+    unwrapped = unwrap_command(tokens)
+    if not isinstance(unwrapped, list) or not unwrapped:
+        return None
+    executable = Path(unwrapped[0]).name.lower()
+    task_names = {"task", "executable_task", "executable_task.py"}
+    if executable in task_names and len(unwrapped) > 1:
+        command = unwrapped[1]
+        if command in PM_TASK_COMMANDS or command == "check":
+            return command, 0
+    if (executable in INTERPRETERS or re.fullmatch(r"python[0-9.]+", executable)) and len(unwrapped) > 2:
+        if Path(unwrapped[1]).name.lower() in task_names:
+            command = unwrapped[2]
+            if command in PM_TASK_COMMANDS or command == "check":
+                return command, 1
+    return None
+
+
+def task_state_write_reason(tokens: list[str], cwd: str) -> str | None:
+    """Reject shell commands that name private task state, including redirect targets."""
+    if any(task_state_path(token, cwd) for token in tokens if not token.startswith("-")):
+        return "Writing or accessing PM task state from an agent command is blocked."
+    return None
+
+
 def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str | None:
     tool = event.get("tool_name")
     data = event.get("tool_input")
     if not isinstance(data, dict):
-        return "Unrecognized tool input; blocked by policy."
+        return Denial("input.invalid", "Unrecognized tool input; blocked by policy.")
     if git_environment_override(event, data):
-        return "Git configuration and execution environment overrides are blocked."
+        return Denial("git.environment_override", "Git configuration and execution environment overrides are blocked.")
     cwd = str(event.get("cwd") or os.getcwd())
     root = root_for(cwd, approved_roots)
     if str(root) == "/__bootstrap_outside_approved_roots__":
-        return "Work outside approved code and knowledge roots is blocked."
+        return Denial("workspace.boundary", "Work outside approved code and knowledge roots is blocked.")
     if tool in {"PowerShell", "Computer", "ComputerUse"}:
-        return "Windows and host-computer actions are blocked."
+        return Denial("host.command_boundary", "Windows and host-computer actions are blocked.")
     if tool in {"Write", "Edit", "MultiEdit"}:
         paths = [data.get(k) for k in ("file_path", "path", "filename")
                  if isinstance(data.get(k), str)]
+        if any(task_state_path(path, cwd) for path in paths):
+            return Denial("task.private_state_write", "Agent writes to private task state are blocked.")
         metadata = git_metadata(root)
         if not paths or any(not writable(p, cwd, root, metadata) for p in paths):
-            return "File writes outside the current repository or into Git metadata are blocked."
+            return Denial("filesystem.write_boundary", "File writes outside the current repository or into Git metadata are blocked.")
         return None
     if tool == "apply_patch":
         patch = data.get("patch", data.get("command", ""))
         if not isinstance(patch, str):
-            return "Patch input is unrecognized; blocked by policy."
+            return Denial("input.invalid", "Patch input is unrecognized; blocked by policy.")
         paths = re.findall(r"^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$",
                            patch, re.MULTILINE)
+        if any(task_state_path(path, cwd) for path in paths):
+            return Denial("task.private_state_write", "Agent writes to private task state are blocked.")
         metadata = git_metadata(root)
         if not paths or any(not writable(p, cwd, root, metadata) for p in paths):
-            return "Patch writes outside the current repository or into Git metadata are blocked."
+            return Denial("filesystem.write_boundary", "Patch writes outside the current repository or into Git metadata are blocked.")
         return None
     if tool != "Bash":
         return None
     command = data.get("command")
     if not isinstance(command, str) or not command.strip():
-        return "Shell command is unrecognized; blocked by policy."
-    return evaluate_command(command, cwd, root, approved_roots)
+        return Denial("input.invalid", "Shell command is unrecognized; blocked by policy.")
+    reason = evaluate_command(command, cwd, root, approved_roots)
+    if not reason or isinstance(reason, Denial):
+        return reason
+    return Denial("command.policy", reason)
 
 
 def split_command(command: str) -> tuple[list[str], list[str]] | str:
@@ -1155,7 +1212,8 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
     while tokens:
         if ENV_ASSIGNMENT.fullmatch(tokens[0]):
             if unsafe_env_name(tokens[0].split("=", 1)[0]):
-                return "Environment variables that change execution or Git behaviour are blocked."
+                return Denial("command.unsafe_environment",
+                              "Environment variables that change execution or Git behaviour are blocked.")
             tokens = tokens[1:]
             continue
         wrapper = Path(tokens[0]).name.lower()
@@ -1178,7 +1236,8 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
                     index += 1
                 elif ENV_ASSIGNMENT.fullmatch(token):
                     if unsafe_env_name(token.split("=", 1)[0]):
-                        return "Environment variables that change execution or Git behaviour are blocked."
+                        return Denial("command.unsafe_environment",
+                                      "Environment variables that change execution or Git behaviour are blocked.")
                     index += 1
                 elif token.startswith("-"):
                     return "Unsupported env option; blocked by policy."
@@ -1265,6 +1324,13 @@ def evaluate_command(command: str, cwd: str, root: Path,
             all_tokens.append(list(lexer))
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
+    for tokens in all_tokens:
+        route = task_route(tokens)
+        if route and route[0] in PM_TASK_COMMANDS:
+            return Denial("task.pm_only", "PM task subcommands are for the PM and may not be invoked from an agent command.")
+        state_reason = task_state_write_reason(tokens, cwd)
+        if state_reason:
+            return Denial("task.private_state_write", state_reason)
     if len(all_tokens) > 1:
         heads: list[tuple[str, list[str]]] = []
         for tokens in all_tokens:
@@ -1339,10 +1405,11 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
         return "Inline shell and interpreter programs are blocked."
     host_reason = host_command_reason(tokens, executable)
     if host_reason:
-        return host_reason
+        return Denial("host.command_boundary", host_reason)
     if executable == "task" and len(tokens) > 1 and tokens[1] in PM_TASK_COMMANDS:
-        return ("`task start`, `task merge` and `task close` are for the PM. Run `task check` in your "
-                "worktree, commit on your branch and report.")
+        return Denial("task.pm_only", "`task start`, `task merge`, `task close`, `task review`, `task cancel`, `task note` "
+                      "and `task denials` are for the PM. Lanes may run `task status` and `task check` in their "
+                      "worktree, commit on your branch and report.")
     if executable == "sed":
         reason = sed_policy(tokens)
         if reason:
@@ -1414,9 +1481,11 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if any(SHELL_EXPANSION.search(t) or not writable(t, cwd, root, metadata) for t in targets):
         return "Shell writes outside the current repository or into Git metadata are blocked."
     if executable == "git":
-        return git_policy(tokens, cwd, root, approved_roots)
+        reason = git_policy(tokens, cwd, root, approved_roots)
+        return Denial("git.command_policy", reason) if reason else None
     if executable == "gh":
-        return gh_policy(tokens)
+        reason = gh_policy(tokens)
+        return Denial("github.command_policy", reason) if reason else None
     return None
 
 
@@ -1443,7 +1512,68 @@ def permission_reason(event: dict, approved_roots: tuple[Path, ...] | None = Non
     return None
 
 
-def main() -> int:
+def first_command_category(command: str) -> str:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return "unparsed"
+    index = 0
+    while index < len(tokens) and ENV_ASSIGNMENT.fullmatch(tokens[index]):
+        index += 1
+    if index < len(tokens) and Path(tokens[index]).name == "env":
+        index += 1
+        while index < len(tokens):
+            if ENV_ASSIGNMENT.fullmatch(tokens[index]):
+                index += 1
+            elif tokens[index] == "-u" and index + 1 < len(tokens):
+                index += 2
+            elif tokens[index].startswith("-"):
+                index += 1
+            else:
+                break
+    return Path(tokens[index]).name if index < len(tokens) else ""
+
+
+def event_vendor(event: dict, vendor: str | None = None) -> str:
+    return vendor if vendor in {"claude", "codex"} else "unknown"
+
+
+def log_denial(event: dict, denial: str | None = None, vendor: str | None = None):
+    """Best-effort denial audit; record a command category, never its arguments."""
+    try:
+        data = event.get("tool_input", {})
+        command = data.get("command", "") if isinstance(data, dict) else ""
+        category = first_command_category(command) if isinstance(command, str) else ""
+        cwd = Path(str(event.get("cwd") or os.getcwd())).resolve()
+        repo = ""
+        try:
+            result = policy_subprocess(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True, timeout=2)
+            if result.returncode == 0:
+                repo = result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+        vendor = event_vendor(event, vendor)
+        if denial is None:
+            denial = evaluate(event)
+        rule_id = getattr(denial, "rule_id", "policy.command_evaluation")
+        entry = {"time": datetime.now(timezone.utc).isoformat(), "vendor": vendor, "repo": repo,
+                 "tool": str(event.get("tool_name", "")), "rule_id": rule_id,
+                 "category": category}
+        target = Path.home() / ".local/state/agent-policy/denials.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:
+        # Audit failure must never change the policy decision.
+        return
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--vendor", choices=("claude", "codex"))
+    options, _unknown = parser.parse_known_args(argv)
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
@@ -1454,6 +1584,8 @@ def main() -> int:
     permission_request = event.get("hook_event_name") == "PermissionRequest"
     reason = permission_reason(event) if permission_request else evaluate(event)
     if reason:
+        log_denial(event, Denial("permission.policy", reason) if permission_request else reason,
+                   options.vendor)
         response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
                     "decision": {"behavior": "deny", "message": reason}}}
                     if permission_request else deny(reason))

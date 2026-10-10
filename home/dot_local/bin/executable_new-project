@@ -40,7 +40,7 @@ MD
 # Agent instructions
 
 Follow the \`slim-workflow\` skill. Read \`~/cortex/cortex-kb-$name\` (INTENT.md, STATUS.md, your task) before working.
-Commit only in this repository; report results in chat. The PM records STATUS.md, backlog tasks and decisions in the knowledge repository.
+Commit only in this repository. Run \`task check\`, complete \`.work/report.md\` with evidence for every criterion and anything noticed but not done, then report that the report is written. The PM records STATUS.md, backlog tasks and decisions in the knowledge repository.
 MD
   printf '.env\n.env.*\nnode_modules/\n.venv/\n__pycache__/\ndist/\nbuild/\n.work/\n' > "$code/.gitignore"
   # The one verification command every lane and `task check` runs; the first task fills it in.

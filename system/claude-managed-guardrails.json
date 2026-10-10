@@ -107,7 +107,9 @@
               "PATH=/usr/local/bin:/usr/bin:/bin",
               "/usr/bin/python3",
               "-I",
-              "/usr/local/lib/agent-policy/pre_tool_use.py"
+              "/usr/local/lib/agent-policy/pre_tool_use.py",
+              "--vendor",
+              "claude"
             ],
             "timeout": 30
           }

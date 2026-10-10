@@ -75,7 +75,11 @@ for event, groups in managed["hooks"].items():
             assert set(handler) == {"type", "command", "args", "timeout"}, handler  # no shell field
             assert handler["type"] == "command"
             argv = [handler["command"], *handler["args"]]
-            assert argv[:8] == PREFIX and len(argv) == 9, argv
+            assert argv[:8] == PREFIX, argv
+            if argv[8].endswith("pre_tool_use.py"):
+                assert argv[9:] == ["--vendor", "claude"], argv
+            else:
+                assert len(argv) == 9, argv
             claude_hooks[(event, group.get("matcher"))] = repo_script(argv[8]).name
 assert claude_hooks == {
     ("PreToolUse", "Bash|PowerShell|Write|Edit|MultiEdit"): "pre_tool_use.py",
@@ -98,7 +102,11 @@ for event, groups in codex_events.items():
         for handler in group["hooks"]:
             assert set(handler) == {"type", "command", "timeout"} and handler["type"] == "command"
             argv = handler["command"].split(" ")
-            assert argv[:8] == PREFIX and len(argv) == 9, argv
+            assert argv[:8] == PREFIX, argv
+            if argv[8].endswith("pre_tool_use.py"):
+                assert argv[9:] == ["--vendor", "codex"], argv
+            else:
+                assert len(argv) == 9, argv
             codex_hooks[(event, group.get("matcher"))] = repo_script(argv[8]).name
 assert codex_hooks == {
     ("PreToolUse", "^Bash$"): "pre_tool_use.py",
@@ -160,6 +168,7 @@ for executable in ("gh", "/usr/bin/gh"):
 
 # --- The managed command line runs the policy (repo copy in place of /opt) -----------------
 pre_argv = [*PREFIX, str(ROOT / "system/agent-policy/pre_tool_use.py")]
+codex_pre_argv = [*pre_argv, "--vendor", "codex"]
 reminder_argv = [*PREFIX, str(ROOT / "system/agent-policy/context_reminder.py")]
 with tempfile.TemporaryDirectory() as temp:
     cwd = Path(temp)
@@ -167,13 +176,22 @@ with tempfile.TemporaryDirectory() as temp:
     planted = cwd / "planted"
     planted.mkdir()
     (planted / "json.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {"PYTHONPATH": str(planted)}
+    hook_home = cwd / "hook-home"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {
+        "PYTHONPATH": str(planted), "HOME": str(hook_home)}
     for command in ("wsl.exe -d AgentDev", "sudo true"):
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
                  "tool_input": {"command": command}, "cwd": str(cwd)}
         result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
                                 cwd=cwd, env=env, check=True, timeout=30)
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", command
+    codex_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                   "tool_input": {"command": "sudo true"}, "cwd": str(ROOT)}
+    result = subprocess.run(codex_pre_argv, input=json.dumps(codex_event), capture_output=True,
+                            text=True, cwd=cwd, env=env, check=True, timeout=30)
+    assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    codex_entry = json.loads((hook_home / ".local/state/agent-policy/denials.jsonl").read_text().splitlines()[-1])
+    assert codex_entry["vendor"] == "codex" and codex_entry["rule_id"] == "host.command_boundary"
     event = {"hook_event_name": "UserPromptSubmit", "prompt": "hello", "cwd": str(cwd)}
     result = subprocess.run(reminder_argv, input=json.dumps(event), capture_output=True, text=True,
                             cwd=cwd, env=env, check=True, timeout=30)
@@ -216,6 +234,61 @@ with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "
         assert not any(k.startswith("GIT_") for k in run.call_args.kwargs["env"])
         assert run.call_args.kwargs["env"]["POLICY_CONTROL"] == "kept"
         assert run.call_args.args == (["git", "status"],) and run.call_args.kwargs["check"] is True
+
+# Denial logging is best-effort, records only the executable category, and cannot
+# change a deny when the state path is broken.
+assert {"review", "note", "cancel", "start", "merge", "close"} <= policy.PM_TASK_COMMANDS
+assert "status" not in policy.PM_TASK_COMMANDS and "check" not in policy.PM_TASK_COMMANDS
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    for command in (
+            "task merge proj 5", "/usr/local/bin/task review proj 5",
+            "python3 /home/agent/dev_workspace/bootstrap/home/dot_local/bin/executable_task close proj 5",
+            "sh /usr/local/bin/task start proj 5", "env task note proj 5 improve x"):
+        assert policy.evaluate_command(command, temp, root, (root,)) is not None, command
+    for command in ("task status proj", "task check"):
+        assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+    assert policy.evaluate_command("echo see task start for details", temp, root, (root,)) is None
+    state_target = str(Path.home() / ".local/state/task/proj/t5/review.json")
+    assert policy.evaluate_command(f"printf x > {state_target}", temp, root, (root,))
+    assert policy.evaluate({"tool_name": "Write", "cwd": temp,
+                            "tool_input": {"file_path": state_target}}, (root,))
+with tempfile.TemporaryDirectory() as temp:
+    home = Path(temp) / "home"
+    home.mkdir()
+    event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "vendor": "claude",
+             "tool_input": {"command": "GITHUB_TOKEN=ghp_x sudo ls /sensitive/argument"}, "cwd": temp}
+    clean_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, clean_env, clear=True):
+        denial = policy.evaluate(event, (Path(temp),))
+        policy.log_denial(event, denial, "claude")
+    log = home / ".local/state/agent-policy/denials.jsonl"
+    entry = json.loads(log.read_text())
+    assert entry["category"] == "sudo" and entry["vendor"] == "claude"
+    assert entry["rule_id"] == "command.unsafe_environment"
+    assert "ghp_x" not in log.read_text() and "/sensitive/argument" not in log.read_text()
+    assert policy.first_command_category("GITHUB_TOKEN=ghp_x sudo ls") == "sudo"
+    assert policy.event_vendor({"hook_event_name": "PreToolUse", "codex_event": "PreToolUse"}) == "unknown"
+    assert policy.event_vendor({}, "codex") == "codex"
+    task_event = {"tool_name": "Bash", "cwd": temp,
+                  "tool_input": {"command": "env task merge proj 5"}}
+    with patch.dict(os.environ, clean_env, clear=True):
+        task_denial = policy.evaluate(task_event, (Path(temp),))
+    assert task_denial.rule_id == "task.pm_only"
+    codex_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": temp,
+                   "tool_input": {"command": "sudo true"}}
+    with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, clean_env, clear=True):
+        policy.log_denial(codex_event, policy.evaluate(codex_event, (Path(temp),)), "codex")
+    codex_log = [json.loads(line) for line in log.read_text().splitlines()][-1]
+    assert codex_log["vendor"] == "codex"
+    assert codex_log["rule_id"] == "host.command_boundary"
+    broken_home = Path(temp) / "broken-home"
+    broken_home.mkdir()
+    (broken_home / ".local").write_text("not a directory")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {"HOME": str(broken_home)}
+    result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
+                            cwd=temp, env=env, check=True, timeout=30)
+    assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
 assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""

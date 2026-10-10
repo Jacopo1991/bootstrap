@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""task: the PM's routine steps for one task, so nobody writes gate/merge/close scripts by hand.
+"""task lifecycle for one task; private evidence lives in ~/.local/state/task.
 
-  task start <repo> <id>             worktree <repo>/.worktrees/<name> on a new branch from the
-                                     up-to-date default branch, with the main checkout's
-                                     environment; prints the dispatch prompt
-  task check [[<repo>] <id>]         in that worktree (or the current one): committed, then
-                                     `just check` (log in .work/check.log); exit 0 only on PASS
-  task merge <repo> <id> [--keep]    after the lane reports done: brings the default branch in,
-                                     checks exactly what will be merged, merges it with a merge
-                                     commit (through the open PR if there is one), updates the
-                                     main checkout, removes the worktree and merged branch
-  task close <repo> <id> -m <text>   marks the Backlog.md task Done, ticks its criteria, sets the
-                                     final summary and commits only that task file
+Lanes and task checks run as the same Unix user. Lane scripts and the repository's justfile can
+forge private task evidence; the managed hook blocks obvious write routes but is not a security
+boundary against code running as that user.
+
+  task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
+  task check [[<repo>] <id>] [--detach]
+  task review <repo> <id> [--record <file>]
+  task merge <repo> <id> [--keep] [--override <reason>] [--detach]
+  task cancel <repo> <id>
+  task close <repo> <id> -m <summary> --retro <text> [--partial]
+  task note <repo> <id> improve|intervention [category] <text>
+  task status [<repo>]
+  task denials [--days N]
 
 <repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
-or a plain name for work without a task. Lanes run only `task check`; the rest is for the PM.
+or a plain name for work without a task. `task start` pins criteria and Verify commands; `task
+check` runs the gate and pinned verification; review and merge are PM actions.
 """
 import argparse
+import hashlib
+import json
 import os
 import re
+import shlex
+import signal
+import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
@@ -34,6 +44,7 @@ SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|erro
 DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
               ".ruff_cache", ".cache", ".tox", ".next", ".astro", ".turbo", "dist", "build",
               "coverage", "target", ".parcel-cache"}
+ACTIVE_FOREGROUND_TASK = None
 
 
 class Stop(Exception):
@@ -141,11 +152,13 @@ class Task:
                 front = re.search(r"(?m)^title:\s*['\"]?(.*?)['\"]?\s*$", self.file.read_text())
                 self.title = front.group(1) if front else ""
         else:
-            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,40}", ident):
-                raise Stop("A task name is lowercase letters, digits, '.', '_' or '-'.")
+            if (not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{0,79}", ident)
+                    or any(part in {"", ".", ".."} for part in ident.split("/"))):
+                raise Stop("A task name is lowercase letters, digits, '.', '_', '-', or '/' between name parts.")
             if ident in {"main", "master", default_branch(repo)}:
                 raise Stop(f"'{ident}' is the default branch, not a task name.")
-            self.name = self.id = ident
+            self.id = self.branch_hint = ident
+            self.name = ident.replace("/", "-")
         self.path = repo / ".worktrees" / self.name
 
     @property
@@ -158,13 +171,13 @@ class Task:
 
     def branch_name(self):
         if self.number is None:
-            return self.name
+            return self.branch_hint
         words = re.findall(r"[a-z0-9]+", self.title.lower())[:4]
         return "-".join([self.name, *words])[:40].rstrip("-")
 
     def existing_branch(self):
         """A local branch for this task, or one that exists only on origin (fetched)."""
-        pattern = f"{self.name}-*" if self.number is not None else self.name
+        pattern = f"{self.name}-*" if self.number is not None else self.branch_hint
         for refs in ("refs/heads/", "refs/remotes/origin/"):
             names = git(self.repo, "for-each-ref", "--format=%(refname:short)",
                         refs + pattern, refs + self.name).split()
@@ -178,6 +191,273 @@ class Task:
                 raise Stop(f"{self.path} exists but is not a worktree of {self.repo}; move it away first.")
             raise Stop(f"No worktree {self.path}; start it with `task start`.")
         return self.path
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def atomic_json(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def criteria_from(text: str):
+    return [{"number": int(number), "text": body.strip(), "checked": checked == "x"}
+            for checked, number, body in re.findall(
+                r"(?m)^- \[([ x])\] #(\d+)\s+(.+?)\s*$", text)]
+
+
+def verification_from(text: str):
+    return re.findall(r"(?m)^Verify:\s*`([^`]+)`\s*$", text)
+
+
+def report_is_filled(path: Path):
+    if not path.is_file():
+        return False
+    content = path.read_text()
+    sections = [re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", content)
+                for heading in ("What changed", "How I verified", "Criteria", "Noticed, not done")]
+    return bool(all(match and match.group(1).strip() for match in sections)
+                and not re.search(r"(?i)\(fill in\)", content))
+
+
+def markdown_section(text: str, heading: str) -> str:
+    match = re.search(rf"(?ms)^#{{1,6}} {re.escape(heading)}\s*\n(.*?)(?=^#{{1,6}} |\Z)", text)
+    return match.group(1).strip() if match else ""
+
+
+def completed_step(task: Task, step: str):
+    path = task_state(task) / "run.json"
+    try:
+        run = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    done = run.setdefault("completed", [])
+    if step not in done:
+        done.append(step)
+    atomic_json(path, run)
+
+
+def task_event(task: Task, name: str):
+    path = task_state(task) / "events.json"
+    try:
+        events = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        events = {}
+    events[name] = utc_now()
+    atomic_json(path, events)
+
+
+def set_child_group(state: Path, pgid: int | None):
+    lock = state / "run.lock"
+    try:
+        data = json.loads(lock.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if pgid is None:
+        data.pop("child_pgid", None)
+    else:
+        data["child_pgid"] = pgid
+    atomic_json(lock, data)
+
+
+def handle_interruption(signum, _frame):
+    task = ACTIVE_FOREGROUND_TASK
+    if task is not None:
+        state = task_state(task)
+        lock = state / "run.lock"
+        try:
+            lock_data = json.loads(lock.read_text())
+            child_pgid = int(lock_data.get("child_pgid", 0))
+            if child_pgid:
+                os.killpg(child_pgid, signal.SIGTERM)
+                time.sleep(0.1)
+                try:
+                    os.killpg(child_pgid, 0)
+                    os.killpg(child_pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        run_path = state / "run.json"
+        try:
+            run = json.loads(run_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            run = {}
+        if run.get("pid") == os.getpid() and run.get("state") in {"foreground", "running"}:
+            run["state"] = "interrupted"
+            run["ended_at"] = utc_now()
+            atomic_json(run_path, run)
+        lock.unlink(missing_ok=True)
+    raise SystemExit(128 + signum)
+
+
+def record_revision(record):
+    body = {key: value for key, value in record.items() if key != "revision"}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def task_state(task: Task) -> Path:
+    return HOME / ".local/state/task" / task.repo.name / task.name
+
+
+def load_record(task: Task, required=True):
+    path = task_state(task) / "task.json"
+    if not path.is_file():
+        if required:
+            raise Stop("No pinned task record; run `task start ... --refresh --builder ...`.")
+        return None
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise Stop(f"Cannot read {path}: {error}.")
+    if record.get("revision") != record_revision(record):
+        raise Stop("The pinned task record is damaged; ask the PM to refresh it.")
+    return record
+
+
+def timeout_for(path: Path):
+    config = path / ".task.toml"
+    if config.is_file():
+        match = re.search(r"(?m)^\s*check_timeout\s*=\s*(\d+)\s*(?:#.*)?$", config.read_text())
+        if match:
+            value = int(match.group(1))
+            if value < 1:
+                raise Stop(".task.toml check_timeout must be a positive number of seconds.")
+            return value
+    return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
+
+
+def run_record_path(task: Task):
+    return task_state(task) / "run.json"
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError, OSError):
+        return False
+
+
+def task_lock_status(task: Task):
+    lock = task_state(task) / "run.lock"
+    if not lock.exists():
+        return ""
+    try:
+        lock_record = json.loads(lock.read_text())
+        pid = int(lock_record["pid"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return "unknown"
+    if pid_alive(pid):
+        return "running"
+    run_path = run_record_path(task)
+    try:
+        run = json.loads(run_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        run = {}
+    active = run.get("state") in {"running", "foreground", "starting"}
+    if active:
+        run["state"] = "interrupted"
+        run["ended_at"] = utc_now()
+        atomic_json(run_path, run)
+    lock.unlink(missing_ok=True)
+    return "interrupted" if active else ""
+
+
+def detached(args, task, path):
+    work = path / ".work"
+    work.mkdir(exist_ok=True)
+    state = task_state(task)
+    state.mkdir(parents=True, exist_ok=True)
+    run_path, lock = state / "run.json", state / "run.lock"
+    if lock.exists() and task_lock_status(task) == "running":
+        raise Stop("A task run is already live; wait for it or use `task cancel`.")
+    if lock.exists():
+        raise Stop("The task run lock is unreadable; ask the PM to inspect task status.")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        raise Stop("A task run is already starting; try again shortly.")
+    started = utc_now()
+    atomic_json(lock, {"pid": os.getpid(), "started_at": started, "command": args.command,
+                       "mode": "detached-starting"})
+    command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    command = [part for part in command if part != "--detach"]
+    log = (work / "run.log").open("ab")
+    archive = run_path
+    env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive))
+    child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+                             close_fds=True)
+    atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
+                           "state": "running", "started_at": started, "ended_at": "",
+                           "completed": []})
+    atomic_json(lock, {"pid": child.pid, "started_at": started, "command": args.command,
+                       "mode": "detached"})
+    print(f"Started detached {args.command} run (pid {child.pid}); see {work / 'run.log'}.")
+    return 0
+
+
+def foreground_lock(args):
+    if args.command not in {"check", "merge"} or os.environ.get("TASK_RUN_RECORD"):
+        return None
+    if args.command == "merge":
+        task = Task(resolve_repo(args.repo), args.id)
+    elif args.id is not None:
+        repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+        task = Task(repo, args.id)
+    else:
+        top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+        task = Task(main_repo(top), top.name)
+    state = task_state(task)
+    state.mkdir(parents=True, exist_ok=True)
+    lock = state / "run.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if task_lock_status(task) == "running":
+            raise Stop("A task run is already live; wait for it or use `task cancel`.")
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            raise Stop("A task run is already starting; try again shortly.")
+    started = utc_now()
+    with os.fdopen(fd, "w") as output:
+        json.dump({"pid": os.getpid(), "started_at": started, "command": args.command,
+                   "mode": "foreground"}, output)
+    atomic_json(state / "run.json", {"command": args.command, "state": "foreground",
+                                      "pid": os.getpid(), "started_at": started, "completed": []})
+    global ACTIVE_FOREGROUND_TASK
+    ACTIVE_FOREGROUND_TASK = task
+    return lock
+
+
+def finish_detached(code):
+    path = os.environ.get("TASK_RUN_RECORD")
+    if not path:
+        return
+    run_path = Path(path)
+    archive = Path(os.environ["TASK_RUN_ARCHIVE"]) if os.environ.get("TASK_RUN_ARCHIVE") else None
+    try:
+        source = run_path if run_path.is_file() else archive
+        record = json.loads(source.read_text()) if source and source.is_file() else {}
+        if record.get("state") == "running":
+            record["state"] = "passed" if code == 0 else "failed"
+            record["ended_at"] = utc_now()
+            if run_path.parent.is_dir():
+                atomic_json(run_path, record)
+            if archive:
+                atomic_json(archive, record)
+        (run_path.parent / "run.lock").unlink(missing_ok=True)
+    except (OSError, json.JSONDecodeError):
+        pass
 
 
 # --- environment for a new worktree ------------------------------------------------------------
@@ -258,6 +538,51 @@ def start(args):
     task = Task(repo, args.id)
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
+    task_text = task.file.read_text() if task.file else ""
+    criteria = criteria_from(task_text)
+    verify = verification_from(task_text)
+    if task.file and not criteria:
+        raise Stop(f"{task.file} has no acceptance criteria.")
+    if task.file and not verify and not args.no_verify:
+        raise Stop(f"{task.file} has no `Verify: `command`` line; add one or use --no-verify \"reason\".")
+    if args.no_verify and verify:
+        raise Stop("--no-verify is only valid when the task has no Verify lines.")
+    if not (repo / "justfile").exists() and not (repo / "Justfile").exists():
+        raise Stop(f"No justfile in {repo}; the repository needs a `just check` recipe.")
+    for command in verify:
+        try:
+            tokens = shlex.split(command)
+        except ValueError as error:
+            raise Stop(f"Invalid Verify command `{command}`: {error}.")
+        if not tokens:
+            raise Stop("A Verify line needs a command.")
+        if tokens == ["just", "check"]:
+            raise Stop("Verify `just check` is redundant: `task check` already runs it before the Verify commands.")
+        probe = subprocess.run(["bash", "-c", 'command -v -- "$1" >/dev/null 2>&1',
+                                "task-preflight", tokens[0]],
+                               capture_output=True, text=True)
+        if probe.returncode:
+            raise Stop(f"Verification command `{tokens[0]}` is not installed or available in bash.")
+    default = default_branch(repo)
+    main_branch = run_git(repo, "branch", "--show-current").stdout.strip()
+    if main_branch != default:
+        print(f"warning: main checkout is on {main_branch or 'detached'}, not default branch {default}.")
+    if has_origin(repo):
+        fetch(repo)
+        remote = f"origin/{default}"
+        if not ok(repo, "rev-parse", "--verify", "--quiet", remote):
+            print("warning: origin default branch is not fetched; preflight could not check whether it is behind.")
+        else:
+            local = run_git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{default}").stdout.strip()
+            upstream = sha(repo, remote)
+            if local and not is_ancestor(repo, local, upstream):
+                print(f"warning: main checkout {default} is not a fast-forward behind {remote}.")
+            elif local and local != upstream:
+                print(f"warning: main checkout {default} is behind {remote}.")
+    for name in (".venv", "node_modules"):
+        candidate = repo / name
+        if candidate.is_symlink() and not candidate.exists():
+            print(f"warning: environment link {candidate} does not resolve.")
     if task.path.exists():
         task.worktree()
         print(f"{task.path} already exists.")
@@ -270,6 +595,15 @@ def start(args):
             git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
             print(f"Created {task.path} on {branch}, from origin's existing branch.")
         elif branch:
+            for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
+                lines = block.splitlines()
+                checked_out = next((line[len("worktree "):]
+                                    for line in lines if line.startswith("worktree ")), None)
+                checked_branch = next((line[len("branch refs/heads/"):]
+                                       for line in lines if line.startswith("branch refs/heads/")), None)
+                if checked_branch == branch and checked_out and Path(checked_out).resolve() != task.path.resolve():
+                    raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
+                               f"move or free that worktree before `task start` can adopt it at {task.path}.")
             git(repo, "worktree", "add", "-q", str(task.path), branch)
             print(f"Created {task.path} on the existing branch {branch}.")
         else:
@@ -278,7 +612,39 @@ def start(args):
             git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
             print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
     prepare_environment(repo, task.path)
+    exclude(task.path, ".work/")
     branch = git(task.path, "branch", "--show-current")
+    default_ref = f"origin/{default}" if has_origin(repo) and ok(
+        repo, "rev-parse", "--verify", "--quiet", f"origin/{default}") else default
+    base = git(task.path, "merge-base", "HEAD", default_ref)
+    work = task.path / ".work"
+    state = task_state(task)
+    record_path = state / "task.json"
+    state.mkdir(parents=True, exist_ok=True)
+    work.mkdir(parents=True, exist_ok=True)
+    if record_path.exists() and not args.refresh:
+        record = load_record(task)
+        if record.get("branch") != branch:
+            raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
+    else:
+        record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
+                  "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
+                  "verify": verify, "no_verify": args.no_verify or ""}
+        record["revision"] = record_revision(record)
+        atomic_json(record_path, record)
+        if args.refresh:
+            for stale in (state / "exception.json", state / "review.json", state / "review.md"):
+                stale.unlink(missing_ok=True)
+        report = work / "report.md"
+        if not report.exists() or args.refresh and not report_is_filled(report):
+            report.write_text("# Task report\n\n## What changed\n\n(fill in)\n\n## How I verified\n\n(fill in)\n\n## Criteria\n\n" +
+                              "\n".join(f"#{item['number']} not met: (fill in)" for item in criteria) +
+                              "\n\n## Noticed, not done\n\n(none)\n")
+    if args.no_verify:
+        print(f"exception: verification omitted: {args.no_verify}")
+    if "Verification and tools" in task_text:
+        section = re.search(r"(?ms)^#{1,6} Verification and tools\s*\n(.*?)(?=^#{1,6} |\Z)", task_text)
+        print("\nVerification and tools:\n" + (section.group(1).strip() if section else ""))
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     print(f"{task.id}{title}")
@@ -286,44 +652,77 @@ def start(args):
           f".worktrees/{task.name} on branch {branch}.")
     if task.file:
         print(f"Task: {task.file}")
-    print("Verify with `task check` from that folder (it runs `just check`); commit on the branch, "
-          "push it if you can, and report what changed and what you verified.")
+    print("Commit on the branch, then run `task check` from that folder, then fill `.work/report.md`; "
+          "any later commit needs a new check. In chat, reply with three lines: `changed: ...`, "
+          "`verified: ...`, and `not done: ...`, followed by `report written`. "
+          "For long gates, the lane can use `task check --detach`; the PM can use `task merge --detach`.")
 
 
-def run_check(path, base):
+def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None):
     """Run the repository's gate in <path>; return True when it passes."""
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
     work = path / ".work"
     work.mkdir(exist_ok=True)
+    state = state or task_state(Task(main_repo(path), path.name))
+    state.mkdir(parents=True, exist_ok=True)
     log = work / "check.log"
     passed = True
+    timeout = timeout_for(path)
+    results = []
     with log.open("w") as out:
         steps = [["just", "check"]]
+        if record:
+            steps.extend([["bash", "-c", command] for command in record.get("verify", [])])
         if (path / ".pre-commit-config.yaml").exists() and base:
             steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
         for step in steps:
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
+            started = time.monotonic()
             try:
-                code = subprocess.run(step, cwd=path, stdout=out, stderr=subprocess.STDOUT,
-                                      stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT).returncode
+                process = subprocess.Popen(step, cwd=path, stdout=out, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL, start_new_session=True)
+                set_child_group(state, process.pid)
+                try:
+                    code = process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    set_child_group(state, None)
+                    out.write(f"\nTIMEOUT after {timeout}s\n")
+                    results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
+                                    "timeout": True})
+                    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "base_sha": base or "",
+                                                       "result": "failed",
+                                                       "steps": results, "time": utc_now()})
+                    if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
+                    print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {display_log or log}")
+                    return False
             except subprocess.TimeoutExpired:
-                out.write(f"\nTIMEOUT after {CHECK_TIMEOUT}s\n")
-                print(f"NOT FINISHED: `{' '.join(step)}` ran over {CHECK_TIMEOUT}s; see {log}")
-                return False
+                raise
             except FileNotFoundError:
                 raise Stop(f"`{step[0]}` is not installed.")
+            set_child_group(state, None)
             out.write(f"exit {code}\n")
+            results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3)})
             if code:
                 passed = False
                 break
+    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "base_sha": base or "",
+                                       "record_revision": record.get("revision") if record else "",
+                                       "result": "passed" if passed else "failed", "steps": results,
+                                       "time": utc_now()})
+    if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
     lines = log.read_text(errors="replace").splitlines()
     summary = [line for line in lines if SUMMARY.match(line.strip())][-4:]
     for line in summary if passed else lines[-20:]:
         print("  " + line)
-    print(("PASS" if passed else "FAIL") + f" (log: {log})")
+    print(("PASS" if passed else "FAIL") + f" (log: {display_log or log})")
     return passed
 
 
@@ -341,6 +740,13 @@ def check(args):
     else:
         repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
         path = Task(repo, args.id).worktree()
+    task = Task(repo, path.name)
+    tracked_work = git(path, "ls-files", "--", ".work")
+    if tracked_work:
+        raise Stop("Tracked files under .work/ are forbidden; remove them from the index and keep evidence out of the repository.")
+    record = load_record(task, required=False)
+    if task.number is not None and record is None:
+        raise Stop("This worktree has no pinned task record; PM must run `task start ... --refresh --builder ...` first.")
     base, label = base_commit(repo, default_branch(repo))
     branch = git(path, "branch", "--show-current")
     print(f"{path}: {branch or 'detached'} at {sha(path, 'HEAD')[:7]}")
@@ -350,7 +756,9 @@ def check(args):
     if not is_ancestor(path, base, "HEAD"):
         print(f"note: {label} has commits this branch lacks; `task merge` brings them in.")
     prepare_environment(repo, path)
-    return 0 if run_check(path, base) else 1
+    if record and record.get("no_verify"):
+        print(f"exception: verification omitted: {record['no_verify']}")
+    return 0 if run_check(path, base, record, task_state(task)) else 1
 
 
 def ignored_leftovers(path):
@@ -404,6 +812,49 @@ def update_local_default(repo, default, commit):
     return f"{holder} fast-forwarded"
 
 
+def sync_dependencies_after_merge(repo: Path, old_head: str, new_head: str, update_message: str):
+    """Run only the repository's explicit sync recipe after an updated main changes dependencies."""
+    if "not updated" in update_message or "up to date" in update_message or not old_head or old_head == new_head:
+        return
+    changed = git(repo, "diff", "--name-only", old_head, new_head).splitlines()
+    dependency_names = {"pyproject.toml", "uv.lock", "package.json", "package-lock.json", "pnpm-lock.yaml"}
+    dependencies = [name for name in changed
+                    if Path(name).name in dependency_names
+                    or (Path(name).name.startswith("requirements")
+                        and Path(name).suffix in {".txt", ".in"})]
+    if not dependencies:
+        return
+    files = ", ".join(dependencies)
+    try:
+        recipe = subprocess.run(["just", "--show", "sync"], cwd=repo, capture_output=True,
+                                text=True, timeout=30)
+    except FileNotFoundError:
+        print(f"WARNING: dependency files changed ({files}) but `just` is not installed; "
+              "the main checkout's environment is now out of date.")
+        return
+    except subprocess.TimeoutExpired:
+        print(f"WARNING: could not determine whether `just sync` exists after dependency changes ({files}); "
+              "the main checkout's environment is now out of date.")
+        return
+    if recipe and recipe.returncode == 0:
+        try:
+            result = subprocess.run(["just", "sync"], cwd=repo, capture_output=True,
+                                    text=True, timeout=timeout_for(repo))
+        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+            result = None
+            detail = str(error)
+        else:
+            detail = (result.stderr or result.stdout).strip()
+        if result and result.returncode == 0:
+            print(f"Ran `just sync` after dependency changes: {files}")
+            return
+        print(f"WARNING: `just sync` failed after dependency changes ({files}); "
+              f"the main checkout's environment may be out of date. {detail}")
+        return
+    print(f"WARNING: dependency files changed ({files}) and this repository has no `just sync` recipe; "
+          "the main checkout's environment is now out of date.")
+
+
 def on_github(repo):
     return has_origin(repo) and "github" in git(repo, "remote", "get-url", "origin")
 
@@ -435,9 +886,211 @@ def open_pr(repo, branch):
     return result.stdout.strip()
 
 
-def merge(args):
+def review(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
+    path = task.worktree()
+    record = load_record(task)
+    head = sha(path, "HEAD")
+    task_text = task.file.read_text() if task.file else ""
+    outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
+    scope = markdown_section(task_text, "Scope") or task.id
+    if not args.record:
+        prompt = [f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
+                  f"Outcome: {outcome}", f"Scope: {scope}"]
+        if record["criteria"]:
+            prompt.append("Criteria:")
+            for item in record["criteria"]:
+                prompt.append(f"#{item['number']} {item['text']}")
+        else:
+            prompt.append("Criteria: none; judge the stated request above against the diff.")
+        prompt.append(f"Diff range: {record['base_sha']}..{head}")
+        prompt.append("Reviewer instructions: read-only review; use `git --no-optional-locks diff`, "
+                      "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
+        if record["criteria"]:
+            prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
+        else:
+            prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
+        prompt.append("Return: Verdict: PASS|FAIL; Commit: <sha>; Reviewer: codex|claude <model>; one line per criterion:")
+        for item in record["criteria"]:
+            prompt.append(f"#{item['number']} pass|fail|unclear: <evidence>")
+        prompt.append("Then list findings.")
+        prompt_text = "\n".join(prompt) + "\n"
+        state = task_state(task)
+        state.mkdir(parents=True, exist_ok=True)
+        prompt_file = state / "review-prompt.md"
+        reply_file = state / "review-response.md"
+        prompt_file.write_text(prompt_text)
+        reply_file.unlink(missing_ok=True)
+        print(prompt_text, end="")
+        if record["builder"] == "codex":
+            command = "claude -p --model haiku --effort high"
+        else:
+            command = "GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -"
+        print("Headless reviewer command (run from the task worktree):")
+        print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
+        print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
+        return 0
+    try:
+        text = Path(args.record).read_text()
+    except OSError as error:
+        raise Stop(f"Cannot read review file {args.record}: {error}.")
+    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict:\s*(PASS|FAIL)(?:\*\*)?\s*$", text)
+    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*([0-9a-f]{7,40})(?:\*\*)?\s*$", text)
+    reviewer = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Reviewer:\s*(codex|claude)\s+(.+?)(?:\*\*)?\s*$", text)
+    judgments = {int(n): (v, evidence.strip()) for n, v, evidence in re.findall(
+        r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?#(\d+)\s+(pass|fail|unclear):\s*(.+?)\s*$", text)}
+    problems = []
+    if not verdict: problems.append("missing Verdict: PASS|FAIL")
+    resolved_review = None
+    if commit:
+        matches = run_git(path, "rev-parse", "--verify", f"{commit.group(1)}^{{commit}}")
+        if matches.returncode == 0 and matches.stdout.strip().startswith(commit.group(1)):
+            resolved_review = matches.stdout.strip()
+    if resolved_review != head: problems.append("Commit does not match the current lane head")
+    if not reviewer: problems.append("missing Reviewer: codex|claude <model>")
+    elif reviewer.group(1) == record["builder"]: problems.append("reviewer vendor must differ from builder")
+    required = {item["number"] for item in record["criteria"]}
+    if required != set(judgments): problems.append("every pinned criterion must have exactly one judgment")
+    if any(not evidence for _, evidence in judgments.values()): problems.append("every judgment needs evidence")
+    if problems:
+        raise Stop("Review rejected: " + "; ".join(problems) + ".")
+    state = task_state(task)
+    (state / "review.md").write_text(text)
+    meta = {"verdict": verdict.group(1).upper(), "commit": head, "reviewer": reviewer.group(1).lower(),
+            "model": reviewer.group(2), "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
+            "record_revision": record["revision"], "time": utc_now()}
+    atomic_json(state / "review.json", meta)
+    task_event(task, "review")
+    print(f"Recorded {meta['verdict']} review for {head[:7]}.")
+    return 0
+
+
+def merge_gate(task, path, head):
+    missing = []
+    record = load_record(task)
+    state = task_state(task)
+    check_path = state / "check.json"
+    try:
+        check = json.loads(check_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        check = {}
+    if check.get("result") != "passed" or check.get("sha") != head or check.get("record_revision") != record["revision"]:
+        missing.append("passing task check for lane head")
+    try:
+        review = json.loads((state / "review.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        review = {}
+    reviewed_head = review.get("commit")
+    if (review.get("verdict") != "PASS" or reviewed_head != head
+            or review.get("record_revision") != record["revision"]
+            or any(v != "pass" for v in review.get("judgments", {}).values())
+            or review.get("reviewer") == record["builder"]):
+        missing.append("recorded PASS review for lane head with every criterion pass by the other vendor")
+    report = path / ".work/report.md"
+    if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", report.read_text(), re.M):
+        # Blank headings and explanatory placeholders mean the lane has not completed its report.
+        content = report.read_text() if report.is_file() else ""
+        headings = (("What changed", "How I verified", "Criteria", "Noticed, not done")
+                    if record["criteria"] else ("What changed", "How I verified"))
+        sections = [re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", content)
+                    for heading in headings]
+        if not all(match and match.group(1).strip() for match in sections) or "(fill in)" in content:
+            missing.append("filled .work/report.md")
+    if report.is_file():
+        content = report.read_text()
+        section = re.search(r"(?ms)^## Criteria\s*\n(.*?)(?=^## |\Z)", content)
+        criteria_text = section.group(1) if section else ""
+        if any(not re.search(rf"(?m)^\s*#?{item['number']}\s+(?:met|not met):\s*\S.+$",
+                             criteria_text, re.I) for item in record["criteria"]):
+            missing.append("criterion evidence in .work/report.md")
+    if missing:
+        raise Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
+    return record
+
+
+def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record) -> bool:
+    """Reuse check evidence only when it passed for this head and revision against this base."""
+    try:
+        checked = json.loads((task_state(task) / "check.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (checked.get("result") == "passed" and checked.get("sha") == lane_head
+            and checked.get("record_revision") == record.get("revision")
+            and checked.get("base_sha") == base and is_ancestor(repo, base, lane_head))
+
+
+def overlap_files(repo: Path, lane_head: str, base: str):
+    common = git(repo, "merge-base", lane_head, base)
+    lane_files = set(git(repo, "diff", "--name-only", common, lane_head).splitlines())
+    main_files = set(git(repo, "diff", "--name-only", common, base).splitlines())
+    return sorted(lane_files & main_files)
+
+
+def overlap_message(files):
+    names = ", ".join(files) if files else "files with merge conflicts"
+    return (f"main changed {names} that this task also changed; ask the lane to merge main into its "
+            "branch, then `task check` and a new review")
+
+
+def prune_stale_gate_worktrees(repo: Path):
+    worktrees = repo / ".worktrees"
+    if not worktrees.is_dir():
+        return
+    for gate in worktrees.glob(".task-gate-*"):
+        match = re.fullmatch(r"\.task-gate-.+-(\d+)", gate.name)
+        if not match or pid_alive(match.group(1)):
+            continue
+        result = run_git(repo, "worktree", "remove", "--force", str(gate))
+        if result.returncode and gate.exists():
+            shutil.rmtree(gate, ignore_errors=True)
+            run_git(repo, "worktree", "prune")
+        print(f"Removed stale gate worktree {gate}.")
+
+
+def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record):
+    gate = repo / ".worktrees" / f".task-gate-{task.name}-{os.getpid()}"
+    if gate.exists():
+        raise Stop(f"Temporary gate worktree already exists: {gate}")
+    exclude(repo, ".worktrees/")
+    git(repo, "worktree", "add", "-q", "--detach", str(gate), base)
+    try:
+        result = run_git(gate, "merge", "--no-edit", "--no-ff", lane_head)
+        if result.returncode:
+            conflicts = git(gate, "diff", "--name-only", "--diff-filter=U").splitlines()
+            run_git(gate, "merge", "--abort")
+            raise Stop(overlap_message(conflicts))
+        prepare_environment(repo, gate)
+        gated_head = sha(gate, "HEAD")
+        archived_log = task_state(task) / "gate-check.log"
+        passed = run_check(gate, base, record, task_state(task), evidence_name="gate-check.json",
+                           display_log=archived_log)
+        shutil.copy2(gate / ".work/check.log", archived_log)
+        completed_step(task, "gate")
+        return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
+    finally:
+        run_git(repo, "worktree", "remove", "--force", str(gate))
+
+
+def merge(args):
+    repo = resolve_repo(args.repo)
+    prune_stale_gate_worktrees(repo)
+    task = Task(repo, args.id)
+    print(f"For long gates, use `task merge {args.repo} {task.id} --detach` and track it with `task status`.")
+    default = default_branch(repo)
+    fetch(repo)
+    base, label = base_commit(repo, default)
+    archive = task_state(task)
+    if not task.path.exists():
+        try:
+            checked = json.loads((archive / "check.json").read_text())
+            lane_head = checked.get("sha")
+        except (OSError, json.JSONDecodeError):
+            lane_head = None
+        if lane_head and is_ancestor(repo, lane_head, base):
+            print(f"{task.id} is already merged in {label}; archive is resumable and complete.")
+            return 0
+        raise Stop(f"No worktree {task.path}; start it with `task start`.")
     path = task.worktree()
     branch = git(path, "branch", "--show-current")
     if not branch:
@@ -446,66 +1099,124 @@ def merge(args):
     if changes:
         raise Stop("The worktree has uncommitted or untracked files; the lane commits or deletes "
                    "them first:\n" + "\n".join(changes))
-    default = default_branch(repo)
-    fetch(repo)
-    base, label = base_commit(repo, default)
-    if is_ancestor(repo, sha(path, "HEAD"), base):
-        print(f"{branch} is already in {label}.")
+    lane_head = sha(path, "HEAD")
+    record = load_record(task)
+    try:
+        record = merge_gate(task, path, lane_head)
+    except Stop:
+        if not args.override:
+            raise
+        atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
+                                                   "missing_gate": True})
+        print(f"exception: merge gate overridden: {args.override}")
+    task_event(task, "merge")
+    if is_ancestor(repo, lane_head, base):
         commit = base
+        print(f"{branch} is already in {label}.")
     else:
-        before = sha(path, "HEAD")
-        if not is_ancestor(path, base, before):
-            result = run_git(path, "merge", "-q", "--no-edit", "-m", f"Merge {label} into {branch}", base)
-            if result.returncode:
-                run_git(path, "merge", "--abort")
-                raise Stop(f"{label} does not merge cleanly into {branch}; the lane resolves it:\n"
-                           + (result.stdout + result.stderr).strip())
-            print(f"Merged {label} into {branch}.")
-        head = sha(path, "HEAD")
-        passed = run_check(path, base)
-        if sha(path, "HEAD") != head:
-            raise Stop("The lane committed while the check ran; nothing merged. Run `task merge` "
-                       "again once the lane has finished.")
-        created = untracked(path)
-        if created:
-            raise Stop("Nothing merged: after the check the worktree has files that are not committed "
-                       "or ignored. If the check creates them, ignore them in .gitignore:\n"
-                       + "\n".join(created))
-        if not passed:
-            if head != before:
-                run_git(path, "reset", "-q", "--keep", before)
-            raise Stop("Check failed; nothing merged and the branch is as the lane left it.")
         title = f": {task.title}" if task.title else ""
-        if on_github(repo):
-            # GitHub repositories take changes through a PR (rulesets); open one when needed and
-            # merge it pinned to the commit that was just checked.
-            git(repo, "push", "-q", "origin", f"{head}:refs/heads/{branch}")
-            pr = open_pr(repo, branch)
-            if not pr:
-                gh(repo, "pr", "create", "--head", branch, "--base", default,
-                   "--title", f"{task.id}{title}" if task.title else task.id,
-                   "--body", f"Branch `{branch}`; `just check` passed on {head[:7]} (`task merge`).")
+        for _attempt in range(3):
+            fetch(repo)
+            base, label = base_commit(repo, default)
+            overlap = overlap_files(repo, lane_head, base)
+            if overlap:
+                raise Stop(overlap_message(overlap))
+            if can_reuse_lane_check(task, repo, lane_head, base, record):
+                print("main unchanged since the lane's check; reusing it")
+                completed_step(task, "gate")
+                tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
+            else:
+                tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
+                if not gate_passed:
+                    if not args.override:
+                        raise Stop("Gate check failed on the would-be merge result; nothing was published.")
+                    atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
+                                                               "gate_failed": True, "missing_gate": True})
+                    print(f"exception: failed merge gate overridden: {args.override}")
+            if sha(path, "HEAD") != lane_head:
+                raise Stop("The lane branch changed while the gate ran; nothing was published. Run `task check` and obtain a new review.")
+            fetch(repo)
+            latest, _ = base_commit(repo, default)
+            if latest != base:
+                print(f"{label} moved during the gate; re-gating against the new tip.")
+                continue
+            if on_github(repo):
+                git(repo, "push", "-q", "origin", f"{lane_head}:refs/heads/{branch}")
                 pr = open_pr(repo, branch)
                 if not pr:
-                    raise Stop("Opened a PR but could not find it again; merge it on GitHub.")
-                print(f"Opened PR #{pr}.")
-            gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
-            fetch(repo)
-            commit = sha(repo, f"origin/{default}")
-            print(f"Merged PR #{pr} ({commit[:7]}).")
-        else:
-            tree = git(path, "rev-parse", f"{head}^{{tree}}")
-            commit = git(repo, "commit-tree", tree, "-p", base, "-p", head,
-                         "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
-            if has_origin(repo):
-                result = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
-                if result.returncode:
-                    raise Stop(f"Push to {default} was refused: {result.stderr.strip()}\n"
-                               f"If {default} moved on, run `task merge` again; if it is protected, "
-                               f"open a PR for {branch} first.")
+                    gh(repo, "pr", "create", "--head", branch, "--base", default,
+                       "--title", f"{task.id}{title}" if task.title else task.id,
+                       "--body", (path / ".work/report.md").read_text())
+                    pr = open_pr(repo, branch)
+                    if not pr:
+                        raise Stop("Opened a PR but could not find it again; rerun `task merge`.")
+                    print(f"Opened PR #{pr}.")
                 fetch(repo)
-            print(f"Merged {branch} into {default} as {commit[:7]}.")
-    print(update_local_default(repo, default, commit))
+                latest, _ = base_commit(repo, default)
+                if latest != base:
+                    print(f"{label} moved before PR merge; re-gating against the new tip.")
+                    continue
+                gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", lane_head)
+                completed_step(task, "published")
+                try:
+                    merge_info = json.loads(gh(repo, "pr", "view", pr, "--json", "mergeCommit"))
+                    pr_merge_commit = (merge_info.get("mergeCommit") or {}).get("oid")
+                except (json.JSONDecodeError, AttributeError):
+                    pr_merge_commit = None
+                if not pr_merge_commit:
+                    raise Stop(f"GitHub merged PR #{pr} but did not report its merge commit; inspect it before continuing.")
+                fetch(repo)
+                commit = sha(repo, f"origin/{default}")
+                first_parent = sha(repo, f"{pr_merge_commit}^1")
+                if first_parent != base:
+                    reason = (f"GitHub merged PR #{pr} on {first_parent[:7]}, not the gated base "
+                              f"{base[:7]}; publication did not match the gate.")
+                    atomic_json(archive / "exception.json", {"reason": reason, "time": utc_now(),
+                                                               "publication_mismatch": True,
+                                                               "gated_base": base,
+                                                               "actual_first_parent": first_parent})
+                    print(f"WARNING: {reason} Exception recorded; the published merge was not reverted.")
+                print(f"Merged PR #{pr} ({pr_merge_commit[:7]}) from reviewed head {lane_head[:7]}.")
+            else:
+                commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
+                             "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
+                if has_origin(repo):
+                    pushed = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
+                    if pushed.returncode:
+                        fetch(repo)
+                        latest, _ = base_commit(repo, default)
+                        if latest != base:
+                            print(f"{label} moved before publication; re-gating against the new tip.")
+                            continue
+                        raise Stop(f"Push to {default} was refused: {pushed.stderr.strip()}\n"
+                                   "Rerun `task merge`; the lane branch is unchanged and will be gated again.")
+                    fetch(repo)
+                    commit = sha(repo, f"origin/{default}")
+                completed_step(task, "published")
+                print(f"Merged {branch} into {default} as {commit[:7]} from reviewed head {lane_head[:7]}.")
+            break
+        else:
+            raise Stop(f"{default} kept moving during three gate attempts; rerun `task merge`.")
+    try:
+        review = json.loads((archive / "review.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        review = {}
+    if review:
+        print(f"Recorded review: {review.get('reviewer', '?')} {review.get('model', '?')} at "
+              f"{review.get('time', '?')} for {review.get('commit', '?')[:7]}.")
+    local_default_before = run_git(repo, "rev-parse", "--verify", "--quiet",
+                                   f"refs/heads/{default}").stdout.strip()
+    update_message = update_local_default(repo, default, commit)
+    print(update_message)
+    sync_dependencies_after_merge(repo, local_default_before, commit, update_message)
+    completed_step(task, "main updated")
+    report_path = path / ".work/report.md"
+    if report_path.is_file():
+        shutil.copy2(report_path, archive / "report.md")
+    check_log = path / ".work/check.log"
+    if check_log.is_file():
+        shutil.copy2(check_log, archive / "check.log")
+    completed_step(task, "archived")
     if args.keep:
         return 0
     leftovers = untracked(path) + ignored_leftovers(path)
@@ -513,12 +1224,12 @@ def merge(args):
         print(f"Kept {path}: it holds files that are not in the merge:\n" + "\n".join(leftovers))
         return 0
     git(repo, "worktree", "remove", "--force", str(path))
-    # The branch is in the merged commit (on origin when there is one), so deleting it loses nothing
-    # even when the local default branch could not be updated.
-    if is_ancestor(repo, branch, commit) and ok(repo, "branch", "-D", branch):
+    completed_step(task, "cleaned")
+    if is_ancestor(repo, lane_head, commit) and ok(repo, "branch", "-D", branch):
         print(f"Removed {path} and branch {branch}.")
     else:
         print(f"Removed {path}; branch {branch} kept (not fully in local {default}).")
+    task_event(task, "merge")
     return 0
 
 
@@ -528,15 +1239,74 @@ def close(args):
     before = task.file
     if before is None:
         raise Stop(f"No Backlog.md task {args.id} in {task.kb}.")
-    criteria = re.findall(r"(?m)^- \[[ x]\] #(\d+)", before.read_text())
-    command = ["backlog", "task", "edit", task.id, "-s", "Done", "--final-summary", args.message]
+    archive = task_state(task)
+    try:
+        record = json.loads((archive / "task.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        raise Stop("Close requires the pinned task record from `task start`.")
+    exception_path = archive / "exception.json"
+    try:
+        review = json.loads((archive / "review.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        if exception_path.is_file():
+            review = {}
+        else:
+            raise Stop("Close requires a recorded review, or an explicit merge exception.")
+    passed = {int(n) for n, verdict in review.get("judgments", {}).items() if verdict == "pass"}
+    criteria = [str(item["number"]) for item in record.get("criteria", []) if item["number"] in passed]
+    not_passed = [str(item["number"]) for item in record.get("criteria", []) if item["number"] not in passed]
+    if not_passed and not args.partial and not exception_path.is_file():
+        raise Stop("Cannot mark Done: criteria not passed in review: #" + ", #".join(not_passed) + ". Use --partial to keep In Progress.")
+    exception = exception_path.exists() or bool(record.get("no_verify"))
+    try:
+        failed_check = json.loads((archive / "check.json").read_text()).get("result") == "failed"
+    except (OSError, json.JSONDecodeError):
+        failed_check = False
+    exception = exception or failed_check
+    notes = HOME / ".local/state/task/notes.jsonl"
+    if notes.is_file():
+        exception = exception or any(
+            (item := json.loads(line)).get("repo") == repo.name and item.get("task") == task.id
+            and item.get("source") == "intervention"
+            for line in notes.read_text().splitlines() if line.strip())
+    if (exception or args.partial) and len(re.findall(
+            r"(?i)went well\s*[:/].*went wrong\s*[:/].*change\s*[:/]", args.retro)) == 0:
+        raise Stop("This task needs a three-part retro: went well / went wrong / change.")
+    status = "In Progress" if args.partial else "Done"
+    summary = args.message + "\n\nRetro: " + args.retro
+    if exception_path.is_file():
+        try:
+            exception_reason = json.loads(exception_path.read_text()).get("reason", "unspecified override")
+        except (OSError, json.JSONDecodeError):
+            exception_reason = "unspecified override"
+        summary += f"\n\nException: merge override — {exception_reason}"
+    command = ["backlog", "task", "edit", task.id, "-s", status, "--final-summary", summary]
     for number in criteria:
         command += ["--check-ac", number]
     result = subprocess.run(command, cwd=task.kb, capture_output=True, text=True)
     if result.returncode:
         raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
     after = task.file
+    recorded_review = archive / "review.md"
+    if recorded_review.is_file():
+        text = after.read_text()
+        if "## Review evidence" not in text:
+            text += "\n\n## Review evidence\n\n" + recorded_review.read_text().strip() + "\n"
+            after.write_text(text)
+    noticed = []
+    report = archive / "report.md"
+    if report.exists():
+        match = re.search(r"(?ms)^## Noticed, not done\s*\n(.*?)(?=^## |\Z)", report.read_text())
+        if match and match.group(1).strip().lower() not in {"(none)", "none", "-", "n/a"}:
+            noticed = [line.strip(" -*\t") for line in match.group(1).splitlines() if line.strip()]
+    if noticed:
+        improvements = task.kb / "improvements.md"
+        with improvements.open("a") as out:
+            for item in noticed:
+                out.write(f"\n- {utc_now()[:10]} | {task.id} | report | {item} | open\n")
     paths = sorted({str(p.relative_to(task.kb)) for p in (before, after) if p})
+    if noticed:
+        paths.append("improvements.md")
     git(task.kb, "add", "-A", "--", *paths)
     if ok(task.kb, "diff", "--cached", "--quiet", "--", *paths):
         print(f"{task.id} was already closed.")
@@ -550,28 +1320,289 @@ def close(args):
     return 0
 
 
+def note(args):
+    repo = resolve_repo(args.repo)
+    task = Task(repo, args.id)
+    if args.kind == "improve":
+        path = task.kb / "improvements.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as out:
+            out.write(f"\n- {utc_now()[:10]} | {task.id} | note | {args.text} | open\n")
+        print(f"Added improvement to {path}.")
+    else:
+        path = HOME / ".local/state/task/notes.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"time": utc_now(), "repo": repo.name, "task": task.id,
+                 "source": "intervention", "category": args.category or "", "text": args.text}
+        with path.open("a") as out:
+            out.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        print(f"Recorded intervention note in {path}.")
+    return 0
+
+
+def status(args):
+    repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
+    for repo in repos:
+        prune_stale_gate_worktrees(repo)
+        print(f"{repo.name}:")
+        attention = []
+        state_root = HOME / ".local/state/task" / repo.name
+        for path in sorted((repo / ".worktrees").glob("*")) if (repo / ".worktrees").is_dir() else []:
+            if path.name.startswith("."):
+                continue
+            if not real_worktree(repo, path):
+                continue
+            task = Task(repo, path.name)
+            state = task_state(task)
+            record = load_record(task, required=False)
+            head = sha(path, "HEAD")
+            branch = git(path, "branch", "--show-current")
+            check = {}
+            review_data = {}
+            for key, file in (("check", state / "check.json"), ("review", state / "review.json")):
+                try:
+                    data = json.loads(file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    data = {}
+                if key == "check": check = data
+                else: review_data = data
+            run = {}
+            try: run = json.loads((state / "run.json").read_text())
+            except (OSError, json.JSONDecodeError): pass
+            run_state = run.get("state", "")
+            lock_state = task_lock_status(task)
+            if lock_state == "interrupted":
+                run_state = "interrupted"
+            elif lock_state == "running" and run_state in {"foreground", "running"}:
+                run_state = "running"
+            if run_state == "running":
+                if run.get("state") == "running":
+                    try: os.killpg(int(run["pgid"]), 0)
+                    except (ProcessLookupError, OSError, KeyError, ValueError): run_state = "interrupted"
+            check_state = run_state if run_state in {"running", "interrupted"} else check.get("result", "missing")
+            run_label = (f"merge {run_state}" if run.get("command") == "merge" and run_state
+                         else f"check={check_state}@{check.get('sha', '?')[:7]}")
+            report = (path / ".work/report.md").is_file()
+            last = int(git(path, "log", "-1", "--format=%ct", "HEAD") or os.stat(path).st_mtime)
+            try:
+                events = json.loads((state / "events.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                events = {}
+            for stamp in events.values():
+                try: last = max(last, int(datetime.fromisoformat(stamp).timestamp()))
+                except (ValueError, TypeError): pass
+            idle = max(0, int(time.time() - last))
+            idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
+            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} head={head[:7]} "
+                  f"{run_label} "
+                  f"review={review_data.get('verdict', 'missing')} "
+                  f"{'matches' if review_data.get('commit') == head else 'stale'} "
+                  f"report={'present' if report else 'missing'} idle={idle_label} branch={branch}")
+            if (state / "exception.json").is_file():
+                attention.append(f"{path.name}: exception")
+            if check.get("result") == "failed":
+                attention.append(f"{path.name}: failed check")
+            if review_data.get("verdict") == "FAIL":
+                attention.append(f"{path.name}: FAIL review")
+            elif review_data and review_data.get("commit") != head:
+                attention.append(f"{path.name}: stale review")
+            if run_state == "interrupted":
+                attention.append(f"{path.name}: interrupted run (log: {path / '.work/run.log'})")
+            elif run_state in {"failed", "cancelled"}:
+                attention.append(f"{path.name}: {run.get('command', 'check')} {run_state} "
+                                 f"(log: {path / '.work/run.log'})")
+        if state_root.is_dir():
+            for state in sorted(item for item in state_root.iterdir() if item.is_dir()):
+                if (state / "exception.json").is_file() and not any(state.name in entry for entry in attention):
+                    attention.append(f"{state.name}: exception")
+        improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
+        open_count = 0
+        if improvements.is_file():
+            open_count = sum(bool(re.search(r"\|\s*open\s*$", line, re.I))
+                             for line in improvements.read_text().splitlines())
+        print("  Needs attention:")
+        for item in attention:
+            print(f"    {item}")
+        print(f"    open improvements: {open_count}")
+    return 0
+
+
+def denials(args):
+    path = HOME / ".local/state/agent-policy/denials.jsonl"
+    cutoff = time.time() - args.days * 86400
+    totals = {}
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            try:
+                item = json.loads(line)
+                stamp = datetime.fromisoformat(item["time"]).timestamp()
+                if stamp >= cutoff: totals[item.get("rule_id", "unknown")] = totals.get(item.get("rule_id", "unknown"), 0) + 1
+            except (ValueError, KeyError, json.JSONDecodeError):
+                continue
+    for rule, count in sorted(totals.items()): print(f"{rule}: {count}")
+    if not totals: print("No denials in range.")
+    return 0
+
+
+def cancel(args):
+    repo = resolve_repo(args.repo)
+    prune_stale_gate_worktrees(repo)
+    task = Task(repo, args.id)
+    run_path = task_state(task) / "run.json"
+    try: run = json.loads(run_path.read_text())
+    except (OSError, json.JSONDecodeError): raise Stop("No detached run to cancel.")
+    lock = run_path.parent / "run.lock"
+    lock_state = task_lock_status(task)
+    if run.get("state") in {"running", "foreground"} and not lock_state:
+        pid = run.get("pid") or run.get("pgid")
+        if not pid_alive(pid):
+            run["state"] = "interrupted"
+            run["ended_at"] = run.get("ended_at") or utc_now()
+            atomic_json(run_path, run)
+    if run.get("state") == "interrupted" or lock_state == "interrupted":
+        lock.unlink(missing_ok=True)
+        run["state"] = "interrupted"
+        run["ended_at"] = run.get("ended_at") or utc_now()
+        atomic_json(run_path, run)
+        prune_stale_gate_worktrees(repo)
+        print("Cleared interrupted run lock.")
+        return 0
+    if run.get("state") not in {"running", "foreground"} or lock_state != "running":
+        raise Stop(f"Run is {run.get('state', 'unknown')}; nothing is running to cancel.")
+    child_pgid = 0
+    try:
+        lock_record = json.loads(lock.read_text())
+        child_pgid = int(lock_record.get("child_pgid", 0))
+        if child_pgid:
+            os.killpg(child_pgid, signal.SIGTERM)
+        if run.get("state") == "running":
+            os.killpg(int(run["pgid"]), signal.SIGTERM)
+        else:
+            os.kill(int(run["pid"]), signal.SIGTERM)
+    except (ProcessLookupError, OSError, KeyError, ValueError): pass
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if run.get("state") == "running":
+            try: os.killpg(int(run["pgid"]), 0)
+            except (ProcessLookupError, OSError, KeyError, ValueError): break
+        elif not pid_alive(run.get("pid")):
+            break
+        time.sleep(0.05)
+    else:
+        try:
+            if child_pgid:
+                os.killpg(child_pgid, signal.SIGKILL)
+            if run.get("state") == "running":
+                os.killpg(int(run["pgid"]), signal.SIGKILL)
+            else:
+                os.kill(int(run["pid"]), signal.SIGKILL)
+        except (ProcessLookupError, OSError, KeyError, ValueError): pass
+    run["state"] = "cancelled"
+    run["ended_at"] = utc_now()
+    atomic_json(run_path, run)
+    (run_path.parent / "run.lock").unlink(missing_ok=True)
+    prune_stale_gate_worktrees(repo)
+    print("Cancelled task run.")
+    return 0
+
+
 def main(argv=None):
+    global ACTIVE_FOREGROUND_TASK
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("start", "merge", "close"):
+    for name in ("start", "merge", "close", "review", "cancel"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
         sub.add_argument("id")
+        if name == "start":
+            sub.add_argument("--builder", choices=("codex", "claude"), required=True)
+            sub.add_argument("--refresh", action="store_true")
+            sub.add_argument("--no-verify", metavar="REASON")
         if name == "merge":
             sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
+            sub.add_argument("--override", metavar="REASON")
+            sub.add_argument("--detach", action="store_true")
         if name == "close":
             sub.add_argument("-m", "--message", required=True, help="final summary")
+            sub.add_argument("--retro", required=True)
+            sub.add_argument("--partial", action="store_true")
+        if name == "review":
+            sub.add_argument("--record", metavar="FILE")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
+    sub.add_argument("--detach", action="store_true")
+    sub = commands.add_parser("note")
+    sub.add_argument("repo")
+    sub.add_argument("id")
+    sub.add_argument("kind", choices=("improve", "intervention"))
+    sub.add_argument("text", nargs="+")
+    sub = commands.add_parser("status")
+    sub.add_argument("repo", nargs="?")
+    sub = commands.add_parser("denials")
+    sub.add_argument("--days", type=int, default=30)
     args = parser.parse_args(argv)
     if args.command == "check":
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
     try:
-        return {"start": start, "check": check, "merge": merge, "close": close}[args.command](args) or 0
+        if args.command == "note":
+            if args.kind == "intervention" and args.text[0] in "ABCDEFGH" and len(args.text) > 1:
+                args.category = args.text.pop(0)
+            else:
+                args.category = ""
+            args.text = " ".join(args.text)
+        if args.command in {"check", "merge"} and args.detach:
+            if args.command == "check":
+                if args.id is None:
+                    path = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+                    repo = main_repo(path)
+                    task = Task(repo, path.name)
+                else:
+                    repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+                    task = Task(repo, args.id)
+                    path = task.worktree()
+            else:
+                repo = resolve_repo(args.repo)
+                task = Task(repo, args.id)
+                path = task.worktree()
+            return detached(args, task, path)
+        lock = foreground_lock(args)
+        if lock:
+            signal.signal(signal.SIGHUP, handle_interruption)
+            signal.signal(signal.SIGTERM, handle_interruption)
+        elif os.environ.get("TASK_RUN_RECORD") and args.command in {"check", "merge"}:
+            if args.command == "merge":
+                ACTIVE_FOREGROUND_TASK = Task(resolve_repo(args.repo), args.id)
+            elif args.id is not None:
+                repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
+                ACTIVE_FOREGROUND_TASK = Task(repo, args.id)
+            else:
+                top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+                ACTIVE_FOREGROUND_TASK = Task(main_repo(top), top.name)
+            signal.signal(signal.SIGHUP, handle_interruption)
+            signal.signal(signal.SIGTERM, handle_interruption)
+        result = 1
+        try:
+            result = {"start": start, "check": check, "merge": merge, "close": close,
+                      "review": review, "cancel": cancel, "note": note, "status": status,
+                      "denials": denials}[args.command](args) or 0
+        finally:
+            if lock:
+                run_path = lock.parent / "run.json"
+                try: run = json.loads(run_path.read_text())
+                except (OSError, json.JSONDecodeError): run = {}
+                if run.get("pid") == os.getpid() and run.get("state") == "foreground":
+                    run["state"] = "passed" if result == 0 else "failed"
+                    run["ended_at"] = utc_now()
+                    atomic_json(run_path, run)
+                lock.unlink(missing_ok=True)
+                ACTIVE_FOREGROUND_TASK = None
+        finish_detached(result)
+        return result
     except Stop as stop:
+        finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1
 
