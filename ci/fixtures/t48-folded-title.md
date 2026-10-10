@@ -17,3 +17,7 @@ dependencies:
   - T-46
   - T-47
 ---
+
+## Acceptance Criteria
+
+- [ ] #1 Household location, module settings, contracts, export, and delete are covered.
