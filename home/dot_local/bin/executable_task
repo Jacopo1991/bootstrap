@@ -59,6 +59,44 @@ class Stop(Exception):
     """A clear, expected reason to stop; printed without a traceback."""
 
 
+def frontmatter_title(text):
+    """Read a title from the small YAML frontmatter subset used by Backlog tasks."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    end = next((index for index in range(1, len(lines))
+                if lines[index].strip() in {"---", "..."}), len(lines))
+    for index, line in enumerate(lines[1:end], 1):
+        match = re.match(r"^(\s*)title:[ \t]*(.*?)[ \t]*$", line)
+        if not match:
+            continue
+        indent, scalar = match.groups()
+        if scalar in {">", ">-", "|", "|-"}:
+            content = []
+            key_indent = len(indent)
+            for continuation in lines[index + 1:end]:
+                leading = len(continuation) - len(continuation.lstrip(" \t"))
+                if continuation.strip() and leading <= key_indent:
+                    break
+                content.append(continuation)
+            indents = [len(value) - len(value.lstrip(" \t")) for value in content if value.strip()]
+            content_indent = min(indents) if indents else key_indent + 1
+            value_lines = [value[content_indent:] if value.strip() else "" for value in content]
+            value = "\n".join(value_lines)
+            if scalar.startswith(">"):
+                value = re.sub(r"(?<=[^\n])\n(?=[^\n])", " ", value)
+            return value.rstrip("\n")
+        if len(scalar) >= 2 and scalar[0] == scalar[-1] == "'":
+            return scalar[1:-1].replace("''", "'")
+        if len(scalar) >= 2 and scalar[0] == scalar[-1] == '"':
+            try:
+                return json.loads(scalar)
+            except json.JSONDecodeError:
+                return scalar[1:-1]
+        return scalar
+    return ""
+
+
 def run_git(cwd, *args):
     return subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(cwd), *args],
                           capture_output=True, text=True)
@@ -170,8 +208,7 @@ class Task:
             self.name = f"t{self.number}"
             self.id = f"T-{self.number}"
             if self.file:
-                front = re.search(r"(?m)^title:\s*['\"]?(.*?)['\"]?\s*$", self.file.read_text())
-                self.title = front.group(1) if front else ""
+                self.title = frontmatter_title(self.file.read_text())
         else:
             if (not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{0,79}", ident)
                     or any(part in {"", ".", ".."} for part in ident.split("/"))):
@@ -1093,6 +1130,132 @@ def open_pr(repo, branch):
     return result.stdout.strip()
 
 
+class ReviewParseError(ValueError):
+    """A review reply is malformed or contains ambiguous criterion judgments."""
+
+
+def normalize_review_line(line):
+    """Remove common Markdown presentation while preserving review text and list numbering."""
+    line = line.rstrip()
+    line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+    table_number = None
+    table_judgment = None
+    table_evidence = None
+    if "|" in line:
+        cells = [part.strip() for part in line.strip().strip("|").split("|")]
+        first = re.fullmatch(r"#?(\d+)", cells[0]) if cells else None
+        table_number = int(first.group(1)) if first else None
+        if table_number is not None and len(cells) > 1:
+            judgment = re.fullmatch(r"(pass|fail|unclear)", cells[1], re.I)
+            if judgment:
+                table_judgment = judgment.group(1).lower()
+                table_evidence = " ".join(cells[2:]).strip()
+        line = " ".join(cells)
+    numbered = re.match(r"^\s*(\d+)[.)]\s+", line)
+    line = re.sub(r"^\s*(?:[-*+]\s+)+", "", line)
+    line = re.sub(r"^\s*\d+[.)]\s+", "", line)
+    line = line.replace("`", "").replace("**", "").replace("__", "")
+    line = line.replace("*", "")
+    line = re.sub(r"(?<!\w)_|_(?!\w)", "", line)
+    return (line.strip(), int(numbered.group(1)) if numbered else None, table_number,
+            table_judgment, table_evidence)
+
+
+def parse_review_block(block, criteria):
+    """Parse the exact plain-text fields in a fenced `review` block."""
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if len(lines) < 3:
+        raise ReviewParseError("review block must contain verdict, commit, and reviewer lines")
+    verdict_match = re.fullmatch(r"Verdict: (PASS|FAIL)", lines[0])
+    commit_match = re.fullmatch(r"Commit: ([0-9a-f]{40})", lines[1])
+    reviewer_match = re.fullmatch(r"Reviewer: (codex|claude) (.+)", lines[2])
+    if not verdict_match:
+        raise ReviewParseError("review block must start with `Verdict: PASS` or `Verdict: FAIL`")
+    if not commit_match:
+        raise ReviewParseError("review block must contain a full 40-character Commit SHA")
+    if not reviewer_match:
+        raise ReviewParseError("review block must contain `Reviewer: <vendor> <model>`")
+    required = set(criteria)
+    judgments = {}
+    for line in lines[3:]:
+        match = re.fullmatch(r"#(\d+) (pass|fail|unclear): (.+)", line)
+        if not match:
+            raise ReviewParseError("review block contains a malformed or Markdown criterion line")
+        number, judgment, evidence = int(match.group(1)), match.group(2), match.group(3)
+        if number in judgments:
+            raise ReviewParseError(f"duplicate judgment for criterion #{number}")
+        if number not in required:
+            raise ReviewParseError(f"review block includes unpinned criterion #{number}")
+        if not evidence.strip():
+            raise ReviewParseError(f"review block has no evidence for criterion #{number}")
+        judgments[number] = (judgment, evidence)
+    if required != set(judgments):
+        raise ReviewParseError("every pinned criterion must have exactly one judgment")
+    return verdict_match.group(1), commit_match.group(1), (reviewer_match.group(1), reviewer_match.group(2)), judgments
+
+
+def review_block(text):
+    """Return the first review block, or None only when no review fence was supplied."""
+    opening = re.search(r"(?m)^```review[ \t]*\r?\n", text)
+    if not opening:
+        return None
+    closing = re.search(r"(?m)^```[ \t]*$", text[opening.end():])
+    if not closing:
+        raise ReviewParseError("review block is missing its closing fence")
+    return text[opening.end():opening.end() + closing.start()]
+
+
+def parse_review_reply(text, criteria):
+    """Prefer a strict fenced block; otherwise parse common Markdown reviewer replies."""
+    block = review_block(text)
+    if block is not None:
+        return parse_review_block(block, criteria)
+    lines = [normalize_review_line(line) for line in text.splitlines()]
+    verdict = next((match.group(1).upper() for line, _, _, _, _ in lines
+                    if (match := re.match(r"Verdict\s*:\s*(PASS|FAIL)\b", line, re.I))), None)
+    commit = next((match.group(1) for line, _, _, _, _ in lines
+                   if (match := re.fullmatch(r"Commit\s*:\s*([0-9a-f]{7,40})", line, re.I))), None)
+    reviewer = None
+    for line, _, _, _, _ in lines:
+        reviewer = re.fullmatch(r"Reviewer\s*:\s*(codex|claude)\s+(.+)", line, re.I)
+        if reviewer:
+            reviewer = (reviewer.group(1), reviewer.group(2))
+            break
+    judgments = {}
+    required = set(criteria)
+    has_hash_criterion_lines = any(re.match(r"#\d+\b", line) for line, _, _, _, _ in lines)
+    for line, number, table_number, table_judgment, table_evidence in lines:
+        explicit = re.fullmatch(r"#(\d+)\s*:?[\s|]+(pass|fail|unclear)\s*:?\s*(.*)", line, re.I)
+        if explicit:
+            n, verdict_value, evidence = int(explicit.group(1)), explicit.group(2), explicit.group(3)
+            if n in required:
+                if n in judgments:
+                    raise ReviewParseError(f"duplicate judgment for criterion #{n}")
+                judgments[n] = (verdict_value.lower(), evidence.strip())
+            continue
+        criterion_number = (number or table_number) if not has_hash_criterion_lines else None
+        if criterion_number in required:
+            if table_number is not None:
+                if table_judgment is not None:
+                    if criterion_number in judgments:
+                        raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
+                    judgments[criterion_number] = (table_judgment, table_evidence or "")
+                continue
+            item = re.fullmatch(
+                r"(?:\d+\s+)?(pass|fail|unclear)(?=$|:|,|\s+[-—]\s)(.*)", line, re.I)
+            if item:
+                remainder = item.group(2)
+                if remainder.startswith((":", ",")):
+                    evidence = remainder[1:].strip()
+                else:
+                    dash = re.match(r"\s+[—–-]\s+(.*)", remainder)
+                    evidence = dash.group(1).strip() if dash else remainder.strip()
+                if criterion_number in judgments:
+                    raise ReviewParseError(f"duplicate judgment for criterion #{criterion_number}")
+                judgments[criterion_number] = (item.group(1).lower(), evidence)
+    return verdict, commit, reviewer, judgments
+
+
 def review(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
@@ -1122,15 +1285,21 @@ def review(args):
         else:
             prompt.append("Criteria: none; judge the stated request above against the diff.")
         prompt.append(f"Diff range: {record['base_sha']}..{head}")
-        prompt.append("Reviewer instructions: read-only review; use `git --no-optional-locks diff`, "
+        prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
+                      "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
         if record["criteria"]:
             prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
         else:
             prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
-        prompt.append("Return: Verdict: PASS|FAIL; Commit: <sha>; Reviewer: codex|claude <model>; one line per criterion:")
+        prompt.append("Return exactly this final fenced block, with plain text only inside it:")
+        prompt.append("```review")
+        prompt.append("Verdict: PASS|FAIL")
+        prompt.append("Commit: <full sha>")
+        prompt.append("Reviewer: <vendor> <model>")
         for item in record["criteria"]:
-            prompt.append(f"#{item['number']} pass|fail|unclear: <evidence>")
+            prompt.append(f"#{item['number']} pass|fail|unclear: <one line of evidence>")
+        prompt.append("```")
         prompt.append("Then list findings.")
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
@@ -1140,10 +1309,13 @@ def review(args):
         prompt_file.write_text(prompt_text)
         reply_file.unlink(missing_ok=True)
         print(prompt_text, end="")
+        add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         if record["builder"] == "codex":
-            command = "claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'"
+            command = (f"claude -p {add_dir}--permission-mode dontAsk --model haiku --effort high "
+                       "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
         else:
-            command = "GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -"
+            command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+                       "-m gpt-6-luna -c model_reasoning_effort=high -")
         print("Headless reviewer command (run from the task worktree):")
         print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
         print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
@@ -1152,32 +1324,29 @@ def review(args):
         text = Path(args.record).read_text()
     except OSError as error:
         raise Stop(f"Cannot read review file {args.record}: {error}.")
-    verdict = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Verdict(?::\*\*|:)\s*"
-                        r"(?:\*\*)?(PASS|FAIL)(?:\*\*)?\s*$", text)
-    commit = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Commit:\s*`?"
-                       r"([0-9a-f]{7,40})`?(?:\*\*)?\s*$", text)
-    reviewer = re.search(r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Reviewer:\s*(codex|claude)\s+(.+?)(?:\*\*)?\s*$", text)
-    judgments = {int(n): (v, evidence.strip()) for n, v, evidence in re.findall(
-        r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?#(\d+)\s+(pass|fail|unclear):\s*(.+?)\s*$", text)}
+    required = {item["number"] for item in record["criteria"]}
+    try:
+        verdict, commit, reviewer, judgments = parse_review_reply(text, required)
+    except ReviewParseError as error:
+        raise Stop(f"Review rejected: {error}.")
     problems = []
     if not verdict: problems.append("missing Verdict: PASS|FAIL")
     resolved_review = None
     if commit:
-        matches = run_git(path, "rev-parse", "--verify", f"{commit.group(1)}^{{commit}}")
-        if matches.returncode == 0 and matches.stdout.strip().startswith(commit.group(1)):
+        matches = run_git(path, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if matches.returncode == 0 and matches.stdout.strip().startswith(commit):
             resolved_review = matches.stdout.strip()
     if resolved_review != head: problems.append("Commit does not match the current lane head")
     if not reviewer: problems.append("missing Reviewer: codex|claude <model>")
-    elif reviewer.group(1) == record["builder"]: problems.append("reviewer vendor must differ from builder")
-    required = {item["number"] for item in record["criteria"]}
+    elif reviewer[0].lower() == record["builder"]: problems.append("reviewer vendor must differ from builder")
     if required != set(judgments): problems.append("every pinned criterion must have exactly one judgment")
     if any(not evidence for _, evidence in judgments.values()): problems.append("every judgment needs evidence")
     if problems:
         raise Stop("Review rejected: " + "; ".join(problems) + ".")
     state = task_state(task)
     (state / "review.md").write_text(text)
-    meta = {"verdict": verdict.group(1).upper(), "commit": head, "reviewer": reviewer.group(1).lower(),
-            "model": reviewer.group(2), "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
+    meta = {"verdict": verdict, "commit": head, "reviewer": reviewer[0].lower(),
+            "model": reviewer[1], "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
             "record_revision": record["revision"], "time": utc_now()}
     atomic_json(state / "review.json", meta)
     task_event(task, "review")
