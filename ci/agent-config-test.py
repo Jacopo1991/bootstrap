@@ -16,6 +16,22 @@ for name in [name for name in os.environ if name.startswith("GIT_")]:
 
 ROOT = Path(__file__).resolve().parents[1]
 assert (ROOT / ".chezmoiroot").read_text(encoding="utf-8").strip() == "home"
+desktop_package = json.loads((ROOT / "home/dot_local/share/bootstrap/npm/package.json").read_text())
+desktop_lock = json.loads((ROOT / "home/dot_local/share/bootstrap/npm/package-lock.json").read_text())
+desktop_launcher = (ROOT / "home/dot_local/bin/executable_agentdev-shell-mcp").read_text()
+assert desktop_package["dependencies"]["@wonderwhy-er/desktop-commander"] == "0.2.52"
+assert desktop_lock["packages"]["node_modules/@wonderwhy-er/desktop-commander"]["version"] == "0.2.52"
+assert "@wonderwhy-er/desktop-commander" in desktop_launcher and "@latest" not in desktop_launcher
+windows_config_refs = []
+for source in (ROOT / "windows", ROOT / "home"):
+    for path in source.rglob("*"):
+        if path.is_file() and path.suffix in {".ps1", ".sh", ".json", ".tmpl", ".toml"}:
+            try:
+                if "claude_desktop_config" in path.read_text(encoding="utf-8"):
+                    windows_config_refs.append(str(path.relative_to(ROOT)))
+            except UnicodeDecodeError:
+                pass
+assert not windows_config_refs, f"bootstrap unexpectedly manages Windows Claude Desktop config: {windows_config_refs}"
 codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="utf-8"))
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
