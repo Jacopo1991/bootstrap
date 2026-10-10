@@ -639,8 +639,9 @@ def start(args):
           f".worktrees/{task.name} on branch {branch}.")
     if task.file:
         print(f"Task: {task.file}")
-    print("Verify with `task check` from that folder; complete .work/report.md, commit on the branch, "
-          "and report that the report is written. For long gates, the PM can use `task merge --detach`.")
+    print("Commit on the branch, then run `task check` from that folder, then fill `.work/report.md`; "
+          "any later commit needs a new check. Report that the report is written. "
+          "For long gates, the PM can use `task merge --detach`.")
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None):
@@ -922,142 +923,6 @@ def merge_gate(task, path, head):
     if missing:
         raise Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
     return record
-
-
-def merge(args):
-    repo = resolve_repo(args.repo)
-    task = Task(repo, args.id)
-    print(f"For long gates, use `task merge {args.repo} {task.id} --detach` and track it with `task status`.")
-    if task.path.exists():
-        path = task.worktree()
-    else:
-        archived = task_state(task)
-        try:
-            checked = json.loads((archived / "check.json").read_text())
-        except (OSError, json.JSONDecodeError):
-            raise Stop(f"No worktree {task.path}; start it with `task start`.")
-        fetch(repo)
-        default = default_branch(repo)
-        base, label = base_commit(repo, default)
-        if checked.get("sha") and is_ancestor(repo, checked["sha"], base):
-            print(f"{task.id} is already merged in {label}; archived run is resumable and complete.")
-            return 0
-        raise Stop(f"No worktree {task.path}; archived evidence does not show the task merged.")
-    branch = git(path, "branch", "--show-current")
-    if not branch:
-        raise Stop(f"{path} is not on a branch.")
-    changes = untracked(path)
-    if changes:
-        raise Stop("The worktree has uncommitted or untracked files; the lane commits or deletes "
-                   "them first:\n" + "\n".join(changes))
-    record = load_record(task)
-    lane_head = sha(path, "HEAD")
-    try:
-        merge_gate(task, path, lane_head)
-    except Stop:
-        if not args.override:
-            raise
-        state = task_state(task)
-        atomic_json(state / "exception.json", {"reason": args.override, "time": utc_now(),
-                                                "missing_gate": True})
-        print(f"exception: merge gate overridden: {args.override}")
-    default = default_branch(repo)
-    fetch(repo)
-    base, label = base_commit(repo, default)
-    if is_ancestor(repo, sha(path, "HEAD"), base):
-        print(f"{branch} is already in {label}.")
-        commit = base
-    else:
-        before = sha(path, "HEAD")
-        old_base = record.get("base_sha")
-        lane_files = set(git(path, "diff", "--name-only", old_base, before).splitlines()) if old_base else set()
-        base_files = set(git(path, "diff", "--name-only", old_base, base).splitlines()) if old_base else set()
-        overlap = sorted(lane_files & base_files)
-        if not is_ancestor(path, base, before):
-            result = run_git(path, "merge", "-q", "--no-edit", "-m", f"Merge {label} into {branch}", base)
-            if result.returncode:
-                run_git(path, "merge", "--abort")
-                raise Stop(f"{label} does not merge cleanly into {branch}; the lane resolves it:\n"
-                           + (result.stdout + result.stderr).strip())
-            print(f"Merged {label} into {branch}.")
-        if sha(path, "HEAD") != before:
-            completed_step(task, "integrated")
-        head = sha(path, "HEAD")
-        passed = run_check(path, base, record, task_state(task))
-        if sha(path, "HEAD") != head:
-            raise Stop("The lane committed while the check ran; nothing merged. Run `task merge` "
-                       "again once the lane has finished.")
-        created = untracked(path)
-        if created:
-            raise Stop("Nothing merged: after the check the worktree has files that are not committed "
-                       "or ignored. If the check creates them, ignore them in .gitignore:\n"
-                       + "\n".join(created))
-        if not passed:
-            if head != before:
-                run_git(path, "reset", "-q", "--keep", before)
-            raise Stop("Check failed; nothing merged and the branch is as the lane left it.")
-        completed_step(task, "gate")
-        if overlap:
-            raise Stop("Default branch commits touched lane files after the review (" + ", ".join(overlap)
-                       + "); review the integrated head with `task review` before merging.")
-        title = f": {task.title}" if task.title else ""
-        if on_github(repo):
-            # GitHub repositories take changes through a PR (rulesets); open one when needed and
-            # merge it pinned to the commit that was just checked.
-            git(repo, "push", "-q", "origin", f"{head}:refs/heads/{branch}")
-            pr = open_pr(repo, branch)
-            if not pr:
-                gh(repo, "pr", "create", "--head", branch, "--base", default,
-                   "--title", f"{task.id}{title}" if task.title else task.id,
-                   "--body", (path / ".work/report.md").read_text())
-                pr = open_pr(repo, branch)
-                if not pr:
-                    raise Stop("Opened a PR but could not find it again; merge it on GitHub.")
-                print(f"Opened PR #{pr}.")
-            gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
-            completed_step(task, "PR merged")
-            fetch(repo)
-            commit = sha(repo, f"origin/{default}")
-            print(f"Merged PR #{pr} ({commit[:7]}).")
-        else:
-            tree = git(path, "rev-parse", f"{head}^{{tree}}")
-            commit = git(repo, "commit-tree", tree, "-p", base, "-p", head,
-                         "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
-            if has_origin(repo):
-                result = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
-                if result.returncode:
-                    raise Stop(f"Push to {default} was refused: {result.stderr.strip()}\n"
-                               f"If {default} moved on, run `task merge` again; if it is protected, "
-                               f"open a PR for {branch} first.")
-                fetch(repo)
-            completed_step(task, "PR merged")
-            print(f"Merged {branch} into {default} as {commit[:7]}.")
-    print(update_local_default(repo, default, commit))
-    completed_step(task, "main updated")
-    archive = task_state(task)
-    archive.mkdir(parents=True, exist_ok=True)
-    report_path = path / ".work/report.md"
-    if report_path.is_file():
-        shutil.copy2(report_path, archive / "report.md")
-    check_log = path / ".work/check.log"
-    if check_log.is_file():
-        shutil.copy2(check_log, archive / "check.log")
-    completed_step(task, "archived")
-    if args.keep:
-        return 0
-    leftovers = untracked(path) + ignored_leftovers(path)
-    if leftovers:
-        print(f"Kept {path}: it holds files that are not in the merge:\n" + "\n".join(leftovers))
-        return 0
-    git(repo, "worktree", "remove", "--force", str(path))
-    completed_step(task, "cleaned")
-    # The branch is in the merged commit (on origin when there is one), so deleting it loses nothing
-    # even when the local default branch could not be updated.
-    if is_ancestor(repo, branch, commit) and ok(repo, "branch", "-D", branch):
-        print(f"Removed {path} and branch {branch}.")
-    else:
-        print(f"Removed {path}; branch {branch} kept (not fully in local {default}).")
-    return 0
 
 
 def overlap_files(repo: Path, lane_head: str, base: str):
