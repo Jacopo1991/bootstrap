@@ -1242,7 +1242,7 @@ def parse_review_reply(text, criteria):
                     judgments[criterion_number] = (table_judgment, table_evidence or "")
                 continue
             item = re.fullmatch(
-                r"(?:\d+\s+)?(pass|fail|unclear)(?=$|:|,|\s)(.*)", line, re.I)
+                r"(?:\d+\s+)?(pass|fail|unclear)(?=$|:|,|\s+[-—]\s)(.*)", line, re.I)
             if item:
                 remainder = item.group(2)
                 if remainder.startswith((":", ",")):

@@ -1703,9 +1703,14 @@ Commit: abcdef0123456789
 Reviewer: codex gpt-6-luna
 1. Fail-safe default is missing
 2. fail
+3. Fail safe default is missing
+4. Pass criteria are met
+5. pass: colon evidence
+6. fail — spaced dash evidence
 """
-        _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2])
-        self.assertEqual(judgments, {2: ("fail", "")})
+        _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2, 3, 4, 5, 6])
+        self.assertEqual(judgments, {2: ("fail", ""), 5: ("pass", "colon evidence"),
+                                     6: ("fail", "spaced dash evidence")})
 
     def test_haiku3_fenced_fixture_records_fail_without_criteria(self):
         fixture = REVIEW_FIXTURES / "haiku-3-fenced.md"
