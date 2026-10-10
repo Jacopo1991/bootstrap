@@ -7,7 +7,7 @@ boundary against code running as that user.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
   task check [[<repo>] <id>] [--detach]
-  task review <repo> <id> [--request <file>] [--record <file>]
+  task review <repo> <id> [--request <file>] [--record <file>] [--reviewer <vendor> <model>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial]
@@ -1164,20 +1164,25 @@ def normalize_review_line(line):
 def parse_review_block(block, criteria):
     """Parse the exact plain-text fields in a fenced `review` block."""
     lines = [line.strip() for line in block.splitlines() if line.strip()]
-    if len(lines) < 3:
-        raise ReviewParseError("review block must contain verdict, commit, and reviewer lines")
+    if len(lines) < 2:
+        raise ReviewParseError("review block must contain verdict and commit lines")
     verdict_match = re.fullmatch(r"Verdict: (PASS|FAIL)", lines[0])
     commit_match = re.fullmatch(r"Commit: ([0-9a-f]{40})", lines[1])
-    reviewer_match = re.fullmatch(r"Reviewer: (codex|claude) (.+)", lines[2])
     if not verdict_match:
         raise ReviewParseError("review block must start with `Verdict: PASS` or `Verdict: FAIL`")
     if not commit_match:
         raise ReviewParseError("review block must contain a full 40-character Commit SHA")
-    if not reviewer_match:
-        raise ReviewParseError("review block must contain `Reviewer: <vendor> <model>`")
+    reviewer = None
+    judgment_lines = lines[2:]
+    reviewer_match = (re.fullmatch(r"Reviewer:\s*(.*)", judgment_lines[0], re.I)
+                      if judgment_lines else None)
+    if reviewer_match:
+        words = reviewer_match.group(1).split(None, 1)
+        reviewer = (words[0], words[1] if len(words) > 1 else "") if words else ("", "")
+        judgment_lines = judgment_lines[1:]
     required = set(criteria)
     judgments = {}
-    for line in lines[3:]:
+    for line in judgment_lines:
         match = re.fullmatch(r"#(\d+) (pass|fail|unclear): (.+)", line)
         if not match:
             raise ReviewParseError("review block contains a malformed or Markdown criterion line")
@@ -1191,7 +1196,7 @@ def parse_review_block(block, criteria):
         judgments[number] = (judgment, evidence)
     if required != set(judgments):
         raise ReviewParseError("every pinned criterion must have exactly one judgment")
-    return verdict_match.group(1), commit_match.group(1), (reviewer_match.group(1), reviewer_match.group(2)), judgments
+    return verdict_match.group(1), commit_match.group(1), reviewer, judgments
 
 
 def review_block(text):
@@ -1217,9 +1222,10 @@ def parse_review_reply(text, criteria):
                    if (match := re.fullmatch(r"Commit\s*:\s*([0-9a-f]{7,40})", line, re.I))), None)
     reviewer = None
     for line, _, _, _, _ in lines:
-        reviewer = re.fullmatch(r"Reviewer\s*:\s*(codex|claude)\s+(.+)", line, re.I)
+        reviewer = re.fullmatch(r"Reviewer\s*:\s*(.*)", line, re.I)
         if reviewer:
-            reviewer = (reviewer.group(1), reviewer.group(2))
+            words = reviewer.group(1).split(None, 1)
+            reviewer = (words[0], words[1] if len(words) > 1 else "") if words else ("", "")
             break
     judgments = {}
     required = set(criteria)
@@ -1272,6 +1278,10 @@ def review(args):
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
+        reviewer_route = (("claude", "haiku") if record["builder"] == "codex"
+                          else ("codex", "gpt-6-luna"))
+        if reviewer_route[0] == record["builder"]:
+            raise Stop("reviewer vendor must differ from builder")
         prompt = [f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
         if request_text:
@@ -1296,7 +1306,6 @@ def review(args):
         prompt.append("```review")
         prompt.append("Verdict: PASS|FAIL")
         prompt.append("Commit: <full sha>")
-        prompt.append("Reviewer: <vendor> <model>")
         for item in record["criteria"]:
             prompt.append(f"#{item['number']} pass|fail|unclear: <one line of evidence>")
         prompt.append("```")
@@ -1304,6 +1313,7 @@ def review(args):
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)
+        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1]})
         prompt_file = state / "review-prompt.md"
         reply_file = state / "review-response.md"
         prompt_file.write_text(prompt_text)
@@ -1331,22 +1341,37 @@ def review(args):
         raise Stop(f"Review rejected: {error}.")
     problems = []
     if not verdict: problems.append("missing Verdict: PASS|FAIL")
+    state = task_state(task)
+    try:
+        route = json.loads((state / "review-routing.json").read_text())
+        routed_reviewer = (route["vendor"], route["model"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        routed_reviewer = None
+    if routed_reviewer is None:
+        routed_reviewer = tuple(args.reviewer) if args.reviewer else None
+        if not routed_reviewer:
+            problems.append("no stored reviewer routing; provide --reviewer <vendor> <model>")
+        elif routed_reviewer[0].lower() not in {"claude", "codex"} or not routed_reviewer[1].strip():
+            problems.append("--reviewer must be <claude|codex> <model>")
+        else:
+            routed_reviewer = (routed_reviewer[0].lower(), routed_reviewer[1])
+    if routed_reviewer and routed_reviewer[0].lower() == record["builder"]:
+        problems.append("reviewer vendor must differ from builder")
+    if reviewer and reviewer[0].lower() == record["builder"]:
+        print(f"WARNING: reply Reviewer: line names builder vendor '{reviewer[0]}'; using routed reviewer identity.")
     resolved_review = None
     if commit:
         matches = run_git(path, "rev-parse", "--verify", f"{commit}^{{commit}}")
         if matches.returncode == 0 and matches.stdout.strip().startswith(commit):
             resolved_review = matches.stdout.strip()
     if resolved_review != head: problems.append("Commit does not match the current lane head")
-    if not reviewer: problems.append("missing Reviewer: codex|claude <model>")
-    elif reviewer[0].lower() == record["builder"]: problems.append("reviewer vendor must differ from builder")
     if required != set(judgments): problems.append("every pinned criterion must have exactly one judgment")
     if any(not evidence for _, evidence in judgments.values()): problems.append("every judgment needs evidence")
     if problems:
         raise Stop("Review rejected: " + "; ".join(problems) + ".")
-    state = task_state(task)
     (state / "review.md").write_text(text)
-    meta = {"verdict": verdict, "commit": head, "reviewer": reviewer[0].lower(),
-            "model": reviewer[1], "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
+    meta = {"verdict": verdict, "commit": head, "reviewer": routed_reviewer[0].lower(),
+            "model": routed_reviewer[1], "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
             "record_revision": record["revision"], "time": utc_now()}
     atomic_json(state / "review.json", meta)
     task_event(task, "review")
@@ -2113,6 +2138,8 @@ def main(argv=None):
         if name == "review":
             sub.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
+            sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
+                             help="reviewer identity for manually supplied reviews")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
