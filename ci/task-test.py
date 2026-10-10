@@ -70,6 +70,9 @@ class TaskTool(unittest.TestCase):
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY)
+        self.gate_dir = self.home / "shared-gate"
+        self.gate_dir.mkdir()
+        self.env["TASK_GATE_DIR"] = str(self.gate_dir)
         self.origin = self.home / "origin.git"
         self.git(self.home, "init", "-q", "--bare", "-b", "main", str(self.origin))
         self.repo = self.home / "dev_workspace/proj"
@@ -420,7 +423,7 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn("claude -p --model haiku --effort high <", out)
+        self.assertIn("claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)' <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         self.assertIn("Worktree:", prompt.read_text())
@@ -428,6 +431,15 @@ class TaskTool(unittest.TestCase):
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
         self.assertFalse(reply.exists(), "a stale response must not be presented as the next review")
+
+    def test_review_includes_direct_request_text(self):
+        self.task("start", "proj", "direct-request", "--builder", "codex")
+        request = self.home / "request.md"
+        request.write_text("Preserve the user's uncommitted files and explain the behavior change.")
+        out = self.raw_task("review", "proj", "direct-request", "--request", str(request))
+        prompt = self.state("direct-request") / "review-prompt.md"
+        self.assertIn("Preserve the user's uncommitted files and explain the behavior change.", prompt.read_text())
+        self.assertIn("--allowedTools Read Grep Glob", out)
 
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
         self.raw_task("start", "proj", "5", "--builder", "claude")
@@ -559,6 +571,8 @@ esac
         archive = self.state()
         (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
         (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
+        close_dirs = self.kb / ".worktrees"
+        close_dirs_existed = close_dirs.exists()
         out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
         self.assertIn("Opened close PR #7", out)
         self.assertIn("Merged close PR #7 with merge commit", out)
@@ -570,9 +584,18 @@ esac
         self.assertEqual(len(parents), 3, "the PR must use a two-parent merge commit")
         self.assertEqual(parents[2], close_head)
         self.assertEqual(self.git(self.kb, "rev-parse", "main"), merge, "clean checkout fast-forwards")
+        contents = sorted(path.name for path in close_dirs.iterdir()) if close_dirs.exists() else []
+        close_paths = list(close_dirs.glob("task-close-*")) if close_dirs.exists() else []
+        self.assertEqual(close_paths, [],
+                         f"assert close removes its own temporary worktree; directory listing: {contents!r}\n{out}")
+        self.assertEqual(close_dirs.exists(), close_dirs_existed,
+                         "close removes .worktrees only when it created the now-empty folder")
         before_count = self.git(origin, "rev-list", "--count", "main")
+        close_dirs.mkdir(exist_ok=True)
         out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
         self.assertIn("already merged", out)
+        self.assertTrue(close_dirs.is_dir(), "close must preserve a pre-existing .worktrees folder")
+        self.assertEqual(list(close_dirs.iterdir()), [], "the pre-existing folder stays empty")
         self.assertEqual(self.git(origin, "rev-list", "--count", "main"), before_count,
                          "rerunning close must not create a second commit")
 
@@ -610,6 +633,8 @@ esac
         (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
         out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine", code=1)
         self.assertIn("PR creation failed", out)
+        self.assertIn("Close worktree kept at", out, "a deliberately kept worktree must be announced")
+        self.assertEqual(len(list((self.kb / ".worktrees").glob("task-close-*"))), 1)
         self.assertEqual(self.git(origin, "rev-list", "--count", "task-close-t5"), "2")
         self.assertEqual(self.git(self.kb, "rev-parse", "main"), self.git(origin, "rev-parse", "main"),
                          "PR workflow leaves the main checkout alone before merge")
@@ -619,12 +644,14 @@ esac
                          "resume reuses the close commit")
         out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
         self.assertIn("Merged close PR #8", out)
+        self.assertFalse((self.kb / ".worktrees").exists(), "the resumed close removes the worktree it created")
         self.assertEqual(self.git(origin, "rev-list", "--count", "task-close-t5"), "2",
                          "merging after a failed attempt still reuses the same close commit")
 
     def test_exclusive_gate_serializes_checks_and_wait_does_not_use_timeout(self):
-        lock_path = Path("/tmp/agent-task-gate.lock")
-        self.addCleanup(lambda: Path("/tmp/agent-task-gate.holder").unlink(missing_ok=True))
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        holder_path = self.gate_dir / "agent-task-gate.holder"
+        self.addCleanup(lambda: holder_path.unlink(missing_ok=True))
         (self.repo / ".task.toml").write_text("exclusive_gate = true\ncheck_timeout = 3\n")
         self.git(self.repo, "add", ".task.toml")
         self.git(self.repo, "commit", "-qm", "enable exclusive gate")
@@ -668,7 +695,7 @@ esac
         dead_holder = self.home / "dead-gate-holder.py"
         dead_holder.write_text(
             "import fcntl, os\n"
-            "fd = os.open('/tmp/agent-task-gate.lock', os.O_CREAT | os.O_RDWR, 0o666)\n"
+            f"fd = os.open({str(lock_path)!r}, os.O_CREAT | os.O_RDWR, 0o666)\n"
             "fcntl.flock(fd, fcntl.LOCK_EX)\n")
         subprocess.run([sys.executable, str(dead_holder)], check=True, timeout=5)
         out = self.raw_task("check", "proj", "other")
@@ -690,6 +717,40 @@ esac
             self.assertNotIn("Waiting for exclusive task gate", out)
         finally:
             os.close(fd)
+
+    def test_exclusive_gate_unavailable_prints_notice_and_runs_check(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable exclusive gate")
+        env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
+        out = self.raw_task("check", "proj", "5", env=env)
+        self.assertEqual(out.count("shared gate lock unavailable in this sandbox; running without it"), 1)
+        self.assertIn("PASS", out)
+
+    def test_close_pr_worktree_is_inside_knowledge_repo(self):
+        origin = self.home / "knowledge-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
+        self.git(self.kb, "remote", "add", "origin", str(origin))
+        self.git(self.kb, "fetch", "-q", "origin")
+        self.git(self.kb, "remote", "set-head", "origin", "main")
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+case "$1 $2" in
+  "pr list") echo '[]' ;;
+  "pr create") echo 'creation refused' >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+""")
+        (self.home / "bin/gh").chmod(0o755)
+        self.started()
+        archive = self.state()
+        (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
+        (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine", code=1)
+        self.assertIn("PR creation failed", out)
+        close_worktrees = list((self.kb / ".worktrees").glob("task-close-*"))
+        self.assertEqual(len(close_worktrees), 1)
+        self.assertTrue(close_worktrees[0].resolve().is_relative_to(self.kb.resolve()))
 
     def test_start_shares_or_rebuilds_the_environment(self):
         venv = self.repo / ".venv/lib/python3.12/site-packages"

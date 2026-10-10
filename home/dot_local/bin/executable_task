@@ -7,7 +7,7 @@ boundary against code running as that user.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
   task check [[<repo>] <id>] [--detach]
-  task review <repo> <id> [--record <file>]
+  task review <repo> <id> [--request <file>] [--record <file>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial]
@@ -361,13 +361,15 @@ def exclusive_gate_enabled(path: Path) -> bool:
 @contextmanager
 def exclusive_gate_lock(task: Task):
     """Serialize opted-in checks across the host and Codex sandboxes sharing /tmp."""
-    lock_path = Path("/tmp/agent-task-gate.lock")
-    holder_path = Path("/tmp/agent-task-gate.holder")
+    gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    lock_path = gate_dir / "agent-task-gate.lock"
+    holder_path = gate_dir / "agent-task-gate.holder"
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-        os.fchmod(descriptor, 0o666)
-    except OSError as error:
-        raise Stop(f"Cannot open shared task gate lock {lock_path}: {error}.")
+    except OSError:
+        print("shared gate lock unavailable in this sandbox; running without it", flush=True)
+        yield
+        return
     holder_record = None
     try:
         waiting = False
@@ -970,11 +972,21 @@ def review(args):
     record = load_record(task)
     head = sha(path, "HEAD")
     task_text = task.file.read_text() if task.file else ""
+    request_text = ""
+    if args.request:
+        try:
+            request_text = Path(args.request).read_text()
+        except OSError as error:
+            raise Stop(f"Cannot read request file {args.request}: {error}.")
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
         prompt = [f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
+        if request_text:
+            prompt.extend(["Direct request:", request_text.rstrip()])
+        if record.get("verify"):
+            prompt.append("Pinned verification commands: " + " ; ".join(record["verify"]))
         if record["criteria"]:
             prompt.append("Criteria:")
             for item in record["criteria"]:
@@ -1001,7 +1013,7 @@ def review(args):
         reply_file.unlink(missing_ok=True)
         print(prompt_text, end="")
         if record["builder"] == "codex":
-            command = "claude -p --model haiku --effort high"
+            command = "claude -p --model haiku --effort high --allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'"
         else:
             command = "GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -"
         print("Headless reviewer command (run from the task worktree):")
@@ -1362,7 +1374,7 @@ def close_pr(repo, branch):
 
 def close_worktree_path(repo, branch):
     digest = hashlib.sha256(f"{repo.resolve()}:{branch}".encode()).hexdigest()[:12]
-    return Path("/tmp") / f"agent-task-close-{digest}"
+    return repo.resolve() / ".worktrees" / f"task-close-{digest}"
 
 
 def close_worktree(repo, branch, default):
@@ -1371,6 +1383,8 @@ def close_worktree(repo, branch, default):
         if not real_worktree(repo, path) or git(path, "branch", "--show-current") != branch:
             raise Stop(f"Close worktree path {path} exists but is not the expected task-close worktree.")
         return path
+    exclude(repo, ".worktrees/")
+    path.parent.mkdir(parents=True, exist_ok=True)
     if ok(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
         for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
             lines = block.splitlines()
@@ -1387,16 +1401,24 @@ def close_worktree(repo, branch, default):
     return path
 
 
-def remove_completed_close_worktree(repo, branch):
+def remove_completed_close_worktree(repo, branch, remove_parent=False):
     path = close_worktree_path(repo, branch)
-    if not path.exists() or not real_worktree(repo, path) or git(path, "branch", "--show-current") != branch:
+    if not path.exists():
+        pass
+    elif not real_worktree(repo, path) or git(path, "branch", "--show-current") != branch:
         return
-    if git(path, "status", "--porcelain", "--untracked-files=all"):
-        print(f"Close worktree kept at {path}: it has uncommitted changes.")
-        return
-    removed = run_git(repo, "worktree", "remove", "-q", str(path))
-    if removed.returncode:
-        print(f"Close worktree kept at {path}: {removed.stderr.strip()}")
+    else:
+        # This deterministic path is owned by task close; after a verified merge, remove it
+        # even if files were left behind in the temporary worktree.
+        removed = run_git(repo, "worktree", "remove", "--force", str(path))
+        if removed.returncode:
+            print(f"Close worktree kept at {path}: {removed.stderr.strip()}")
+            return
+    if remove_parent:
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
 
 
 def close_commit_present(path, task):
@@ -1414,6 +1436,10 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
     ensure_origin_head(repo)
     default = default_branch(repo)
     branch = f"task-close-{task.name.replace('/', '-')}"
+    close_path = close_worktree_path(repo, branch)
+    # .worktrees counts as ours when it is absent, or when only a kept close worktree from an earlier run is in it.
+    kept_alone = {close_path} if close_path.exists() else None
+    worktree_parent_existed = close_path.parent.exists() and set(close_path.parent.iterdir()) != kept_alone
     fetch(repo)
     existing = close_pr(repo, branch)
     if existing and str(existing.get("state", "")).upper() == "MERGED":
@@ -1425,7 +1451,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
             raise Stop(f"Close PR #{existing.get('number')} reports merge {merge_commit[:7]}, not present on origin/{default}.")
         print(f"Close PR #{existing['number']} is already merged ({merge_commit[:7]}).")
         print(update_closed_knowledge_checkout(repo, default))
-        remove_completed_close_worktree(repo, branch)
+        remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
         return 0
     if existing and str(existing.get("state", "")).upper() != "OPEN":
         raise Stop(f"Close PR #{existing.get('number')} is {existing.get('state')}; branch {branch} is preserved for inspection.")
@@ -1443,16 +1469,19 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
             git(path, "clean", "-fd")
         changed = apply_close_update(path, task, before, archive, criteria, status, summary)
         if not changed:
+            # Nothing was committed, so there is no state to resume from: do not leave the folder behind.
+            remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
             raise Stop(f"{task.id} has no close changes to commit on {branch}.")
         head = sha(path, "HEAD")
 
+    kept = f" Close worktree kept at {path} for the resume."
     pushed = run_git(path, "push", "-q", "-u", "origin", branch)
     if pushed.returncode:
         raise Stop(f"Close branch {branch} at {head[:7]} remains locally at {path}; push failed: {pushed.stderr.strip()}. Rerun `task close` to resume.")
     readback = run_git(repo, "ls-remote", "origin", f"refs/heads/{branch}")
     remote_head = readback.stdout.split()[0] if readback.returncode == 0 and readback.stdout.split() else ""
     if remote_head != head:
-        raise Stop(f"Close branch push read back as {remote_head[:7] or 'missing'}, expected {head[:7]}; branch {branch} remains for resume.")
+        raise Stop(f"Close branch push read back as {remote_head[:7] or 'missing'}, expected {head[:7]}; branch {branch} remains for resume.{kept}")
 
     existing = close_pr(repo, branch)
     if not existing:
@@ -1460,22 +1489,22 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
             gh(repo, "pr", "create", "--head", branch, "--base", default,
                "--title", f"Close {task.id}: {task.title}", "--body", summary)
         except Stop as error:
-            raise Stop(f"Close branch {branch} is pushed at {head[:7]}, but PR creation failed: {error}. Rerun `task close` to resume.")
+            raise Stop(f"Close branch {branch} is pushed at {head[:7]}, but PR creation failed: {error}. Rerun `task close` to resume.{kept}")
         existing = close_pr(repo, branch)
         if (not existing or str(existing.get("state", "")).upper() != "OPEN"
                 or existing.get("headRefName") != branch or existing.get("baseRefName") != default):
-            raise Stop(f"Close branch {branch} is pushed at {head[:7]}, but no open PR could be read back; rerun `task close` to resume.")
+            raise Stop(f"Close branch {branch} is pushed at {head[:7]}, but no open PR could be read back; rerun `task close` to resume.{kept}")
         print(f"Opened close PR #{existing['number']}.")
     pr = str(existing["number"])
     try:
         gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
     except Stop as error:
-        raise Stop(f"Close PR #{pr} for branch {branch} at {head[:7]} remains open; merge failed: {error}. Rerun `task close` to resume.")
+        raise Stop(f"Close PR #{pr} for branch {branch} at {head[:7]} remains open; merge failed: {error}. Rerun `task close` to resume.{kept}")
     try:
         merged = json.loads(gh(repo, "pr", "view", pr, "--json", "state,mergeCommit"))
         merge_commit = (merged.get("mergeCommit") or {}).get("oid")
         if str(merged.get("state", "")).upper() != "MERGED" or not merge_commit:
-            raise Stop(f"Close PR #{pr} merge was not verified; branch {branch} at {head[:7]} is preserved. Rerun `task close` to resume.")
+            raise Stop(f"Close PR #{pr} merge was not verified; branch {branch} at {head[:7]} is preserved. Rerun `task close` to resume.{kept}")
     except (json.JSONDecodeError, AttributeError) as error:
         raise Stop(f"Close PR #{pr} merged but its read-back was invalid ({error}); rerun `task close` to resume.")
     fetch(repo)
@@ -1487,7 +1516,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
                    f"merge {merge_commit[:7]} remains on origin for inspection.")
     print(f"Merged close PR #{pr} with merge commit {merge_commit[:7]}.")
     print(update_closed_knowledge_checkout(repo, default))
-    remove_completed_close_worktree(repo, branch)
+    remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
     return 0
 
 
@@ -1757,6 +1786,7 @@ def main(argv=None):
             sub.add_argument("--partial", action="store_true")
         if name == "review":
             sub.add_argument("--record", metavar="FILE")
+            sub.add_argument("--request", metavar="FILE")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
