@@ -59,6 +59,47 @@ class Stop(Exception):
     """A clear, expected reason to stop; printed without a traceback."""
 
 
+def frontmatter_title(text):
+    """Read a title from the small YAML frontmatter subset used by Backlog tasks."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    end = next((index for index in range(1, len(lines))
+                if lines[index].strip() in {"---", "..."}), len(lines))
+    for index, line in enumerate(lines[1:end], 1):
+        match = re.match(r"^(\s*)title:[ \t]*(.*?)[ \t]*$", line)
+        if not match:
+            continue
+        indent, scalar = match.groups()
+        if scalar in {">", ">-", "|", "|-"}:
+            content = []
+            key_indent = len(indent)
+            for continuation in lines[index + 1:end]:
+                leading = len(continuation) - len(continuation.lstrip(" \t"))
+                if continuation.strip() and leading <= key_indent:
+                    break
+                content.append(continuation)
+            indents = [len(value) - len(value.lstrip(" \t")) for value in content if value.strip()]
+            content_indent = min(indents) if indents else key_indent + 1
+            value_lines = [value[content_indent:] if value.strip() else "" for value in content]
+            value = "\n".join(value_lines)
+            if scalar.startswith(">"):
+                value = re.sub(r"(?<=[^\n])\n(?=[^\n])", " ", value)
+            value = value.rstrip("\n")
+            if scalar in {">", "|"} and value:
+                value += "\n"
+            return value
+        if len(scalar) >= 2 and scalar[0] == scalar[-1] == "'":
+            return scalar[1:-1].replace("''", "'")
+        if len(scalar) >= 2 and scalar[0] == scalar[-1] == '"':
+            try:
+                return json.loads(scalar)
+            except json.JSONDecodeError:
+                return scalar[1:-1]
+        return scalar
+    return ""
+
+
 def run_git(cwd, *args):
     return subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(cwd), *args],
                           capture_output=True, text=True)
@@ -170,8 +211,7 @@ class Task:
             self.name = f"t{self.number}"
             self.id = f"T-{self.number}"
             if self.file:
-                front = re.search(r"(?m)^title:\s*['\"]?(.*?)['\"]?\s*$", self.file.read_text())
-                self.title = front.group(1) if front else ""
+                self.title = frontmatter_title(self.file.read_text())
         else:
             if (not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{0,79}", ident)
                     or any(part in {"", ".", ".."} for part in ident.split("/"))):

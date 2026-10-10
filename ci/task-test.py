@@ -219,6 +219,38 @@ class TaskTool(unittest.TestCase):
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
 
+    def test_real_folded_backlog_title_reaches_dispatch_and_review_prompts(self):
+        source = ROOT / ".work/t48-folded-title.md"
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 - *.md"))
+        task_file.write_text(source.read_text())
+        expected = ("Data layer phase 5 - household zone - location, module settings, "
+                    "contracts, export and delete")
+        out = self.raw_task("start", "proj", "5", "--builder", "codex", "--no-verify",
+                            "fixture has no Verify command")
+        self.assertIn(f"T-5 - {expected}", out)
+        self.assertIn("on branch t5-data-layer-phase-5", out)
+        record = __import__("json").loads((self.state() / "task.json").read_text())
+        self.assertEqual(record["title"], expected)
+        self.assertNotIn(">-", out)
+
+        out = self.raw_task("review", "proj", "5")
+        prompt = (self.state() / "review-prompt.md").read_text()
+        self.assertIn(f"Outcome: {expected}", prompt)
+        self.assertNotIn(">-", prompt)
+
+    def test_frontmatter_title_reads_quoted_folded_and_literal_scalars(self):
+        parser = TASK_MODULE.frontmatter_title
+        self.assertEqual(parser("---\ntitle: 'Quoted: it''s a title'\n---\n"), "Quoted: it's a title")
+        self.assertEqual(parser('---\ntitle: "Quoted title"\n---\n'), "Quoted title")
+        self.assertEqual(parser("---\ntitle: >-\n  folded title\n  continues here\nstatus: Done\n---\n"),
+                         "folded title continues here")
+        self.assertEqual(parser("---\ntitle: >\n  folded title\n  continues here\nstatus: Done\n---\n"),
+                         "folded title continues here\n")
+        self.assertEqual(parser("---\ntitle: |-\n  literal title\n  continues here\nstatus: Done\n---\n"),
+                         "literal title\ncontinues here")
+        self.assertEqual(parser("---\ntitle: |\n  literal title\n  continues here\nstatus: Done\n---\n"),
+                         "literal title\ncontinues here\n")
+
     def test_start_adopts_existing_branch_without_task_worktree(self):
         self.git(self.repo, "branch", "t5-preexisting", "main")
         out = self.task("start", "proj", "5", "--builder", "codex")
