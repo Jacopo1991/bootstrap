@@ -148,6 +148,24 @@ class TaskTool(unittest.TestCase):
         self.git(wt, "add", name)
         self.git(wt, "commit", "-qm", f"add {name}")
 
+    def start_slow_detached_gate(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.home / "bin/just").write_text("#!/bin/sh\nsleep 30\necho OK\n")
+        (self.home / "bin/just").chmod(0o755)
+        out = self.raw_task("merge", "proj", "5", "--detach")
+        self.assertIn("Started detached merge", out)
+        deadline = __import__("time").monotonic() + 10
+        gates = []
+        while __import__("time").monotonic() < deadline:
+            gates = list((self.repo / ".worktrees").glob(".task-gate-*"))
+            if gates:
+                break
+            __import__("time").sleep(0.02)
+        self.assertTrue(gates, "detached merge should create a temporary gate worktree")
+        return wt, gates[0]
+
     def test_start_makes_worktree_and_prompt(self):
         wt, out = self.started()
         self.assertEqual(self.git(wt, "branch", "--show-current"), "t5-add-the-b-file")
@@ -414,6 +432,22 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.assertIn("PASS", self.task("check", "proj", "5"))
         self.assertTrue((self.repo / ".worktrees/t5/.venv").is_symlink())
 
+    def test_merge_gate_prepares_lane_environment(self):
+        (self.repo / ".venv").mkdir()
+        (self.repo / "node_modules").mkdir()
+        (self.home / "bin/just").write_text(
+            "#!/bin/sh\n[ -d .venv ] && [ -d node_modules ] || exit 9\n"
+            "echo 'Ran 1 test'; echo OK\n")
+        (self.home / "bin/just").chmod(0o755)
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.assertIn("PASS", self.raw_task("check", "proj", "5"))
+        out = self.task("merge", "proj", "5")
+        self.assertIn("PASS", out)
+        self.assertIn(str(self.state() / "gate-check.log"), out)
+        self.assertFalse(any(line.startswith("PASS (log: ") and ".task-gate-" in line
+                             for line in out.splitlines()))
+
     def test_github_repo_merges_through_a_pull_request(self):
         github = self.home / "github-origin.git"
         self.git(self.home, "clone", "-q", "--bare", str(self.origin), str(github))
@@ -440,6 +474,36 @@ exit 1
         self.assertIn("b.txt", self.git(github, "ls-tree", "--name-only", "main"))
         self.assertEqual(self.git(self.repo, "rev-parse", "main"), self.git(github, "rev-parse", "main"))
         self.assertFalse(wt.exists(), out)
+
+    def test_github_merge_base_mismatch_records_exception_without_reverting(self):
+        github = self.home / "github-origin.git"
+        self.git(self.home, "clone", "-q", "--bare", str(self.origin), str(github))
+        self.git(self.repo, "remote", "set-url", "origin", str(github))
+        self.git(self.repo, "fetch", "-q", "origin")
+        state = self.home / "pr-state"
+        (self.home / "bin/gh").write_text(f"""#!/bin/sh
+set -e
+case "$1 $2" in
+  "pr list") [ -f {state} ] && cat {state}; exit 0 ;;
+  "pr create") echo 7 > {state}; exit 0 ;;
+  "pr merge")
+    head=$6; tmp=$(mktemp -d); git clone -q {github} $tmp
+    echo moved > $tmp/late.txt; git -C $tmp add late.txt; git -C $tmp commit -qm moved
+    git -C $tmp push -q origin main
+    git -C $tmp merge -q --no-ff -m "Merge pull request #7" $head
+    git -C $tmp push -q origin HEAD:main; rm -rf $tmp; rm -f {state}; exit 0 ;;
+esac
+exit 1
+""")
+        (self.home / "bin/gh").chmod(0o755)
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: GitHub merged PR", out)
+        exception = __import__("json").loads((self.state() / "exception.json").read_text())
+        self.assertTrue(exception["publication_mismatch"])
+        self.assertNotEqual(exception["actual_first_parent"], exception["gated_base"])
+        self.assertIn("b.txt", self.git(github, "ls-tree", "--name-only", "main"))
 
     def test_plain_name_without_task(self):
         out = self.task("start", "proj", "tidy-docs", "--builder", "codex")
@@ -799,6 +863,28 @@ exit 1
         self.assertIn("interrupted", status)
         self.assertIn("Needs attention", status)
         self.assertIn("Cleared interrupted run lock", self.raw_task("cancel", "proj", "5"))
+
+    def test_round4_status_skips_live_gate_and_cancel_removes_it(self):
+        _wt, gate = self.start_slow_detached_gate()
+        out = self.raw_task("status", "proj")
+        self.assertIn("t5:", out)
+        self.assertNotIn("task status:", out)
+        self.assertTrue(gate.exists())
+        out = self.raw_task("cancel", "proj", "5")
+        self.assertIn("Cancelled", out)
+        self.assertFalse(gate.exists(), f"gate worktree survived cancel: {gate}")
+        self.assertFalse(list((self.repo / ".worktrees").glob(".task-gate-*")))
+
+    def test_round4_merge_prunes_killed_gate_worktree(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        dead_pid = 999999999
+        stale = self.repo / ".worktrees" / f".task-gate-t5-{dead_pid}"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(stale), "main")
+        self.assertTrue(stale.is_dir())
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Removed stale gate worktree", out)
+        self.assertFalse(stale.exists())
 
 
 if __name__ == "__main__":
