@@ -556,6 +556,8 @@ def start(args):
             raise Stop(f"Invalid Verify command `{command}`: {error}.")
         if not tokens:
             raise Stop("A Verify line needs a command.")
+        if tokens == ["just", "check"]:
+            raise Stop("Verify `just check` is redundant: `task check` already runs it before the Verify commands.")
         probe = subprocess.run(["bash", "-c", 'command -v -- "$1" >/dev/null 2>&1',
                                 "task-preflight", tokens[0]],
                                capture_output=True, text=True)
@@ -695,7 +697,8 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
                     out.write(f"\nTIMEOUT after {timeout}s\n")
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
                                     "timeout": True})
-                    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "result": "failed",
+                    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "base_sha": base or "",
+                                                       "result": "failed",
                                                        "steps": results, "time": utc_now()})
                     if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
                     print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {display_log or log}")
@@ -710,7 +713,8 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             if code:
                 passed = False
                 break
-    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "record_revision": record.get("revision") if record else "",
+    atomic_json(state / evidence_name, {"sha": sha(path, "HEAD"), "base_sha": base or "",
+                                       "record_revision": record.get("revision") if record else "",
                                        "result": "passed" if passed else "failed", "steps": results,
                                        "time": utc_now()})
     if evidence_name == "check.json": task_event(Task(main_repo(path), path.name), "check")
@@ -808,6 +812,43 @@ def update_local_default(repo, default, commit):
     return f"{holder} fast-forwarded"
 
 
+def sync_dependencies_after_merge(repo: Path, old_head: str, new_head: str, update_message: str):
+    """Run only the repository's explicit sync recipe after an updated main changes dependencies."""
+    if "not updated" in update_message or "up to date" in update_message or not old_head or old_head == new_head:
+        return
+    changed = git(repo, "diff", "--name-only", old_head, new_head).splitlines()
+    dependency_names = {"pyproject.toml", "uv.lock", "package.json", "package-lock.json", "pnpm-lock.yaml"}
+    dependencies = [name for name in changed
+                    if Path(name).name in dependency_names
+                    or (Path(name).name.startswith("requirements")
+                        and Path(name).suffix in {".txt", ".in"})]
+    if not dependencies:
+        return
+    files = ", ".join(dependencies)
+    try:
+        recipe = subprocess.run(["just", "--show", "sync"], cwd=repo, capture_output=True,
+                                text=True, timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        recipe = None
+    if recipe and recipe.returncode == 0:
+        try:
+            result = subprocess.run(["just", "sync"], cwd=repo, capture_output=True,
+                                    text=True, timeout=timeout_for(repo))
+        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+            result = None
+            detail = str(error)
+        else:
+            detail = (result.stderr or result.stdout).strip()
+        if result and result.returncode == 0:
+            print(f"Ran `just sync` after dependency changes: {files}")
+            return
+        print(f"WARNING: `just sync` failed after dependency changes ({files}); "
+              f"the main checkout's environment may be out of date. {detail}")
+        return
+    print(f"WARNING: dependency files changed ({files}) and this repository has no `just sync` recipe; "
+          "the main checkout's environment is now out of date.")
+
+
 def on_github(repo):
     return has_origin(repo) and "github" in git(repo, "remote", "get-url", "origin")
 
@@ -849,23 +890,40 @@ def review(args):
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
-        print(f"Task: {task.file or '(no Backlog task file)'}\nWorktree: {path}\n"
-              f"Outcome: {outcome}\nScope: {scope}")
+        prompt = [f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
+                  f"Outcome: {outcome}", f"Scope: {scope}"]
         if record["criteria"]:
-            print("Criteria:")
+            prompt.append("Criteria:")
             for item in record["criteria"]:
-                print(f"#{item['number']} {item['text']}")
+                prompt.append(f"#{item['number']} {item['text']}")
         else:
-            print("Criteria: none; judge the stated request above against the diff.")
-        print(f"Diff range: {record['base_sha']}..{head}")
+            prompt.append("Criteria: none; judge the stated request above against the diff.")
+        prompt.append(f"Diff range: {record['base_sha']}..{head}")
+        prompt.append("Reviewer instructions: read-only review; use `git --no-optional-locks diff`, "
+                      "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
         if record["criteria"]:
-            print("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
+            prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
         else:
-            print("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
-        print("Return: Verdict: PASS|FAIL; Commit: <sha>; Reviewer: codex|claude <model>; one line per criterion:")
+            prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
+        prompt.append("Return: Verdict: PASS|FAIL; Commit: <sha>; Reviewer: codex|claude <model>; one line per criterion:")
         for item in record["criteria"]:
-            print(f"#{item['number']} pass|fail|unclear: <evidence>")
-        print("Then list findings.")
+            prompt.append(f"#{item['number']} pass|fail|unclear: <evidence>")
+        prompt.append("Then list findings.")
+        prompt_text = "\n".join(prompt) + "\n"
+        state = task_state(task)
+        state.mkdir(parents=True, exist_ok=True)
+        prompt_file = state / "review-prompt.md"
+        reply_file = state / "review-response.md"
+        prompt_file.write_text(prompt_text)
+        reply_file.unlink(missing_ok=True)
+        print(prompt_text, end="")
+        if record["builder"] == "codex":
+            command = "claude -p --model haiku --effort high"
+        else:
+            command = "GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -"
+        print("Headless reviewer command (run from the task worktree):")
+        print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
+        print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
         return 0
     try:
         text = Path(args.record).read_text()
@@ -945,6 +1003,17 @@ def merge_gate(task, path, head):
     return record
 
 
+def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record) -> bool:
+    """Reuse check evidence only when it passed for this head and revision against this base."""
+    try:
+        checked = json.loads((task_state(task) / "check.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (checked.get("result") == "passed" and checked.get("sha") == lane_head
+            and checked.get("record_revision") == record.get("revision")
+            and checked.get("base_sha") == base and is_ancestor(repo, base, lane_head))
+
+
 def overlap_files(repo: Path, lane_head: str, base: str):
     common = git(repo, "merge-base", lane_head, base)
     lane_files = set(git(repo, "diff", "--name-only", common, lane_head).splitlines())
@@ -992,9 +1061,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
                            display_log=archived_log)
         shutil.copy2(gate / ".work/check.log", archived_log)
         completed_step(task, "gate")
-        if not passed:
-            raise Stop("Gate check failed on the would-be merge result; nothing was published.")
-        return git(gate, "rev-parse", f"{gated_head}^{{tree}}")
+        return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
     finally:
         run_git(repo, "worktree", "remove", "--force", str(gate))
 
@@ -1048,7 +1115,17 @@ def merge(args):
             overlap = overlap_files(repo, lane_head, base)
             if overlap:
                 raise Stop(overlap_message(overlap))
-            tree = gate_merge_result(task, repo, lane_head, base, record)
+            if can_reuse_lane_check(task, repo, lane_head, base, record):
+                print("main unchanged since the lane's check; reusing it")
+                tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
+            else:
+                tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
+                if not gate_passed:
+                    if not args.override:
+                        raise Stop("Gate check failed on the would-be merge result; nothing was published.")
+                    atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
+                                                               "gate_failed": True, "missing_gate": True})
+                    print(f"exception: failed merge gate overridden: {args.override}")
             if sha(path, "HEAD") != lane_head:
                 raise Stop("The lane branch changed while the gate ran; nothing was published. Run `task check` and obtain a new review.")
             fetch(repo)
@@ -1120,7 +1197,11 @@ def merge(args):
     if review:
         print(f"Recorded review: {review.get('reviewer', '?')} {review.get('model', '?')} at "
               f"{review.get('time', '?')} for {review.get('commit', '?')[:7]}.")
-    print(update_local_default(repo, default, commit))
+    local_default_before = run_git(repo, "rev-parse", "--verify", "--quiet",
+                                   f"refs/heads/{default}").stdout.strip()
+    update_message = update_local_default(repo, default, commit)
+    print(update_message)
+    sync_dependencies_after_merge(repo, local_default_before, commit, update_message)
     completed_step(task, "main updated")
     report_path = path / ".work/report.md"
     if report_path.is_file():

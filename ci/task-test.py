@@ -20,12 +20,16 @@ IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
 
 STUBS = {
     "just": """#!/bin/sh
-case "$1" in
-  check)
+case "$1 $2" in
+  "--show sync") grep -q '^sync:' justfile && { echo 'sync recipe'; exit 0; }; exit 1 ;;
+  "sync ")
+    [ -x "$HOME/during-sync.sh" ] && "$HOME/during-sync.sh"
+    echo OK ;;
+  "check ")
     [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
     [ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
     echo "Ran 3 tests in 0.01s"; echo OK ;;
-  mcp-probe) echo "probe passed" ;;
+  "mcp-probe ") echo "probe passed" ;;
   *) exit 2 ;;
 esac
 """,
@@ -247,6 +251,110 @@ class TaskTool(unittest.TestCase):
         self.git(wt, "checkout", "--", "a.txt")
         self.commit_in(wt, "FAIL")
         self.assertIn("FAIL", self.task("check", "proj", "5", code=1))
+
+    def test_start_rejects_redundant_just_check_verify_line(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text().replace("Verify: `true`", "Verify: `just check   `"))
+        out = self.raw_task("start", "proj", "5", "--builder", "codex", code=1)
+        self.assertIn("Verify `just check` is redundant", out)
+        self.assertIn("already runs it before the Verify commands", out)
+        self.assertFalse((self.repo / ".worktrees/t5").exists())
+
+    def test_merge_reuses_lane_check_when_default_has_not_moved(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
+        check = __import__("json").loads((self.state() / "check.json").read_text())
+        self.assertEqual(check["base_sha"], self.git(self.repo, "rev-parse", "origin/main"))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("main unchanged since the lane's check; reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1,
+                         "unchanged default should not rerun just check in a gate worktree")
+
+    def test_merge_regates_when_default_moved_after_lane_check(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        other = self.home / "other"
+        self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.commit_in(other, "c.txt")
+        self.git(other, "push", "-q", "origin", "main")
+        out = self.raw_task("merge", "proj", "5")
+        self.assertNotIn("main unchanged since the lane's check; reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
+                         "default movement requires checking the would-be merge result")
+
+    def test_override_runs_gate_without_check_record_and_records_failed_gate(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "FAIL")
+        self.prepare_merge_evidence("5")
+        (self.state() / "check.json").unlink()
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        out = self.raw_task("merge", "proj", "5", "--override", "approved failing-gate exception")
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
+        self.assertIn("FAIL (log:", out)
+        self.assertIn("failed merge gate overridden", out)
+        self.assertIn("Merged", out)
+        exception = __import__("json").loads((self.state() / "exception.json").read_text())
+        self.assertTrue(exception["gate_failed"])
+
+    def test_merge_warns_when_dependency_change_has_no_sync_recipe(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "requirements.txt", "package==1\n")
+        self.prepare_merge_evidence("5")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: dependency files changed (requirements.txt)", out)
+        self.assertIn("main checkout's environment is now out of date", out)
+
+    def test_merge_runs_only_repository_sync_recipe_for_dependency_change(self):
+        justfile = self.repo / "justfile"
+        justfile.write_text(justfile.read_text() + "\nsync:\n    echo sync\n")
+        self.git(self.repo, "add", "justfile")
+        self.git(self.repo, "commit", "-qm", "add sync recipe")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        self.commit_in(wt, "pyproject.toml", "[project]\nname = 'fixture'\n")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-sync.sh").write_text('echo sync >> "$HOME/sync-count"\n')
+        (self.home / "during-sync.sh").chmod(0o755)
+        out = self.task("merge", "proj", "5")
+        self.assertIn("Ran `just sync` after dependency changes: pyproject.toml", out)
+        self.assertEqual((self.home / "sync-count").read_text().splitlines(), ["sync"])
+        self.assertNotIn("environment is now out of date", out)
+
+    def test_review_prints_claude_headless_command_and_persisted_prompt(self):
+        wt, _ = self.started()
+        out = self.raw_task("review", "proj", "5")
+        prompt = self.state() / "review-prompt.md"
+        reply = self.state() / "review-response.md"
+        self.assertIn("claude -p --model haiku --effort high <", out)
+        self.assertIn(f"{prompt} > {reply}", out)
+        self.assertIn(f"task review proj 5 --record {reply}", out)
+        self.assertIn("Worktree:", prompt.read_text())
+        for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
+                        "git --no-optional-locks show"):
+            self.assertIn(command, prompt.read_text())
+        self.assertFalse(reply.exists(), "a stale response must not be presented as the next review")
+
+    def test_review_prints_read_only_codex_command_for_claude_builder(self):
+        self.raw_task("start", "proj", "5", "--builder", "claude")
+        out = self.raw_task("review", "proj", "5")
+        prompt = self.state() / "review-prompt.md"
+        reply = self.state() / "review-response.md"
+        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high - <", out)
+        self.assertIn(f"{prompt} > {reply}", out)
+        self.assertIn(f"task review proj 5 --record {reply}", out)
+        for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
+                        "git --no-optional-locks show"):
+            self.assertIn(command, prompt.read_text())
 
     def test_merge_gates_merge_result_without_changing_lane_and_is_idempotent(self):
         wt, _ = self.started()
