@@ -204,6 +204,36 @@ class TaskTool(unittest.TestCase):
         self.assertNotIn("fatal:", out)
         self.assertFalse((self.repo / ".worktrees/t5").exists())
 
+    def test_start_adopts_slash_branch_with_sanitized_worktree_name(self):
+        self.git(self.repo, "branch", "codex/direct-request", "main")
+        out = self.raw_task("start", "proj", "codex/direct-request", "--builder", "codex")
+        wt = self.repo / ".worktrees/codex-direct-request"
+        self.assertIn("on the existing branch codex/direct-request", out)
+        self.assertIn(".worktrees/codex-direct-request on branch codex/direct-request", out)
+        self.assertEqual(self.git(wt, "branch", "--show-current"), "codex/direct-request")
+        self.assertTrue((self.state("codex-direct-request") / "task.json").is_file())
+
+    def test_direct_request_without_backlog_uses_two_part_report_and_request_review(self):
+        self.git(self.repo, "branch", "codex/direct-request", "main")
+        self.raw_task("start", "proj", "codex/direct-request", "--builder", "codex")
+        wt = self.repo / ".worktrees/codex-direct-request"
+        self.commit_in(wt, "direct-request.txt")
+        (wt / ".work/report.md").write_text(
+            "# Task report\n\n## What changed\n\nImplemented the direct request.\n\n"
+            "## How I verified\n\n`task check` passed.\n")
+        self.raw_task("check", "proj", "codex/direct-request")
+        prompt = self.raw_task("review", "proj", "codex/direct-request")
+        self.assertIn("Outcome: Direct request for branch codex/direct-request", prompt)
+        self.assertIn("Criteria: none; judge the stated request above against the diff.", prompt)
+        self.assertIn("judge the stated request above against the diff", prompt)
+        self.assertIn("Diff range:", prompt)
+        review = self.home / "direct-request-review.txt"
+        head = self.git(wt, "rev-parse", "HEAD")
+        review.write_text(f"Verdict: PASS\nCommit: {head}\nReviewer: claude reviewer-model\n")
+        self.raw_task("review", "proj", "codex/direct-request", "--record", str(review))
+        merged = self.raw_task("merge", "proj", "codex/direct-request")
+        self.assertIn("Merged codex/direct-request into main", merged)
+
     def test_check_passes_fails_and_refuses_dirty(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")

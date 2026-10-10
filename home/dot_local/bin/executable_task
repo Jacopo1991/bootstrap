@@ -152,11 +152,13 @@ class Task:
                 front = re.search(r"(?m)^title:\s*['\"]?(.*?)['\"]?\s*$", self.file.read_text())
                 self.title = front.group(1) if front else ""
         else:
-            if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,40}", ident):
-                raise Stop("A task name is lowercase letters, digits, '.', '_' or '-'.")
+            if (not re.fullmatch(r"[a-z0-9][a-z0-9._/-]{0,79}", ident)
+                    or any(part in {"", ".", ".."} for part in ident.split("/"))):
+                raise Stop("A task name is lowercase letters, digits, '.', '_', '-', or '/' between name parts.")
             if ident in {"main", "master", default_branch(repo)}:
                 raise Stop(f"'{ident}' is the default branch, not a task name.")
-            self.name = self.id = ident
+            self.id = self.branch_hint = ident
+            self.name = ident.replace("/", "-")
         self.path = repo / ".worktrees" / self.name
 
     @property
@@ -169,13 +171,13 @@ class Task:
 
     def branch_name(self):
         if self.number is None:
-            return self.name
+            return self.branch_hint
         words = re.findall(r"[a-z0-9]+", self.title.lower())[:4]
         return "-".join([self.name, *words])[:40].rstrip("-")
 
     def existing_branch(self):
         """A local branch for this task, or one that exists only on origin (fetched)."""
-        pattern = f"{self.name}-*" if self.number is not None else self.name
+        pattern = f"{self.name}-*" if self.number is not None else self.branch_hint
         for refs in ("refs/heads/", "refs/remotes/origin/"):
             names = git(self.repo, "for-each-ref", "--format=%(refname:short)",
                         refs + pattern, refs + self.name).split()
@@ -844,16 +846,22 @@ def review(args):
     record = load_record(task)
     head = sha(path, "HEAD")
     task_text = task.file.read_text() if task.file else ""
-    outcome = markdown_section(task_text, "Outcome") or record.get("title") or task.id
+    outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
         print(f"Task: {task.file or '(no Backlog task file)'}\nWorktree: {path}\n"
               f"Outcome: {outcome}\nScope: {scope}")
-        print("Criteria:")
-        for item in record["criteria"]:
-            print(f"#{item['number']} {item['text']}")
+        if record["criteria"]:
+            print("Criteria:")
+            for item in record["criteria"]:
+                print(f"#{item['number']} {item['text']}")
+        else:
+            print("Criteria: none; judge the stated request above against the diff.")
         print(f"Diff range: {record['base_sha']}..{head}")
-        print("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
+        if record["criteria"]:
+            print("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
+        else:
+            print("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
         print("Return: Verdict: PASS|FAIL; Commit: <sha>; Reviewer: codex|claude <model>; one line per criterion:")
         for item in record["criteria"]:
             print(f"#{item['number']} pass|fail|unclear: <evidence>")
@@ -919,8 +927,10 @@ def merge_gate(task, path, head):
     if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", report.read_text(), re.M):
         # Blank headings and explanatory placeholders mean the lane has not completed its report.
         content = report.read_text() if report.is_file() else ""
+        headings = (("What changed", "How I verified", "Criteria", "Noticed, not done")
+                    if record["criteria"] else ("What changed", "How I verified"))
         sections = [re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", content)
-                    for heading in ("What changed", "How I verified", "Criteria", "Noticed, not done")]
+                    for heading in headings]
         if not all(match and match.group(1).strip() for match in sections) or "(fill in)" in content:
             missing.append("filled .work/report.md")
     if report.is_file():
