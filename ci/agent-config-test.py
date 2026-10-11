@@ -203,6 +203,10 @@ with tempfile.TemporaryDirectory() as temp:
     for sub in ("start", "merge", "close"):
         reason = policy.evaluate(event(f"task {sub} proj T-5"), roots)
         assert reason and "for the PM" in reason, (sub, reason)
+    for command in ("task note proj T-5 setup request", "task note - - setup-done 1"):
+        reason = policy.evaluate(event(command), roots)
+        assert reason and "for the PM" in reason, (command, reason)
+    assert policy.evaluate(event("task status"), roots) is None
     assert policy.evaluate(event("task check"), roots) is None
     # One rejection names every missing flag and the full command (MadPlanner T-32 hit its
     # two-failure stop learning them one per rejection), and points to a .work/ copy.

@@ -200,7 +200,9 @@ class TaskTool(unittest.TestCase):
     def test_start_makes_worktree_and_prompt(self):
         wt, out = self.started()
         self.assertEqual(self.git(wt, "branch", "--show-current"), "t5-add-the-b-file")
-        self.assertIn("work only in .worktrees/t5 on branch t5-add-the-b-file", out)
+        self.assertIn("In the Codex app: open the ", out)
+        self.assertIn("start a Local chat (not Worktree), then work only in .worktrees/t5.", out)
+        self.assertIn("Use branch t5-add-the-b-file.", out)
         self.assertIn("t-5 - Add-the-b-file.md", out)
         commit_at = out.index("Commit on the branch")
         check_at = out.index("then run `task check`", commit_at)
@@ -219,6 +221,34 @@ class TaskTool(unittest.TestCase):
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
 
+    def test_setup_requests_are_pm_intake_and_status_attention(self):
+        out = self.raw_task("note", "proj", "5", "setup", "Please configure the new provider")
+        self.assertIn("Recorded setup request #1", out)
+        path = self.home / ".local/state/task/setup-requests.jsonl"
+        import json
+        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(entries[0]["repo"], "proj")
+        self.assertEqual(entries[0]["task"], "T-5")
+        self.assertEqual(entries[0]["text"], "Please configure the new provider")
+        self.assertTrue(entries[0]["time"])
+        status = self.raw_task("status")
+        self.assertIn("Needs attention:", status)
+        self.assertIn("setup request #1 (task T-5): Please configure the new provider", status)
+        self.raw_task("note", "proj", "-", "setup", "Repository-level request")
+        entries = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(entries[1]["task"], "-")
+        self.raw_task("note", "-", "-", "setup-done", "1")
+        status = self.raw_task("status", "proj")
+        self.assertNotIn("setup request #1", status)
+        self.assertIn("setup request #2 (task -): Repository-level request", status)
+        self.raw_task("note", "-", "-", "setup-done", "2")
+        self.assertNotIn("setup request", self.raw_task("status"))
+        self.assertIn('"action":"setup-done","id":1', path.read_text())
+        self.raw_task("note", str(self.kb), "-", "setup", "Cortex repository setup")
+        status = self.raw_task("status")
+        self.assertIn("Needs attention (setup requests outside dev_workspace):", status)
+        self.assertIn("setup request #3 (cortex-kb-proj, task -): Cortex repository setup", status)
+
     def test_real_folded_backlog_title_reaches_dispatch_and_review_prompts(self):
         source = ROOT / "ci/fixtures/t48-folded-title.md"
         task_file = next((self.kb / "backlog/tasks").glob("t-5 - *.md"))
@@ -228,7 +258,7 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("start", "proj", "5", "--builder", "codex", "--no-verify",
                             "fixture has no Verify command")
         self.assertIn(f"T-5 - {expected}", out)
-        self.assertIn("on branch t5-data-layer-phase-5", out)
+        self.assertIn("Use branch t5-data-layer-phase-5.", out)
         record = __import__("json").loads((self.state() / "task.json").read_text())
         self.assertEqual(record["title"], expected)
         self.assertNotIn(">-", out)
@@ -273,7 +303,8 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("start", "proj", "codex/direct-request", "--builder", "codex")
         wt = self.repo / ".worktrees/codex-direct-request"
         self.assertIn("on the existing branch codex/direct-request", out)
-        self.assertIn(".worktrees/codex-direct-request on branch codex/direct-request", out)
+        self.assertIn(".worktrees/codex-direct-request.", out)
+        self.assertIn("Use branch codex/direct-request.", out)
         self.assertEqual(self.git(wt, "branch", "--show-current"), "codex/direct-request")
         self.assertTrue((self.state("codex-direct-request") / "task.json").is_file())
 
@@ -1326,7 +1357,13 @@ exit 1
 
     def test_plain_name_without_task(self):
         out = self.task("start", "proj", "tidy-docs", "--builder", "codex")
-        self.assertIn("work only in .worktrees/tidy-docs on branch tidy-docs", out)
+        self.assertIn("start a Local chat (not Worktree), then work only in .worktrees/tidy-docs.", out)
+        self.assertIn("Use branch tidy-docs.", out)
+
+    def test_claude_dispatch_wording_stays_the_same(self):
+        out = self.raw_task("start", "proj", "claude-lane", "--builder", "claude")
+        self.assertIn("Open " + str(self.repo) + " (Claude Code, or the Codex project on the agentdev host) "
+                      "and work only in .worktrees/claude-lane on branch claude-lane.", out)
 
     def test_acceptance_1_merge_gate_lists_missing_evidence_and_override_is_visible(self):
         wt, _ = self.started()

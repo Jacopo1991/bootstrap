@@ -11,7 +11,8 @@ boundary against code running as that user.
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial]
-  task note <repo> <id> improve|intervention [category] <text>
+  task note <repo> <id> improve|intervention|setup <text>
+  task note - - setup-done <n>
   task status [<repo>]
   task denials [--days N]
 
@@ -856,8 +857,13 @@ def start(args):
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     print(f"{task.id}{title}")
-    print(f"Open {repo} (Claude Code, or the Codex project on the agentdev host) and work only in "
-          f".worktrees/{task.name} on branch {branch}.")
+    if args.builder == "codex":
+        print(f"In the Codex app: open the {repo} project and start a Local chat (not Worktree), "
+              f"then work only in .worktrees/{task.name}.")
+        print(f"Use branch {branch}.")
+    else:
+        print(f"Open {repo} (Claude Code, or the Codex project on the agentdev host) and work only in "
+              f".worktrees/{task.name} on branch {branch}.")
     if task.file:
         print(f"Task: {task.file}")
     print("Commit on the branch, then run `task check` from that folder for advisory feedback, "
@@ -1910,9 +1916,72 @@ def close(args):
     return 0
 
 
+def read_setup_events(path):
+    if not path.is_file():
+        return []
+    entries = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise Stop(f"Setup request log line {number} is invalid JSON: {error.msg}.")
+        if not isinstance(item, dict):
+            raise Stop(f"Setup request log line {number} is not an object.")
+        entries.append(item)
+    return entries
+
+
+def open_setup_requests(path, repo_name=None):
+    events = read_setup_events(path)
+    done = {item.get("id") for item in events
+            if item.get("action") == "setup-done" and isinstance(item.get("id"), int)}
+    return [item for item in events if item.get("action") == "setup"
+            and (repo_name is None or item.get("repo") == repo_name)
+            and item.get("id") not in done]
+
+
 def note(args):
+    if args.kind == "setup-done":
+        if args.repo != "-" or args.id != "-" or len(args.text) != 1 or not args.text[0].isdigit():
+            raise Stop("Usage: task note - - setup-done <n>.")
+        request_id = int(args.text[0])
+        if request_id < 1:
+            raise Stop("Setup request number must be positive.")
+        path = HOME / ".local/state/task/setup-requests.jsonl"
+        events = read_setup_events(path)
+        entries = {item["id"]: item for item in events
+                   if item.get("action") == "setup" and isinstance(item.get("id"), int)}
+        request = entries.get(request_id)
+        if not request or request.get("action") != "setup":
+            raise Stop(f"No setup request #{request_id}.")
+        if any(item.get("action") == "setup-done" and item.get("id") == request_id for item in events):
+            raise Stop(f"Setup request #{request_id} is already done.")
+        with path.open("a", encoding="utf-8") as out:
+            out.write(json.dumps({"time": utc_now(), "action": "setup-done", "id": request_id},
+                                 separators=(",", ":")) + "\n")
+        print(f"Marked setup request #{request_id} done.")
+        return 0
+
     repo = resolve_repo(args.repo)
-    task = Task(repo, args.id)
+    task = Task(repo, args.id) if args.id != "-" else None
+    if args.kind == "setup":
+        path = HOME / ".local/state/task/setup-requests.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entries = read_setup_events(path)
+        request_id = max((item.get("id", 0) for item in entries
+                          if item.get("action") == "setup" and isinstance(item.get("id"), int)),
+                         default=0) + 1
+        entry = {"time": utc_now(), "action": "setup", "id": request_id, "repo": repo.name,
+                 "task": task.id if task else "-", "text": args.text}
+        with path.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+        print(f"Recorded setup request #{request_id} for {repo.name}.")
+        return 0
+
+    if task is None:
+        raise Stop("An improvement or intervention note needs a task id.")
     if args.kind == "improve":
         path = task.kb / "improvements.md"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2014,6 +2083,10 @@ def status(args):
             for state in sorted(item for item in state_root.iterdir() if item.is_dir()):
                 if (state / "exception.json").is_file() and not any(state.name in entry for entry in attention):
                     attention.append(f"{state.name}: exception")
+        setup_path = HOME / ".local/state/task/setup-requests.jsonl"
+        for request in open_setup_requests(setup_path, repo.name):
+            attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
+                             f"{request.get('text', '')}")
         improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
         open_count = 0
         if improvements.is_file():
@@ -2023,6 +2096,15 @@ def status(args):
         for item in attention:
             print(f"    {item}")
         print(f"    open improvements: {open_count}")
+    if args.repo is None:
+        visible_repos = {repo.name for repo in repos}
+        unlisted = [item for item in open_setup_requests(HOME / ".local/state/task/setup-requests.jsonl")
+                    if item.get("repo") not in visible_repos]
+        if unlisted:
+            print("Needs attention (setup requests outside dev_workspace):")
+            for item in unlisted:
+                print(f"  setup request #{item['id']} ({item.get('repo', '?')}, task "
+                      f"{item.get('task') or '-'}): {item.get('text', '')}")
     return 0
 
 
@@ -2146,7 +2228,7 @@ def main(argv=None):
     sub = commands.add_parser("note")
     sub.add_argument("repo")
     sub.add_argument("id")
-    sub.add_argument("kind", choices=("improve", "intervention"))
+    sub.add_argument("kind", choices=("improve", "intervention", "setup", "setup-done"))
     sub.add_argument("text", nargs="+")
     sub = commands.add_parser("status")
     sub.add_argument("repo", nargs="?")
@@ -2159,11 +2241,12 @@ def main(argv=None):
         args.repo, args.id = ([None, None] + args.args)[-2:]
     try:
         if args.command == "note":
-            if args.kind == "intervention" and args.text[0] in "ABCDEFGH" and len(args.text) > 1:
-                args.category = args.text.pop(0)
-            else:
-                args.category = ""
-            args.text = " ".join(args.text)
+            if args.kind != "setup-done":
+                if args.kind == "intervention" and args.text[0] in "ABCDEFGH" and len(args.text) > 1:
+                    args.category = args.text.pop(0)
+                else:
+                    args.category = ""
+                args.text = " ".join(args.text)
         if args.command in {"check", "merge"} and args.detach:
             if args.command == "check" and advisory_check_for(check_task_from_args(args)):
                 args.detach = False

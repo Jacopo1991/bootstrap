@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """workspace-tidy removes only finished, clean, unlocked, old worktrees and merged branches.
 
-Real git fixtures in a temporary HOME: everything that is new, dirty, unmerged, locked,
-checked out or owned by the Codex app must survive; strays and undeclared project-data
-are reported; report mode changes nothing.
+Real git fixtures in a temporary HOME: new, dirty, unmerged, locked and in-use worktrees must
+survive; finished Codex app worktrees may be removed, and strays and undeclared project-data are
+reported. Report mode changes nothing.
 """
 import os
 import subprocess
@@ -66,9 +66,21 @@ class Tidy(unittest.TestCase):
         (ws / "proj-wt/c.txt").write_text("c\n")
         run(ws / "proj-wt", "add", "c.txt", old=True)
         run(ws / "proj-wt", "commit", "-qm", "sib", old=True)
-        # Codex app worktree, merged and old -> never touched
+        # Detached Codex worktree at a default-branch commit -> eligible for removal.
         self.codex = self.home / ".codex/worktrees/ab12"
         run(self.repo, "worktree", "add", "-q", "--detach", str(self.codex), old=True)
+        # A clean merged Codex branch is eligible without the usual one-day grace period.
+        self.codex_branch = self.home / ".codex/worktrees/cd34/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-done", str(self.codex_branch))
+        # Uncommitted Codex work is retained and explicitly reported.
+        self.codex_dirty = self.home / ".codex/worktrees/ef56/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-dirty", str(self.codex_dirty))
+        (self.codex_dirty / "a.txt").write_text("unsaved Codex work\n")
+        self.codex_open = self.home / ".codex/worktrees/gh78/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-open", str(self.codex_open), old=True)
+        (self.codex_open / "open.txt").write_text("committed but unmerged\n")
+        run(self.codex_open, "add", "open.txt", old=True)
+        run(self.codex_open, "commit", "-qm", "unmerged Codex work", old=True)
         for name in ("done", "open", "dirty", "locked"):
             age(wt / name)
         age(ws / "proj-wt")
@@ -101,6 +113,10 @@ class Tidy(unittest.TestCase):
         before = (self.branches(), sorted(p.name for p in (self.repo / ".worktrees").iterdir()))
         out = self.tidy()
         self.assertIn("finished worktree", out)
+        self.assertIn(f"Codex worktree {self.codex} (detached) is finished and clean; would be removed", out)
+        self.assertIn(f"Codex worktree {self.codex_branch} (codex-done) is finished and clean; would be removed", out)
+        self.assertIn(f"Codex worktree {self.codex_dirty} (codex-dirty) kept: uncommitted or untracked changes", out)
+        self.assertIn(f"Codex worktree {self.codex_open} (codex-open) kept: branch is not merged", out)
         self.assertIn("merged branch merged-old would be deleted", out)
         self.assertEqual(before, (self.branches(), sorted(p.name for p in (self.repo / ".worktrees").iterdir())))
         self.assertTrue((self.home / ".local/state/workspace-tidy/report.txt").is_file())
@@ -112,11 +128,17 @@ class Tidy(unittest.TestCase):
         for kept in ("fresh", "open", "dirty", "locked"):
             self.assertTrue((wt / kept).exists(), f"{kept} must survive:\n{out}")
         self.assertTrue((self.repo.parent / "proj-wt").exists())
-        self.assertTrue(self.codex.exists(), "the Codex app's worktree must never be touched")
+        self.assertFalse(self.codex.exists(), out)
+        self.assertFalse(self.codex_branch.exists(), out)
+        self.assertTrue(self.codex_dirty.exists(), out)
+        self.assertTrue(self.codex_open.exists(), out)
+        self.assertIn("removed finished Codex worktree", out)
+        self.assertEqual((self.codex_dirty / "a.txt").read_text(), "unsaved Codex work\n")
         branches = self.branches()
         self.assertNotIn("merged-old", branches)
         self.assertNotIn("done", branches, "the finished worktree's merged branch goes too")
-        for kept in ("main", "merged-new", "unmerged", "fresh", "open", "dirty", "locked", "sibling"):
+        for kept in ("main", "merged-new", "unmerged", "fresh", "open", "dirty", "locked", "sibling",
+                     "codex-done", "codex-dirty", "codex-open"):
             self.assertIn(kept, branches, f"{kept} must survive:\n{out}")
         self.assertEqual((wt / "dirty/a.txt").read_text(), "changed\n")
 

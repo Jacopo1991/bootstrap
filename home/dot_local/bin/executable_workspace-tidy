@@ -6,9 +6,11 @@ Removes only what is provably finished and nothing else:
   that are clean, unlocked, not in use, idle for a day, hold no ignored files beyond rebuildable
   caches, and whose every commit (HEAD and its reflog) is already in the default branch;
 - local branches whose commits, including their reflog, are all in the default branch.
+- Codex app worktrees under `$CODEX_HOME/worktrees` that are clean and whose branch is merged
+  or whose detached commit is reachable from a default branch.
 Everything else is reported for the PM, never changed: worktrees elsewhere, ~/project-data,
-plain folders, second checkouts. The Codex app's worktrees ($CODEX_HOME/worktrees) are left to
-the app, which snapshots and cleans them itself.
+plain folders, second checkouts. Finished, clean Codex app worktrees in $CODEX_HOME/worktrees are
+reported and removed only with --apply; unfinished or dirty Codex worktrees are retained.
 
 Usage: workspace-tidy            report only
        workspace-tidy --apply    also remove finished worktrees and merged branches
@@ -153,8 +155,50 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
     return None
 
 
+def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], apply: bool,
+                        in_use: list[Path], report: list[str], done: list[str]) -> None:
+    branch = entry.get("branch") if isinstance(entry.get("branch"), str) else None
+    label = branch[len("refs/heads/"):] if branch else "detached"
+    prefix = f"{repo.name}: Codex worktree {path} ({label})"
+    if "prunable" in entry or not path.is_dir():
+        report.append(f"{prefix} kept: worktree folder missing or prunable")
+        return
+    if "locked" in entry:
+        report.append(f"{prefix} kept: worktree is locked")
+        return
+    if not refs:
+        report.append(f"{prefix} kept: repository default branch could not be identified")
+        return
+    default_branches = {ref.removeprefix("refs/heads/") for ref in refs
+                        if ref.startswith("refs/heads/")}
+    if branch and label in default_branches:
+        report.append(f"{prefix} kept: it is a default-branch checkout")
+        return
+    head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
+    if branch:
+        commits = {head} | reflog_commits(path, "HEAD")
+        finished = all_contained(repo, commits, refs)
+    else:
+        finished = all_contained(repo, {head}, refs)
+    if not finished:
+        report.append(f"{prefix} kept: branch is not merged or detached commit is outside the default branch")
+        return
+    gitdir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or "/nonexistent")
+    blocker = removal_blocker(path, gitdir, in_use)
+    if blocker:
+        report.append(f"{prefix} kept: {blocker}")
+    elif not apply:
+        report.append(f"{prefix} is finished and clean; would be removed")
+    else:
+        result = git(repo, "worktree", "remove", str(path))
+        if result.returncode == 0:
+            done.append(f"{repo.name}: removed finished Codex worktree {path} ({label})")
+        else:
+            report.append(f"{prefix} could not be removed: {result.stderr.strip()}")
+
+
 def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: list[str],
-              done: list[str]) -> None:
+              done: list[str], seen_codex: set[Path]) -> None:
     refs = default_refs(repo)
     entries = worktree_list(repo)
     checked_out = {entry["branch"] for entry in entries if isinstance(entry.get("branch"), str)}
@@ -162,8 +206,12 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
         path = Path(entry["worktree"])
         branch = entry.get("branch") if isinstance(entry.get("branch"), str) else None
         label = branch[len("refs/heads/"):] if branch else "detached"
-        if inside(path, CODEX_WORKTREES) or "locked" in entry:
-            continue                         # the Codex app's own, or a running Claude Code session
+        if inside(path, CODEX_WORKTREES):
+            seen_codex.add(path.resolve())
+            tidy_codex_worktree(repo, entry, path, refs, apply, in_use, report, done)
+            continue
+        if "locked" in entry:
+            continue                         # a running Claude Code session
         if "prunable" in entry:
             report.append(f"{repo.name}: worktree folder missing: {path} ({label}); if it was moved, "
                           f"run `git -C {repo} worktree repair <new path>`; if deleted, check, then prune")
@@ -254,6 +302,16 @@ def check_project_data(report: list[str]) -> None:
             report.append(f"project-data/{top.name}: undeclared {', '.join(missing)}")
 
 
+def check_codex_orphans(seen: set[Path], report: list[str]) -> None:
+    """Report Codex worktree directories not registered by any repository we inspected."""
+    if not CODEX_WORKTREES.is_dir():
+        return
+    for marker in CODEX_WORKTREES.rglob(".git"):
+        path = marker.parent.resolve()
+        if path not in seen:
+            report.append(f"Codex worktree kept: {path}: not registered to a repository under the managed roots")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--apply", action="store_true",
@@ -261,8 +319,10 @@ def main() -> int:
     args = parser.parse_args()
     now, report, done = time.time(), [], []
     in_use = paths_in_use()
+    seen_codex = set()
     for repo in repos():
-        tidy_repo(repo, args.apply, now, in_use, report, done)
+        tidy_repo(repo, args.apply, now, in_use, report, done, seen_codex)
+    check_codex_orphans(seen_codex, report)
     check_folders(report)
     check_project_data(report)
     lines = [f"workspace-tidy {time.strftime('%Y-%m-%d %H:%M')} ({'apply' if args.apply else 'report'})"]
