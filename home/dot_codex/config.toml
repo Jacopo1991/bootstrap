@@ -2,11 +2,6 @@ approval_policy = "on-request"
 approvals_reviewer = "user"
 sandbox_mode = "workspace-write"
 
-# Codex's HTTP proxy keeps the sandbox allowlist active. Drop the SOCKS proxy from
-# command environments so httpx clients do not select an unavailable SOCKS transport.
-[shell_environment_policy]
-exclude = ["ALL_PROXY", "all_proxy"]
-
 [sandbox_workspace_write]
 # Tool caches needed by sandboxed project checks. Keep these roots limited to caches.
 writable_roots = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
@@ -20,3 +15,5 @@ network_access = true
 enabled = true
 allow_local_binding = true
 domains = { "openrouter.ai" = "allow" }
+# Keep the HTTP proxy and its domain policy, but do not expose a SOCKS proxy to commands.
+enable_socks5 = false
