@@ -40,10 +40,11 @@ cache_paths = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
 assert codex["sandbox_workspace_write"]["writable_roots"] == cache_paths
 for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
     assert forbidden not in codex["sandbox_workspace_write"]["writable_roots"]
-# Sandbox network is on only to reach localhost: all traffic goes through Codex's proxy,
-# which allows no domain and only local binding (tests that start a local server).
+# Sandbox network is on for local tests and the paid probe. The proxy allows only the exact
+# openrouter.ai host plus local binding for tests that start a local server.
 assert codex["sandbox_workspace_write"]["network_access"] is True
-assert codex["features"]["network_proxy"] == {"enabled": True, "allow_local_binding": True, "domains": {}}
+assert codex["features"]["network_proxy"] == {
+    "enabled": True, "allow_local_binding": True, "domains": {"openrouter.ai": "allow"}}
 # Guardrails live in root-owned managed config (ci/managed-policy-test.py checks the shape):
 # the hooks feature and hooks in /etc/codex/requirements.toml, none in the user config.
 assert "hooks" not in codex and "hooks" not in codex["features"]
@@ -71,7 +72,8 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False,
     # Package registries for `uv sync`; writable paths are the exact cache roots, nothing wider.
-    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]},
+    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org",
+                                     "registry.npmjs.org", "openrouter.ai"]},
     "filesystem": {"allowWrite": cache_paths}}
 for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
     assert forbidden not in claude["sandbox"]["filesystem"]["allowWrite"]
