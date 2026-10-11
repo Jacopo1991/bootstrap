@@ -388,7 +388,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(evidence["result"], "failed")
         self.assertTrue(evidence["advisory"])
 
-    def test_advisory_check_keeps_exclusive_gate_lock_inside_worktree_lock(self):
+    def test_advisory_check_holds_exclusive_gate_lock_during_run(self):
         wt, _ = self.started()
         (wt / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(wt, "add", ".task.toml")
@@ -400,6 +400,16 @@ class TaskTool(unittest.TestCase):
         self.assertIn("PASS", out)
         self.assertFalse((self.gate_dir / "agent-task-gate.holder").exists(),
                          "the shared gate holder should be released after the advisory run")
+
+    def test_bare_just_check_does_not_expand_unset_proxy_bypass_vars(self):
+        justfile = (ROOT / "justfile").read_text()
+        self.assertIn("check:\n", justfile, "inspect the repository's real justfile")
+        self.assertIn("bash ci/lint.sh", justfile, "the check recipe should call ci/lint.sh")
+        for path in (ROOT / "justfile", ROOT / "ci/lint.sh"):
+            source = path.read_text()
+            for expansion in ("$NO_PROXY", "${NO_PROXY", "$no_proxy", "${no_proxy"):
+                self.assertNotIn(expansion, source,
+                                 f"{path.relative_to(ROOT)} must not expand unset {expansion}")
 
     def test_check_steps_append_localhost_proxy_bypasses(self):
         wt, _ = self.started()

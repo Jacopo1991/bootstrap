@@ -892,11 +892,12 @@ Git/gh ask rules. The deny list and PreToolUse hook remain active as managed set
 The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
 Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
 and `/usr/bin/gh *`: bare names alone only match argument-less calls.
-The only network allow is `sandbox.network.allowedDomains` of exactly `pypi.org`
-and `files.pythonhosted.org` (no wildcards), so `uv sync` works in the sandbox;
-`sandbox.filesystem.allowWrite` adds only `~/.cache/uv`, created by the tools
-script, as its writable cache. CI asserts both lists exactly. The native GitHub CLI may use its
-existing credential store; agents must never read or print credential files.
+Claude Code's `sandbox.network.allowedDomains` is exactly `pypi.org`,
+`files.pythonhosted.org`, `registry.npmjs.org` and `openrouter.ai` (no wildcards).
+Codex's network proxy allows exactly `openrouter.ai`. These are the host rules
+pinned in `ci/agent-config-test.py`; the same test pins both vendors' writable
+cache paths. The native GitHub CLI may use its existing credential store;
+agents must never read or print credential files.
 
 Force pushes (including lease variants, short flags, force refspecs and flags
 after the remote/branch), remote branch deletion (delete flags, empty-source
@@ -907,9 +908,10 @@ including inherited repository selectors and attached API method values.
 The previous never-merge, workspace, Git metadata/configuration and secret
 checks remain in force.
 
-Codex keeps `workspace-write`, `network_access = false`, `on-request` and the
-user approval reviewer. Four native allow prefixes permit routine Git/gh to
-run outside the sandbox without a prompt. Explicit forbidden prefixes (in
+Codex keeps `workspace-write`, `network_access = true`, the network proxy with
+only `openrouter.ai` allowed, `on-request` and the user approval reviewer.
+Four native allow prefixes permit routine Git/gh to run outside the sandbox
+without a prompt. Explicit forbidden prefixes (in
 `/etc/codex/requirements.toml`) and the shared hook block the forbidden operations above.
 Prompt rules there cover `git reset/rebase/cherry-pick/revert` and `git stash pop/drop/clear`.
 These approval-required forms must use a plain command without global
