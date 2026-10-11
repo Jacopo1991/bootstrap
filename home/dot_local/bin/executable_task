@@ -1035,7 +1035,11 @@ def check(args):
         print(f"exception: verification omitted: {record['no_verify']}")
     if advisory:
         with advisory_check_lock(path):
-            passed = run_check(path, base, record, None, advisory=True)
+            if exclusive_gate_enabled(path):
+                with exclusive_gate_lock(task, silent_unavailable=True):
+                    passed = run_check(path, base, record, None, advisory=True)
+            else:
+                passed = run_check(path, base, record, None, advisory=True)
     elif exclusive_gate_enabled(path):
         with exclusive_gate_lock(task, silent_unavailable=advisory):
             passed = run_check(path, base, record, task_state(task), advisory=False)

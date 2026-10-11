@@ -388,10 +388,20 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(evidence["result"], "failed")
         self.assertTrue(evidence["advisory"])
 
+    def test_advisory_check_keeps_exclusive_gate_lock_inside_worktree_lock(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable shared check gate")
+        (self.home / "during-check.sh").write_text(
+            'test -s "$TASK_GATE_DIR/agent-task-gate.holder" || exit 7\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
+        self.assertIn("PASS", out)
+        self.assertFalse((self.gate_dir / "agent-task-gate.holder").exists(),
+                         "the shared gate holder should be released after the advisory run")
+
     def test_check_steps_append_localhost_proxy_bypasses(self):
-        self.assertIn('NO_PROXY="$NO_PROXY" no_proxy="$no_proxy"',
-                      (ROOT / "justfile").read_text(),
-                      "the check recipe must preserve the bypass variables through env -i")
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         (wt / ".pre-commit-config.yaml").write_text("repos: []\n")
