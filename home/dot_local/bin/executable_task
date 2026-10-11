@@ -739,6 +739,40 @@ def prepare_environment(repo: Path, path: Path):
             print(f"Linked {target} -> {source}.")
 
 
+@contextmanager
+def advisory_check_lock(path: Path):
+    """Protect the shared advisory log from concurrent lane checks in this worktree."""
+    work = path / ".work"
+    work.mkdir(exist_ok=True)
+    lock_path = work / "check.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.seek(0)
+            owner = lock.read().strip() or "an active check (owner details unavailable)"
+            raise Stop(f"Advisory check already running: {owner}; refusing to overwrite {work / 'check.log'}.")
+        owner = f"pid {os.getpid()} for {path} (branch {git(path, 'branch', '--show-current') or 'detached'})"
+        lock.seek(0)
+        lock.truncate()
+        lock.write(owner + "\n")
+        lock.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def check_step_environment(run_id):
+    """Keep local mock traffic off the sandbox proxy without changing proxy settings."""
+    child_env = dict(os.environ, TASK_RUN_ID=run_id)
+    bypass = ("localhost", "127.0.0.1", "::1")
+    for name in ("NO_PROXY", "no_proxy"):
+        existing = child_env.get(name, "")
+        child_env[name] = ",".join(part for part in (existing.rstrip(","), *bypass) if part)
+    return child_env
+
+
 # --- commands ----------------------------------------------------------------------------------
 
 def start(args):
@@ -903,7 +937,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             out.flush()
             started = time.monotonic()
             try:
-                child_env = dict(os.environ, TASK_RUN_ID=run_id)
+                child_env = check_step_environment(run_id)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                            start_new_session=True)
@@ -999,13 +1033,14 @@ def check(args):
     prepare_environment(repo, path)
     if record and record.get("no_verify"):
         print(f"exception: verification omitted: {record['no_verify']}")
-    if exclusive_gate_enabled(path):
+    if advisory:
+        with advisory_check_lock(path):
+            passed = run_check(path, base, record, None, advisory=True)
+    elif exclusive_gate_enabled(path):
         with exclusive_gate_lock(task, silent_unavailable=advisory):
-            passed = run_check(path, base, record, None if advisory else task_state(task),
-                               advisory=advisory)
+            passed = run_check(path, base, record, task_state(task), advisory=False)
     else:
-        passed = run_check(path, base, record, None if advisory else task_state(task),
-                           advisory=advisory)
+        passed = run_check(path, base, record, task_state(task), advisory=False)
     if advisory:
         print("advisory lane check (not evidence for merge)")
     return 0 if passed else 1
