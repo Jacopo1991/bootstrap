@@ -49,6 +49,10 @@ esac
     "gh": """#!/bin/sh
 exit 0
 """,
+    "pre-commit": """#!/bin/sh
+env > "$HOME/pre-commit-env"
+exit 0
+""",
     "backlog": """#!/usr/bin/env python3
 import re, sys, pathlib
 args = sys.argv[1:]
@@ -383,6 +387,81 @@ class TaskTool(unittest.TestCase):
         evidence = __import__("json").loads((wt / ".work/check.json").read_text())
         self.assertEqual(evidence["result"], "failed")
         self.assertTrue(evidence["advisory"])
+
+    def test_advisory_check_holds_exclusive_gate_lock_during_run(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable shared check gate")
+        (self.home / "during-check.sh").write_text(
+            'test -s "$TASK_GATE_DIR/agent-task-gate.holder" || exit 7\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
+        self.assertIn("PASS", out)
+        self.assertFalse((self.gate_dir / "agent-task-gate.holder").exists(),
+                         "the shared gate holder should be released after the advisory run")
+
+    def test_bare_just_check_does_not_expand_unset_proxy_bypass_vars(self):
+        justfile = (ROOT / "justfile").read_text()
+        self.assertIn("check:\n", justfile, "inspect the repository's real justfile")
+        self.assertIn("bash ci/lint.sh", justfile, "the check recipe should call ci/lint.sh")
+        for path in (ROOT / "justfile", ROOT / "ci/lint.sh"):
+            source = path.read_text()
+            for expansion in ("$NO_PROXY", "${NO_PROXY", "$no_proxy", "${no_proxy"):
+                self.assertNotIn(expansion, source,
+                                 f"{path.relative_to(ROOT)} must not expand unset {expansion}")
+
+    def test_check_steps_append_localhost_proxy_bypasses(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".pre-commit-config.yaml").write_text("repos: []\n")
+        self.git(wt, "add", ".pre-commit-config.yaml")
+        self.git(wt, "commit", "-qm", "add pre-commit config")
+        (self.home / "during-check.sh").write_text('env > "$HOME/just-env"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        task_record_path = self.state() / "task.json"
+        import json
+        record = json.loads(task_record_path.read_text())
+        record["verify"] = [f'env > "{self.home}/verify-env"']
+        record["revision"] = TASK_MODULE.record_revision(record)
+        task_record_path.write_text(json.dumps(record))
+        env = dict(self.env, CLAUDECODE="1", HTTP_PROXY="http://127.0.0.1:8123",
+                   HTTPS_PROXY="http://127.0.0.1:8123", ALL_PROXY="socks5://127.0.0.1:8123",
+                   http_proxy="http://127.0.0.1:8124", https_proxy="http://127.0.0.1:8124",
+                   all_proxy="socks5://127.0.0.1:8124", NO_PROXY="existing.example",
+                   no_proxy="lower.example")
+        out = self.raw_task("check", "proj", "5", env=env)
+        self.assertIn("PASS", out)
+        for name in ("just", "verify", "pre-commit"):
+            captured = dict(line.split("=", 1) for line in
+                            (self.home / f"{name}-env").read_text().splitlines() if "=" in line)
+            self.assertEqual(captured["NO_PROXY"], "existing.example,localhost,127.0.0.1,::1")
+            self.assertEqual(captured["no_proxy"], "lower.example,localhost,127.0.0.1,::1")
+            for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+                self.assertEqual(captured[key], env[key], f"{key} must be preserved for {name}")
+
+    def test_concurrent_advisory_check_is_refused_without_overwriting_log(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "FAIL")
+        (self.home / "during-check.sh").write_text(
+            '#!/bin/sh\necho active > "$HOME/advisory-active"\nsleep 1\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        env = dict(self.env, CLAUDECODE="1")
+        first = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "5"],
+                                 cwd=self.home, env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True)
+        deadline = __import__("time").monotonic() + 5
+        while __import__("time").monotonic() < deadline and not (self.home / "advisory-active").exists():
+            __import__("time").sleep(0.02)
+        self.assertTrue((self.home / "advisory-active").exists(), "first advisory check should be running")
+        second = self.raw_task("check", "proj", "5", env=env, code=1)
+        first_out, _ = first.communicate(timeout=8)
+        self.assertEqual(first.returncode, 1, first_out)
+        self.assertIn("Advisory check already running", second)
+        self.assertIn(str(wt), second)
+        self.assertNotIn("PASS", second)
+        self.assertIn("FAILED (failures=1)", (wt / ".work/check.log").read_text())
+        self.assertIn("FAIL (log:", first_out)
 
     def test_agent_markers_skip_unavailable_shared_gate_and_status_separates_lane_result(self):
         (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
