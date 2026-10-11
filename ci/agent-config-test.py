@@ -36,6 +36,10 @@ codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
 assert codex["sandbox_mode"] == "workspace-write"
+cache_paths = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
+assert codex["sandbox_workspace_write"]["writable_roots"] == cache_paths
+for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
+    assert forbidden not in codex["sandbox_workspace_write"]["writable_roots"]
 # Sandbox network is on only to reach localhost: all traffic goes through Codex's proxy,
 # which allows no domain and only local binding (tests that start a local server).
 assert codex["sandbox_workspace_write"]["network_access"] is True
@@ -66,10 +70,13 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "failIfUnavailable": True,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False,
-    # Package registries for `uv sync` and the one writable cache path, nothing wider.
+    # Package registries for `uv sync`; writable paths are the exact cache roots, nothing wider.
     "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]},
-    "filesystem": {"allowWrite": ["~/.cache/uv", "~/.npm"]}}
-assert 'mkdir -p "$HOME/.cache/uv"' in (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
+    "filesystem": {"allowWrite": cache_paths}}
+for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
+    assert forbidden not in claude["sandbox"]["filesystem"]["allowWrite"]
+tools_template = (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
+assert 'mkdir -p "$HOME/.cache/uv" "$HOME/.cache/pre-commit" "$HOME/.cache/pip" "$HOME/.npm"' in tools_template
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
 assert "Bash(git merge *)" not in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
