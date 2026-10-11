@@ -6,6 +6,8 @@ survive; finished Codex app worktrees may be removed, and strays and undeclared 
 reported. Report mode changes nothing.
 """
 import os
+import importlib.machinery
+import importlib.util
 import subprocess
 import tempfile
 import time
@@ -14,6 +16,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "home/dot_local/bin/executable_workspace-tidy"
+TIDY_LOADER = importlib.machinery.SourceFileLoader("workspace_tidy_test", str(TOOL))
+TIDY_SPEC = importlib.util.spec_from_loader(TIDY_LOADER.name, TIDY_LOADER)
+TIDY_MODULE = importlib.util.module_from_spec(TIDY_SPEC)
+TIDY_SPEC.loader.exec_module(TIDY_MODULE)
 OLD = time.time() - 10 * 86400
 OLD_DATE = f"@{int(OLD)} +0000"
 
@@ -69,7 +75,10 @@ class Tidy(unittest.TestCase):
         # Detached Codex worktree at a default-branch commit -> eligible for removal.
         self.codex = self.home / ".codex/worktrees/ab12"
         run(self.repo, "worktree", "add", "-q", "--detach", str(self.codex), old=True)
-        # A clean merged Codex branch is eligible without the usual one-day grace period.
+        # A recent clean Codex worktree is finished but still inside the one-day grace period.
+        self.codex_fresh = self.home / ".codex/worktrees/ij90/proj"
+        run(self.repo, "worktree", "add", "-q", "--detach", str(self.codex_fresh))
+        # A clean merged Codex branch is eligible once its one-day grace period has elapsed.
         self.codex_branch = self.home / ".codex/worktrees/cd34/proj"
         run(self.repo, "worktree", "add", "-q", "-b", "codex-done", str(self.codex_branch))
         # Uncommitted Codex work is retained and explicitly reported.
@@ -85,6 +94,8 @@ class Tidy(unittest.TestCase):
             age(wt / name)
         age(ws / "proj-wt")
         age(self.codex)
+        age(self.codex_branch)
+        age(self.codex_dirty)
         # branches: merged+old -> deleted; merged+recent -> kept; unmerged -> kept
         run(self.repo, "branch", "merged-old", old=True)
         run(self.repo, "branch", "merged-new")
@@ -115,6 +126,7 @@ class Tidy(unittest.TestCase):
         self.assertIn("finished worktree", out)
         self.assertIn(f"Codex worktree {self.codex} (detached) is finished and clean; would be removed", out)
         self.assertIn(f"Codex worktree {self.codex_branch} (codex-done) is finished and clean; would be removed", out)
+        self.assertIn(f"Codex worktree {self.codex_fresh} (detached) kept: within one-day grace period", out)
         self.assertIn(f"Codex worktree {self.codex_dirty} (codex-dirty) kept: uncommitted or untracked changes", out)
         self.assertIn(f"Codex worktree {self.codex_open} (codex-open) kept: branch is not merged", out)
         self.assertIn("merged branch merged-old would be deleted", out)
@@ -130,6 +142,7 @@ class Tidy(unittest.TestCase):
         self.assertTrue((self.repo.parent / "proj-wt").exists())
         self.assertFalse(self.codex.exists(), out)
         self.assertFalse(self.codex_branch.exists(), out)
+        self.assertTrue(self.codex_fresh.exists(), out)
         self.assertTrue(self.codex_dirty.exists(), out)
         self.assertTrue(self.codex_open.exists(), out)
         self.assertIn("removed finished Codex worktree", out)
@@ -260,6 +273,17 @@ class Safety(unittest.TestCase):
             sleeper.wait()
         self.assertTrue(busy.exists(), out)
         self.assertIn("in use by a running process", out)
+
+    def test_codex_worktree_with_missing_head_is_kept(self):
+        codex = self.home / ".codex/worktrees/missing-head"
+        run(self.repo, "worktree", "add", "-q", "--detach", str(codex), old=True)
+        entry = {"worktree": str(codex), "detached": True}
+        report, done = [], []
+        TIDY_MODULE.tidy_codex_worktree(self.repo, entry, codex, TIDY_MODULE.default_refs(self.repo),
+                                        True, time.time(), [], report, done)
+        self.assertTrue(codex.exists())
+        self.assertEqual(done, [])
+        self.assertIn("kept: HEAD is missing", report[0])
 
 
 if __name__ == "__main__":

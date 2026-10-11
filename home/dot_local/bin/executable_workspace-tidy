@@ -156,6 +156,7 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
 
 
 def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], apply: bool,
+                        now: float,
                         in_use: list[Path], report: list[str], done: list[str]) -> None:
     branch = entry.get("branch") if isinstance(entry.get("branch"), str) else None
     label = branch[len("refs/heads/"):] if branch else "detached"
@@ -166,6 +167,10 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
     if "locked" in entry:
         report.append(f"{prefix} kept: worktree is locked")
         return
+    head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
+    if not head:
+        report.append(f"{prefix} kept: HEAD is missing")
+        return
     if not refs:
         report.append(f"{prefix} kept: repository default branch could not be identified")
         return
@@ -174,7 +179,6 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
     if branch and label in default_branches:
         report.append(f"{prefix} kept: it is a default-branch checkout")
         return
-    head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
     if branch:
         commits = {head} | reflog_commits(path, "HEAD")
         finished = all_contained(repo, commits, refs)
@@ -184,6 +188,10 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
         report.append(f"{prefix} kept: branch is not merged or detached commit is outside the default branch")
         return
     gitdir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or "/nonexistent")
+    age = now - last_activity(repo, path, gitdir, head)
+    if age <= GRACE:
+        report.append(f"{prefix} kept: within one-day grace period (idle {max(0, int(age // 3600))} hours)")
+        return
     blocker = removal_blocker(path, gitdir, in_use)
     if blocker:
         report.append(f"{prefix} kept: {blocker}")
@@ -208,7 +216,7 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
         label = branch[len("refs/heads/"):] if branch else "detached"
         if inside(path, CODEX_WORKTREES):
             seen_codex.add(path.resolve())
-            tidy_codex_worktree(repo, entry, path, refs, apply, in_use, report, done)
+            tidy_codex_worktree(repo, entry, path, refs, apply, now, in_use, report, done)
             continue
         if "locked" in entry:
             continue                         # a running Claude Code session

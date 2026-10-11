@@ -249,6 +249,17 @@ class TaskTool(unittest.TestCase):
         self.assertIn("Needs attention (setup requests outside dev_workspace):", status)
         self.assertIn("setup request #3 (cortex-kb-proj, task -): Cortex repository setup", status)
 
+    def test_status_skips_corrupt_setup_request_line_once(self):
+        self.raw_task("note", "proj", "-", "setup", "Valid setup request")
+        path = self.home / ".local/state/task/setup-requests.jsonl"
+        with path.open("a") as output:
+            output.write("{broken json\n")
+        status = self.raw_task("status")
+        self.assertIn("setup request #1 (task -): Valid setup request", status)
+        warning = "warning: setup request log line 2 is invalid JSON; skipped"
+        self.assertIn(warning, status)
+        self.assertEqual(status.count(warning), 1)
+
     def test_real_folded_backlog_title_reaches_dispatch_and_review_prompts(self):
         source = ROOT / "ci/fixtures/t48-folded-title.md"
         task_file = next((self.kb / "backlog/tasks").glob("t-5 - *.md"))

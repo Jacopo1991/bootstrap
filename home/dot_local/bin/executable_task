@@ -1916,25 +1916,35 @@ def close(args):
     return 0
 
 
-def read_setup_events(path):
+def read_setup_events(path, warnings=None):
     if not path.is_file():
         return []
     entries = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for number, line in enumerate(path.read_bytes().splitlines(), 1):
         if not line.strip():
             continue
         try:
             item = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise Stop(f"Setup request log line {number} is invalid JSON: {error.msg}.")
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            message = f"setup request log line {number} is invalid JSON; skipped"
+            if warnings is None:
+                detail = error.msg if isinstance(error, json.JSONDecodeError) else error.reason
+                raise Stop(f"Setup request log line {number} is invalid JSON: {detail}.")
+            warnings.append(message)
+            continue
         if not isinstance(item, dict):
-            raise Stop(f"Setup request log line {number} is not an object.")
+            message = f"setup request log line {number} is not an object; skipped"
+            if warnings is None:
+                raise Stop(f"Setup request log line {number} is not an object.")
+            warnings.append(message)
+            continue
         entries.append(item)
     return entries
 
 
-def open_setup_requests(path, repo_name=None):
-    events = read_setup_events(path)
+def open_setup_requests(path, repo_name=None, events=None):
+    if events is None:
+        events = read_setup_events(path)
     done = {item.get("id") for item in events
             if item.get("action") == "setup-done" and isinstance(item.get("id"), int)}
     return [item for item in events if item.get("action") == "setup"
@@ -2001,6 +2011,9 @@ def note(args):
 
 def status(args):
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
+    setup_path = HOME / ".local/state/task/setup-requests.jsonl"
+    setup_warnings = []
+    setup_events = read_setup_events(setup_path, setup_warnings)
     for repo in repos:
         prune_stale_gate_worktrees(repo)
         print(f"{repo.name}:")
@@ -2083,8 +2096,7 @@ def status(args):
             for state in sorted(item for item in state_root.iterdir() if item.is_dir()):
                 if (state / "exception.json").is_file() and not any(state.name in entry for entry in attention):
                     attention.append(f"{state.name}: exception")
-        setup_path = HOME / ".local/state/task/setup-requests.jsonl"
-        for request in open_setup_requests(setup_path, repo.name):
+        for request in open_setup_requests(setup_path, repo.name, setup_events):
             attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
                              f"{request.get('text', '')}")
         improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
@@ -2098,13 +2110,15 @@ def status(args):
         print(f"    open improvements: {open_count}")
     if args.repo is None:
         visible_repos = {repo.name for repo in repos}
-        unlisted = [item for item in open_setup_requests(HOME / ".local/state/task/setup-requests.jsonl")
+        unlisted = [item for item in open_setup_requests(setup_path, events=setup_events)
                     if item.get("repo") not in visible_repos]
         if unlisted:
             print("Needs attention (setup requests outside dev_workspace):")
             for item in unlisted:
                 print(f"  setup request #{item['id']} ({item.get('repo', '?')}, task "
                       f"{item.get('task') or '-'}): {item.get('text', '')}")
+    for warning in setup_warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 
