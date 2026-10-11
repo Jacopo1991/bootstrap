@@ -36,6 +36,7 @@ codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
 assert codex["sandbox_mode"] == "workspace-write"
+assert codex["shell_environment_policy"]["exclude"] == ["ALL_PROXY", "all_proxy"]
 cache_paths = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
 assert codex["sandbox_workspace_write"]["writable_roots"] == cache_paths
 for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
