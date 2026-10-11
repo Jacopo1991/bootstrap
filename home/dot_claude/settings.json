@@ -48,6 +48,8 @@
     "filesystem": {
       "allowWrite": [
         "~/.cache/uv",
+        "~/.cache/pre-commit",
+        "~/.cache/pip",
         "~/.npm"
       ]
     }

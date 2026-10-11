@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """workspace-tidy removes only finished, clean, unlocked, old worktrees and merged branches.
 
-Real git fixtures in a temporary HOME: everything that is new, dirty, unmerged, locked,
-checked out or owned by the Codex app must survive; strays and undeclared project-data
-are reported; report mode changes nothing.
+Real git fixtures in a temporary HOME: new, dirty, unmerged, locked and in-use worktrees must
+survive; finished Codex app worktrees may be removed, and strays and undeclared project-data are
+reported. Report mode changes nothing.
 """
 import os
+import importlib.machinery
+import importlib.util
 import subprocess
 import tempfile
 import time
@@ -14,6 +16,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "home/dot_local/bin/executable_workspace-tidy"
+TIDY_LOADER = importlib.machinery.SourceFileLoader("workspace_tidy_test", str(TOOL))
+TIDY_SPEC = importlib.util.spec_from_loader(TIDY_LOADER.name, TIDY_LOADER)
+TIDY_MODULE = importlib.util.module_from_spec(TIDY_SPEC)
+TIDY_SPEC.loader.exec_module(TIDY_MODULE)
 OLD = time.time() - 10 * 86400
 OLD_DATE = f"@{int(OLD)} +0000"
 
@@ -66,13 +72,30 @@ class Tidy(unittest.TestCase):
         (ws / "proj-wt/c.txt").write_text("c\n")
         run(ws / "proj-wt", "add", "c.txt", old=True)
         run(ws / "proj-wt", "commit", "-qm", "sib", old=True)
-        # Codex app worktree, merged and old -> never touched
+        # Detached Codex worktree at a default-branch commit -> eligible for removal.
         self.codex = self.home / ".codex/worktrees/ab12"
         run(self.repo, "worktree", "add", "-q", "--detach", str(self.codex), old=True)
+        # A recent clean Codex worktree is finished but still inside the one-day grace period.
+        self.codex_fresh = self.home / ".codex/worktrees/ij90/proj"
+        run(self.repo, "worktree", "add", "-q", "--detach", str(self.codex_fresh))
+        # A clean merged Codex branch is eligible once its one-day grace period has elapsed.
+        self.codex_branch = self.home / ".codex/worktrees/cd34/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-done", str(self.codex_branch))
+        # Uncommitted Codex work is retained and explicitly reported.
+        self.codex_dirty = self.home / ".codex/worktrees/ef56/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-dirty", str(self.codex_dirty))
+        (self.codex_dirty / "a.txt").write_text("unsaved Codex work\n")
+        self.codex_open = self.home / ".codex/worktrees/gh78/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-open", str(self.codex_open), old=True)
+        (self.codex_open / "open.txt").write_text("committed but unmerged\n")
+        run(self.codex_open, "add", "open.txt", old=True)
+        run(self.codex_open, "commit", "-qm", "unmerged Codex work", old=True)
         for name in ("done", "open", "dirty", "locked"):
             age(wt / name)
         age(ws / "proj-wt")
         age(self.codex)
+        age(self.codex_branch)
+        age(self.codex_dirty)
         # branches: merged+old -> deleted; merged+recent -> kept; unmerged -> kept
         run(self.repo, "branch", "merged-old", old=True)
         run(self.repo, "branch", "merged-new")
@@ -101,6 +124,11 @@ class Tidy(unittest.TestCase):
         before = (self.branches(), sorted(p.name for p in (self.repo / ".worktrees").iterdir()))
         out = self.tidy()
         self.assertIn("finished worktree", out)
+        self.assertIn(f"Codex worktree {self.codex} (detached) is finished and clean; would be removed", out)
+        self.assertIn(f"Codex worktree {self.codex_branch} (codex-done) is finished and clean; would be removed", out)
+        self.assertIn(f"Codex worktree {self.codex_fresh} (detached) kept: within one-day grace period", out)
+        self.assertIn(f"Codex worktree {self.codex_dirty} (codex-dirty) kept: uncommitted or untracked changes", out)
+        self.assertIn(f"Codex worktree {self.codex_open} (codex-open) kept: branch is not merged", out)
         self.assertIn("merged branch merged-old would be deleted", out)
         self.assertEqual(before, (self.branches(), sorted(p.name for p in (self.repo / ".worktrees").iterdir())))
         self.assertTrue((self.home / ".local/state/workspace-tidy/report.txt").is_file())
@@ -112,11 +140,18 @@ class Tidy(unittest.TestCase):
         for kept in ("fresh", "open", "dirty", "locked"):
             self.assertTrue((wt / kept).exists(), f"{kept} must survive:\n{out}")
         self.assertTrue((self.repo.parent / "proj-wt").exists())
-        self.assertTrue(self.codex.exists(), "the Codex app's worktree must never be touched")
+        self.assertFalse(self.codex.exists(), out)
+        self.assertFalse(self.codex_branch.exists(), out)
+        self.assertTrue(self.codex_fresh.exists(), out)
+        self.assertTrue(self.codex_dirty.exists(), out)
+        self.assertTrue(self.codex_open.exists(), out)
+        self.assertIn("removed finished Codex worktree", out)
+        self.assertEqual((self.codex_dirty / "a.txt").read_text(), "unsaved Codex work\n")
         branches = self.branches()
         self.assertNotIn("merged-old", branches)
         self.assertNotIn("done", branches, "the finished worktree's merged branch goes too")
-        for kept in ("main", "merged-new", "unmerged", "fresh", "open", "dirty", "locked", "sibling"):
+        for kept in ("main", "merged-new", "unmerged", "fresh", "open", "dirty", "locked", "sibling",
+                     "codex-done", "codex-dirty", "codex-open"):
             self.assertIn(kept, branches, f"{kept} must survive:\n{out}")
         self.assertEqual((wt / "dirty/a.txt").read_text(), "changed\n")
 
@@ -238,6 +273,17 @@ class Safety(unittest.TestCase):
             sleeper.wait()
         self.assertTrue(busy.exists(), out)
         self.assertIn("in use by a running process", out)
+
+    def test_codex_worktree_with_missing_head_is_kept(self):
+        codex = self.home / ".codex/worktrees/missing-head"
+        run(self.repo, "worktree", "add", "-q", "--detach", str(codex), old=True)
+        entry = {"worktree": str(codex), "detached": True}
+        report, done = [], []
+        TIDY_MODULE.tidy_codex_worktree(self.repo, entry, codex, TIDY_MODULE.default_refs(self.repo),
+                                        True, time.time(), [], report, done)
+        self.assertTrue(codex.exists())
+        self.assertEqual(done, [])
+        self.assertIn("kept: HEAD is missing", report[0])
 
 
 if __name__ == "__main__":
