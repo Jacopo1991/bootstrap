@@ -36,6 +36,10 @@ codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
 assert codex["sandbox_mode"] == "workspace-write"
+# The network proxy injects variables after shell_environment_policy filtering; do not regress
+# to that ineffective workaround for sandbox proxy variables.
+assert not {"ALL_PROXY", "all_proxy"}.intersection(
+    codex.get("shell_environment_policy", {}).get("exclude", []))
 cache_paths = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
 assert codex["sandbox_workspace_write"]["writable_roots"] == cache_paths
 for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
@@ -44,7 +48,8 @@ for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"
 # openrouter.ai host plus local binding for tests that start a local server.
 assert codex["sandbox_workspace_write"]["network_access"] is True
 assert codex["features"]["network_proxy"] == {
-    "enabled": True, "allow_local_binding": True, "domains": {"openrouter.ai": "allow"}}
+    "enabled": True, "allow_local_binding": True, "domains": {"openrouter.ai": "allow"},
+    "enable_socks5": False}
 # Guardrails live in root-owned managed config (ci/managed-policy-test.py checks the shape):
 # the hooks feature and hooks in /etc/codex/requirements.toml, none in the user config.
 assert "hooks" not in codex and "hooks" not in codex["features"]

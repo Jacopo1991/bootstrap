@@ -15,3 +15,5 @@ network_access = true
 enabled = true
 allow_local_binding = true
 domains = { "openrouter.ai" = "allow" }
+# Keep the HTTP proxy and its domain policy, but do not expose a SOCKS proxy to commands.
+enable_socks5 = false
