@@ -773,6 +773,27 @@ def check_step_environment(run_id):
     return child_env
 
 
+def advisory_pre_commit_environment(path: Path, child_env):
+    """Give advisory pre-commit its own disposable index inside the writable worktree."""
+    work = path / ".work"
+    directory = Path(tempfile.mkdtemp(prefix="pre-commit-index-", dir=work))
+    try:
+        private_index = directory / "index"
+        real_index = Path(git(path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+        if real_index.is_file():
+            shutil.copyfile(real_index, private_index)
+        else:
+            private_env = dict(child_env, GIT_INDEX_FILE=str(private_index))
+            result = subprocess.run(["git", "-C", str(path), "read-tree", "HEAD"],
+                                    env=private_env, capture_output=True, text=True)
+            if result.returncode:
+                raise Stop(f"Could not seed advisory pre-commit index: {(result.stderr or result.stdout).strip()}")
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return dict(child_env, GIT_INDEX_FILE=str(private_index)), directory
+
+
 # --- commands ----------------------------------------------------------------------------------
 
 def start(args):
@@ -936,8 +957,11 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
             started = time.monotonic()
+            private_index_directory = None
             try:
                 child_env = check_step_environment(run_id)
+                if advisory and step[0] == "pre-commit":
+                    child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                            start_new_session=True)
@@ -973,6 +997,9 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
                 raise
             except FileNotFoundError:
                 raise Stop(f"`{step[0]}` is not installed.")
+            finally:
+                if private_index_directory is not None:
+                    shutil.rmtree(private_index_directory, ignore_errors=True)
             if state:
                 set_child_group(state, None)
             out.write(f"exit {code}\n")
