@@ -29,6 +29,7 @@ IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
 TASK_LOADER = importlib.machinery.SourceFileLoader("task_tool_for_review_test", str(TOOL))
 TASK_SPEC = importlib.util.spec_from_loader(TASK_LOADER.name, TASK_LOADER)
 TASK_MODULE = importlib.util.module_from_spec(TASK_SPEC)
+sys.dont_write_bytecode = True
 TASK_SPEC.loader.exec_module(TASK_MODULE)
 
 STUBS = {
