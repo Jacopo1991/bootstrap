@@ -51,6 +51,16 @@ exit 0
 """,
     "pre-commit": """#!/bin/sh
 env > "$HOME/pre-commit-env"
+printf '%s\\n' "$@" > "$HOME/pre-commit-args"
+if [ "${SIMULATE_READ_ONLY_GIT_DIR:-}" = 1 ]; then
+  case "${GIT_INDEX_FILE:-}" in
+    "$PWD"/.work/pre-commit-index-*/index) ;;
+    *) echo "fatal: Unable to create git index.lock: Read-only file system" >&2; exit 1 ;;
+  esac
+  git write-tree >/dev/null || exit $?
+  git update-index --assume-unchanged a.txt || exit $?
+fi
+[ "${PRE_COMMIT_FAIL:-}" = 1 ] && exit 1
 exit 0
 """,
     "backlog": """#!/usr/bin/env python3
@@ -387,6 +397,60 @@ class TaskTool(unittest.TestCase):
         evidence = __import__("json").loads((wt / ".work/check.json").read_text())
         self.assertEqual(evidence["result"], "failed")
         self.assertTrue(evidence["advisory"])
+
+    def test_advisory_pre_commit_uses_private_index_for_committed_range(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".pre-commit-config.yaml").write_text("repos: []\n")
+        self.git(wt, "add", ".pre-commit-config.yaml")
+        self.git(wt, "commit", "-qm", "add pre-commit config")
+        real_index = Path(self.git(wt, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+        index_before = real_index.read_bytes()
+        original_worktree = (wt / "a.txt").read_bytes()
+        env = dict(self.env, CLAUDECODE="1", SIMULATE_READ_ONLY_GIT_DIR="1")
+
+        out = self.raw_task("check", "proj", "5", env=env)
+
+        self.assertIn("PASS", out)
+        self.assertEqual(real_index.read_bytes(), index_before, "advisory hooks must not write the real index")
+        self.assertEqual((wt / "a.txt").read_bytes(), original_worktree,
+                         "advisory hooks must not alter the worktree")
+        captured = dict(line.split("=", 1) for line in
+                        (self.home / "pre-commit-env").read_text().splitlines() if "=" in line)
+        private_index = Path(captured["GIT_INDEX_FILE"])
+        self.assertEqual(private_index.parent.parent, wt / ".work")
+        self.assertFalse(private_index.parent.exists(), "private index storage should be disposed after the step")
+        self.assertEqual((self.home / "pre-commit-args").read_text().splitlines(),
+                         ["run", "--from-ref", self.git(self.repo, "rev-parse", "origin/main"),
+                          "--to-ref", "HEAD"], "pre-commit must check the committed range")
+
+        failed = self.raw_task("check", "proj", "5",
+                               env=dict(env, PRE_COMMIT_FAIL="1"), code=1)
+        self.assertIn("FAIL", failed)
+        evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(evidence["steps"][-1]["command"],
+                         ["pre-commit", "run", "--from-ref", self.git(self.repo, "rev-parse", "origin/main"),
+                          "--to-ref", "HEAD"])
+        self.assertEqual(evidence["steps"][-1]["exit"], 1)
+        self.assertEqual(real_index.read_bytes(), index_before, "a failing hook must not write the real index")
+        self.assertEqual((wt / "a.txt").read_bytes(), original_worktree)
+
+    def test_trusted_pre_commit_keeps_default_index_environment(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".pre-commit-config.yaml").write_text("repos: []\n")
+        self.git(wt, "add", ".pre-commit-config.yaml")
+        self.git(wt, "commit", "-qm", "add pre-commit config")
+
+        out = self.raw_task("check", "proj", "5")
+
+        self.assertIn("PASS", out)
+        captured = dict(line.split("=", 1) for line in
+                        (self.home / "pre-commit-env").read_text().splitlines() if "=" in line)
+        self.assertNotIn("GIT_INDEX_FILE", captured, "trusted pre-commit must retain its existing environment")
+        self.assertEqual((self.home / "pre-commit-args").read_text().splitlines(),
+                         ["run", "--from-ref", self.git(self.repo, "rev-parse", "origin/main"),
+                          "--to-ref", "HEAD"])
 
     def test_advisory_check_holds_exclusive_gate_lock_during_run(self):
         wt, _ = self.started()
