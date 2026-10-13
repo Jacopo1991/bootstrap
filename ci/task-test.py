@@ -1349,9 +1349,15 @@ esac
         archive = self.state()
         (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
         (archive / "review.md").write_text("Verdict: PASS\n#1 pass: reviewed\n")
+        close_path = TASK_MODULE.close_worktree_path(self.kb, "task-close-t5")
+        self.git(self.kb, "worktree", "add", "-q", "-b", "task-close-t5", str(close_path), "main")
+        (close_path / ".work").mkdir()
+        (close_path / ".work/evidence").write_text("before close reset and clean")
         out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
         self.assertIn("T-5 was already closed.", out)
         self.assertEqual(list((self.kb / ".worktrees").glob("task-close-*")), [])
+        saved = list(self.work_archives().glob("*/.work/evidence"))
+        self.assertEqual([path.read_text() for path in saved], ["before close reset and clean"])
 
     def test_exclusive_gate_serializes_checks_and_wait_does_not_use_timeout(self):
         lock_path = self.gate_dir / "agent-task-gate.lock"

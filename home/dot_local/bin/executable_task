@@ -1939,6 +1939,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         if head != base:
             raise Stop(f"Close branch {branch} at {head[:7]} has an unexpected commit; preserved at {path}.")
         if git(path, "status", "--porcelain", "--untracked-files=all"):
+            preserve_work(task, path)
             git(path, "reset", "--hard", "HEAD")
             git(path, "clean", "-fd")
         changed = apply_close_update(path, task, before, archive, criteria, status, summary)
