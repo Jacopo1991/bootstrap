@@ -430,66 +430,60 @@ def exclusive_gate_enabled(path: Path) -> bool:
 
 @contextmanager
 def exclusive_gate_lock(task: Task, silent_unavailable=False):
-    """Serialize checks using kernel flock; holder metadata is display-only."""
+    """Serialize opted-in checks across the host and Codex sandboxes sharing /tmp."""
     gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
     lock_path = gate_dir / "agent-task-gate.lock"
     holder_path = gate_dir / "agent-task-gate.holder"
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
     except OSError:
-        # Preserve the existing fallback only when this sandbox cannot open the lock at all.
         if not silent_unavailable:
             print("shared gate lock unavailable in this sandbox; running without it", flush=True)
         yield
         return
     holder_record = None
     try:
-        waiting_for = None
+        waiting = False
         while True:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                try:
-                    recorded = json.loads(holder_path.read_text())
-                    detail = (f"task {recorded['task']} in {recorded['repo']}, "
-                              f"pid {recorded['pid']} since {recorded['since']}")
-                except (OSError, KeyError, json.JSONDecodeError, TypeError):
-                    detail = "another gate (holder details unavailable)"
-                try:
-                    if waiting_for != detail:
-                        waiting_for = detail
-                        print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
-                    time.sleep(0.1)
-                except OSError as error:
-                    raise Stop(f"Cannot wait for shared gate lock {lock_path}; "
-                               f"refusing to run without it: {error}")
-            except OSError as error:
-                raise Stop(f"Cannot acquire shared gate lock {lock_path}; "
-                           f"refusing to run without it: {error}")
+                if not waiting:
+                    waiting = True
+                    try:
+                        holder_record = json.loads(holder_path.read_text())
+                        detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
+                                  f"pid {holder_record['pid']} since {holder_record['since']}")
+                    except (OSError, KeyError, json.JSONDecodeError, TypeError):
+                        detail = "another gate (holder details unavailable)"
+                    print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
+                time.sleep(0.1)
+            except OSError:
+                if not silent_unavailable:
+                    print("shared gate lock unavailable in this sandbox; running without it", flush=True)
+                os.close(descriptor)
+                descriptor = None
+                yield
+                return
         metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
                     "repo": task.repo.name}
         try:
             atomic_json(holder_path, metadata)
-        except OSError as error:
-            raise Stop(f"Cannot record shared gate holder at {holder_path}; "
-                       f"refusing to run check: {error}")
-        holder_record = metadata
+            holder_record = metadata
+        except OSError:
+            holder_record = None
         yield
     finally:
-        try:
-            if holder_record:
-                try:
-                    current = json.loads(holder_path.read_text())
-                    if current.get("pid") == os.getpid():
-                        holder_path.unlink(missing_ok=True)
-                except (OSError, json.JSONDecodeError, AttributeError):
-                    pass  # Stale display metadata cannot block the next kernel acquisition.
-        finally:
+        if holder_record and holder_record.get("pid") == os.getpid():
             try:
-                os.close(descriptor)
-            except OSError as error:
-                raise Stop(f"Cannot release shared gate lock {lock_path}: {error}")
+                current = json.loads(holder_path.read_text())
+                if current.get("pid") == os.getpid():
+                    holder_path.unlink(missing_ok=True)
+            except (OSError, json.JSONDecodeError, AttributeError):
+                pass
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def run_record_path(task: Task):
