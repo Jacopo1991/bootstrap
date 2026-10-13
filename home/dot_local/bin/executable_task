@@ -430,100 +430,66 @@ def exclusive_gate_enabled(path: Path) -> bool:
 
 @contextmanager
 def exclusive_gate_lock(task: Task, silent_unavailable=False):
-    """Serialize checks; recover dead owners locally, without changing task state."""
+    """Serialize checks using kernel flock; holder metadata is display-only."""
     gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
     lock_path = gate_dir / "agent-task-gate.lock"
     holder_path = gate_dir / "agent-task-gate.holder"
-    descriptor = coordinator = None
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
+    except OSError:
+        # Preserve the existing fallback only when this sandbox cannot open the lock at all.
+        if not silent_unavailable:
+            print("shared gate lock unavailable in this sandbox; running without it", flush=True)
+        yield
+        return
     holder_record = None
     try:
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(lock_path, flags, 0o666)
-        # Serialize inode replacement with acquisitions and metadata publication. A dead
-        # parent's flock can outlive it through an inherited descriptor in a descendant.
-        coordinator = os.open(gate_dir / "agent-task-gate.recovery", flags, 0o666)
         waiting_for = None
         while True:
-            acquired = False
             try:
-                fcntl.flock(coordinator, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
             except BlockingIOError:
-                time.sleep(0.1)
-                continue
-            try:
-                current, opened = lock_path.stat(), os.fstat(descriptor)
-                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-                    os.close(descriptor)
-                    descriptor = None
-                    descriptor = os.open(lock_path, flags, 0o666)
                 try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                except BlockingIOError:
-                    try:
-                        recorded = json.loads(holder_path.read_text())
-                        pid = int(recorded["pid"])
-                        detail = (f"task {recorded['task']} in {recorded['repo']}, "
-                                  f"pid {pid} since {recorded['since']}")
-                    except (OSError, KeyError, ValueError, json.JSONDecodeError, TypeError):
-                        pid = None
-                        detail = "another gate (holder details unavailable)"
+                    recorded = json.loads(holder_path.read_text())
+                    detail = (f"task {recorded['task']} in {recorded['repo']}, "
+                              f"pid {recorded['pid']} since {recorded['since']}")
+                except (OSError, KeyError, json.JSONDecodeError, TypeError):
+                    detail = "another gate (holder details unavailable)"
+                try:
                     if waiting_for != detail:
                         waiting_for = detail
                         print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
-                    dead = False
-                    if pid is not None and pid > 0:
-                        try:
-                            os.kill(pid, 0)
-                        except ProcessLookupError:
-                            dead = True
-                        except OSError:
-                            pass  # Lack of permission is not evidence of a dead owner.
-                    if dead:
-                        # Every participating waiter reopens a replaced inode under the
-                        # coordinator, so recovery cannot create overlapping checks.
-                        lock_path.unlink()
-                        os.close(descriptor)
-                        descriptor = None
-                        descriptor = os.open(lock_path, flags, 0o666)
-                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        acquired = True
-                        print(f"Recovered exclusive task gate from dead holder {detail}.", flush=True)
-                if acquired:
-                    metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
-                                "repo": task.repo.name}
-                    try:
-                        atomic_json(holder_path, metadata)
-                        holder_record = metadata
-                    except OSError:
-                        # Do not leave a dead owner's metadata on a live lock if
-                        # publication fails: another waiter might recover it again.
-                        holder_path.unlink(missing_ok=True)
-            finally:
-                fcntl.flock(coordinator, fcntl.LOCK_UN)
-            if acquired:
-                break
-            time.sleep(0.1)
-    except OSError:
-        if not silent_unavailable:
-            print("shared gate lock unavailable in this sandbox; running without it", flush=True)
-        if descriptor is not None:
-            os.close(descriptor)
-            descriptor = None
-    try:
+                    time.sleep(0.1)
+                except OSError as error:
+                    raise Stop(f"Cannot wait for shared gate lock {lock_path}; "
+                               f"refusing to run without it: {error}")
+            except OSError as error:
+                raise Stop(f"Cannot acquire shared gate lock {lock_path}; "
+                           f"refusing to run without it: {error}")
+        metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
+                    "repo": task.repo.name}
+        try:
+            atomic_json(holder_path, metadata)
+        except OSError as error:
+            raise Stop(f"Cannot record shared gate holder at {holder_path}; "
+                       f"refusing to run check: {error}")
+        holder_record = metadata
         yield
     finally:
-        if holder_record:
+        try:
+            if holder_record:
+                try:
+                    current = json.loads(holder_path.read_text())
+                    if current.get("pid") == os.getpid():
+                        holder_path.unlink(missing_ok=True)
+                except (OSError, json.JSONDecodeError, AttributeError):
+                    pass  # Stale display metadata cannot block the next kernel acquisition.
+        finally:
             try:
-                current = json.loads(holder_path.read_text())
-                if current.get("pid") == os.getpid():
-                    holder_path.unlink(missing_ok=True)
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-        if descriptor is not None:
-            os.close(descriptor)
-        if coordinator is not None:
-            os.close(coordinator)
+                os.close(descriptor)
+            except OSError as error:
+                raise Stop(f"Cannot release shared gate lock {lock_path}: {error}")
 
 
 def run_record_path(task: Task):

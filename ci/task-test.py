@@ -337,25 +337,26 @@ class TaskTool(unittest.TestCase):
         (wt / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable gate")
-        # Keep the kernel lock after its recorded owner exits, as an inherited descriptor can.
-        holder_script = self.home / "orphan-lock.py"
+        holder_script = self.home / "gate-holder.py"
         holder_script.write_text(
             "import fcntl, os, sys\n"
             "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o666)\n"
             "fcntl.flock(fd, fcntl.LOCK_EX)\n"
             "print('locked', flush=True)\n"
             "sys.stdin.read()\n")
-        holder = subprocess.Popen([sys.executable, str(holder_script),
-                                   str(self.gate_dir / "agent-task-gate.lock")],
+        lock_path = self.gate_dir / "agent-task-gate.lock"
+        holder = subprocess.Popen([sys.executable, str(holder_script), str(lock_path)],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.addCleanup(holder.stdout.close)
         self.addCleanup(holder.stdin.close)
         self.addCleanup(lambda: holder.wait(timeout=3))
         self.addCleanup(holder.terminate)
         self.assertEqual(holder.stdout.readline().strip(), "locked")
+        lock_inode = lock_path.stat().st_ino
         metadata = self.gate_dir / "agent-task-gate.holder"
+        # A host PID can be invisible in a sandbox; display data must never authorize recovery.
         metadata.write_text(json.dumps({"repo": "foreign", "task": "T-56",
-                                        "pid": holder.pid, "since": "2026-10-13T00:00:00Z"}))
+                                        "pid": 99999999, "since": "2026-10-13T00:00:00Z"}))
         foreign = self.home / ".local/state/task/foreign/t56"
         foreign.mkdir(parents=True)
         run = foreign / "run.json"
@@ -371,45 +372,50 @@ class TaskTool(unittest.TestCase):
         self.git(other, "commit", "-qm", "enable gate")
         (self.home / "during-check.sh").write_text(
             '#!/bin/sh\n'
-            'if [ -e "$HOME/gate-active" ]; then echo overlap > "$HOME/gate-overlap"; fi\n'
-            'touch "$HOME/gate-active"\nsleep 0.4\nrm "$HOME/gate-active"\n')
+            'if ! mkdir "$HOME/gate-active" 2>/dev/null; then\n'
+            '  echo overlap > "$HOME/gate-overlap"; exit 9\nfi\n'
+            'sleep 0.4\nrmdir "$HOME/gate-active"\n')
         (self.home / "during-check.sh").chmod(0o755)
-        process = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "5"],
-                                   cwd=self.home, env=dict(self.env, CLAUDECODE="1"),
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        second = None
+        waiters = []
+        logs = []
         try:
-            time.sleep(0.4)
-            self.assertIsNone(process.poll(), "a live recorded holder must block")
-            metadata.write_text(json.dumps({"repo": "foreign", "task": "T-56",
-                                            "pid": 99999999, "since": "2026-10-13T00:00:00Z"}))
-            second = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "other"],
-                                      cwd=self.home, env=dict(self.env, CLAUDECODE="1"),
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            try:
-                out, _ = process.communicate(timeout=4)
-            except subprocess.TimeoutExpired:
-                self.fail("waiting lane did not recover the dead recorded holder")
-            self.assertEqual(process.returncode, 0, out)
-            second_out, _ = second.communicate(timeout=4)
-            self.assertEqual(second.returncode, 0, second_out)
-            self.assertFalse((self.home / "gate-overlap").exists(), "recovery must serialize waiters")
-            self.assertIn("Waiting for exclusive task gate held by task T-56 in foreign, pid", out)
-            self.assertIn("since 2026-10-13", out)
-            self.assertIn("advisory lane check", out)
-            self.assertIn("PASS", out)
+            for ident in ("5", "other"):
+                log = self.home / f"waiter-{ident}.log"
+                output = self.enterContext(log.open("w"))
+                waiters.append(subprocess.Popen(
+                    [sys.executable, str(TOOL), "check", "proj", ident],
+                    cwd=self.home, env=dict(self.env, CLAUDECODE="1"),
+                    stdout=output, stderr=subprocess.STDOUT, text=True))
+                logs.append(log)
+            deadline = time.monotonic() + 5
+            while not all("Waiting for exclusive task gate" in log.read_text() for log in logs):
+                self.assertTrue(all(waiter.poll() is None for waiter in waiters),
+                                "waiters must not proceed while the kernel holder is live")
+                self.assertLess(time.monotonic(), deadline, "both waiters must visibly queue")
+                time.sleep(0.02)
+            self.assertTrue(all(waiter.poll() is None for waiter in waiters))
+            self.assertFalse((self.home / "gate-active").exists(),
+                             "an invisible recorded PID must not bypass the live kernel lock")
+            self.assertEqual(lock_path.stat().st_ino, lock_inode, "the shared lock must not be unlinked")
+            holder.terminate()
+            holder.wait(timeout=3)  # Kernel releases flock; leave stale holder/run records in place.
+            for waiter, log in zip(waiters, logs):
+                self.assertEqual(waiter.wait(timeout=4), 0, log.read_text())
+                out = log.read_text()
+                self.assertIn("Waiting for exclusive task gate held by task T-56 in foreign, pid", out)
+                self.assertIn("since 2026-10-13", out)
+                self.assertIn("advisory lane check", out)
+                self.assertIn("PASS", out)
+            self.assertFalse((self.home / "gate-overlap").exists(), "queued gates must never overlap")
+            self.assertEqual(lock_path.stat().st_ino, lock_inode)
             self.assertEqual((run.stat().st_mtime_ns, run.stat().st_mode, run.read_bytes()), before)
             self.assertFalse((self.state() / "check.json").exists())
-            # Recovery must leave a usable lock for the next waiter, even while the orphan lives.
             self.assertIn("PASS", self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1")))
         finally:
-            if process.poll() is None:
-                process.terminate()
-            process.communicate(timeout=3)
-            if second is not None:
-                if second.poll() is None:
-                    second.terminate()
-                second.communicate(timeout=3)
+            for waiter in waiters:
+                if waiter.poll() is None:
+                    waiter.terminate()
+                waiter.wait(timeout=3)
 
     def test_free_gate_ignores_stale_live_holder_record(self):
         wt, _ = self.started()
@@ -422,7 +428,7 @@ class TaskTool(unittest.TestCase):
         self.assertIn("PASS", out)
         self.assertNotIn("Waiting", out)
 
-    def test_holder_publication_failure_cannot_leave_dead_metadata_on_live_gate(self):
+    def test_holder_publication_failure_stops_before_running_check(self):
         self.started()
         task = TASK_MODULE.Task(self.repo, "5")
         metadata = self.gate_dir / "agent-task-gate.holder"
@@ -430,14 +436,34 @@ class TaskTool(unittest.TestCase):
                                         "pid": 99999999, "since": "old"}))
         with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
                 mock.patch.object(TASK_MODULE, "atomic_json", side_effect=OSError("disk full")):
-            with TASK_MODULE.exclusive_gate_lock(task):
-                self.assertFalse(metadata.exists(), "a live gate must not advertise a dead owner")
-                descriptor = os.open(self.gate_dir / "agent-task-gate.lock", os.O_RDWR)
-                try:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                finally:
-                    os.close(descriptor)
+            with self.assertRaisesRegex(TASK_MODULE.Stop, "Cannot record shared gate holder"):
+                with TASK_MODULE.exclusive_gate_lock(task):
+                    self.fail("a holder publication error must not run the check")
+        descriptor = os.open(self.gate_dir / "agent-task-gate.lock", os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+
+    def test_shared_gate_wait_error_stops_before_running_check(self):
+        self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE.fcntl, "flock",
+                                  side_effect=[BlockingIOError(), OSError("wait probe failure")]):
+            with self.assertRaisesRegex(TASK_MODULE.Stop, "Cannot acquire shared gate lock"):
+                with TASK_MODULE.exclusive_gate_lock(task):
+                    self.fail("a wait error must not run the check unlocked")
+
+    def test_shared_gate_wait_sleep_error_stops_before_running_check(self):
+        self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE.fcntl, "flock", side_effect=BlockingIOError()), \
+                mock.patch.object(TASK_MODULE.time, "sleep", side_effect=OSError("wait interrupted")):
+            with self.assertRaisesRegex(TASK_MODULE.Stop, "Cannot wait for shared gate lock"):
+                with TASK_MODULE.exclusive_gate_lock(task):
+                    self.fail("a wait error must not run the check unlocked")
 
     def test_start_makes_worktree_and_prompt(self):
         wt, out = self.started()
@@ -793,7 +819,7 @@ class TaskTool(unittest.TestCase):
         self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
         self.assertFalse((state / "check.json").exists())
 
-    def test_exclude_failure_and_flock_error_degrade_without_traceback(self):
+    def test_exclude_failure_degrades_but_flock_error_stops(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         exclude_path = self.repo / ".git/info/exclude"
@@ -819,12 +845,12 @@ class TaskTool(unittest.TestCase):
         output = io.StringIO()
         try:
             with contextlib.redirect_stdout(output):
-                with module.exclusive_gate_lock(task):
-                    pass
+                with self.assertRaisesRegex(module.Stop, "Cannot acquire shared gate lock"):
+                    with module.exclusive_gate_lock(task):
+                        self.fail("flock errors must not run checks without the lock")
         finally:
             module.fcntl.flock = original_flock
-        self.assertEqual(output.getvalue().count(
-            "shared gate lock unavailable in this sandbox; running without it"), 1)
+        self.assertNotIn("running without it", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
 
     def test_shared_gate_symlink_is_refused(self):
