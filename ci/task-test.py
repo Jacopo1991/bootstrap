@@ -10,6 +10,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -17,11 +18,13 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL = ROOT / "home/dot_local/bin/executable_task"
+TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
 REVIEW_FIXTURES = ROOT / "ci/fixtures/reviews"
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
@@ -211,6 +214,230 @@ class TaskTool(unittest.TestCase):
             __import__("time").sleep(0.02)
         self.assertTrue(gates, "detached merge should create a temporary gate worktree")
         return wt, gates[0]
+
+    def work_archives(self):
+        return self.home / ".local/state/task/archive/proj/t5"
+
+    def test_merge_preserves_all_work_including_large_data_and_harness(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        work = wt / ".work"
+        for number in range(81):
+            run = work / "heldout" / str(number)
+            run.mkdir(parents=True)
+            (run / "transcript.json").write_text(f'{{"run": {number}}}\n')
+        (work / "product-harness").mkdir()
+        (work / "product-harness/patch.py").write_text("# paid-run patch\n")
+        # Results named build, dist, .cache, etc. are not disposable inside .work.
+        (work / "build").mkdir()
+        (work / "build/result.bin").write_bytes(b"result" * (2 * 1024 * 1024))
+        (work / "link").symlink_to("heldout/0/transcript.json")
+        (work / "dangling").symlink_to("missing")
+        for cache in ("__pycache__", ".pytest_cache", ".venv"):
+            (work / "product-harness" / cache).mkdir()
+            (work / "product-harness" / cache / "regenerable").write_text("cache")
+        self.prepare_merge_evidence("5")
+        expected_report = (work / "report.md").read_bytes()
+        out = self.raw_task("merge", "proj", "5")
+        self.assertFalse(wt.exists(), out)
+        snapshots = list(self.work_archives().glob("*/.work"))
+        self.assertEqual(len(snapshots), 2, "lane and temporary gate both preserve their .work")
+        saved = next(path for path in snapshots if (path / "heldout").exists())
+        self.assertEqual(len(list((saved / "heldout").glob("*/transcript.json"))), 81)
+        self.assertEqual((saved / "heldout/80/transcript.json").read_text(), '{"run": 80}\n')
+        self.assertEqual((saved / "product-harness/patch.py").read_text(), "# paid-run patch\n")
+        self.assertEqual((saved / "build/result.bin").read_bytes(), b"result" * (2 * 1024 * 1024))
+        self.assertEqual((saved / "report.md").read_bytes(), expected_report)
+        self.assertEqual(os.readlink(saved / "link"), "heldout/0/transcript.json")
+        self.assertEqual(os.readlink(saved / "dangling"), "missing")
+        for cache in ("__pycache__", ".pytest_cache", ".venv"):
+            self.assertFalse((saved / "product-harness" / cache).exists())
+        self.assertIn(str(saved), out)
+        self.assertRegex(out, r"Preserved .* \(\d+ bytes\)")
+
+    def test_merge_preservation_failure_keeps_worktree_and_data(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        self.raw_task("check", "proj", "5")  # Reuse the trusted check: exercise lane cleanup.
+        (wt / ".work/paid-transcript").write_text("irreplaceable")
+        archive_root = self.home / ".local/state/task/archive"
+        archive_root.write_text("not a directory")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("refusing to remove", out)
+        self.assertTrue(wt.is_dir())
+        self.assertEqual((wt / ".work/paid-transcript").read_text(), "irreplaceable")
+
+    def test_stale_gate_cleanup_preserves_work_and_refuses_failed_copy(self):
+        self.started()
+        gate = self.repo / ".worktrees/.task-gate-t5-99999999"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(gate), "main")
+        (gate / ".work").mkdir()
+        (gate / ".work/paid-transcript").write_text("gate evidence")
+        archive_root = self.home / ".local/state/task/archive"
+        archive_root.write_text("not a directory")
+        out = self.raw_task("status", "proj", code=1)
+        self.assertIn("refusing to remove", out)
+        self.assertTrue(gate.is_dir())
+        archive_root.unlink()
+        out = self.raw_task("status", "proj")
+        self.assertFalse(gate.exists(), out)
+        saved = list(self.work_archives().glob("*/.work/paid-transcript"))
+        self.assertEqual([path.read_text() for path in saved], ["gate evidence"])
+
+    def test_close_cleanup_preserves_work_and_repeated_snapshots(self):
+        self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        branch = "task-close-t5"
+        close_path = TASK_MODULE.close_worktree_path(self.kb, branch)
+        for content in ("first", "second"):
+            self.git(self.kb, "worktree", "add", "-q", "-B", branch, str(close_path), "main")
+            (close_path / ".work").mkdir()
+            (close_path / ".work/evidence").write_text(content)
+            with mock.patch.object(TASK_MODULE, "HOME", self.home):
+                TASK_MODULE.remove_completed_close_worktree(self.kb, branch, task=task)
+            self.assertFalse(close_path.exists())
+        saved = list(self.work_archives().glob("*/.work/evidence"))
+        self.assertEqual(sorted(path.read_text() for path in saved), ["first", "second"])
+
+    def test_close_cleanup_copy_failure_keeps_registered_worktree(self):
+        self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        branch = "task-close-t5"
+        path = TASK_MODULE.close_worktree_path(self.kb, branch)
+        self.git(self.kb, "worktree", "add", "-q", "-b", branch, str(path), "main")
+        (path / ".work").mkdir()
+        (path / ".work/evidence").write_text("irreplaceable")
+
+        def full_disk(_source, destination, **_kwargs):
+            destination.mkdir()
+            (destination / "evidence").write_text("partial")
+            raise OSError("No space left on device")
+
+        with mock.patch.object(TASK_MODULE, "HOME", self.home), \
+                mock.patch.object(TASK_MODULE.shutil, "copytree", side_effect=full_disk):
+            with self.assertRaisesRegex(TASK_MODULE.Stop, "refusing to remove"):
+                TASK_MODULE.remove_completed_close_worktree(self.kb, branch, task=task)
+        self.assertEqual((path / ".work/evidence").read_text(), "irreplaceable")
+        self.assertIn(str(path), self.git(self.kb, "worktree", "list", "--porcelain"))
+
+    def test_cancel_cleanup_preserves_temporary_gate_work(self):
+        _wt, gate = self.start_slow_detached_gate()
+        (gate / ".work").mkdir(exist_ok=True)
+        (gate / ".work/paid-transcript").write_text("gate evidence")
+        out = self.raw_task("cancel", "proj", "5")
+        self.assertIn("Cancelled", out)
+        self.assertFalse(gate.exists(), out)
+        saved = list(self.work_archives().glob("*/.work/paid-transcript"))
+        self.assertTrue(saved, out)
+        self.assertTrue(all(path.read_text() == "gate evidence" for path in saved))
+
+    def test_waiting_lane_recovers_dead_holder_without_foreign_state_writes(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable gate")
+        # Keep the kernel lock after its recorded owner exits, as an inherited descriptor can.
+        holder_script = self.home / "orphan-lock.py"
+        holder_script.write_text(
+            "import fcntl, os, sys\n"
+            "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o666)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "print('locked', flush=True)\n"
+            "sys.stdin.read()\n")
+        holder = subprocess.Popen([sys.executable, str(holder_script),
+                                   str(self.gate_dir / "agent-task-gate.lock")],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.stdin.close)
+        self.addCleanup(lambda: holder.wait(timeout=3))
+        self.addCleanup(holder.terminate)
+        self.assertEqual(holder.stdout.readline().strip(), "locked")
+        metadata = self.gate_dir / "agent-task-gate.holder"
+        metadata.write_text(json.dumps({"repo": "foreign", "task": "T-56",
+                                        "pid": holder.pid, "since": "2026-10-13T00:00:00Z"}))
+        foreign = self.home / ".local/state/task/foreign/t56"
+        foreign.mkdir(parents=True)
+        run = foreign / "run.json"
+        run.write_text('{"state":"running","pid":99999999}')
+        run.chmod(0o444)
+        foreign.chmod(0o555)
+        self.addCleanup(lambda: foreign.chmod(0o755))
+        before = run.stat().st_mtime_ns, run.stat().st_mode, run.read_bytes()
+        other = self.repo / ".worktrees/other"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "other", str(other), "HEAD")
+        (other / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(other, "add", ".task.toml")
+        self.git(other, "commit", "-qm", "enable gate")
+        (self.home / "during-check.sh").write_text(
+            '#!/bin/sh\n'
+            'if [ -e "$HOME/gate-active" ]; then echo overlap > "$HOME/gate-overlap"; fi\n'
+            'touch "$HOME/gate-active"\nsleep 0.4\nrm "$HOME/gate-active"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        process = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "5"],
+                                   cwd=self.home, env=dict(self.env, CLAUDECODE="1"),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        second = None
+        try:
+            time.sleep(0.4)
+            self.assertIsNone(process.poll(), "a live recorded holder must block")
+            metadata.write_text(json.dumps({"repo": "foreign", "task": "T-56",
+                                            "pid": 99999999, "since": "2026-10-13T00:00:00Z"}))
+            second = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "other"],
+                                      cwd=self.home, env=dict(self.env, CLAUDECODE="1"),
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                out, _ = process.communicate(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.fail("waiting lane did not recover the dead recorded holder")
+            self.assertEqual(process.returncode, 0, out)
+            second_out, _ = second.communicate(timeout=4)
+            self.assertEqual(second.returncode, 0, second_out)
+            self.assertFalse((self.home / "gate-overlap").exists(), "recovery must serialize waiters")
+            self.assertIn("Waiting for exclusive task gate held by task T-56 in foreign, pid", out)
+            self.assertIn("since 2026-10-13", out)
+            self.assertIn("advisory lane check", out)
+            self.assertIn("PASS", out)
+            self.assertEqual((run.stat().st_mtime_ns, run.stat().st_mode, run.read_bytes()), before)
+            self.assertFalse((self.state() / "check.json").exists())
+            # Recovery must leave a usable lock for the next waiter, even while the orphan lives.
+            self.assertIn("PASS", self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1")))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=3)
+            if second is not None:
+                if second.poll() is None:
+                    second.terminate()
+                second.communicate(timeout=3)
+
+    def test_free_gate_ignores_stale_live_holder_record(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "enable gate")
+        (self.gate_dir / "agent-task-gate.holder").write_text(json.dumps(
+            {"repo": "foreign", "task": "T-56", "pid": os.getpid(), "since": "old"}))
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
+        self.assertIn("PASS", out)
+        self.assertNotIn("Waiting", out)
+
+    def test_holder_publication_failure_cannot_leave_dead_metadata_on_live_gate(self):
+        self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        metadata = self.gate_dir / "agent-task-gate.holder"
+        metadata.write_text(json.dumps({"repo": "foreign", "task": "T-56",
+                                        "pid": 99999999, "since": "old"}))
+        with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE, "atomic_json", side_effect=OSError("disk full")):
+            with TASK_MODULE.exclusive_gate_lock(task):
+                self.assertFalse(metadata.exists(), "a live gate must not advertise a dead owner")
+                descriptor = os.open(self.gate_dir / "agent-task-gate.lock", os.O_RDWR)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(descriptor)
 
     def test_start_makes_worktree_and_prompt(self):
         wt, out = self.started()

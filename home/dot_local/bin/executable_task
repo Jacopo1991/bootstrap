@@ -47,11 +47,13 @@ CORTEX = HOME / "cortex"
 CHECK_TIMEOUT = int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|error)|"
                      r"Tests?:? .*\b(passed|failed)|\d+ (passed|failed)|.*\b(PASS|FAIL)\b)")
-# Ignored paths a merged worktree may hold and still be removed: tool folders and caches that are
-# rebuilt on demand. Anything else ignored (results, data) keeps the worktree.
+# Ignored paths a merged worktree may hold and still be removed: .work (preserved separately),
+# and tool folders/caches rebuilt on demand. Other ignored results/data keep the worktree.
 DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache",
               ".ruff_cache", ".cache", ".tox", ".next", ".astro", ".turbo", "dist", "build",
               "coverage", "target", ".parcel-cache"}
+# .work is removable only after preservation; its outputs are not disposable.
+WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv"}
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
 
@@ -363,6 +365,31 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
+def preserve_work(task: Task, path: Path):
+    """Snapshot all task evidence before deletion, without size limits or overwrites."""
+    source = path / ".work"
+    if not source.exists() and not source.is_symlink():
+        return
+    archive = HOME / ".local/state/task/archive" / task.repo.name / task.name
+    try:
+        archive.mkdir(parents=True, exist_ok=True)
+        pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=archive))
+        saved = pending / ".work"
+
+        def caches(directory, names):
+            return [name for name in names if name in WORK_CACHES
+                    and (Path(directory) / name).is_dir()]
+
+        shutil.copytree(source, saved, symlinks=True, ignore=caches)
+        size = sum(item.lstat().st_size for item in saved.rglob("*")
+                   if item.is_symlink() or not item.is_dir())
+        destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
+        pending.rename(destination)
+    except (OSError, shutil.Error) as error:
+        raise Stop(f"Cannot preserve {source} in {archive}; refusing to remove {path}: {error}")
+    print(f"Preserved {source} at {destination / '.work'} ({size} bytes).", flush=True)
+
+
 def load_record(task: Task, required=True):
     path = task_state(task) / "task.json"
     if not path.is_file():
@@ -403,52 +430,90 @@ def exclusive_gate_enabled(path: Path) -> bool:
 
 @contextmanager
 def exclusive_gate_lock(task: Task, silent_unavailable=False):
-    """Serialize opted-in checks across the host and Codex sandboxes sharing /tmp."""
+    """Serialize checks; recover dead owners locally, without changing task state."""
     gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
     lock_path = gate_dir / "agent-task-gate.lock"
     holder_path = gate_dir / "agent-task-gate.holder"
+    descriptor = coordinator = None
+    holder_record = None
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o666)
+        # Serialize inode replacement with acquisitions and metadata publication. A dead
+        # parent's flock can outlive it through an inherited descriptor in a descendant.
+        coordinator = os.open(gate_dir / "agent-task-gate.recovery", flags, 0o666)
+        waiting_for = None
+        while True:
+            acquired = False
+            try:
+                fcntl.flock(coordinator, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                time.sleep(0.1)
+                continue
+            try:
+                current, opened = lock_path.stat(), os.fstat(descriptor)
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    os.close(descriptor)
+                    descriptor = None
+                    descriptor = os.open(lock_path, flags, 0o666)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except BlockingIOError:
+                    try:
+                        recorded = json.loads(holder_path.read_text())
+                        pid = int(recorded["pid"])
+                        detail = (f"task {recorded['task']} in {recorded['repo']}, "
+                                  f"pid {pid} since {recorded['since']}")
+                    except (OSError, KeyError, ValueError, json.JSONDecodeError, TypeError):
+                        pid = None
+                        detail = "another gate (holder details unavailable)"
+                    if waiting_for != detail:
+                        waiting_for = detail
+                        print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
+                    dead = False
+                    if pid is not None and pid > 0:
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            dead = True
+                        except OSError:
+                            pass  # Lack of permission is not evidence of a dead owner.
+                    if dead:
+                        # Every participating waiter reopens a replaced inode under the
+                        # coordinator, so recovery cannot create overlapping checks.
+                        lock_path.unlink()
+                        os.close(descriptor)
+                        descriptor = None
+                        descriptor = os.open(lock_path, flags, 0o666)
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                        print(f"Recovered exclusive task gate from dead holder {detail}.", flush=True)
+                if acquired:
+                    metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
+                                "repo": task.repo.name}
+                    try:
+                        atomic_json(holder_path, metadata)
+                        holder_record = metadata
+                    except OSError:
+                        # Do not leave a dead owner's metadata on a live lock if
+                        # publication fails: another waiter might recover it again.
+                        holder_path.unlink(missing_ok=True)
+            finally:
+                fcntl.flock(coordinator, fcntl.LOCK_UN)
+            if acquired:
+                break
+            time.sleep(0.1)
     except OSError:
         if not silent_unavailable:
             print("shared gate lock unavailable in this sandbox; running without it", flush=True)
-        yield
-        return
-    holder_record = None
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
     try:
-        waiting = False
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if not waiting:
-                    waiting = True
-                    try:
-                        holder_record = json.loads(holder_path.read_text())
-                        detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
-                                  f"pid {holder_record['pid']} since {holder_record['since']}")
-                    except (OSError, KeyError, json.JSONDecodeError, TypeError):
-                        detail = "another gate (holder details unavailable)"
-                    print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
-                time.sleep(0.1)
-            except OSError:
-                if not silent_unavailable:
-                    print("shared gate lock unavailable in this sandbox; running without it", flush=True)
-                os.close(descriptor)
-                descriptor = None
-                yield
-                return
-        metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
-                    "repo": task.repo.name}
-        try:
-            atomic_json(holder_path, metadata)
-            holder_record = metadata
-        except OSError:
-            holder_record = None
         yield
     finally:
-        if holder_record and holder_record.get("pid") == os.getpid():
+        if holder_record:
             try:
                 current = json.loads(holder_path.read_text())
                 if current.get("pid") == os.getpid():
@@ -457,6 +522,8 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                 pass
         if descriptor is not None:
             os.close(descriptor)
+        if coordinator is not None:
+            os.close(coordinator)
 
 
 def run_record_path(task: Task):
@@ -1517,9 +1584,10 @@ def prune_stale_gate_worktrees(repo: Path):
     if not worktrees.is_dir():
         return
     for gate in worktrees.glob(".task-gate-*"):
-        match = re.fullmatch(r"\.task-gate-.+-(\d+)", gate.name)
-        if not match or pid_alive(match.group(1)):
+        match = re.fullmatch(r"\.task-gate-(.+)-(\d+)", gate.name)
+        if not match or pid_alive(match.group(2)):
             continue
+        preserve_work(Task(repo, match.group(1)), gate)
         result = run_git(repo, "worktree", "remove", "--force", str(gate))
         if result.returncode and gate.exists():
             shutil.rmtree(gate, ignore_errors=True)
@@ -1553,6 +1621,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
         completed_step(task, "gate")
         return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
     finally:
+        preserve_work(task, gate)
         run_git(repo, "worktree", "remove", "--force", str(gate))
 
 
@@ -1707,6 +1776,7 @@ def merge(args):
     if leftovers:
         print(f"Kept {path}: it holds files that are not in the merge:\n" + "\n".join(leftovers))
         return 0
+    preserve_work(task, path)
     git(repo, "worktree", "remove", "--force", str(path))
     completed_step(task, "cleaned")
     if is_ancestor(repo, lane_head, commit) and ok(repo, "branch", "-D", branch):
@@ -1796,7 +1866,7 @@ def close_worktree(repo, branch, default):
     return path
 
 
-def remove_completed_close_worktree(repo, branch, remove_parent=False):
+def remove_completed_close_worktree(repo, branch, remove_parent=False, *, task):
     path = close_worktree_path(repo, branch)
     if not path.exists():
         pass
@@ -1805,6 +1875,7 @@ def remove_completed_close_worktree(repo, branch, remove_parent=False):
     else:
         # This deterministic path is owned by task close; after a verified merge, remove it
         # even if files were left behind in the temporary worktree.
+        preserve_work(task, path)
         removed = run_git(repo, "worktree", "remove", "--force", str(path))
         if removed.returncode:
             print(f"Close worktree kept at {path}: {removed.stderr.strip()}")
@@ -1853,7 +1924,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
             raise Stop(f"Close PR #{existing.get('number')} reports merge {merge_commit[:7]}, not present on origin/{default}.")
         print(f"Close PR #{existing['number']} is already merged ({merge_commit[:7]}).")
         print(update_closed_knowledge_checkout(repo, default))
-        remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+        remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed, task=task)
         delete_merged_close_branch(repo, branch)
         return 0
     if existing and str(existing.get("state", "")).upper() != "OPEN":
@@ -1873,7 +1944,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         changed = apply_close_update(path, task, before, archive, criteria, status, summary)
         if not changed:
             # Nothing was committed, so there is no state to resume from: do not leave the folder behind.
-            remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+            remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed, task=task)
             print(f"{task.id} was already closed.")
             return 0
         head = sha(path, "HEAD")
@@ -1920,7 +1991,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
                    f"merge {merge_commit[:7]} remains on origin for inspection.")
     print(f"Merged close PR #{pr} with merge commit {merge_commit[:7]}.")
     print(update_closed_knowledge_checkout(repo, default))
-    remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed)
+    remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed, task=task)
     delete_merged_close_branch(repo, branch)
     return 0
 
