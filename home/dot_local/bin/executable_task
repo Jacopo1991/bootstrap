@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """task lifecycle for one task; private evidence lives in ~/.local/state/task.
 
-Lanes and task checks run as the same Unix user. Lane scripts and the repository's justfile can
-forge private task evidence; the managed hook blocks obvious write routes but is not a security
-boundary against code running as that user.
+The sandbox protects private task state from lanes running as the same Unix user.
+Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
+  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol] [--builder codex|claude]
   task check [[<repo>] <id>] [--detach]
   task review <repo> <id> [--request <file>] [--record <file>] [--reviewer <vendor> <model>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
@@ -19,8 +19,9 @@ boundary against code running as that user.
 <repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
 or a plain name for work without a task. `task start` pins criteria and Verify commands; `task
 check` runs the gate and pinned verification; review and merge are PM actions.
-Claude Code and Codex sessions are treated as advisory lanes. The PM runs `task` from the
-agentdev-shell connector, which sets neither vendor's agent markers.
+Sessions unable to write ~/.local/state/task are advisory lanes. The PM shell and
+an unsandboxed batch runner are trusted. Always launch builders via `task lane`;
+it keeps the builders sandboxed, including when the runner itself uses bypass.
 """
 import argparse
 from contextlib import contextmanager
@@ -56,6 +57,11 @@ DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", 
 WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv"}
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
+# Keep this set aligned with the hook's GIT_OVERRIDE_ENV; other Git variables
+# (including author/committer identity and optional locks) remain available.
+GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                    "GIT_EXEC_PATH", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EXTERNAL_DIFF"}
 
 
 class Stop(Exception):
@@ -595,13 +601,8 @@ def detached(args, task, path):
     return 0
 
 
-def agent_session():
-    return any(os.environ.get(name) for name in
-               ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"))
-
-
-def task_state_writable(task: Task):
-    state = task_state(task)
+def task_state_writable(task: Task | None = None):
+    state = task_state(task) if task else HOME / ".local/state/task"
     probe = None
     try:
         state.mkdir(parents=True, exist_ok=True)
@@ -626,7 +627,94 @@ def check_task_from_args(args):
 
 
 def advisory_check_for(task: Task):
-    return agent_session() or not task_state_writable(task)
+    return not task_state_writable() or not task_state_writable(task)
+
+
+def require_pm(args):
+    """Refuse before dispatch, locks, records or detached processes can be written."""
+    if not task_state_writable():
+        raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel"}:
+        task = Task(resolve_repo(args.repo), args.id)
+        if not task_state_writable(task):
+            raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
+
+
+def lane_environment():
+    # The hook refuses Git control-plane overrides inherited by a nested CLI.
+    # Never carry a runner's detached gate ownership into a builder.
+    return {name: value for name, value in os.environ.items()
+            if name not in GIT_OVERRIDE_ENV and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
+
+
+def lane(args):
+    task = Task(resolve_repo(args.repo), args.id)
+    path = task.worktree()
+    record = load_record(task)
+    builder = args.builder or record["builder"]
+    if builder != record["builder"]:
+        raise Stop("--builder must match the pinned task builder; ask the PM to refresh the task.")
+    work = path / ".work"
+    prompt = work / "prompt.md"
+    if not prompt.is_file():
+        raise Stop(f"Missing lane prompt: {prompt}; the PM must write it before dispatch.")
+    binary = builder
+    if not shutil.which(binary):
+        raise Stop(f"{binary} is not installed or available on PATH.")
+    final = work / "final.md"
+    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", args.model,
+                "--output-last-message", str(final), "-"] if builder == "codex" else
+               ["claude", "-p", "--model", "sonnet", "--effort", "high",
+                "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
+    lane_record = work / "lane.json"
+    with (work / "lane.lock").open("a") as lock:
+        # The worker waits for the launcher to publish its pid before proceeding.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args._worker:
+            run = json.loads(lane_record.read_text())
+            if run.get("pid") != os.getpid():
+                raise Stop("Lane ownership changed before the worker started.")
+        else:
+            try:
+                previous = json.loads(lane_record.read_text())
+            except (OSError, json.JSONDecodeError):
+                previous = {}
+            if previous.get("state") == "running" and pid_alive(previous.get("pid")):
+                raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
+            final.unlink(missing_ok=True)
+            worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
+                      "--builder", builder, "--model", args.model, "--_worker"]
+            with (work / "lane.log").open("wb") as log:
+                child = subprocess.Popen(worker, cwd=path, env=lane_environment(),
+                                         stdin=subprocess.DEVNULL, stdout=log,
+                                         stderr=subprocess.STDOUT, start_new_session=True,
+                                         close_fds=True)
+            atomic_json(lane_record, {"state": "running", "pid": child.pid,
+                                      "builder": builder, "model": args.model if builder == "codex" else "sonnet",
+                                      "started_at": utc_now(), "ended_at": ""})
+            print(f"Started sandboxed {builder} lane (pid {child.pid}); "
+                  f"see {work / 'lane.log'} and {final}; track it with `task status`.")
+            return 0
+    code = 1
+    try:
+        with prompt.open("rb") as source:
+            if builder == "codex":
+                code = subprocess.run(command, cwd=path, env=lane_environment(), stdin=source).returncode
+            else:
+                with final.open("wb") as output:
+                    child = subprocess.Popen(command, cwd=path, env=lane_environment(), stdin=source,
+                                             stdout=subprocess.PIPE)
+                    while chunk := child.stdout.read1(65536):
+                        output.write(chunk)
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+                    code = child.wait()
+    except OSError as error:
+        print(f"Lane launch failed: {error}", file=sys.stderr)
+    finally:
+        run.update(state="finished", exit_code=code, ended_at=utc_now())
+        atomic_json(lane_record, run)
+    return code
 
 
 def foreground_lock(args):
@@ -638,7 +726,7 @@ def foreground_lock(args):
         else:
             repo = resolve_repo(args.repo) if args.repo else main_repo(Path.cwd())
             task = Task(repo, args.id)
-        CHECK_ADVISORY = agent_session() or not task_state_writable(task)
+        CHECK_ADVISORY = advisory_check_for(task)
         if CHECK_ADVISORY or os.environ.get("TASK_RUN_RECORD"):
             return None
     elif args.command == "merge" and not os.environ.get("TASK_RUN_RECORD"):
@@ -939,13 +1027,7 @@ def start(args):
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     print(f"{task.id}{title}")
-    if args.builder == "codex":
-        print(f"In the Codex app: open the {repo} project and start a Local chat (not Worktree), "
-              f"then work only in .worktrees/{task.name}.")
-        print(f"Use branch {branch}.")
-    else:
-        print(f"Open {repo} (Claude Code, or the Codex project on the agentdev host) and work only in "
-              f".worktrees/{task.name} on branch {branch}.")
+    print(f"Work only in {task.path} on branch {branch}.")
     if task.file:
         print(f"Task: {task.file}")
     print("Commit on the branch, then run `task check` from that folder for advisory feedback, "
@@ -954,6 +1036,8 @@ def start(args):
           "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
           "`verified: ...`, and `not done: ...`, followed by `report written`. "
           "For long gates, the PM can use `task merge --detach`.")
+    print(f"The PM writes the approved prompt to {work / 'prompt.md'} and launches the builder with "
+          f"`task lane {args.repo} {task.id}`. Always use `task lane` so builders stay sandboxed.")
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
@@ -2177,6 +2261,19 @@ def status(args):
                            and lane_check.get("record_revision") == record.get("revision"))
                 freshness = "" if current else ", stale"
                 print(f"    lane check: {lane_result} (advisory{freshness})")
+            try:
+                lane_run = json.loads((path / ".work/lane.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                lane_run = {}
+            if lane_run:
+                lane_state = lane_run.get("state", "unknown")
+                if lane_state == "running" and not pid_alive(lane_run.get("pid")):
+                    lane_state = "interrupted"
+                result = f" (exit {lane_run['exit_code']})" if "exit_code" in lane_run else ""
+                print(f"    lane: {lane_state}{result} pid={lane_run.get('pid', '?')} "
+                      f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
+                if lane_state == "interrupted" or lane_run.get("exit_code", 0) != 0:
+                    attention.append(f"{path.name}: lane {lane_state}{result}")
             if (state / "exception.json").is_file():
                 attention.append(f"{path.name}: exception")
             if check.get("result") == "failed":
@@ -2313,7 +2410,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("start", "merge", "close", "review", "cancel"):
+    for name in ("start", "lane", "merge", "close", "review", "cancel"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
         sub.add_argument("id")
@@ -2321,6 +2418,10 @@ def main(argv=None):
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
             sub.add_argument("--no-verify", metavar="REASON")
+        if name == "lane":
+            sub.add_argument("--builder", choices=("codex", "claude"))
+            sub.add_argument("--model", choices=("gpt-6-luna", "gpt-6.1-sol"), default="gpt-6-luna")
+            sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
             sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
             sub.add_argument("--override", metavar="REASON")
@@ -2351,6 +2452,12 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note"}:
+        try:
+            require_pm(args)
+        except Stop as stop:
+            print(f"task {args.command}: {stop}", file=sys.stderr)
+            return 1
     try:
         if args.command == "note":
             if args.kind != "setup-done":
@@ -2394,7 +2501,7 @@ def main(argv=None):
             signal.signal(signal.SIGTERM, handle_interruption)
         result = 1
         try:
-            result = {"start": start, "check": check, "merge": merge, "close": close,
+            result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials}[args.command](args) or 0
         finally:

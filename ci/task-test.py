@@ -86,6 +86,28 @@ path.write_text(text)
 """,
 }
 
+MODEL_STUB = """#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+work = pathlib.Path.cwd() / '.work'
+prompt = sys.stdin.read()
+(work / 'model-call.json').write_text(json.dumps({
+    'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt,
+    'env_names': sorted(os.environ),
+}))
+release = os.environ.get('LANE_STUB_RELEASE')
+deadline = time.monotonic() + 10
+while release and not pathlib.Path(release).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+if pathlib.Path(sys.argv[0]).name == 'codex':
+    final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
+    final.write_text('codex-final: ' + prompt)
+    print('codex-log')
+else:
+    print('claude-final: ' + prompt, end='')
+    print('claude-log', file=sys.stderr)
+sys.exit(int(os.environ.get('LANE_STUB_EXIT', '0')))
+"""
+
 
 class TaskTool(unittest.TestCase):
     def setUp(self):
@@ -157,6 +179,34 @@ class TaskTool(unittest.TestCase):
 
     def state(self, name="t5"):
         return self.home / ".local/state/task/proj" / name
+
+    def sandbox_state(self):
+        """Simulate the sandbox's private-state mount, independently of vendor markers."""
+        state = self.home / ".local/state/task"
+        state.mkdir(parents=True, exist_ok=True)
+        state.chmod(0o555)
+        self.addCleanup(state.chmod, 0o755)
+        return state
+
+    def stub_models(self):
+        for name in ("codex", "claude"):
+            binary = self.home / "bin" / name
+            binary.write_text(MODEL_STUB)
+            binary.chmod(0o755)
+
+    def wait_for_lane(self, wt, finished=True):
+        import json
+        import time
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if finished:
+                record = json.loads((wt / ".work/lane.json").read_text())
+                if record["state"] == "finished":
+                    return record
+            elif (wt / ".work/model-call.json").exists():
+                return json.loads((wt / ".work/model-call.json").read_text())
+            time.sleep(0.02)
+        self.fail("lane did not reach the expected state")
 
     def prepare_merge_evidence(self, ident):
         path = self.repo / ".worktrees" / ("t" + ident.lower().removeprefix("t-").removeprefix("t"))
@@ -333,9 +383,9 @@ class TaskTool(unittest.TestCase):
     def test_start_makes_worktree_and_prompt(self):
         wt, out = self.started()
         self.assertEqual(self.git(wt, "branch", "--show-current"), "t5-add-the-b-file")
-        self.assertIn("In the Codex app: open the ", out)
-        self.assertIn("start a Local chat (not Worktree), then work only in .worktrees/t5.", out)
-        self.assertIn("Use branch t5-add-the-b-file.", out)
+        self.assertIn(f"Work only in {wt} on branch t5-add-the-b-file.", out)
+        self.assertIn("`task lane proj T-5`", out)
+        self.assertIn(str(wt / ".work/prompt.md"), out)
         self.assertIn("t-5 - Add-the-b-file.md", out)
         commit_at = out.index("Commit on the branch")
         check_at = out.index("then run `task check`", commit_at)
@@ -402,7 +452,7 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("start", "proj", "5", "--builder", "codex", "--no-verify",
                             "fixture has no Verify command")
         self.assertIn(f"T-5 - {expected}", out)
-        self.assertIn("Use branch t5-data-layer-phase-5.", out)
+        self.assertIn("on branch t5-data-layer-phase-5.", out)
         record = __import__("json").loads((self.state() / "task.json").read_text())
         self.assertEqual(record["title"], expected)
         self.assertNotIn(">-", out)
@@ -447,8 +497,8 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("start", "proj", "codex/direct-request", "--builder", "codex")
         wt = self.repo / ".worktrees/codex-direct-request"
         self.assertIn("on the existing branch codex/direct-request", out)
-        self.assertIn(".worktrees/codex-direct-request.", out)
-        self.assertIn("Use branch codex/direct-request.", out)
+        self.assertIn(".worktrees/codex-direct-request on branch codex/direct-request.", out)
+        self.assertIn("`task lane proj codex/direct-request`", out)
         self.assertEqual(self.git(wt, "branch", "--show-current"), "codex/direct-request")
         self.assertTrue((self.state("codex-direct-request") / "task.json").is_file())
 
@@ -509,6 +559,7 @@ class TaskTool(unittest.TestCase):
     def test_agent_advisory_check_returns_real_failure_code(self):
         wt, _ = self.started()
         self.commit_in(wt, "FAIL")
+        self.sandbox_state()
         env = dict(self.env, CLAUDECODE="1")
         out = self.raw_task("check", "proj", "5", env=env, code=1)
         self.assertIn("advisory lane check (not evidence for merge)", out)
@@ -526,6 +577,7 @@ class TaskTool(unittest.TestCase):
         real_index = Path(self.git(wt, "rev-parse", "--path-format=absolute", "--git-path", "index"))
         index_before = real_index.read_bytes()
         original_worktree = (wt / "a.txt").read_bytes()
+        self.sandbox_state()
         env = dict(self.env, CLAUDECODE="1", SIMULATE_READ_ONLY_GIT_DIR="1")
 
         out = self.raw_task("check", "proj", "5", env=env)
@@ -579,6 +631,7 @@ class TaskTool(unittest.TestCase):
         (self.home / "during-check.sh").write_text(
             'test -s "$TASK_GATE_DIR/agent-task-gate.holder" || exit 7\n')
         (self.home / "during-check.sh").chmod(0o755)
+        self.sandbox_state()
         out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
         self.assertIn("PASS", out)
         self.assertFalse((self.gate_dir / "agent-task-gate.holder").exists(),
@@ -608,6 +661,7 @@ class TaskTool(unittest.TestCase):
         record["verify"] = [f'env > "{self.home}/verify-env"']
         record["revision"] = TASK_MODULE.record_revision(record)
         task_record_path.write_text(json.dumps(record))
+        self.sandbox_state()
         env = dict(self.env, CLAUDECODE="1", HTTP_PROXY="http://127.0.0.1:8123",
                    HTTPS_PROXY="http://127.0.0.1:8123", ALL_PROXY="socks5://127.0.0.1:8123",
                    http_proxy="http://127.0.0.1:8124", https_proxy="http://127.0.0.1:8124",
@@ -629,6 +683,7 @@ class TaskTool(unittest.TestCase):
         (self.home / "during-check.sh").write_text(
             '#!/bin/sh\necho active > "$HOME/advisory-active"\nsleep 1\n')
         (self.home / "during-check.sh").chmod(0o755)
+        self.sandbox_state()
         env = dict(self.env, CLAUDECODE="1")
         first = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "5"],
                                  cwd=self.home, env=env, stdout=subprocess.PIPE,
@@ -646,13 +701,14 @@ class TaskTool(unittest.TestCase):
         self.assertIn("FAILED (failures=1)", (wt / ".work/check.log").read_text())
         self.assertIn("FAIL (log:", first_out)
 
-    def test_agent_markers_skip_unavailable_shared_gate_and_status_separates_lane_result(self):
+    def test_read_only_state_skips_unavailable_shared_gate_and_separates_lane_result(self):
         (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(self.repo, "add", ".task.toml")
         self.git(self.repo, "commit", "-qm", "enable exclusive gate")
         self.git(self.repo, "push", "-q", "origin", "main")
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
+        read_only = self.sandbox_state()
         for index, (marker, value) in enumerate((("CLAUDECODE", "1"),
                                                   ("CODEX_SANDBOX", "workspace-write"))):
             env = dict(self.env, **{marker: value},
@@ -666,29 +722,165 @@ class TaskTool(unittest.TestCase):
             self.assertFalse((self.state() / "check.json").exists())
         lane_result = __import__("json").loads((wt / ".work/check.json").read_text())
         self.assertTrue(lane_result["advisory"])
+        read_only.chmod(0o755)
         self.raw_task("check", "proj", "5")
         trusted = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertTrue(trusted["trusted"])
         self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
         self.assertIn("lane check: passed (advisory)", self.raw_task("status", "proj"))
 
-    def test_codex_marker_is_advisory_even_when_state_is_writable(self):
+    def test_vendor_markers_do_not_make_writable_state_advisory(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         state = self.state()
         probe = state / "writable-probe"
         probe.write_text("writable")
         probe.unlink()
-        out = self.raw_task("check", "proj", "5", env=dict(self.env, CODEX_THREAD_ID="thread-test"))
-        self.assertIn("advisory lane check (not evidence for merge)", out)
-        self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
-        self.assertFalse((state / "check.json").exists())
+        for markers in ({"CODEX_THREAD_ID": "thread-test"}, {"CODEX_SANDBOX": "workspace-write"},
+                        {"CODEX_SANDBOX": "read-only"}, {"CLAUDECODE": "1"},
+                        {"CLAUDE_CODE_ENTRYPOINT": "cli"}):
+            with self.subTest(markers=markers):
+                out = self.raw_task("check", "proj", "5", env=dict(self.env, **markers))
+                self.assertNotIn("advisory lane check", out)
+                checked = __import__("json").loads((state / "check.json").read_text())
+                self.assertTrue(checked["trusted"])
+                self.assertFalse(checked["advisory"])
+        self.assertFalse((wt / ".work/check.json").exists())
+
+    def test_read_only_state_refuses_mutating_commands_without_writes(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        read_only = self.sandbox_state()
+        before = {str(path.relative_to(self.home)): path.read_bytes()
+                  for path in self.home.rglob("*") if path.is_file()}
+        commands = (("start", "proj", "5", "--builder", "codex", "--refresh"),
+                    ("review", "proj", "5"),
+                    ("review", "proj", "5", "--record", "missing-review.md"),
+                    ("merge", "proj", "5"), ("merge", "proj", "5", "--detach"),
+                    ("close", "proj", "5", "-m", "done", "--retro", "tested"),
+                    ("cancel", "proj", "5"), ("lane", "proj", "5"),
+                    ("note", "proj", "5", "improve", "idea"))
+        for markers in ({}, {"CODEX_THREAD_ID": "thread-test"}, {"CODEX_SANDBOX": "workspace-write"},
+                        {"CODEX_SANDBOX": "read-only"}, {"CLAUDECODE": "1"},
+                        {"CLAUDE_CODE_ENTRYPOINT": "cli"}):
+            for command in commands:
+                with self.subTest(markers=markers, command=command):
+                    out = self.raw_task(*command, code=1, env=dict(self.env, **markers))
+                    self.assertIn("run this from the PM shell or a batch runner", out)
+        after = {str(path.relative_to(self.home)): path.read_bytes()
+                 for path in self.home.rglob("*") if path.is_file()}
+        self.assertEqual(after, before, "a denied PM command must write nothing")
+        read_only.chmod(0o755)
+
+    def test_writable_runner_can_start_check_record_merge_and_close(self):
+        self.env.update(CODEX_THREAD_ID="runner-test")
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.raw_task("check", "proj", "5")
+        self.assertTrue(__import__("json").loads((self.state() / "check.json").read_text())["trusted"])
+        self.prepare_merge_evidence("5")
+        self.raw_task("review", "proj", "5")
+        review = self.home / "review.md"
+        review.write_text(f"```review\nVerdict: PASS\nCommit: {self.git(wt, 'rev-parse', 'HEAD')}\n"
+                          "#1 pass: b exists\n#2 pass: checked\n```\n")
+        self.raw_task("review", "proj", "5", "--record", str(review))
+        self.assertIn("Merged", self.raw_task("merge", "proj", "5"))
+        self.assertIn("Closed", self.raw_task("close", "proj", "5", "-m", "done", "--retro", "tested"))
+        task_text = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
+        self.assertIn("status: Done", task_text)
+
+    def test_codex_lane_is_detached_sandboxed_clean_and_visible_in_status(self):
+        self.stub_models()
+        wt, _ = self.started()
+        prompt = "Build only the approved task.\n"
+        (wt / ".work/prompt.md").write_text(prompt)
+        release = self.home / "lane-release"
+        self.env.update(GIT_PAGER="cat", GIT_EXTERNAL_DIFF="blocked-helper", GIT_CONFIG_COUNT="0",
+                        TASK_RUN_RECORD=str(self.home / "runner-record.json"), TASK_RUN_ID="runner-id",
+                        LANE_STUB_RELEASE=str(release))
+        out = self.raw_task("lane", "proj", "5", "--model", "gpt-6.1-sol")
+        self.assertRegex(out, r"pid \d+")
+        self.assertIn(str(wt / ".work/lane.log"), out)
+        call = self.wait_for_lane(wt, finished=False)
+        try:
+            self.assertEqual(call["cwd"], str(wt))
+            self.assertEqual(call["prompt"], prompt)
+            self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
+                                            "--output-last-message", str(wt / ".work/final.md"), "-"])
+            self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
+                                 name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
+            self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
+            self.assertIn("GIT_COMMITTER_EMAIL", call["env_names"])
+            self.assertIn("lane: running", self.raw_task("status", "proj"))
+            self.assertIn("Lane already running", self.raw_task("lane", "proj", "5", code=1))
+        finally:
+            release.touch()
+            record = self.wait_for_lane(wt)
+        self.assertEqual(record["exit_code"], 0)
+        self.assertEqual((wt / ".work/final.md").read_text(), "codex-final: " + prompt)
+        self.assertIn("codex-log", (wt / ".work/lane.log").read_text())
+        self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))
+        self.assertFalse((self.home / "runner-record.json").exists())
+
+    def test_claude_lane_uses_pinned_builder_and_logs_final_and_failure(self):
+        self.stub_models()
+        self.raw_task("start", "proj", "5", "--builder", "claude")
+        wt = self.repo / ".worktrees/t5"
+        prompt = "Approved Claude task.\n"
+        (wt / ".work/prompt.md").write_text(prompt)
+        self.env["LANE_STUB_EXIT"] = "3"
+        self.raw_task("lane", "proj", "5", "--builder", "claude")
+        record = self.wait_for_lane(wt)
+        call = __import__("json").loads((wt / ".work/model-call.json").read_text())
+        self.assertEqual(call["args"], ["-p", "--model", "sonnet", "--effort", "high",
+                                       "--permission-mode", "acceptEdits", "--allowedTools",
+                                       "Bash Read Write Edit Glob Grep"])
+        self.assertEqual(call["cwd"], str(wt))
+        self.assertEqual(call["prompt"], prompt)
+        self.assertEqual(record["exit_code"], 3)
+        self.assertEqual((wt / ".work/final.md").read_text(), "claude-final: " + prompt)
+        log = (wt / ".work/lane.log").read_text()
+        self.assertIn("claude-log", log)
+        self.assertIn("claude-final", log)
+        self.assertIn("lane: finished (exit 3)", self.raw_task("status", "proj"))
+
+    def test_lane_refuses_missing_prompt_invalid_model_and_builder_mismatch(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.assertIn("Missing lane prompt", self.raw_task("lane", "proj", "5", code=1))
+        self.assertFalse((wt / ".work/lane.json").exists())
+        self.assertFalse((wt / ".work/lane.log").exists())
+        (wt / ".work/prompt.md").write_text("task\n")
+        self.assertIn("invalid choice", self.raw_task("lane", "proj", "5", "--model", "other", code=2))
+        self.assertIn("must match", self.raw_task("lane", "proj", "5", "--builder", "claude", code=1))
+        self.assertFalse((wt / ".work/model-call.json").exists())
+
+    def test_lane_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
+        blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}
+        blocked.update(GIT_CONFIG="blocked", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="override",
+                       GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner")
+        kept = {"GIT_AUTHOR_NAME": "builder", "GIT_AUTHOR_EMAIL": "builder@example.invalid",
+                "GIT_COMMITTER_NAME": "builder", "GIT_COMMITTER_EMAIL": "builder@example.invalid",
+                "GIT_OPTIONAL_LOCKS": "0", "GIT_FUTURE_VARIABLE": "value",
+                "CODEX_THREAD_ID": "runner", "PATH": "tools"}
+        with mock.patch.dict(os.environ, dict(blocked, **kept), clear=True):
+            self.assertEqual(TASK_MODULE.lane_environment(), kept)
+
+    def test_lane_git_override_set_matches_the_hook(self):
+        import ast
+        tree = ast.parse((ROOT / "system/agent-policy/pre_tool_use.py").read_text())
+        assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "GIT_OVERRIDE_ENV"
+                                  for target in node.targets))
+        self.assertEqual(TASK_MODULE.GIT_OVERRIDE_ENV, ast.literal_eval(assignment.value))
 
     def test_exclude_failure_and_flock_error_degrade_without_traceback(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         exclude_path = self.repo / ".git/info/exclude"
         exclude_path.chmod(0o444)
+        self.sandbox_state()
         out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
         self.assertIn("advisory lane check (not evidence for merge)", out)
         self.assertNotIn("Traceback", out)
@@ -1636,13 +1828,13 @@ exit 1
 
     def test_plain_name_without_task(self):
         out = self.task("start", "proj", "tidy-docs", "--builder", "codex")
-        self.assertIn("start a Local chat (not Worktree), then work only in .worktrees/tidy-docs.", out)
-        self.assertIn("Use branch tidy-docs.", out)
+        self.assertIn(f"Work only in {self.repo / '.worktrees/tidy-docs'} on branch tidy-docs.", out)
+        self.assertIn("`task lane proj tidy-docs`", out)
 
-    def test_claude_dispatch_wording_stays_the_same(self):
+    def test_claude_dispatch_uses_task_lane(self):
         out = self.raw_task("start", "proj", "claude-lane", "--builder", "claude")
-        self.assertIn("Open " + str(self.repo) + " (Claude Code, or the Codex project on the agentdev host) "
-                      "and work only in .worktrees/claude-lane on branch claude-lane.", out)
+        self.assertIn(f"Work only in {self.repo / '.worktrees/claude-lane'} on branch claude-lane.", out)
+        self.assertIn("`task lane proj claude-lane`", out)
 
     def test_acceptance_1_merge_gate_lists_missing_evidence_and_override_is_visible(self):
         wt, _ = self.started()
