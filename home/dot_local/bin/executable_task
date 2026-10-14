@@ -640,9 +640,9 @@ def require_pm(args):
             raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
 
 
-def lane_environment():
+def agent_environment():
     # The hook refuses Git control-plane overrides inherited by a nested CLI.
-    # Never carry a runner's detached gate ownership into a builder.
+    # Never carry a runner's detached gate ownership into an agent.
     return {name: value for name, value in os.environ.items()
             if name not in GIT_OVERRIDE_ENV and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
 
@@ -685,7 +685,7 @@ def lane(args):
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", args.model, "--_worker"]
             with (work / "lane.log").open("wb") as log:
-                child = subprocess.Popen(worker, cwd=path, env=lane_environment(),
+                child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
                                          stdin=subprocess.DEVNULL, stdout=log,
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
@@ -699,10 +699,10 @@ def lane(args):
     try:
         with prompt.open("rb") as source:
             if builder == "codex":
-                code = subprocess.run(command, cwd=path, env=lane_environment(), stdin=source).returncode
+                code = subprocess.run(command, cwd=path, env=agent_environment(), stdin=source).returncode
             else:
                 with final.open("wb") as output:
-                    child = subprocess.Popen(command, cwd=path, env=lane_environment(), stdin=source,
+                    child = subprocess.Popen(command, cwd=path, env=agent_environment(), stdin=source,
                                              stdout=subprocess.PIPE)
                     while chunk := child.stdout.read1(65536):
                         output.write(chunk)
@@ -1452,7 +1452,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
         raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
     if timeout < 1:
         raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
-    env = dict(os.environ)
+    env = agent_environment()
     argv = shlex.split(command)
     if argv[0] == "GIT_OPTIONAL_LOCKS=0":
         env["GIT_OPTIONAL_LOCKS"] = "0"
