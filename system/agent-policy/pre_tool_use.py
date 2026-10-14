@@ -65,7 +65,6 @@ STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
-PM_TASK_COMMANDS = {"start", "merge", "close", "review", "cancel", "note", "denials"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -1081,25 +1080,6 @@ def task_state_path(path_text: str, cwd: str) -> bool:
         return resolved == root or root in resolved.parents
     except (OSError, ValueError):
         return ".local/state/task" in path_text.replace("\\", "/")
-
-
-def task_route(tokens: list[str]) -> tuple[str, int] | None:
-    """Find a task-tool invocation at command position, never a mention in arguments."""
-    unwrapped = unwrap_command(tokens)
-    if not isinstance(unwrapped, list) or not unwrapped:
-        return None
-    executable = Path(unwrapped[0]).name.lower()
-    task_names = {"task", "executable_task", "executable_task.py"}
-    if executable in task_names and len(unwrapped) > 1:
-        command = unwrapped[1]
-        if command in PM_TASK_COMMANDS or command == "check":
-            return command, 0
-    if (executable in INTERPRETERS or re.fullmatch(r"python[0-9.]+", executable)) and len(unwrapped) > 2:
-        if Path(unwrapped[1]).name.lower() in task_names:
-            command = unwrapped[2]
-            if command in PM_TASK_COMMANDS or command == "check":
-                return command, 1
-    return None
 
 
 def task_state_write_reason(tokens: list[str], cwd: str) -> str | None:

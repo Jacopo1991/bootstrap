@@ -436,6 +436,8 @@ and unsandboxed runner can write it and produce trusted evidence. Sandboxed
 Codex and Claude Code builders cannot: their checks remain advisory, and commands
 that mutate PM state refuse with “run this from the PM shell or a batch runner”.
 The hook permits PM task command routes; its other rules remain in force.
+`task lane` and plain `task review` are PM/runner-only too: lane dispatch starts
+a builder, and review preparation writes private routing and prompt records.
 
 Always launch build lanes through `task lane`, including from a batch runner:
 
@@ -450,11 +452,14 @@ task status bootstrap
 requires an existing task worktree, pinned task record and `.work/prompt.md`.
 The builder defaults to the pinned builder; an explicit builder must match it.
 Codex defaults to `gpt-6-luna` and always uses `codex exec --sandbox workspace-write`.
-Claude uses `claude -p --model sonnet --effort high --dangerously-skip-permissions`;
-its managed sandbox remains active. Builder lanes never use Codex's bypass flag.
+Claude uses `claude -p --model sonnet --effort high --permission-mode acceptEdits
+--allowedTools "Bash Read Write Edit Glob Grep"`; its sandbox, configured in
+`settings.json`, and the policy hook remain active. Builders use no bypass flag.
 
-The launcher removes inherited `GIT_*` overrides and gate-run ownership variables,
-runs from the task worktree, detaches and prints its pid. The final response is
+The launcher removes hook-blocked Git overrides (`GIT_PAGER`, `GIT_CONFIG*` and
+the hook's `GIT_OVERRIDE_ENV` set) and gate-run ownership variables, preserving
+other Git variables such as author/committer identity and `GIT_OPTIONAL_LOCKS`.
+It runs from the task worktree, detaches and prints its pid. The final response is
 `.work/final.md`, logs are `.work/lane.log`, and `task status` shows the lane as
 running, finished with its exit code, or interrupted. A live lane cannot be
 launched twice. Commit, check, report and other-vendor review still precede merge.

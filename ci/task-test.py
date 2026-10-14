@@ -808,7 +808,10 @@ class TaskTool(unittest.TestCase):
             self.assertEqual(call["prompt"], prompt)
             self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
                                             "--output-last-message", str(wt / ".work/final.md"), "-"])
-            self.assertFalse(any(name.startswith(("GIT_", "TASK_RUN_")) for name in call["env_names"]))
+            self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
+                                 name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
+            self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
+            self.assertIn("GIT_COMMITTER_EMAIL", call["env_names"])
             self.assertIn("lane: running", self.raw_task("status", "proj"))
             self.assertIn("Lane already running", self.raw_task("lane", "proj", "5", code=1))
         finally:
@@ -831,7 +834,8 @@ class TaskTool(unittest.TestCase):
         record = self.wait_for_lane(wt)
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
         self.assertEqual(call["args"], ["-p", "--model", "sonnet", "--effort", "high",
-                                       "--dangerously-skip-permissions"])
+                                       "--permission-mode", "acceptEdits", "--allowedTools",
+                                       "Bash Read Write Edit Glob Grep"])
         self.assertEqual(call["cwd"], str(wt))
         self.assertEqual(call["prompt"], prompt)
         self.assertEqual(record["exit_code"], 3)
@@ -852,12 +856,24 @@ class TaskTool(unittest.TestCase):
         self.assertIn("must match", self.raw_task("lane", "proj", "5", "--builder", "claude", code=1))
         self.assertFalse((wt / ".work/model-call.json").exists())
 
-    def test_lane_environment_removes_all_git_and_runner_ownership_variables(self):
-        with mock.patch.dict(os.environ, {"GIT_PAGER": "cat", "GIT_DIR": "other",
-                                          "GIT_CONFIG_KEY_0": "override", "GIT_SSH_COMMAND": "helper",
-                                          "GIT_FUTURE_OVERRIDE": "value", "TASK_RUN_ID": "runner",
-                                          "CODEX_THREAD_ID": "runner", "PATH": "tools"}, clear=True):
-            self.assertEqual(TASK_MODULE.lane_environment(), {"CODEX_THREAD_ID": "runner", "PATH": "tools"})
+    def test_lane_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
+        blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}
+        blocked.update(GIT_CONFIG="blocked", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="override",
+                       GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner")
+        kept = {"GIT_AUTHOR_NAME": "builder", "GIT_AUTHOR_EMAIL": "builder@example.invalid",
+                "GIT_COMMITTER_NAME": "builder", "GIT_COMMITTER_EMAIL": "builder@example.invalid",
+                "GIT_OPTIONAL_LOCKS": "0", "GIT_FUTURE_VARIABLE": "value",
+                "CODEX_THREAD_ID": "runner", "PATH": "tools"}
+        with mock.patch.dict(os.environ, dict(blocked, **kept), clear=True):
+            self.assertEqual(TASK_MODULE.lane_environment(), kept)
+
+    def test_lane_git_override_set_matches_the_hook(self):
+        import ast
+        tree = ast.parse((ROOT / "system/agent-policy/pre_tool_use.py").read_text())
+        assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "GIT_OVERRIDE_ENV"
+                                  for target in node.targets))
+        self.assertEqual(TASK_MODULE.GIT_OVERRIDE_ENV, ast.literal_eval(assignment.value))
 
     def test_exclude_failure_and_flock_error_degrade_without_traceback(self):
         wt, _ = self.started()

@@ -57,6 +57,11 @@ DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", 
 WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv"}
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
+# Keep this set aligned with the hook's GIT_OVERRIDE_ENV; other Git variables
+# (including author/committer identity and optional locks) remain available.
+GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                    "GIT_EXEC_PATH", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                    "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EXTERNAL_DIFF"}
 
 
 class Stop(Exception):
@@ -637,10 +642,9 @@ def require_pm(args):
 
 def lane_environment():
     # The hook refuses Git control-plane overrides inherited by a nested CLI.
-    # Drop all GIT_* so future hook additions cannot silently break dispatch.
     # Never carry a runner's detached gate ownership into a builder.
     return {name: value for name, value in os.environ.items()
-            if not name.startswith(("GIT_", "TASK_RUN_"))}
+            if name not in GIT_OVERRIDE_ENV and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
 
 
 def lane(args):
@@ -661,7 +665,7 @@ def lane(args):
     command = (["codex", "exec", "--sandbox", "workspace-write", "--model", args.model,
                 "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--model", "sonnet", "--effort", "high",
-                "--dangerously-skip-permissions"])
+                "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
         # The worker waits for the launcher to publish its pid before proceeding.

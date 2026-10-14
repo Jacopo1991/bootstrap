@@ -237,8 +237,6 @@ with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "
 
 # Denial logging is best-effort, records only the executable category, and cannot
 # change a deny when the state path is broken.
-assert {"review", "note", "cancel", "start", "merge", "close"} <= policy.PM_TASK_COMMANDS
-assert "status" not in policy.PM_TASK_COMMANDS and "check" not in policy.PM_TASK_COMMANDS
 with tempfile.TemporaryDirectory() as temp:
     root = Path(temp)
     for command in (
