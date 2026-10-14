@@ -244,8 +244,10 @@ with tempfile.TemporaryDirectory() as temp:
     for command in (
             "task merge proj 5", "/usr/local/bin/task review proj 5",
             "python3 /home/agent/dev_workspace/bootstrap/home/dot_local/bin/executable_task close proj 5",
-            "sh /usr/local/bin/task start proj 5", "env task note proj 5 improve x"):
-        assert policy.evaluate_command(command, temp, root, (root,)) is not None, command
+            "sh /usr/local/bin/task start proj 5", "env task note proj 5 improve x",
+            "task cancel proj 5", "task denials", "task lane proj 5",
+            "task review proj 5 --record review.md"):
+        assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     for command in ("task status proj", "task check"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     assert policy.evaluate_command("echo see task start for details", temp, root, (root,)) is None
@@ -274,7 +276,7 @@ with tempfile.TemporaryDirectory() as temp:
                   "tool_input": {"command": "env task merge proj 5"}}
     with patch.dict(os.environ, clean_env, clear=True):
         task_denial = policy.evaluate(task_event, (Path(temp),))
-    assert task_denial.rule_id == "task.pm_only"
+    assert task_denial is None
     codex_event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": temp,
                    "tool_input": {"command": "sudo true"}}
     with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, clean_env, clear=True):

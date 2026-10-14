@@ -207,12 +207,12 @@ with tempfile.TemporaryDirectory() as temp:
         for subcommand in ("add", "commit", "push", "pull", "merge", "checkout", "switch", "reset", "config"):
             command = f"git -C {target} {subcommand}"
             assert policy.evaluate(event(command), roots) is not None, command
-    for sub in ("start", "merge", "close"):
+    for sub in ("start", "merge", "close", "review", "cancel", "denials", "lane"):
         reason = policy.evaluate(event(f"task {sub} proj T-5"), roots)
-        assert reason and "for the PM" in reason, (sub, reason)
+        assert reason is None, (sub, reason)
     for command in ("task note proj T-5 setup request", "task note - - setup-done 1"):
         reason = policy.evaluate(event(command), roots)
-        assert reason and "for the PM" in reason, (command, reason)
+        assert reason is None, (command, reason)
     assert policy.evaluate(event("task status"), roots) is None
     assert policy.evaluate(event("task check"), roots) is None
     # One rejection names every missing flag and the full command (MadPlanner T-32 hit its

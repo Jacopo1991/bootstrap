@@ -1336,9 +1336,6 @@ def evaluate_command(command: str, cwd: str, root: Path,
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
     for tokens in all_tokens:
-        route = task_route(tokens)
-        if route and route[0] in PM_TASK_COMMANDS:
-            return Denial("task.pm_only", "PM task subcommands are for the PM and may not be invoked from an agent command.")
         state_reason = task_state_write_reason(tokens, cwd)
         if state_reason:
             return Denial("task.private_state_write", state_reason)
@@ -1417,10 +1414,6 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     host_reason = host_command_reason(tokens, executable)
     if host_reason:
         return Denial("host.command_boundary", host_reason)
-    if executable == "task" and len(tokens) > 1 and tokens[1] in PM_TASK_COMMANDS:
-        return Denial("task.pm_only", "`task start`, `task merge`, `task close`, `task review`, `task cancel`, `task note` "
-                      "and `task denials` are for the PM. Lanes may run `task status` and `task check` in their "
-                      "worktree, commit on your branch and report.")
     if executable == "sed":
         reason = sed_policy(tokens)
         if reason:
