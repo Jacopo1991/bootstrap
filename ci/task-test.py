@@ -114,7 +114,22 @@ work = pathlib.Path.cwd() / '.work'
 (work / 'reviewer-call.json').write_text(json.dumps({
     'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': sys.stdin.read(),
     'git_optional_locks': os.environ.get('GIT_OPTIONAL_LOCKS'),
+    'env_names': sorted(os.environ),
 }))
+if os.environ.get('REVIEW_STUB_POLICY'):
+    import importlib.util, subprocess
+    spec = importlib.util.spec_from_file_location('review_policy', os.environ['REVIEW_STUB_POLICY'])
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    command = ['git', '--no-optional-locks', 'diff', 'origin/main..HEAD']
+    denial = policy.evaluate({'tool_name': 'Bash', 'cwd': os.getcwd(),
+                              'tool_input': {'command': ' '.join(command)}},
+                             approved_roots=(pathlib.Path.cwd(),))
+    if denial:
+        print(denial, file=sys.stderr)
+        sys.exit(1)
+    diff = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+    (work / 'reviewer-diff.txt').write_text(diff)
 print(os.environ.get('REVIEW_STUB_REPLY', ''), end='', flush=True)
 time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
 sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
@@ -876,7 +891,7 @@ class TaskTool(unittest.TestCase):
         self.assertIn("must match", self.raw_task("lane", "proj", "5", "--builder", "claude", code=1))
         self.assertFalse((wt / ".work/model-call.json").exists())
 
-    def test_lane_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
+    def test_agent_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
         blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}
         blocked.update(GIT_CONFIG="blocked", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="override",
                        GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner")
@@ -885,7 +900,7 @@ class TaskTool(unittest.TestCase):
                 "GIT_OPTIONAL_LOCKS": "0", "GIT_FUTURE_VARIABLE": "value",
                 "CODEX_THREAD_ID": "runner", "PATH": "tools"}
         with mock.patch.dict(os.environ, dict(blocked, **kept), clear=True):
-            self.assertEqual(TASK_MODULE.lane_environment(), kept)
+            self.assertEqual(TASK_MODULE.agent_environment(), kept)
 
     def test_lane_git_override_set_matches_the_hook(self):
         import ast
@@ -1201,6 +1216,35 @@ class TaskTool(unittest.TestCase):
 
     def test_review_run_codex_records_fail_like_manual_record(self):
         self.assert_review_run("claude", "FAIL")
+
+    def test_review_run_cleans_inherited_environment_before_hook_and_diff(self):
+        import json
+        self.stub_reviewers()
+        for builder in ("codex", "claude"):
+            with self.subTest(builder=builder):
+                name = f"clean-{builder}"
+                self.raw_task("start", "proj", name, "--builder", builder)
+                wt = self.repo / ".worktrees" / name
+                self.commit_in(wt, "b.txt")
+                head = self.git(wt, "rev-parse", "HEAD")
+                reply = f"```review\nVerdict: PASS\nCommit: {head}\n```\n"
+                env = dict(self.env, GIT_PAGER="cat", GIT_EXTERNAL_DIFF="blocked-helper",
+                           GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.pager",
+                           GIT_CONFIG_VALUE_0="cat", GIT_CONFIG_FUTURE="blocked",
+                           GIT_OPTIONAL_LOCKS="1", TASK_RUN_ID="runner",
+                           REVIEW_STUB_POLICY=str(ROOT / "system/agent-policy/pre_tool_use.py"),
+                           REVIEW_STUB_REPLY=reply)
+                self.raw_task("review", "proj", name, "--run", env=env)
+                call = json.loads((wt / ".work/reviewer-call.json").read_text())
+                self.assertFalse(any(key in TASK_MODULE.GIT_OVERRIDE_ENV or
+                                     key.startswith(("GIT_CONFIG", "TASK_RUN_"))
+                                     for key in call["env_names"]))
+                self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
+                self.assertIn("GIT_COMMITTER_EMAIL", call["env_names"])
+                self.assertEqual(call["git_optional_locks"], "0" if builder == "claude" else "1")
+                self.assertIn("diff --git a/b.txt b/b.txt", (wt / ".work/reviewer-diff.txt").read_text())
+                self.assertEqual(json.loads((self.state(name) / "review.json").read_text())["verdict"],
+                                 "PASS")
 
     def test_review_run_direct_request_has_no_kb_and_records_without_criteria(self):
         import json
