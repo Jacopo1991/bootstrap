@@ -7,7 +7,7 @@ Write capability there determines trust; vendor environment markers do not.
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
   task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol] [--builder codex|claude]
   task check [[<repo>] <id>] [--detach]
-  task review <repo> <id> [--request <file>] [--record <file>] [--reviewer <vendor> <model>]
+  task review <repo> <id> [--request <file>] [--run | --record <file>] [--reviewer <vendor> <model>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial]
@@ -1445,6 +1445,39 @@ def parse_review_reply(text, criteria):
     return verdict, commit, reviewer, judgments
 
 
+def run_reviewer(command, path, prompt_file, reply_file):
+    try:
+        timeout = int(os.environ.get("TASK_REVIEW_TIMEOUT", "900"))
+    except ValueError:
+        raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
+    if timeout < 1:
+        raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
+    env = dict(os.environ)
+    argv = shlex.split(command)
+    if argv[0] == "GIT_OPTIONAL_LOCKS=0":
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        argv.pop(0)
+    try:
+        with prompt_file.open() as prompt, reply_file.open("w") as reply:
+            process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
+                                       start_new_session=True)
+            try:
+                code = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                raise Stop(f"Reviewer timed out after {timeout}s; no review recorded. Reply: {reply_file}")
+    except OSError as error:
+        raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
+    if code:
+        raise Stop(f"Reviewer exited with status {code}; no review recorded. Reply: {reply_file}")
+    if not reply_file.read_text().strip():
+        raise Stop(f"Reviewer returned an empty reply; no review recorded. Reply: {reply_file}")
+
+
 def review(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
@@ -1509,10 +1542,14 @@ def review(args):
         else:
             command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
                        "-m gpt-6-luna -c model_reasoning_effort=high -")
-        print("Headless reviewer command (run from the task worktree):")
-        print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
-        print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
-        return 0
+        if not args.run:
+            print("Headless reviewer command (run from the task worktree):")
+            print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
+            print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
+            return 0
+        run_reviewer(command, path, prompt_file, reply_file)
+        args.record = str(reply_file)
+        head = sha(path, "HEAD")
     try:
         text = Path(args.record).read_text()
     except OSError as error:
@@ -1559,6 +1596,8 @@ def review(args):
     atomic_json(state / "review.json", meta)
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
+    if args.run:
+        print(f"Verdict: {meta['verdict']}\nReview reply: {args.record}")
     return 0
 
 
@@ -2431,7 +2470,9 @@ def main(argv=None):
             sub.add_argument("--retro", required=True)
             sub.add_argument("--partial", action="store_true")
         if name == "review":
-            sub.add_argument("--record", metavar="FILE")
+            mode = sub.add_mutually_exclusive_group()
+            mode.add_argument("--run", action="store_true", help="run the routed reviewer and record its reply")
+            mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
