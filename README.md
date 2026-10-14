@@ -445,8 +445,9 @@ reply and record the verdict in one command. This keeps private task-state file
 access inside `task`; the runner does not need shell redirections into that state.
 Codex-built work routes to Claude Haiku with high effort and read-only tools;
 Claude-built work routes to GPT-6 luna with high reasoning effort and the read-only
-sandbox. The command prints the verdict and saved reply path. Reviewer identity
-comes from stored routing, just as with `--record`.
+sandbox. The command prints the full reviewer reply under a clear header, then
+ends with the recorded verdict. Reviewer identity comes from stored routing,
+just as with `--record`.
 `TASK_REVIEW_TIMEOUT` sets the timeout in seconds (default 900). A timeout, empty
 reply or reviewer command failure exits non-zero without recording a review.
 Plain `task review <repo> <id>` still prints the prompt and headless command for

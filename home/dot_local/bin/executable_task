@@ -1534,7 +1534,6 @@ def review(args):
         reply_file = state / "review-response.md"
         prompt_file.write_text(prompt_text)
         reply_file.unlink(missing_ok=True)
-        print(prompt_text, end="")
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         if record["builder"] == "codex":
             command = (f"claude -p {add_dir}--permission-mode dontAsk --model haiku --effort high "
@@ -1543,6 +1542,7 @@ def review(args):
             command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
                        "-m gpt-6-luna -c model_reasoning_effort=high -")
         if not args.run:
+            print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
             print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
@@ -1554,6 +1554,9 @@ def review(args):
         text = Path(args.record).read_text()
     except OSError as error:
         raise Stop(f"Cannot read review file {args.record}: {error}.")
+    if args.run:
+        print("--- reviewer reply ---")
+        print(text, end="" if text.endswith("\n") else "\n")
     required = {item["number"] for item in record["criteria"]}
     try:
         verdict, commit, reviewer, judgments = parse_review_reply(text, required)
@@ -1597,7 +1600,7 @@ def review(args):
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     if args.run:
-        print(f"Verdict: {meta['verdict']}\nReview reply: {args.record}")
+        print(f"Review recorded: {meta['verdict']}")
     return 0
 
 
@@ -2471,7 +2474,8 @@ def main(argv=None):
             sub.add_argument("--partial", action="store_true")
         if name == "review":
             mode = sub.add_mutually_exclusive_group()
-            mode.add_argument("--run", action="store_true", help="run the routed reviewer and record its reply")
+            mode.add_argument("--run", action="store_true",
+                              help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),

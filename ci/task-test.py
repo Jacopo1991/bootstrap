@@ -1204,8 +1204,11 @@ class TaskTool(unittest.TestCase):
                          ("claude", "haiku") if builder == "codex" else ("codex", "gpt-6-luna"))
         self.assertEqual(metadata["verdict"], verdict)
         self.assertEqual(metadata["commit"], head)
-        self.assertIn(f"Verdict: {verdict}", out)
-        self.assertIn(f"Review reply: {self.state() / 'review-response.md'}", out)
+        self.assertIn("--- reviewer reply ---", out)
+        self.assertIn("inspected b", out)
+        self.assertIn("inspected check evidence", out)
+        self.assertNotIn(prompt, out)
+        self.assertEqual(out.rstrip().splitlines()[-1], f"Review recorded: {verdict}")
         self.raw_task("review", "proj", "5", "--record", str(self.state() / "review-response.md"))
         manual = json.loads((self.state() / "review.json").read_text())
         self.assertEqual({k: v for k, v in metadata.items() if k != "time"},
@@ -1270,7 +1273,7 @@ class TaskTool(unittest.TestCase):
                  ({"REVIEW_STUB_REPLY": valid_reply, "REVIEW_STUB_DELAY": "10",
                    "TASK_REVIEW_TIMEOUT": "1"}, "timed out after 1s"),
                  ({"REVIEW_STUB_REPLY": valid_reply, "REVIEW_STUB_EXIT": "7"}, "status 7"),
-                 ({"REVIEW_STUB_REPLY": "not a verdict"}, "Review rejected"),
+                 ({"REVIEW_STUB_REPLY": "Finding: parser rejected this reply\nnot a verdict"}, "Review rejected"),
                  ({"REVIEW_STUB_REPLY": valid_reply.replace(head, "a" * 40)}, "Commit does not match"))
         for previous in (False, True):
             if previous:
@@ -1281,6 +1284,9 @@ class TaskTool(unittest.TestCase):
                 with self.subTest(previous=previous, message=message):
                     out = self.raw_task("review", "proj", "5", "--run", code=1, env=dict(self.env, **env))
                     self.assertIn(message, out)
+                    if message == "Review rejected":
+                        self.assertIn("--- reviewer reply ---", out)
+                        self.assertIn("Finding: parser rejected this reply", out)
                     after = {name: (self.state() / name).read_bytes() if (self.state() / name).exists() else None
                              for name in before}
                     self.assertEqual(after, before)
