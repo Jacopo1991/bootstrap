@@ -108,6 +108,18 @@ else:
 sys.exit(int(os.environ.get('LANE_STUB_EXIT', '0')))
 """
 
+REVIEW_STUB = """#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+work = pathlib.Path.cwd() / '.work'
+(work / 'reviewer-call.json').write_text(json.dumps({
+    'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': sys.stdin.read(),
+    'git_optional_locks': os.environ.get('GIT_OPTIONAL_LOCKS'),
+}))
+print(os.environ.get('REVIEW_STUB_REPLY', ''), end='', flush=True)
+time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
+sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
+"""
+
 
 class TaskTool(unittest.TestCase):
     def setUp(self):
@@ -192,6 +204,12 @@ class TaskTool(unittest.TestCase):
         for name in ("codex", "claude"):
             binary = self.home / "bin" / name
             binary.write_text(MODEL_STUB)
+            binary.chmod(0o755)
+
+    def stub_reviewers(self):
+        for name in ("codex", "claude"):
+            binary = self.home / "bin" / name
+            binary.write_text(REVIEW_STUB)
             binary.chmod(0o755)
 
     def wait_for_lane(self, wt, finished=True):
@@ -748,6 +766,7 @@ class TaskTool(unittest.TestCase):
         self.assertFalse((wt / ".work/check.json").exists())
 
     def test_read_only_state_refuses_mutating_commands_without_writes(self):
+        self.stub_reviewers()
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         self.prepare_merge_evidence("5")
@@ -756,6 +775,7 @@ class TaskTool(unittest.TestCase):
                   for path in self.home.rglob("*") if path.is_file()}
         commands = (("start", "proj", "5", "--builder", "codex", "--refresh"),
                     ("review", "proj", "5"),
+                    ("review", "proj", "5", "--run"),
                     ("review", "proj", "5", "--record", "missing-review.md"),
                     ("merge", "proj", "5"), ("merge", "proj", "5", "--detach"),
                     ("close", "proj", "5", "-m", "done", "--retro", "tested"),
@@ -1134,6 +1154,97 @@ class TaskTool(unittest.TestCase):
             self.assertIn(command, prompt.read_text())
         self.assertIn(f"read {wt / '.work/report.md'} alongside the diff", prompt.read_text())
         self.assertFalse(reply.exists(), "a stale response must not be presented as the next review")
+
+    def assert_review_run(self, builder, verdict):
+        import json
+        import shlex
+        self.stub_reviewers()
+        self.raw_task("start", "proj", "5", "--builder", builder)
+        wt = self.repo / ".worktrees/t5"
+        head = self.git(wt, "rev-parse", "HEAD")
+        prepared = self.raw_task("review", "proj", "5")
+        self.assertFalse((wt / ".work/reviewer-call.json").exists())
+        prompt = (self.state() / "review-prompt.md").read_text()
+        expected_command = next(line.strip() for line in prepared.splitlines()
+                                if " < " in line and " > " in line)
+        expected_args = shlex.split(expected_command.split(" < ")[0])
+        if expected_args[0] == "GIT_OPTIONAL_LOCKS=0":
+            expected_args.pop(0)
+        reply = (f"```review\nVerdict: {verdict}\nCommit: {head}\n"
+                 f"Reviewer: {builder} wrong-model\n"
+                 f"#1 {'pass' if verdict == 'PASS' else 'fail'}: inspected b\n"
+                 "#2 pass: inspected check evidence\n```\n")
+        out = self.raw_task("review", "proj", "5", "--run",
+                            env=dict(self.env, CODEX_THREAD_ID="runner-test", REVIEW_STUB_REPLY=reply))
+        call = json.loads((wt / ".work/reviewer-call.json").read_text())
+        self.assertEqual(call["args"], expected_args[1:])
+        self.assertEqual(call["cwd"], str(wt))
+        self.assertEqual(call["prompt"], prompt)
+        if builder == "claude":
+            self.assertEqual(call["git_optional_locks"], "0")
+        self.assertEqual((self.state() / "review-response.md").read_text(), reply)
+        self.assertEqual((self.state() / "review.md").read_text(), reply)
+        metadata = json.loads((self.state() / "review.json").read_text())
+        self.assertEqual((metadata["reviewer"], metadata["model"]),
+                         ("claude", "haiku") if builder == "codex" else ("codex", "gpt-6-luna"))
+        self.assertEqual(metadata["verdict"], verdict)
+        self.assertEqual(metadata["commit"], head)
+        self.assertIn(f"Verdict: {verdict}", out)
+        self.assertIn(f"Review reply: {self.state() / 'review-response.md'}", out)
+        self.raw_task("review", "proj", "5", "--record", str(self.state() / "review-response.md"))
+        manual = json.loads((self.state() / "review.json").read_text())
+        self.assertEqual({k: v for k, v in metadata.items() if k != "time"},
+                         {k: v for k, v in manual.items() if k != "time"})
+
+    def test_review_run_claude_records_pass_like_manual_record(self):
+        self.assert_review_run("codex", "PASS")
+
+    def test_review_run_codex_records_fail_like_manual_record(self):
+        self.assert_review_run("claude", "FAIL")
+
+    def test_review_run_direct_request_has_no_kb_and_records_without_criteria(self):
+        import json
+        self.stub_reviewers()
+        self.raw_task("start", "proj", "direct-request", "--builder", "claude")
+        wt = self.repo / ".worktrees/direct-request"
+        request = self.home / "request with spaces.md"
+        request.write_text("Preserve user files.")
+        reply = f"```review\nVerdict: PASS\nCommit: {self.git(wt, 'rev-parse', 'HEAD')}\n```\n"
+        self.raw_task("review", "proj", "direct-request", "--run", "--request", str(request),
+                      env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        call = json.loads((wt / ".work/reviewer-call.json").read_text())
+        self.assertIn(request.read_text(), call["prompt"])
+        self.assertNotIn("--add-dir", call["args"])
+        self.assertEqual(json.loads((self.state("direct-request") / "review.json").read_text())["judgments"], {})
+
+    def test_review_run_errors_do_not_record_or_replace_previous_review(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        valid_reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: b\n#2 pass: checked\n```\n"
+        cases = (({"REVIEW_STUB_REPLY": " \n\t"}, "empty reply"),
+                 ({"REVIEW_STUB_REPLY": valid_reply, "REVIEW_STUB_DELAY": "10",
+                   "TASK_REVIEW_TIMEOUT": "1"}, "timed out after 1s"),
+                 ({"REVIEW_STUB_REPLY": valid_reply, "REVIEW_STUB_EXIT": "7"}, "status 7"),
+                 ({"REVIEW_STUB_REPLY": "not a verdict"}, "Review rejected"),
+                 ({"REVIEW_STUB_REPLY": valid_reply.replace(head, "a" * 40)}, "Commit does not match"))
+        for previous in (False, True):
+            if previous:
+                self.prepare_merge_evidence("5")
+            before = {name: (self.state() / name).read_bytes() if (self.state() / name).exists() else None
+                      for name in ("review.json", "review.md", "events.json")}
+            for env, message in cases:
+                with self.subTest(previous=previous, message=message):
+                    out = self.raw_task("review", "proj", "5", "--run", code=1, env=dict(self.env, **env))
+                    self.assertIn(message, out)
+                    after = {name: (self.state() / name).read_bytes() if (self.state() / name).exists() else None
+                             for name in before}
+                    self.assertEqual(after, before)
+
+    def test_review_run_and_record_are_mutually_exclusive(self):
+        out = self.raw_task("review", "proj", "5", "--run", "--record", "reply.md", code=2)
+        self.assertIn("not allowed with argument --run", out)
+        self.assertFalse(self.state().exists())
 
     def test_record_uses_routed_identity_despite_openai_gpt6_reply_line(self):
         wt, _ = self.started()

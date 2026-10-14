@@ -439,6 +439,20 @@ The hook permits PM task command routes; its other rules remain in force.
 `task lane` and plain `task review` are PM/runner-only too: lane dispatch starts
 a builder, and review preparation writes private routing and prompt records.
 
+Use `task review <repo> <id> --run [--request <file>]` from the PM shell or an
+approved batch runner to prepare the prompt, run the routed reviewer, save its
+reply and record the verdict in one command. This keeps private task-state file
+access inside `task`; the runner does not need shell redirections into that state.
+Codex-built work routes to Claude Haiku with high effort and read-only tools;
+Claude-built work routes to GPT-6 luna with high reasoning effort and the read-only
+sandbox. The command prints the verdict and saved reply path. Reviewer identity
+comes from stored routing, just as with `--record`.
+`TASK_REVIEW_TIMEOUT` sets the timeout in seconds (default 900). A timeout, empty
+reply or reviewer command failure exits non-zero without recording a review.
+Plain `task review <repo> <id>` still prints the prompt and headless command for
+manual use; `--record <file>` still records a supplied reply. `--run` and `--record`
+are mutually exclusive, and all review modes refuse in a sandboxed session.
+
 Always launch build lanes through `task lane`, including from a batch runner:
 
 ```sh
