@@ -874,11 +874,34 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(call["cwd"], str(wt))
         self.assertEqual(call["prompt"], prompt)
         self.assertEqual(record["exit_code"], 3)
+        self.assertEqual(record["model"], "sonnet")
         self.assertEqual((wt / ".work/final.md").read_text(), "claude-final: " + prompt)
         log = (wt / ".work/lane.log").read_text()
         self.assertIn("claude-log", log)
         self.assertIn("claude-final", log)
         self.assertIn("lane: finished (exit 3)", self.raw_task("status", "proj"))
+
+    def test_claude_lane_accepts_opus_and_records_selected_model(self):
+        self.stub_models()
+        self.raw_task("start", "proj", "5", "--builder", "claude")
+        wt = self.repo / ".worktrees/t5"
+        (wt / ".work/prompt.md").write_text("Approved Claude task.\n")
+        self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", "opus")
+        record = self.wait_for_lane(wt)
+        call = __import__("json").loads((wt / ".work/model-call.json").read_text())
+        self.assertEqual(call["args"][:3], ["-p", "--model", "opus"])
+        self.assertEqual(call["args"][3:], ["--effort", "high", "--permission-mode", "acceptEdits",
+                                            "--allowedTools", "Bash Read Write Edit Glob Grep"])
+        self.assertEqual(record["model"], "opus")
+
+    def test_lane_rejects_model_from_other_builder(self):
+        self.stub_models()
+        self.raw_task("start", "proj", "5", "--builder", "claude")
+        wt = self.repo / ".worktrees/t5"
+        (wt / ".work/prompt.md").write_text("task\n")
+        out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", "gpt-6-luna", code=1)
+        self.assertIn("not available for the claude builder", out)
+        self.assertFalse((wt / ".work/lane.json").exists())
 
     def test_lane_refuses_missing_prompt_invalid_model_and_builder_mismatch(self):
         self.stub_models()
@@ -1438,7 +1461,10 @@ class TaskTool(unittest.TestCase):
         archive = self.state()
         archive.mkdir(parents=True, exist_ok=True)
         (archive / "review.json").write_text(__import__("json").dumps({"judgments": {"1": "pass"}}))
-        (archive / "review.md").write_text("Verdict: PASS\n#1 pass: evidence inspected\n")
+        (archive / "review.md").write_text(
+            "Verdict: PASS\n#1 pass: [absolute](/home/agent/report.md) "
+            "[file](file:///tmp/review.md) [web](https://example.com/review) "
+            "[relative](../report.md) evidence inspected\n")
         (archive / "report.md").write_text("## Noticed, not done\n\n- Slow startup could be improved\n")
         out = self.task("close", "proj", "T-5", "-m", "Built b; check green.", "--retro",
                         "went well: evidence / went wrong: none / change: keep it", "--partial")
@@ -1449,7 +1475,12 @@ class TaskTool(unittest.TestCase):
         self.assertIn("- [ ] #2", text)
         self.assertIn("Built b; check green.", text)
         self.assertIn("## Review evidence", text)
-        self.assertIn("#1 pass: evidence inspected", text)
+        self.assertIn("#1 pass: absolute file [web](https://example.com/review) "
+                      "[relative](../report.md) evidence inspected", text)
+        self.assertNotIn("/home/agent/report.md", text)
+        self.assertNotIn("file:///tmp/review.md", text)
+        self.assertIn("[web](https://example.com/review)", text)
+        self.assertIn("[relative](../report.md)", text)
         self.assertEqual(self.git(self.kb, "log", "-1", "--format=%s"), "Close T-5: Add the b file")
         self.assertIn("Slow startup", (self.kb / "improvements.md").read_text())
         self.assertIn("improvements.md", self.git(self.kb, "show", "--name-only", "--format=", "HEAD"))
