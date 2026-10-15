@@ -697,7 +697,7 @@ def lane(args):
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                      "builder": builder, "model": model,
+                                      "builder": builder, "model": model,
                                       "started_at": utc_now(), "ended_at": ""})
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
                   f"see {work / 'lane.log'} and {final}; track it with `task status`.")
@@ -1880,6 +1880,36 @@ def merge(args):
     return 0
 
 
+def flatten_review_links(review):
+    link = re.compile(r"(?P<image>!)?\[(?P<label>[^\]]*)\]\(\s*(?P<target><[^>]*>|[^\s)]+)(?:\s+[^)]*)?\)")
+    definition = re.compile(r"(?m)^(?P<prefix>\s*\[[^\]]+\]:\s*)(?P<target><[^>]*>|\S+)")
+    autolink = re.compile(r"<(?P<target>file:[^>]+)>", re.IGNORECASE)
+
+    def local_target(target):
+        target = target.strip("<>")
+        return (target.startswith("/") and not target.startswith("//")
+                or re.match(r"^[A-Za-z]:[\\/]", target)
+                or target.startswith("\\\\")
+                or target.lower().startswith("file:"))
+
+    def local_basename(target):
+        target = target.strip("<>")
+        if target.lower().startswith("file:"):
+            target = re.sub(r"(?i)^file:(//)?", "", target)
+        return re.split(r"[\\/]", target.rstrip("\\/"))[-1]
+
+    def flatten_local_link(match):
+        if not local_target(match.group("target")):
+            return match.group(0)
+        return match.group("label")
+
+    review = link.sub(flatten_local_link, review)
+    review = definition.sub(
+        lambda match: match.group("prefix") + local_basename(match.group("target"))
+        if local_target(match.group("target")) else match.group(0), review)
+    return autolink.sub(lambda match: local_basename(match.group("target")), review)
+
+
 def apply_close_update(kb, task, before, archive, criteria, status, summary):
     """Apply only this task's close records in the supplied knowledge checkout."""
     before = kb / before.relative_to(task.kb)
@@ -1899,15 +1929,7 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
         text = after.read_text()
         if "## Review evidence" not in text:
             review = recorded_review.read_text().strip()
-            link = re.compile(r"(?<!!)\[([^\]]*)\]\(\s*(<[^>]*>|[^\s)]+)(?:\s+[^)]*)?\)")
-
-            def flatten_local_link(match):
-                target = match.group(2).strip("<>")
-                if target.startswith("/") or target.lower().startswith("file:"):
-                    return match.group(1)
-                return match.group(0)
-
-            review = link.sub(flatten_local_link, review)
+            review = flatten_review_links(review)
             text += "\n\n## Review evidence\n\n" + review + "\n"
             after.write_text(text)
     noticed = []

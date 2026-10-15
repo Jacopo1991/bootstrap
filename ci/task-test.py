@@ -137,6 +137,25 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_flatten_review_links_handles_windows_drive_and_unc_targets(self):
+        self.assertEqual(TASK_MODULE.flatten_review_links(
+            r"[drive](C:\Users\agent\report.md) [slash](d:/reports/final.md) "
+            r"[unc](\\server\share\review.md)"),
+            "drive slash unc")
+
+    def test_flatten_review_links_keeps_protocol_relative_web_target(self):
+        text = "[web](//example.com/review.md)"
+        self.assertEqual(TASK_MODULE.flatten_review_links(text), text)
+
+    def test_flatten_review_links_flattens_local_reference_and_autolinks(self):
+        self.assertEqual(TASK_MODULE.flatten_review_links(
+            "[1]: /home/agent/report.md\n<file:///tmp/review.md>"),
+            "[1]: report.md\nreview.md")
+
+    def test_flatten_review_links_flattens_local_images_to_alt_text(self):
+        self.assertEqual(TASK_MODULE.flatten_review_links(
+            "![alt](/home/agent/x.png)"), "alt")
+
     def setUp(self):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
         bin_dir = self.home / "bin"
