@@ -5,7 +5,8 @@ The sandbox protects private task state from lanes running as the same Unix user
 Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
-  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol] [--builder codex|claude]
+  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|sonnet|opus|fable] [--builder codex|claude]
+      Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach]
   task review <repo> <id> [--request <file>] [--run | --record <file>] [--reviewer <vendor> <model>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach]
@@ -654,6 +655,12 @@ def lane(args):
     builder = args.builder or record["builder"]
     if builder != record["builder"]:
         raise Stop("--builder must match the pinned task builder; ask the PM to refresh the task.")
+    models = {"codex": ("gpt-6-luna", "gpt-6.1-sol"),
+              "claude": ("sonnet", "opus", "fable")}
+    model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
+    if model not in models[builder]:
+        raise Stop(f"Model {model!r} is not available for the {builder} builder; "
+                   f"choose one of: {', '.join(models[builder])}.")
     work = path / ".work"
     prompt = work / "prompt.md"
     if not prompt.is_file():
@@ -662,9 +669,9 @@ def lane(args):
     if not shutil.which(binary):
         raise Stop(f"{binary} is not installed or available on PATH.")
     final = work / "final.md"
-    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", args.model,
+    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", model,
                 "--output-last-message", str(final), "-"] if builder == "codex" else
-               ["claude", "-p", "--model", "sonnet", "--effort", "high",
+               ["claude", "-p", "--model", model, "--effort", "high",
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
@@ -683,14 +690,14 @@ def lane(args):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
             final.unlink(missing_ok=True)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
-                      "--builder", builder, "--model", args.model, "--_worker"]
+                      "--builder", builder, "--model", model, "--_worker"]
             with (work / "lane.log").open("wb") as log:
                 child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
                                          stdin=subprocess.DEVNULL, stdout=log,
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                                      "builder": builder, "model": args.model if builder == "codex" else "sonnet",
+                                      "builder": builder, "model": model,
                                       "started_at": utc_now(), "ended_at": ""})
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
                   f"see {work / 'lane.log'} and {final}; track it with `task status`.")
@@ -1873,6 +1880,36 @@ def merge(args):
     return 0
 
 
+def flatten_review_links(review):
+    link = re.compile(r"(?P<image>!)?\[(?P<label>[^\]]*)\]\(\s*(?P<target><[^>]*>|[^\s)]+)(?:\s+[^)]*)?\)")
+    definition = re.compile(r"(?m)^(?P<prefix>\s*\[[^\]]+\]:\s*)(?P<target><[^>]*>|\S+)")
+    autolink = re.compile(r"<(?P<target>file:[^>]+)>", re.IGNORECASE)
+
+    def local_target(target):
+        target = target.strip("<>")
+        return (target.startswith("/") and not target.startswith("//")
+                or re.match(r"^[A-Za-z]:[\\/]", target)
+                or target.startswith("\\\\")
+                or target.lower().startswith("file:"))
+
+    def local_basename(target):
+        target = target.strip("<>")
+        if target.lower().startswith("file:"):
+            target = re.sub(r"(?i)^file:(//)?", "", target)
+        return re.split(r"[\\/]", target.rstrip("\\/"))[-1]
+
+    def flatten_local_link(match):
+        if not local_target(match.group("target")):
+            return match.group(0)
+        return match.group("label")
+
+    review = link.sub(flatten_local_link, review)
+    review = definition.sub(
+        lambda match: match.group("prefix") + local_basename(match.group("target"))
+        if local_target(match.group("target")) else match.group(0), review)
+    return autolink.sub(lambda match: local_basename(match.group("target")), review)
+
+
 def apply_close_update(kb, task, before, archive, criteria, status, summary):
     """Apply only this task's close records in the supplied knowledge checkout."""
     before = kb / before.relative_to(task.kb)
@@ -1891,7 +1928,9 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
     if recorded_review.is_file():
         text = after.read_text()
         if "## Review evidence" not in text:
-            text += "\n\n## Review evidence\n\n" + recorded_review.read_text().strip() + "\n"
+            review = recorded_review.read_text().strip()
+            review = flatten_review_links(review)
+            text += "\n\n## Review evidence\n\n" + review + "\n"
             after.write_text(text)
     noticed = []
     report = archive / "report.md"
@@ -2462,7 +2501,7 @@ def main(argv=None):
             sub.add_argument("--no-verify", metavar="REASON")
         if name == "lane":
             sub.add_argument("--builder", choices=("codex", "claude"))
-            sub.add_argument("--model", choices=("gpt-6-luna", "gpt-6.1-sol"), default="gpt-6-luna")
+            sub.add_argument("--model", choices=("gpt-6-luna", "gpt-6.1-sol", "sonnet", "opus", "fable"))
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
             sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
