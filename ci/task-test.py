@@ -430,10 +430,35 @@ store.write_text(json.dumps(prs))
         os.mkfifo(wt / ".work/pipe")
         self.task("merge", "proj", "5")
         self.assertTrue((self.state() / "merge.json").exists())
-        manifests = list(self.work_archives().glob("*/manifest.json"))
-        self.assertTrue(manifests)
-        self.assertEqual(set(json.loads(manifests[-1].read_text())["skipped_special_files"]),
+        manifests = list(self.work_archives().glob(f"{wt.name}-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(set(json.loads(manifests[0].read_text())["skipped_special_files"]),
                          {"service.sock", "pipe"})
+        self.assertFalse((manifests[0].parent / ".work/service.sock").exists())
+        self.assertFalse((manifests[0].parent / ".work/pipe").exists())
+
+    def test_reliability_fifo_only_archive_manifest_and_publication(self):
+        import json
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        work = wt / ".work"
+        (work / "nested").mkdir()
+        os.mkfifo(work / "pipe")
+        os.mkfifo(work / "nested/pipe")
+        (work / "nested/evidence.txt").write_text("preserved")
+        (work / "pipe-link").symlink_to("pipe")
+        self.task("merge", "proj", "5")
+        self.assertTrue((self.state() / "merge.json").exists())
+        manifests = list(self.work_archives().glob(f"{wt.name}-*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        self.assertEqual(set(json.loads(manifests[0].read_text())["skipped_special_files"]),
+                         {"pipe", "nested/pipe"})
+        saved = manifests[0].parent / ".work"
+        self.assertFalse((saved / "pipe").exists())
+        self.assertFalse((saved / "nested/pipe").exists())
+        self.assertEqual((saved / "nested/evidence.txt").read_text(), "preserved")
+        self.assertTrue((saved / "pipe-link").is_symlink())
+        self.assertEqual(os.readlink(saved / "pipe-link"), "pipe")
 
     def test_reliability_setup_ids_are_atomic(self):
         import json
@@ -1130,9 +1155,13 @@ store.write_text(json.dumps(prs))
             env = dict(self.env, **{marker: value},
                        TASK_GATE_DIR=str(self.home / (marker + "-missing") / "gate"))
             args = ("check", "proj", "5", "--detach") if index == 0 else ("check", "proj", "5")
-            out = self.raw_task(*args, env=env, code=1)
+            out = self.raw_task(*args, env=env)
             self.assertNotIn("Started detached", out)
             self.assertIn("Cannot open shared gate lock", out)
+            self.assertIn("PASS", out)
+            checked = __import__("json").loads((wt / ".work/check.json").read_text())
+            self.assertTrue(checked["advisory"])
+            self.assertEqual(checked["result"], "passed")
             self.assertFalse((self.state() / "check.json").exists())
         self.raw_task("check", "proj", "5")
         lane_result = __import__("json").loads((wt / ".work/check.json").read_text())
@@ -2177,6 +2206,11 @@ esac
         out = self.raw_task("check", "proj", "5", env=env, code=1)
         self.assertIn("Cannot open shared gate lock", out)
         self.assertNotIn("PASS", out)
+        self.sandbox_state()
+        out = self.raw_task("check", "proj", "5", env=env)
+        self.assertIn("Cannot open shared gate lock", out)
+        self.assertIn("running advisory check unlocked", out)
+        self.assertIn("PASS", out)
 
     def test_close_pr_worktree_is_inside_knowledge_repo(self):
         origin = self.home / "knowledge-origin.git"
