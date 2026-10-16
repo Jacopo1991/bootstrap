@@ -292,12 +292,18 @@ store.write_text(json.dumps(prs))
         self.commit_in(wt, 'lane.txt')
         self.commit_in(self.repo, 'main-only.txt')
         self.git(self.repo, 'push', '-q', 'origin', 'main')
+        base = self.git(wt, 'merge-base', 'origin/main', 'HEAD').strip()
+        self.assertNotEqual(base, self.git(wt, 'rev-parse', 'origin/main').strip())
+        self.assertIn('Diff range: ' + base + '...' + self.git(wt, 'rev-parse', 'HEAD').strip(),
+                      self.raw_task('review', 'proj', '5'))
         self.git(wt, 'merge', '--no-edit', 'main')
         self.commit_in(wt, 'after-integration.txt')
         prompt = self.raw_task('review', 'proj', '5')
         import re
         match = re.search(r'Diff range: (\S+)', prompt)
         self.assertIsNotNone(match, prompt)
+        base = self.git(wt, 'merge-base', 'origin/main', 'HEAD').strip()
+        self.assertEqual(match[1], base + '...' + self.git(wt, 'rev-parse', 'HEAD').strip())
         names = self.git(wt, 'diff', '--name-only', match[1]).splitlines()
         self.assertEqual(set(names), {'lane.txt', 'after-integration.txt'})
 
@@ -333,6 +339,8 @@ store.write_text(json.dumps(prs))
                 break
             time.sleep(0.02)
         self.assertEqual(run["state"], "timed_out")
+        self.assertIsNone(run['exit_code'])
+        self.assertIn('lane timed_out', self.raw_task('status', 'proj').split('Needs attention:')[1])
         self.assertTrue((wt / '.work/descendant.pid').exists())
         self.assert_group_stopped(run['pid'])
         self.assertTrue(wt.exists())
@@ -491,15 +499,81 @@ store.write_text(json.dumps(prs))
                 self.assertIn("gate busy: held by proj/T-9 since 2026-01-01", output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
-    def test_reliability_close_without_merge_requires_reason(self):
+    def test_reliability_start_clears_stale_run_locks(self):
+        import json
+        import time
+        self.started()
+        for detach in (False, True):
+            for malformed in (False, True):
+                with self.subTest(detach=detach, malformed=malformed):
+                    lock = self.state() / 'run.lock'
+                    lock.write_text('unreadable' if malformed else json.dumps({'pid': 99999999}))
+                    os.utime(lock, (time.time() - 60, time.time() - 60))
+                    self.raw_task('check', 'proj', '5', *(['--detach'] if detach else []))
+                    deadline = time.monotonic() + 5
+                    while lock.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertFalse(lock.exists())
+                    self.assertEqual(json.loads((self.state() / 'check.json').read_text())['result'], 'passed')
+
+    def test_reliability_lane_timeout_must_be_positive(self):
+        for value in ('0', '-1'):
+            out = self.raw_task('lane', 'proj', '5', '--timeout', value, code=2)
+            self.assertIn('--timeout must be greater than zero', out)
+
+    def test_reliability_claude_streams_before_exit(self):
+        import time
+        wt, _ = self.started()
+        binary = self.home / 'bin/claude'
+        binary.write_text('#!/usr/bin/env python3\nimport pathlib, time\nprint("early-output", flush=True)\nwhile not pathlib.Path(".work/release").exists(): time.sleep(0.02)\nprint("late-output", flush=True)\n')
+        binary.chmod(0o755)
+        (wt / '.work/prompt.md').write_text('stream')
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--timeout', '1')
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                final = wt / '.work/final.md'
+                if final.exists() and 'early-output' in final.read_text():
+                    break
+                time.sleep(0.02)
+            self.assertIn('early-output', final.read_text())
+            self.assertIn('early-output', (wt / '.work/lane.log').read_text())
+            self.assertNotIn('late-output', final.read_text())
+            self.assertEqual(__import__('json').loads((wt / '.work/lane.json').read_text())['state'], 'running')
+        finally:
+            (wt / '.work/release').touch()
+        self.wait_for_lane(wt)
+        self.assertIn('late-output', final.read_text())
+
+    def test_reliability_claude_timeout_kills_group(self):
+        import json
+        import time
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('timeout')
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--timeout', '0.005',
+                      env=dict(self.env, LANE_STUB_RELEASE=str(self.home / 'release')))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = json.loads((wt / '.work/lane.json').read_text())
+            if run['state'] == 'timed_out':
+                break
+            time.sleep(0.02)
+        self.assertEqual(run['state'], 'timed_out')
+        self.assertIsNone(run['exit_code'])
+        self.assertTrue((wt / '.work/descendant.pid').exists())
+        self.assert_group_stopped(run['pid'])
+
+    def test_reliability_close_without_merge_records_notice(self):
         wt, _ = self.started()
         self.prepare_merge_evidence("5")
         command = [sys.executable, str(TOOL), "close", "proj", "5", "-m", "done", "--retro", "fine"]
         result = subprocess.run(command, cwd=self.home, env=self.env, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('--no-merge "reason"', result.stderr)
-        self.raw_task("close", "proj", "5", "-m", "done", "--retro", "fine", "--no-merge", "abandoned")
-        self.assertIn("Done (not merged: abandoned)", next((self.kb / "backlog/tasks").glob("t-5 *")).read_text())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('merge not recorded', result.stdout)
+        closed = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
+        self.assertIn('Done', closed)
+        self.assertIn('merge not recorded', closed)
 
     def test_reliability_noticed_import_lists_only_and_deduplicates(self):
         self.started()
@@ -590,8 +664,6 @@ store.write_text(json.dumps(prs))
         return self.raw_task(*args, cwd=cwd, code=code)
 
     def raw_task(self, *args, cwd=None, code=0, env=None):
-        if args and args[0] == "close" and "--no-merge" not in args:
-            args = (*args, "--no-merge", "legacy fixture closes without publishing")
         result = subprocess.run([sys.executable, str(TOOL), *args], env=env or self.env, cwd=cwd or self.home,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
@@ -1442,12 +1514,16 @@ store.write_text(json.dumps(prs))
         module.fcntl.flock = lambda *_args: (_ for _ in ()).throw(OSError("probe failure"))
         output = io.StringIO()
         try:
+            with contextlib.redirect_stdout(output):
+                with module.exclusive_gate_lock(task, silent_unavailable=True):
+                    print('advisory ran')
             with contextlib.redirect_stdout(output), self.assertRaisesRegex(module.Stop, "probe failure"):
                 with module.exclusive_gate_lock(task):
                     pass
         finally:
             module.fcntl.flock = original_flock
-        self.assertNotIn("running without it", output.getvalue())
+        self.assertIn("running advisory check unlocked", output.getvalue())
+        self.assertIn("advisory ran", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
 
     def test_shared_gate_symlink_is_refused(self):

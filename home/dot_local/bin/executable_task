@@ -39,6 +39,7 @@ import json
 import os
 import re
 import secrets
+import selectors
 import shlex
 import signal
 import shutil
@@ -498,6 +499,12 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                     print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
                 time.sleep(0.1)
             except OSError as error:
+                if silent_unavailable:
+                    print(f"Cannot acquire shared gate lock: {error}; running advisory check unlocked.", flush=True)
+                    os.close(descriptor)
+                    descriptor = None
+                    yield
+                    return
                 raise Stop(f"Cannot acquire shared gate lock: {error}")
         metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
                     "repo": task.repo.name}
@@ -598,6 +605,8 @@ def task_lock_status(task: Task, repair=False):
         lock_record = json.loads(lock.read_text())
         pid = int(lock_record["pid"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        if repair and time.time() - lock.stat().st_mtime > 5:
+            lock.unlink(missing_ok=True)
         return "unknown"
     if pid_alive(pid):
         return "running"
@@ -622,7 +631,7 @@ def detached(args, task, path):
     state = task_state(task)
     state.mkdir(parents=True, exist_ok=True)
     run_path, lock = state / "run.json", state / "run.lock"
-    if lock.exists() and task_lock_status(task) == "running":
+    if lock.exists() and task_lock_status(task, repair=True) == "running":
         raise Stop("A task run is already live; wait for it or use `task cancel`.")
     if lock.exists():
         raise Stop("The task run lock is unreadable; ask the PM to inspect task status.")
@@ -811,21 +820,33 @@ def lane(args):
                 child = subprocess.Popen(command, cwd=path, env=agent_environment(), stdin=source,
                                          stdout=subprocess.PIPE if output else None)
                 try:
-                    captured, _ = child.communicate(timeout=args.timeout * 60 if args.timeout is not None else None)
-                    code = child.returncode
-                    if output:
-                        output.write(captured)
-                        sys.stdout.buffer.write(captured)
-                        sys.stdout.buffer.flush()
+                    deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
+                    with selectors.DefaultSelector() as reader:
+                        if output:
+                            reader.register(child.stdout, selectors.EVENT_READ)
+                        while reader.get_map() or child.poll() is None:
+                            remaining = deadline - time.monotonic() if deadline is not None else None
+                            if remaining is not None and remaining <= 0:
+                                raise subprocess.TimeoutExpired(command, args.timeout * 60)
+                            for key, _ in reader.select(min(0.1, remaining) if remaining is not None else 0.1):
+                                chunk = os.read(key.fd, 65536)
+                                if not chunk:
+                                    reader.unregister(key.fileobj)
+                                    continue
+                                output.write(chunk)
+                                output.flush()
+                                sys.stdout.buffer.write(chunk)
+                                sys.stdout.buffer.flush()
+                    code = child.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    run.update(state="timed_out", ended_at=utc_now())
+                    run.update(state="timed_out", exit_code=None, ended_at=utc_now())
                     atomic_json(lane_record, run)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        run.update(state="timed_out" if timed_out else "finished", exit_code=code, ended_at=utc_now())
+        run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
         atomic_json(lane_record, run)
     return code
 
@@ -852,7 +873,7 @@ def foreground_lock(args):
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        if task_lock_status(task) == "running":
+        if task_lock_status(task, repair=True) == "running":
             raise Stop("A task run is already live; wait for it or use `task cancel`.")
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1746,6 +1767,7 @@ def review(args):
             prompt.append("Criteria: none; judge the stated request above against the diff.")
         review_base = sha(task.repo, f"origin/{default_branch(task.repo)}" if has_origin(task.repo)
                           else default_branch(task.repo))
+        review_base = git(task.repo, "merge-base", review_base, head)
         prompt.append(f"Diff range: {review_base}...{head}")
         prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
                       "read-only review; use `git --no-optional-locks diff`, "
@@ -1882,7 +1904,9 @@ def merge_gate(task, path, head):
                              criteria_text, re.I) for item in record["criteria"]):
             missing.append("criterion evidence in .work/report.md")
     if missing:
-        raise Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
+        error = Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
+        error.missing_steps = missing
+        raise error
     return record
 
 
@@ -1994,7 +2018,7 @@ def merge(args):
         atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
                                                    "missing_gate": True,
                                                    "waived": [{"step": item, "reason": args.override}
-                                                              for item in str(error).split("missing: ", 1)[-1].split(". Use --override", 1)[0].split("; ")]})
+                                                              for item in error.missing_steps]})
         for item in json.loads((archive / "exception.json").read_text())["waived"]:
             print(f"exception: {item['step']} waived: {args.override}")
     task_event(task, "merge")
@@ -2439,10 +2463,13 @@ def close(args):
         merge_evidence = {}
     head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else review.get("commit")
     if not args.partial and (not head or merge_evidence.get("head") != head):
-        if not args.no_merge:
-            raise Stop('No merge evidence for the task head. Merge first, or close with --no-merge "reason".')
-        status = f"Done (not merged: {args.no_merge})"
+        if args.no_merge:
+            status = f"Done (not merged: {args.no_merge})"
+        else:
+            print("Notice: merge not recorded for the task head.")
     summary = args.message + "\n\nRetro: " + args.retro
+    if not args.partial and (not head or merge_evidence.get("head") != head):
+        summary += f"\n\nMerge: {args.no_merge or 'merge not recorded'}"
     if exception_path.is_file():
         try:
             exception_reason = json.loads(exception_path.read_text()).get("reason", "unspecified override")
@@ -2636,7 +2663,7 @@ def status(args):
                 result = f" (exit {lane_run['exit_code']})" if "exit_code" in lane_run else ""
                 print(f"    lane: {lane_state}{result} pid={lane_run.get('pid', '?')} "
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
-                if lane_state == "interrupted" or lane_run.get("exit_code", 0) != 0:
+                if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
                     attention.append(f"{path.name}: lane {lane_state}{result}")
             if (state / "exception.json").is_file():
                 attention.append(f"{path.name}: exception")
@@ -2877,6 +2904,8 @@ def main(argv=None):
     sub = commands.add_parser("denials")
     sub.add_argument("--days", type=int, default=30)
     args = parser.parse_args(argv)
+    if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
+        parser.error("--timeout must be greater than zero minutes")
     global GATE_LOCK_WAIT
     GATE_LOCK_WAIT = getattr(args, "lock_wait", 45)
     if args.command == "check":
