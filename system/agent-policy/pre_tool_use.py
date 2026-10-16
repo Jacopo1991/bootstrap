@@ -1208,6 +1208,8 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
             tokens = tokens[1:]
             continue
         wrapper = Path(tokens[0]).name.lower()
+        if pure_lookup(tokens):
+            return tokens
         if wrapper in REFUSED_WRAPPERS:
             return "xargs, setsid, nohup and other command-hiding wrappers are blocked."
         if wrapper not in EVALUATED_WRAPPERS:
@@ -1260,6 +1262,14 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
                 index += 1
         tokens = tokens[index:]
     return tokens
+
+
+def pure_lookup(tokens: list[str]) -> bool:
+    return bool(tokens) and (
+        tokens[0] == "command" and len(tokens) == 3 and tokens[1] in {"-v", "-V"}
+        and bool(re.fullmatch(r"[A-Za-z0-9_.+-]+", tokens[2]))
+        or tokens[0] in {"type", "which"} and len(tokens) == 2
+        and bool(re.fullmatch(r"[A-Za-z0-9_.+-]+", tokens[1])))
 
 
 def git_subcommand(tokens: list[str], cwd: str) -> str | None:
@@ -1337,7 +1347,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
                 writes = any(token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
                              and (i + 1 >= len(unwrapped) or unwrapped[i + 1] not in NULL_DEVICES)
                              for i, token in enumerate(unwrapped))
-                if head not in MIXED_CHAIN_TEXT_TOOLS or writes:
+                if (head not in MIXED_CHAIN_TEXT_TOOLS and not pure_lookup(unwrapped)) or writes:
                     return MIXED_CHAIN_MESSAGE
     seen_changing = False
     for position, tokens in enumerate(all_tokens):
@@ -1364,7 +1374,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
             return reason
         if unwrapped:
             sub = git_subcommand(unwrapped, effective) if head == "git" else None
-            if not (head in READ_ONLY_COMMANDS or sub in READ_ONLY_GIT):
+            if not (head in READ_ONLY_COMMANDS or sub in READ_ONLY_GIT or pure_lookup(unwrapped)):
                 seen_changing = True
     return None
 

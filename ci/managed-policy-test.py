@@ -246,7 +246,12 @@ with tempfile.TemporaryDirectory() as temp:
             "task cancel proj 5", "task denials", "task lane proj 5",
             "task review proj 5 --record review.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
-    for command in ("task status proj", "task check"):
+    # pure_lookup_forms: standalone and read-only chains; execution wrappers stay denied.
+    for lookup in ("command -v task", "command -V task", "type task", "which task"):
+        for command in (lookup, "pwd; " + lookup, "pwd && " + lookup):
+            assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+    assert policy.evaluate_command("command git push", temp, root, (root,))
+    for command in ("task status proj", "task check", "task runner-check proj runner.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     assert policy.evaluate_command("echo see task start for details", temp, root, (root,)) is None
     state_target = str(Path.home() / ".local/state/task/proj/t5/review.json")
