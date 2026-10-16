@@ -512,6 +512,10 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("review", "proj", "5")
         prompt = (self.state() / "review-prompt.md").read_text()
         self.assertIn(f"Outcome: {expected}", prompt)
+        self.assertIn(
+            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
+            "or the change breaks something that worked.", prompt)
+        self.assertIn("Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.", prompt)
         self.assertNotIn(">-", prompt)
 
     def test_frontmatter_title_reads_quoted_folded_and_literal_scalars(self):
@@ -558,6 +562,8 @@ class TaskTool(unittest.TestCase):
         self.git(self.repo, "branch", "codex/direct-request", "main")
         self.raw_task("start", "proj", "codex/direct-request", "--builder", "codex")
         wt = self.repo / ".worktrees/codex-direct-request"
+        lane_prompt = "Implement the requested change from the lane prompt."
+        (wt / ".work/prompt.md").write_text(lane_prompt)
         self.commit_in(wt, "direct-request.txt")
         (wt / ".work/report.md").write_text(
             "# Task report\n\n## What changed\n\nImplemented the direct request.\n\n"
@@ -565,6 +571,7 @@ class TaskTool(unittest.TestCase):
         self.raw_task("check", "proj", "codex/direct-request")
         prompt = self.raw_task("review", "proj", "codex/direct-request")
         self.assertIn("Outcome: Direct request for branch codex/direct-request", prompt)
+        self.assertIn("Request (lane prompt):\n" + lane_prompt, prompt)
         self.assertIn("Criteria: none; judge the stated request above against the diff.", prompt)
         self.assertIn("judge the stated request above against the diff", prompt)
         self.assertIn("Diff range:", prompt)
@@ -1251,9 +1258,16 @@ class TaskTool(unittest.TestCase):
                          {"vendor": "claude", "model": "haiku"})
         self.assertTrue(prompt.read_text().endswith(
             "Return exactly this final fenced block, with plain text only inside it:\n"
+            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
+            "or the change breaks something that worked. Everything else is a non-blocking "
+            "note: list it under 'Notes', never as a reason to FAIL.\n"
+            "Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.\n"
             "```review\nVerdict: PASS|FAIL\nCommit: <full sha>\n"
             "#1 pass|fail|unclear: <one line of evidence>\n"
-            "#2 pass|fail|unclear: <one line of evidence>\n```\nThen list findings.\n"))
+            "#2 pass|fail|unclear: <one line of evidence>\n```\n"
+            "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
+            "Blocking finding must identify its criterion or the breakage. Put all other "
+            "observations under Notes.\n"))
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
