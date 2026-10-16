@@ -32,7 +32,10 @@ for source in (ROOT / "windows", ROOT / "home"):
             except UnicodeDecodeError:
                 pass
 assert not windows_config_refs, f"bootstrap unexpectedly manages Windows Claude Desktop config: {windows_config_refs}"
-codex = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="utf-8"))
+network_domains = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org", "github.com",
+                   "objects.githubusercontent.com", "codeload.github.com", "raw.githubusercontent.com",
+                   "release-assets.githubusercontent.com", "openrouter.ai"]
+codex = tomllib.loads((ROOT / "home/.chezmoitemplates/codex-config.toml").read_text(encoding="utf-8"))
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
 assert codex["sandbox_mode"] == "workspace-write"
@@ -48,7 +51,7 @@ for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"
 # openrouter.ai host plus local binding for tests that start a local server.
 assert codex["sandbox_workspace_write"]["network_access"] is True
 assert codex["features"]["network_proxy"] == {
-    "enabled": True, "allow_local_binding": True, "domains": {"openrouter.ai": "allow"},
+    "enabled": True, "allow_local_binding": True, "domains": {host: "allow" for host in network_domains},
     "enable_socks5": False}
 # Guardrails live in root-owned managed config (ci/managed-policy-test.py checks the shape):
 # the hooks feature and hooks in /etc/codex/requirements.toml, none in the user config.
@@ -77,8 +80,7 @@ assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     "excludedCommands": ["git", "gh", "git *", "gh *", "/usr/bin/git *", "/usr/bin/gh *"],
     "autoAllowBashIfSandboxed": False,
     # Package registries for `uv sync`; writable paths are the exact cache roots, nothing wider.
-    "network": {"allowedDomains": ["pypi.org", "files.pythonhosted.org",
-                                     "registry.npmjs.org", "openrouter.ai"]},
+    "network": {"allowedDomains": network_domains},
     "filesystem": {"allowWrite": cache_paths}}
 for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
     assert forbidden not in claude["sandbox"]["filesystem"]["allowWrite"]
@@ -1135,8 +1137,27 @@ print("PASS: founder-approved routine Git/gh, destructive denies and canonical n
 
 for path in ("home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md"):
     rules = (ROOT / path).read_text(encoding="utf-8").lower()
-    for phrase in ("slim-workflow", "never merge", "read the affected", "secret values",
+    for phrase in ("slim-workflow", "never push", "task start <repo> <branch>", "read the affected", "secret values",
                    "approved workspace roots", "scheduled project jobs remain deferred",
                    "customerharness and typo3"):
         assert phrase in rules, (path, phrase)
 print("PASS: native settings, hook schema, and policy negative controls")
+
+assert (ROOT / "home/dot_codex/AGENTS.md").read_text() == (ROOT / "home/dot_claude/CLAUDE.md").read_text()
+modifier = subprocess.run(
+    ["chezmoi", "--source", str(ROOT / "home"), "execute-template"],
+    input=(ROOT / "home/dot_codex/modify_config.toml.tmpl").read_text(),
+    text=True, capture_output=True, check=True).stdout
+local = '[projects."/home/agent/dev_workspace/example"]\ntrust_level = "trusted"\n'
+local += '[projects."/tmp/other"]\ntrust_level = "untrusted"\n'
+local += 'enabled = false\n'
+for old in ("", 'approval_policy = "never"\n' + local):
+    result = subprocess.run(["python3", "-c", modifier], input=old, text=True,
+                            capture_output=True, check=True).stdout
+    parsed = tomllib.loads(result)
+    assert {k: v for k, v in parsed.items() if k != "projects"} == codex
+    assert parsed.get("projects", {}) == tomllib.loads(old).get("projects", {})
+    again = subprocess.run(["python3", "-c", modifier], input=result, text=True,
+                           capture_output=True, check=True).stdout
+    assert again == result
+print("PASS: identical rulebooks and idempotent Codex modifier preserving project trust entries")

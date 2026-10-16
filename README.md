@@ -417,7 +417,7 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 **Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `README.md` and `AGENTS.md` at the root, and a Backlog.md `backlog/` from `backlog init` (integration mode none, task prefix `T`, `auto_commit`, `remote_operations` and `check_active_branches` all false) for tasks and decisions. Both repositories get the standard pre-commit gate (see [Local quality gate](#local-quality-gate-pre-commit)) before the first commit, so that commit already passes it. The command ends by printing "run chezmoi apply to add it to the qmd index". Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
 
-**Package registries.** The Claude Code sandbox may reach exactly `pypi.org`, `files.pythonhosted.org` and `registry.npmjs.org`, and may write `~/.cache/uv` and `~/.npm`. Other registries are added here, by PR, when a project needs them. Codex keeps `network_access = false`: its domain-allowlist proxy does not yet resolve allowlisted hosts inside the Linux sandbox (openai/codex#22387), so a Codex lane asks for approval (`on-request`) to run an install outside the sandbox.
+**Lane downloads.** Both sandboxes enable network access to `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `github.com`, `objects.githubusercontent.com`, `codeload.github.com`, `raw.githubusercontent.com`, `release-assets.githubusercontent.com` and `openrouter.ai`. Codex uses its domain proxy with SOCKS disabled. Both vendors can write the uv, pre-commit, pip and npm caches. Installs and lint downloads run inside the sandbox. The Codex chezmoi modifier enforces managed keys while retaining local `[projects.*]` trust entries.
 
 **One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, backlog tasks and decisions in the knowledge repository.
 
@@ -721,8 +721,9 @@ PyPI and about six for npm (its database is about 200 MB).
   `Jacopo1991/cortex-core`; hand copies and other sources are `global-skill-outside-bootstrap`.
 - **Prompt reminder:** `agent-policy/context_reminder.py` is wired as a native
   `UserPromptSubmit` hook for Claude Code and Codex (`hookSpecificOutput.additionalContext`,
-  six lines: slim-workflow, stop after two failed attempts or at the time box, report in chat and
-  the PR description, git/gh network commands on their own, verify-ui, github-ci). For Claude Code
+  reminders for slim-workflow, stopping after two failed attempts or at the time box, reporting as
+  the task or skill asks, the given worktree and PM adoption of direct requests, git/gh commands
+  on their own, verify-ui only for tasks with a UI to verify, and github-ci). For Claude Code
   it is also a `PreToolUse` hook that adds a "read the github-ci skill first" note before a
   Write/Edit/Bash that touches `.github/workflows` or changes repository settings (`gh repo edit`,
   `gh secret set`, `gh workflow run`, `gh api` with a write method on a settings endpoint). It
@@ -967,7 +968,7 @@ The previous never-merge, workspace, Git metadata/configuration and secret
 checks remain in force.
 
 Codex keeps `workspace-write`, `network_access = true`, the network proxy with
-only `openrouter.ai` allowed, `on-request` and the user approval reviewer.
+the package registry, GitHub download and `openrouter.ai` hosts allowed, `on-request` and the user approval reviewer.
 Four native allow prefixes permit routine Git/gh to run outside the sandbox
 without a prompt. Explicit forbidden prefixes (in
 `/etc/codex/requirements.toml`) and the shared hook block the forbidden operations above.
