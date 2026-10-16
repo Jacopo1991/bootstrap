@@ -6,19 +6,21 @@ Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
-  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|sonnet|opus|fable] [--builder codex|claude]
+  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
-  task check [[<repo>] <id>] [--detach]
+  task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
   task review <repo> <id> [--request <file>] [--run | --record <file>] [--reviewer <vendor> <model>]
-  task merge <repo> <id> [--keep] [--override <reason>] [--detach]
+  task merge <repo> <id> [--keep] [--override <reason>] [--detach] [--lock-wait <minutes>]
   task cancel <repo> <id>
-  task close <repo> <id> -m <summary> --retro <text> [--partial]
+  task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
   task note <repo> <id> improve|intervention|setup <text>
   task note - - setup-done <n>
   task status [<repo>]
+  task repair [<repo>]
+  task wait <repo> <id> [--max <minutes>]
   task denials [--days N]
 
 <repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
@@ -29,6 +31,7 @@ an unsandboxed batch runner are trusted. Always launch builders via `task lane`;
 it keeps the builders sandboxed, including when the runner itself uses bypass.
 """
 import argparse
+import contextlib
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -36,9 +39,11 @@ import json
 import os
 import re
 import secrets
+import selectors
 import shlex
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -387,11 +392,24 @@ def preserve_work(task: Task, path: Path):
         pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=archive))
         saved = pending / ".work"
 
+        skipped = []
+
         def caches(directory, names):
-            return [name for name in names if name in WORK_CACHES
-                    and (Path(directory) / name).is_dir()]
+            ignored = []
+            for name in names:
+                item = Path(directory) / name
+                mode = item.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    continue
+                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                    skipped.append(str(item.relative_to(source)))
+                    ignored.append(name)
+                elif name in WORK_CACHES and item.is_dir():
+                    ignored.append(name)
+            return ignored
 
         shutil.copytree(source, saved, symlinks=True, ignore=caches)
+        atomic_json(pending / "manifest.json", {"skipped_special_files": skipped})
         size = sum(item.lstat().st_size for item in saved.rglob("*")
                    if item.is_symlink() or not item.is_dir())
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
@@ -447,19 +465,29 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
     holder_path = gate_dir / "agent-task-gate.holder"
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
-    except OSError:
-        if not silent_unavailable:
-            print("shared gate lock unavailable in this sandbox; running without it", flush=True)
-        yield
-        return
+    except OSError as error:
+        if silent_unavailable:
+            print(f"Cannot open shared gate lock: {error}; running advisory check unlocked.", flush=True)
+            yield
+            return
+        raise Stop(f"Cannot open shared gate lock: {error}")
     holder_record = None
     try:
         waiting = False
+        deadline = time.monotonic() + GATE_LOCK_WAIT * 60
         while True:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    try:
+                        holder = json.loads(holder_path.read_text()) if gate_holder_alive(lock_path) else {}
+                    except (OSError, ValueError):
+                        holder = {}
+                    print(f"gate busy: held by {holder.get('repo', '?')}/{holder.get('task', '?')} "
+                          f"since {holder.get('since', '?')}", file=sys.stderr, flush=True)
+                    raise SystemExit(3)
                 if not waiting:
                     waiting = True
                     try:
@@ -470,13 +498,14 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                         detail = "another gate (holder details unavailable)"
                     print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
                 time.sleep(0.1)
-            except OSError:
-                if not silent_unavailable:
-                    print("shared gate lock unavailable in this sandbox; running without it", flush=True)
-                os.close(descriptor)
-                descriptor = None
-                yield
-                return
+            except OSError as error:
+                if silent_unavailable:
+                    print(f"Cannot acquire shared gate lock: {error}; running advisory check unlocked.", flush=True)
+                    os.close(descriptor)
+                    descriptor = None
+                    yield
+                    return
+                raise Stop(f"Cannot acquire shared gate lock: {error}")
         metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
                     "repo": task.repo.name}
         try:
@@ -495,6 +524,21 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                 pass
         if descriptor is not None:
             os.close(descriptor)
+
+
+def gate_holder_alive(lock_path):
+    """Kernel lock identity survives PID namespace differences."""
+    info = lock_path.stat()
+    for line in Path("/proc/locks").read_text().splitlines():
+        fields = line.split()
+        if "->" in fields or "FLOCK" not in fields:
+            continue
+        for field in fields:
+            match = re.fullmatch(r"([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)", field)
+            if match and (int(match[1], 16), int(match[2], 16), int(match[3])) == (
+                    os.major(info.st_dev), os.minor(info.st_dev), info.st_ino):
+                return True
+    return False
 
 
 def run_record_path(task: Task):
@@ -543,14 +587,26 @@ def signal_task_run(run_id, signum):
                 pass
 
 
-def task_lock_status(task: Task):
+def task_lock_status(task: Task, repair=False):
     lock = task_state(task) / "run.lock"
     if not lock.exists():
+        if repair:
+            run_path = run_record_path(task)
+            try:
+                run = json.loads(run_path.read_text())
+            except (OSError, ValueError):
+                return ""
+            if run.get("state") in {"running", "foreground", "starting"} and not pid_alive(run.get("pid")):
+                run.update(state="interrupted", ended_at=utc_now())
+                atomic_json(run_path, run)
+                return "interrupted"
         return ""
     try:
         lock_record = json.loads(lock.read_text())
         pid = int(lock_record["pid"])
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        if repair and time.time() - lock.stat().st_mtime > 5:
+            lock.unlink(missing_ok=True)
         return "unknown"
     if pid_alive(pid):
         return "running"
@@ -560,11 +616,12 @@ def task_lock_status(task: Task):
     except (OSError, json.JSONDecodeError):
         run = {}
     active = run.get("state") in {"running", "foreground", "starting"}
-    if active:
+    if active and repair:
         run["state"] = "interrupted"
         run["ended_at"] = utc_now()
         atomic_json(run_path, run)
-    lock.unlink(missing_ok=True)
+    if repair:
+        lock.unlink(missing_ok=True)
     return "interrupted" if active else ""
 
 
@@ -574,7 +631,7 @@ def detached(args, task, path):
     state = task_state(task)
     state.mkdir(parents=True, exist_ok=True)
     run_path, lock = state / "run.json", state / "run.lock"
-    if lock.exists() and task_lock_status(task) == "running":
+    if lock.exists() and task_lock_status(task, repair=True) == "running":
         raise Stop("A task run is already live; wait for it or use `task cancel`.")
     if lock.exists():
         raise Stop("The task run lock is unreadable; ask the PM to inspect task status.")
@@ -665,10 +722,66 @@ def resolve_model(builder, model):
     return MODELS[builder][model]
 
 
+GATE_LOCK_WAIT = 45
+
+
+def refresh_context(task):
+    destination = task.path / ".work/context"
+    # Never traverse lane-controlled links, including dangling links and links
+    # to directories. Clean recursively before reading or changing permissions.
+    def clean(path):
+        if path.is_symlink() or (path.exists() and not path.is_dir() and not path.is_file()):
+            path.unlink()
+        elif path.is_dir():
+            for entry in path.iterdir():
+                clean(entry)
+
+    clean(destination)
+    if destination.is_file():
+        destination.unlink()
+    destination.mkdir(parents=True, exist_ok=True)
+    sources = [task.kb / "INTENT.md", task.kb / "STATUS.md"]
+    if task.file:
+        sources.append(task.file)
+        text = task.file.read_text()
+        for decision in (task.kb / "backlog/decisions").glob("*.md"):
+            if decision.name in text or re.search(r"\b" + re.escape(decision.stem.split(" - ")[0]) + r"\b", text, re.I):
+                sources.append(decision)
+    expected = {source.relative_to(task.kb) for source in sources if source.is_file()}
+    for target in destination.rglob("*"):
+        if target.is_file() and target.relative_to(destination) not in expected:
+            target.chmod(0o644)
+            target.unlink()
+            print(f"Context source removed: {target.relative_to(destination)}")
+    for source in sources:
+        if not source.is_file():
+            continue
+        target = destination / source.relative_to(task.kb)
+        for parent in reversed(target.relative_to(destination).parents):
+            directory = destination / parent
+            if directory.is_symlink() or directory.is_file():
+                directory.unlink()
+            directory.mkdir(exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = source.read_bytes()
+        if target.is_symlink():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+        if not target.exists() or target.read_bytes() != content:
+            if target.exists():
+                target.chmod(0o644)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "wb") as output:
+                output.write(content)
+        target.chmod(0o444)
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
     path = task.worktree()
     record = load_record(task)
+    refresh_context(task)
     builder = args.builder or record["builder"]
     model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
     cli_model = resolve_model(builder, model)
@@ -702,6 +815,8 @@ def lane(args):
             final.unlink(missing_ok=True)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--_worker"]
+            if args.timeout is not None:
+                worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
                 child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
                                          stdin=subprocess.DEVNULL, stdout=log,
@@ -719,23 +834,42 @@ def lane(args):
                   f"see {work / 'lane.log'} and {final}; track it with `task status`.")
             return 0
     code = 1
+    timed_out = False
     try:
-        with prompt.open("rb") as source:
-            if builder == "codex":
-                code = subprocess.run(command, cwd=path, env=agent_environment(), stdin=source).returncode
-            else:
-                with final.open("wb") as output:
-                    child = subprocess.Popen(command, cwd=path, env=agent_environment(), stdin=source,
-                                             stdout=subprocess.PIPE)
-                    while chunk := child.stdout.read1(65536):
-                        output.write(chunk)
-                        sys.stdout.buffer.write(chunk)
-                        sys.stdout.buffer.flush()
+        with tempfile.TemporaryFile() as source:
+            source.write(b"Read the pinned task context in .work/context/ before working.\n\n" + prompt.read_bytes())
+            source.seek(0)
+            with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output:
+                child = subprocess.Popen(command, cwd=path, env=agent_environment(), stdin=source,
+                                         stdout=subprocess.PIPE if output else None)
+                try:
+                    deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
+                    with selectors.DefaultSelector() as reader:
+                        if output:
+                            reader.register(child.stdout, selectors.EVENT_READ)
+                        while reader.get_map() or child.poll() is None:
+                            remaining = deadline - time.monotonic() if deadline is not None else None
+                            if remaining is not None and remaining <= 0:
+                                raise subprocess.TimeoutExpired(command, args.timeout * 60)
+                            for key, _ in reader.select(min(0.1, remaining) if remaining is not None else 0.1):
+                                chunk = os.read(key.fd, 65536)
+                                if not chunk:
+                                    reader.unregister(key.fileobj)
+                                    continue
+                                output.write(chunk)
+                                output.flush()
+                                sys.stdout.buffer.write(chunk)
+                                sys.stdout.buffer.flush()
                     code = child.wait()
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    run.update(state="timed_out", exit_code=None, ended_at=utc_now())
+                    atomic_json(lane_record, run)
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        run.update(state="finished", exit_code=code, ended_at=utc_now())
+        run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
         atomic_json(lane_record, run)
     return code
 
@@ -762,7 +896,7 @@ def foreground_lock(args):
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        if task_lock_status(task) == "running":
+        if task_lock_status(task, repair=True) == "running":
             raise Stop("A task run is already live; wait for it or use `task cancel`.")
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1159,6 +1293,8 @@ def start(args):
         print("\nVerification and tools:\n" + (section.group(1).strip() if section else ""))
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
+    refresh_context(task)
+    print("Context: .work/context/")
     print(f"{task.id}{title}")
     print(f"Work only in {task.path} on branch {branch}.")
     if task.file:
@@ -1652,7 +1788,10 @@ def review(args):
                 prompt.append(f"#{item['number']} {item['text']}")
         else:
             prompt.append("Criteria: none; judge the stated request above against the diff.")
-        prompt.append(f"Diff range: {record['base_sha']}..{head}")
+        review_base = sha(task.repo, f"origin/{default_branch(task.repo)}" if has_origin(task.repo)
+                          else default_branch(task.repo))
+        review_base = git(task.repo, "merge-base", review_base, head)
+        prompt.append(f"Diff range: {review_base}...{head}")
         prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
                       "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
@@ -1788,7 +1927,9 @@ def merge_gate(task, path, head):
                              criteria_text, re.I) for item in record["criteria"]):
             missing.append("criterion evidence in .work/report.md")
     if missing:
-        raise Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
+        error = Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
+        error.missing_steps = missing
+        raise error
     return record
 
 
@@ -1894,12 +2035,15 @@ def merge(args):
     record = load_record(task)
     try:
         record = merge_gate(task, path, lane_head)
-    except Stop:
+    except Stop as error:
         if not args.override:
             raise
         atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
-                                                   "missing_gate": True})
-        print(f"exception: merge gate overridden: {args.override}")
+                                                   "missing_gate": True,
+                                                   "waived": [{"step": item, "reason": args.override}
+                                                              for item in error.missing_steps]})
+        for item in json.loads((archive / "exception.json").read_text())["waived"]:
+            print(f"exception: {item['step']} waived: {args.override}")
     task_event(task, "merge")
     if is_ancestor(repo, lane_head, base):
         commit = base
@@ -1921,9 +2065,18 @@ def merge(args):
                 if not gate_passed:
                     if not args.override:
                         raise Stop("Gate check failed on the would-be merge result; nothing was published.")
-                    atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
-                                                               "gate_failed": True, "missing_gate": True})
-                    print(f"exception: failed merge gate overridden: {args.override}")
+                    try:
+                        exception = json.loads((archive / "exception.json").read_text())
+                    except (OSError, ValueError):
+                        exception = {"waived": []}
+                    gate_check = json.loads((archive / "gate-check.json").read_text())
+                    for step in gate_check.get("steps", []):
+                        if step.get("exit") or step.get("timeout"):
+                            name = "check:" + " ".join(step["command"])
+                            exception.setdefault("waived", []).append({"step": name, "reason": args.override})
+                            print(f"exception: {name} waived: {args.override}")
+                    exception.update(reason=args.override, time=utc_now(), gate_failed=True, missing_gate=True)
+                    atomic_json(archive / "exception.json", exception)
             if sha(path, "HEAD") != lane_head:
                 raise Stop("The lane branch changed while the gate ran; nothing was published. Run `task check` and obtain a new review.")
             fetch(repo)
@@ -1988,6 +2141,7 @@ def merge(args):
             break
         else:
             raise Stop(f"{default} kept moving during three gate attempts; rerun `task merge`.")
+    atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit, "time": utc_now()})
     try:
         review = json.loads((archive / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -2080,9 +2234,24 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
     noticed = []
     report = archive / "report.md"
     if report.exists():
-        match = re.search(r"(?ms)^## Noticed, not done\s*\n(.*?)(?=^## |\Z)", report.read_text())
-        if match and match.group(1).strip().lower() not in {"(none)", "none", "-", "n/a"}:
-            noticed = [line.strip(" -*\t") for line in match.group(1).splitlines() if line.strip()]
+        active = False
+        fence = None
+        existing_path = kb / "improvements.md"
+        existing = existing_path.read_text() if existing_path.exists() else ""
+        for line in report.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("```", "~~~")):
+                marker = stripped[:3]
+                fence = None if fence == marker else marker if fence is None else fence
+                continue
+            if fence:
+                continue
+            if line.startswith("## "):
+                active = bool(re.match(r"## Noticed(?:, not done)?\s*$", line, re.I))
+                continue
+            item = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$", line) if active else None
+            if item and item[1] not in noticed and f"| {item[1]} |" not in existing:
+                noticed.append(item[1])
     if noticed:
         with (kb / "improvements.md").open("a") as out:
             for item in noticed:
@@ -2196,7 +2365,11 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         print(update_closed_knowledge_checkout(repo, default))
         remove_completed_close_worktree(repo, branch, remove_parent=not worktree_parent_existed, task=task)
         delete_merged_close_branch(repo, branch)
-        return 0
+        current = task.file
+        if args.partial or current and re.search(r"(?m)^status: [\"']?Done", current.read_text()):
+            return 0
+        branch += "-final"
+        existing = close_pr(repo, branch)
     if existing and str(existing.get("state", "")).upper() != "OPEN":
         raise Stop(f"Close PR #{existing.get('number')} is {existing.get('state')}; branch {branch} is preserved for inspection.")
     if existing and (existing.get("headRefName") != branch or existing.get("baseRefName") != default):
@@ -2205,7 +2378,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
     path = close_worktree(repo, branch, default)
     head = sha(path, "HEAD")
     base = sha(repo, f"origin/{default}")
-    if not close_commit_present(path, task):
+    if not close_commit_present(path, task) or head == base:
         if head != base:
             raise Stop(f"Close branch {branch} at {head[:7]} has an unexpected commit; preserved at {path}.")
         if git(path, "status", "--porcelain", "--untracked-files=all"):
@@ -2307,7 +2480,17 @@ def close(args):
             r"(?i)went well\s*[:/].*went wrong\s*[:/].*change\s*[:/]", args.retro)) == 0:
         raise Stop("This task needs a three-part retro: went well / went wrong / change.")
     status = "In Progress" if args.partial else "Done"
+    try:
+        merge_evidence = json.loads((archive / "merge.json").read_text())
+    except (OSError, ValueError):
+        merge_evidence = {}
+    head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else review.get("commit")
+    if not args.partial and (not head or merge_evidence.get("head") != head):
+        if not args.no_merge:
+            print("Notice: merge not recorded for the task head.")
     summary = args.message + "\n\nRetro: " + args.retro
+    if not args.partial and (not head or merge_evidence.get("head") != head):
+        summary += "\n\nMerge: " + (f"not merged: {args.no_merge}" if args.no_merge else 'merge not recorded')
     if exception_path.is_file():
         try:
             exception_reason = json.loads(exception_path.read_text()).get("reason", "unspecified override")
@@ -2387,13 +2570,14 @@ def note(args):
     if args.kind == "setup":
         path = HOME / ".local/state/task/setup-requests.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
-        entries = read_setup_events(path)
-        request_id = max((item.get("id", 0) for item in entries
-                          if item.get("action") == "setup" and isinstance(item.get("id"), int)),
-                         default=0) + 1
-        entry = {"time": utc_now(), "action": "setup", "id": request_id, "repo": repo.name,
-                 "task": task.id if task else "-", "text": args.text}
         with path.open("a", encoding="utf-8") as out:
+            fcntl.flock(out, fcntl.LOCK_EX)
+            entries = read_setup_events(path)
+            request_id = max((item.get("id", 0) for item in entries
+                              if item.get("action") == "setup" and isinstance(item.get("id"), int)),
+                             default=0) + 1
+            entry = {"time": utc_now(), "action": "setup", "id": request_id, "repo": repo.name,
+                     "task": task.id if task else "-", "text": args.text}
             out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
         print(f"Recorded setup request #{request_id} for {repo.name}.")
         return 0
@@ -2423,7 +2607,8 @@ def status(args):
     setup_warnings = []
     setup_events = read_setup_events(setup_path, setup_warnings)
     for repo in repos:
-        prune_stale_gate_worktrees(repo)
+        for gate in (repo / ".worktrees").glob(".task-gate-*"):
+            print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
         attention = []
         state_root = HOME / ".local/state/task" / repo.name
@@ -2456,6 +2641,7 @@ def status(args):
             lock_state = task_lock_status(task)
             if lock_state == "interrupted":
                 run_state = "interrupted"
+                print(f"repair available: interrupted run lock {state}")
             elif lock_state == "running" and run_state in {"foreground", "running"}:
                 run_state = "running"
             if run_state == "running":
@@ -2498,7 +2684,7 @@ def status(args):
                 result = f" (exit {lane_run['exit_code']})" if "exit_code" in lane_run else ""
                 print(f"    lane: {lane_state}{result} pid={lane_run.get('pid', '?')} "
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
-                if lane_state == "interrupted" or lane_run.get("exit_code", 0) != 0:
+                if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
                     attention.append(f"{path.name}: lane {lane_state}{result}")
             if (state / "exception.json").is_file():
                 attention.append(f"{path.name}: exception")
@@ -2564,6 +2750,24 @@ def cancel(args):
     repo = resolve_repo(args.repo)
     prune_stale_gate_worktrees(repo)
     task = Task(repo, args.id)
+    lane_path = task.path / ".work/lane.json"
+    try:
+        lane_run = json.loads(lane_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        lane_run = {}
+    if lane_run.get("state") == "running" and pid_alive(lane_run.get("pid")):
+        try:
+            os.killpg(int(lane_run["pid"]), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError) as error:
+            lane_run.update(state="interrupted", ended_at=utc_now())
+            atomic_json(lane_path, lane_run)
+            reason = "could not stop (permission denied)" if isinstance(error, PermissionError) else "already stopped"
+            print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
+            return 0
+        lane_run.update(state="cancelled", ended_at=utc_now())
+        atomic_json(lane_path, lane_run)
+        print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
+        return 0
     run_path = task_state(task) / "run.json"
     try: run = json.loads(run_path.read_text())
     except (OSError, json.JSONDecodeError): raise Stop("No detached run to cancel.")
@@ -2631,29 +2835,82 @@ def cancel(args):
     return 0
 
 
+def repair(args):
+    repos = [resolve_repo(args.repo)] if args.repo else sorted(
+        p for p in WORKSPACE.iterdir() if (p / ".git").exists())
+    for repo in repos:
+        prune_stale_gate_worktrees(repo)
+        names = {p.name for p in (repo / ".worktrees").glob("*") if not p.name.startswith(".")}
+        names.update(p.name for p in (HOME / ".local/state/task" / repo.name).glob("*") if p.is_dir())
+        for name in sorted(names):
+            task = Task(repo, name)
+            lane_path = task.path / ".work/lane.json"
+            try:
+                lane_run = json.loads(lane_path.read_text())
+            except (OSError, ValueError):
+                lane_run = {}
+            if lane_run.get("state") == "running" and not pid_alive(lane_run.get("pid")):
+                lane_run.update(state="interrupted", ended_at=utc_now())
+                atomic_json(lane_path, lane_run)
+                print(f"Repaired interrupted lane: {repo.name}/{task.id}")
+            lock = task_state(task) / "run.lock"
+            had_lock = lock.exists()
+            result = task_lock_status(task, repair=True)
+            if result == "interrupted" or had_lock and not lock.exists():
+                print(f"Repaired interrupted run lock: {repo.name}/{task.id}")
+    return 0
+
+
+def wait_task(args):
+    task = Task(resolve_repo(args.repo), args.id)
+    deadline = time.monotonic() + args.max * 60
+    while True:
+        runs = []
+        for file in (task.path / ".work/lane.json", run_record_path(task)):
+            try:
+                run = json.loads(file.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if run.get("state") in {"running", "foreground", "starting"} and not pid_alive(run.get("pid")):
+                run["state"] = "interrupted"
+            runs.append(run)
+        if not any(r.get("state") in {"running", "foreground", "starting"} for r in runs):
+            print("; ".join(r.get("state", "unknown") for r in runs) or "not started")
+            return 0
+        if time.monotonic() >= deadline:
+            print("still running")
+            return 3
+        time.sleep(min(10, max(0, deadline - time.monotonic())))
+
+
 def main(argv=None):
     global ACTIVE_FOREGROUND_TASK
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("start", "lane", "merge", "close", "review", "cancel"):
+    for name in ("start", "lane", "merge", "close", "review", "cancel", "wait"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
         sub.add_argument("id")
+        if name == "wait":
+            sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
         if name == "start":
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
             sub.add_argument("--seed", action="append", default=[], metavar="NAME")
             sub.add_argument("--no-verify", metavar="REASON")
         if name == "lane":
+            sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
             sub.add_argument("--builder", choices=("codex", "claude"))
             sub.add_argument("--model", help="Claude aliases sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
+            sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
             sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
             sub.add_argument("--override", metavar="REASON")
             sub.add_argument("--detach", action="store_true")
         if name == "close":
+            sub.add_argument("--no-merge", metavar="REASON", help="record why Done has no merge evidence")
             sub.add_argument("-m", "--message", required=True, help="final summary")
             sub.add_argument("--retro", required=True)
             sub.add_argument("--partial", action="store_true")
@@ -2671,6 +2928,7 @@ def main(argv=None):
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
+    sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
     sub = commands.add_parser("note")
     sub.add_argument("repo")
     sub.add_argument("id")
@@ -2678,14 +2936,20 @@ def main(argv=None):
     sub.add_argument("text", nargs="+")
     sub = commands.add_parser("status")
     sub.add_argument("repo", nargs="?")
+    sub = commands.add_parser("repair", help="explicitly repair stale task state and gate worktrees")
+    sub.add_argument("repo", nargs="?")
     sub = commands.add_parser("denials")
     sub.add_argument("--days", type=int, default=30)
     args = parser.parse_args(argv)
+    if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
+        parser.error("--timeout must be greater than zero minutes")
+    global GATE_LOCK_WAIT
+    GATE_LOCK_WAIT = getattr(args, "lock_wait", 45)
     if args.command == "check":
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note"}:
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair"}:
         try:
             require_pm(args)
         except Stop as stop:
@@ -2736,7 +3000,8 @@ def main(argv=None):
         try:
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
-                      "denials": denials, "runner-check": runner_check}[args.command](args) or 0
+                      "denials": denials, "runner-check": runner_check, "repair": repair,
+                      "wait": wait_task}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"
@@ -2750,6 +3015,9 @@ def main(argv=None):
                 ACTIVE_FOREGROUND_TASK = None
         finish_detached(result)
         return result
+    except SystemExit as stop:
+        finish_detached(stop.code or 0)
+        raise
     except Stop as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
