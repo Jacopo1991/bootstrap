@@ -266,6 +266,21 @@ class Safety(unittest.TestCase):
             self.assertTrue(path.exists(), out)
         self.assertTrue((self.home / ".local/state/task/archive/proj/archived/snapshot/.work/report.md").exists())
 
+    def test_backlog_archive_uses_task_folder_instead_of_branch(self):
+        task = self.worktree("t28", "-b", "t28-clean-up-workspaces")
+        (task / ".work").mkdir()
+        (task / ".work/state.sqlite").write_text("task state")
+        age(task)
+        out = self.tidy()
+        self.assertTrue(task.exists(), out)
+        self.assertIn("ignored file that is not a rebuildable cache", out)
+        archive = self.home / ".local/state/task/archive/proj/t28/t28-snapshot/.work"
+        archive.mkdir(parents=True)
+        (archive / "state.sqlite").write_text("task state")
+        out = self.tidy()
+        self.assertFalse(task.exists(), out)
+        self.assertEqual((archive / "state.sqlite").read_text(), "task state")
+
     def test_moved_worktree_is_not_pruned(self):
         moved = self.worktree("moved", "--detach")
         (moved / "z.txt").write_text("z")

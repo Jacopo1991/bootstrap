@@ -132,11 +132,10 @@ def paths_in_use() -> list[Path]:
 
 def work_archived(path: Path) -> bool:
     """task merge snapshots .work under archive/<repo>/<task>/<snapshot>/.work."""
-    branch = git(path, "symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
-    if not branch:
-        return False
     common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
-    archive = HOME / ".local/state/task/archive" / common.parent.name / branch.replace("/", "-")
+    if path.parent != common.parent / ".worktrees":
+        return False
+    archive = HOME / ".local/state/task/archive" / common.parent.name / path.name
     return archive.is_dir() and any(p.is_dir() for p in archive.glob("*/.work"))
 
 
