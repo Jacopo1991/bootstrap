@@ -1854,10 +1854,13 @@ def review(args):
             run_reviewer(command, path, prompt_file, reply_file)
             head = sha(path, "HEAD")
             try:
-                block = review_block(reply_file.read_text())
-                parsed = parse_review_block(block, {item["number"] for item in record["criteria"]}) if block is not None else None
-                if parsed and parsed[1] == head:
-                    break
+                verdict, commit, _, _ = parse_review_reply(
+                    reply_file.read_text(), {item["number"] for item in record["criteria"]})
+                if verdict and commit:
+                    matches = run_git(path, "rev-parse", "--verify", f"{commit}^{{commit}}")
+                    if (matches.returncode == 0 and matches.stdout.strip().startswith(commit)
+                            and matches.stdout.strip() == head):
+                        break
             except ReviewParseError:
                 pass
             if attempt:

@@ -1556,6 +1556,32 @@ store.write_text(json.dumps(prs))
             self.assertIn("Recorded PASS", out)
             self.assertNotIn("I am the builder", out)
 
+    def test_review_run_records_unfenced_reply_on_first_try(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        reply = f"Verdict: PASS\nCommit: {head[:12]}\n#1 pass: source\n#2 pass: evidence\n"
+        out = self.raw_task("review", "proj", "5", "--run",
+                            env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((wt / ".work/reviewer-count").read_text(), "1")
+        self.assertIn("Recorded PASS", out)
+        review = __import__("json").loads((self.state() / "review.json").read_text())
+        self.assertEqual(review["commit"], head)
+        self.assertEqual((self.state() / "review.md").read_text(), reply)
+
+    def test_review_run_without_verdict_retries_once_then_stops(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        reply = f"Commit: {head}\n#1 pass: source\n#2 pass: evidence\n"
+        out = self.raw_task("review", "proj", "5", "--run", code=1,
+                            env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((wt / ".work/reviewer-count").read_text(), "2")
+        self.assertIn("review produced no verdict", out)
+        self.assertNotIn(reply, out)
+        self.assertFalse((self.state() / "review.json").exists())
+        self.assertFalse((self.state() / "review.md").exists())
+
     def test_report_criteria_list_markers_merge_and_check(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
