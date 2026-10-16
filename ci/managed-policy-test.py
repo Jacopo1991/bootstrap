@@ -7,6 +7,7 @@ Claude Code: system/claude-managed-guardrails.json -> /etc/claude-code/managed-s
 either may limit bypass/auto mode, approval policy, sandbox choice or the user's own hooks.
 """
 import ast
+import io
 import importlib.util
 import json
 import os
@@ -271,7 +272,9 @@ with tempfile.TemporaryDirectory() as temp:
     entry = json.loads(log.read_text())
     assert entry["category"] == "sudo" and entry["vendor"] == "claude"
     assert entry["rule_id"] == "command.unsafe_environment"
-    assert "ghp_x" not in log.read_text() and "/sensitive/argument" not in log.read_text()
+    assert "ghp_x" not in log.read_text()
+    assert entry["reason"] and entry["command"].endswith("[REDACTED]")
+    assert len(entry["reason"]) <= 200 and len(entry["command"]) <= 200
     assert policy.first_command_category("GITHUB_TOKEN=ghp_x sudo ls") == "sudo"
     assert policy.event_vendor({"hook_event_name": "PreToolUse", "codex_event": "PreToolUse"}) == "unknown"
     assert policy.event_vendor({}, "codex") == "codex"
@@ -294,6 +297,54 @@ with tempfile.TemporaryDirectory() as temp:
     result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
                             cwd=temp, env=env, check=True, timeout=30)
     assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+# Hardening regressions: reads stay frictionless; errors never escape the hook.
+with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, clear=True):
+    root = Path(temp)
+    loop_path = root / "loop"
+    loop_path.symlink_to(loop_path)
+    state = Path.home() / ".local/state/task/proj/check.json"
+    def read_event(command):
+        return {"tool_name": "Bash", "cwd": temp, "tool_input": {"command": command}}
+    for executable in ("cat", "ls", "head", "grep", "wc", "stat"):
+        for path in (str(state), "~/.local/state/task/proj/check.json",
+                     "~/cortex/cortex-kb-proj/STATUS.md", "~/cortex/cortex-core/catalogs/TOOLS.md"):
+            reason = policy.evaluate(read_event(f"{executable} {path}"), (root,))
+            assert reason is None, (executable, path, reason)
+    for command in (f"touch {state}", f"cat file > {state}", f"tee {state}"):
+        assert policy.evaluate(read_event(command), (root,))
+    for command in ("for x in README.md LICENSE; do cat $x; done",
+                    'for x in README.md LICENSE; do head "$x"; done'):
+        assert policy.evaluate(read_event(command), (root,)) is None, command
+    for command in ("for x in README.md; do touch $x; done",
+                    "for x in README.md; do cat $x > /outside; done",
+                    "for x in README.md; do sudo cat $x; done"):
+        assert policy.evaluate(read_event(command), (root,)), command
+    for path in ("~unknownuser/file", str(loop_path)):
+        event = read_event(f"touch {path}")
+        with patch.object(policy, "root_for", return_value=root), patch.object(policy, "git_metadata", return_value=()):
+            assert policy.evaluate(event, (root,))
+    for function, hook_event in (("evaluate", "PreToolUse"), ("permission_reason", "PermissionRequest")):
+        event = read_event("cat file") | {"hook_event_name": hook_event}
+        with patch.object(policy.sys, "stdin", io.StringIO(json.dumps(event))), \
+                patch.object(policy.sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(policy, function, side_effect=RuntimeError("test failure")), \
+                patch.object(policy, "log_denial") as logged:
+            assert policy.main([]) == 0
+            assert "policy hook error: RuntimeError: test failure" in output.getvalue()
+            assert logged.call_args.args[1].rule_id == "hook.error"
+    for text in ("token=synthetic", "key=synthetic", "password=synthetic", "Authorization: synthetic"):
+        assert "synthetic" not in policy.audit_text(text)
+    assert len(policy.audit_text("x" * 300)) == 200
+    assert policy.command_rule("Inline shell and interpreter programs are blocked.") == "shell.interpreter"
+    assert policy.command_rule(policy.MIXED_CHAIN_MESSAGE) == "command.mixed_chain"
+    for path in ("~unknownuser/file", str(loop_path)):
+        event = {"tool_name": "Bash", "cwd": str(ROOT), "tool_input": {"command": f"touch {path}"}}
+        result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
+                                env=clean_env | {"HOME": temp}, check=True, timeout=30)
+        assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "Traceback" not in result.stderr
+assert 'sudo python3 -m compileall -q "$policy_dir"' in install
 
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
 assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""

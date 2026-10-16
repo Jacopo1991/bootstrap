@@ -51,6 +51,7 @@ for script in pre_tool_use.py context_reminder.py; do
   sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"
   sudo mv -f -- "$policy_temp" "$policy_dir/$script"
 done
+sudo python3 -m compileall -q "$policy_dir"
 current_temp=$(sudo mktemp -d /opt/machine-bootstrap/.current.XXXXXX)
 sudo ln -s "$public_source" "$current_temp/current"
 sudo mv -T -- "$current_temp/current" /opt/machine-bootstrap/current

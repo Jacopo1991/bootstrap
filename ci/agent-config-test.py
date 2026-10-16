@@ -215,14 +215,13 @@ with tempfile.TemporaryDirectory() as temp:
         assert reason is None, (command, reason)
     assert policy.evaluate(event("task status"), roots) is None
     assert policy.evaluate(event("task check"), roots) is None
-    # One rejection names every missing flag and the full command (MadPlanner T-32 hit its
-    # two-failure stop learning them one per rejection), and points to a .work/ copy.
-    reason = policy.evaluate(event(f"git -C {sibling} show HEAD:file"), roots)
-    for flag in ("--no-pager", "--no-optional-locks", "--no-textconv", "--no-ext-diff", ".work/"):
-        assert reason and flag in reason, (flag, reason)
-    reason = policy.evaluate(event(f"git --no-pager -C {sibling} blame file"), roots)
-    assert reason and "missing: --no-optional-locks --no-textconv." in reason, reason
-    assert "--no-ext-diff ..." not in reason, reason
+    for target in (sibling, knowledge):
+        for sub in ("log", "show HEAD:file", "diff", "status", "branch", "branch --list",
+                    "branch --show-current", "branch --list main", "for-each-ref", "rev-parse",
+                    "worktree list", "ls-files", "cat-file -p HEAD"):
+            assert policy.evaluate(event(f"git -C {target} {sub}"), roots) is None, sub
+        assert policy.evaluate(event(f"git -C {target} branch -D main"), roots)
+    assert policy.evaluate(event(f"git --no-pager -C {sibling} blame file"), roots) is None
     assert policy.evaluate(event(
         f"git --no-pager --no-optional-locks -C {sibling} show --no-textconv --no-ext-diff HEAD:file"),
         roots) is None
@@ -378,7 +377,6 @@ with tempfile.TemporaryDirectory() as temp:
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv -wS/tmp/revisions file",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --ext-diff",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --textconv",
-        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv",
         "git --no-pager --no-optional-locks -C ../sibling grep -f/etc/file needle",
         "git --no-pager --no-optional-locks -C ../sibling grep -foutside-link needle",
         "git --no-pager --no-optional-locks -C ../sibling ls-files -X/etc/file",
@@ -386,13 +384,8 @@ with tempfile.TemporaryDirectory() as temp:
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --contents=outside-link file",
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --ignore-revs-file=outside-link file",
         "git --no-pager --no-optional-locks -C ../sibling show --no-textconv --no-ext-diff outside-link",
-        "git --no-pager --no-optional-locks -C ../sibling log -p",
         "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
         "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",
-        "git -C ../sibling status",
-        f"git -C --no-pager -C --no-optional-locks -C {sibling} status",
-        "git --no-pager -C ../sibling status",
-        "git --no-pager --no-optional-locks -C ../sibling diff",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --out=/tmp/no-write",
         "git --no-pager --no-optional-locks -C ../sibling grep -Ocat needle",
         "git --no-pager --no-optional-locks -C ../sibling grep --open-files-in-pager=cat needle",
