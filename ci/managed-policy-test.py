@@ -299,7 +299,8 @@ with tempfile.TemporaryDirectory() as temp:
                  "/home/agent/dev_workspace/bootstrap/", "src/some/normal/path.py",
                  *(prefix + "a" * 40 for prefix in ("/", "./", "../", "~/", "$HOME/"))):
         assert policy.audit_text(path) == path
-    fixtures += ["relative/" + "a" * 40, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"]
+    fixtures += ["relative/" + "a" * 40, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                 "relative/" + "abc/" * 10, "'./" + "a" * 40 + "'"]
     assert policy.audit_text(None) == "None"
     assert policy.audit_text(123) == "123"
     assert policy.audit_text({"message": "ok"}) == str({"message": "ok"})
@@ -319,6 +320,11 @@ with tempfile.TemporaryDirectory() as temp:
             assert "[REDACTED]" in redacted[field], (fixture, field)
     for command in (r"rg --foo C:\Users\x pat", r"grep --weird X \\srv\share"):
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
+    for executable in ("grep", "rg"):
+        for option in ("--file=pats", "-fpats", "-nfpats"):
+            for operand in (r"'C:\Users\x'", r"'\\srv\share'"):
+                command = executable + " " + option + " " + operand
+                assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     for command in (r"rg '\d+' src", r"grep -e '\bx\b' f",
                     r"rg -S '\w\s' src", r"grep -rIn '\s\d' .",
                     r"rg --unknown=value '\w\s' src"):

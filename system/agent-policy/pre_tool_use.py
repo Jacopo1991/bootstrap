@@ -1115,7 +1115,9 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
                 has_expression = True
             index += 1
         elif options and token.startswith("--") and "=" in token:
-            pass  # Self-contained unknown option: it consumes no following operand.
+            if token.startswith("--file="):
+                has_expression = True
+            # Self-contained options consume no following operand.
         elif options and token.startswith("-"):
             if token not in switches:
                 if token.startswith("--"):
@@ -1682,11 +1684,10 @@ def event_vendor(event: dict, vendor: str | None = None) -> str:
 def audit_text(value: str) -> str:
     value = str(value)
     def redact_run(match):
-        token_start = re.split(r"[\s\"']", value[:match.start()])[-1]
+        token_start = re.split(r"\s", value[:match.start()])[-1]
         token = token_start + match[0]
         path = token.startswith(("/", "./", "../", "~/", "$HOME/"))
-        return match[0] if "/" in match[0] and (path or all(
-            len(segment) < 32 for segment in match[0].split("/"))) else "[REDACTED]"
+        return match[0] if path else "[REDACTED]"
 
     # Redact before truncating: a token may cross the audit length boundary.
     value = re.sub(
