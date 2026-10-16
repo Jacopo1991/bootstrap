@@ -217,14 +217,19 @@ with tempfile.TemporaryDirectory() as temp:
         assert reason is None, (command, reason)
     assert policy.evaluate(event("task status"), roots) is None
     assert policy.evaluate(event("task check"), roots) is None
-    # One rejection names every missing flag and the full command (MadPlanner T-32 hit its
-    # two-failure stop learning them one per rejection), and points to a .work/ copy.
-    reason = policy.evaluate(event(f"git -C {sibling} show HEAD:file"), roots)
-    for flag in ("--no-pager", "--no-optional-locks", "--no-textconv", "--no-ext-diff", ".work/"):
-        assert reason and flag in reason, (flag, reason)
-    reason = policy.evaluate(event(f"git --no-pager -C {sibling} blame file"), roots)
-    assert reason and "missing: --no-optional-locks --no-textconv." in reason, reason
-    assert "--no-ext-diff ..." not in reason, reason
+    for target in (sibling, knowledge):
+        for sub in ("log", "show HEAD:file", "diff", "status", "branch", "branch --list",
+                    "branch --show-current", "branch --list main", "for-each-ref", "rev-parse",
+                    "worktree list", "ls-files", "cat-file -p HEAD", "cat-file -t HEAD",
+                    "rev-list HEAD", "ls-tree HEAD", "show-ref", "describe HEAD",
+                    "remote -v", "remote show -n origin", "config --get remote.origin.url",
+                    "config --list", "merge-base HEAD HEAD", "name-rev HEAD"):
+            assert policy.evaluate(event(f"git -C {target} {sub}"), roots) is None, sub
+        for sub in ("remote show origin", "remote update", "remote add other https://github.com/example/repo",
+                    "config remote.origin.url value", "config --unset remote.origin.url"):
+            assert policy.evaluate(event(f"git -C {target} {sub}"), roots), sub
+        assert policy.evaluate(event(f"git -C {target} branch -D main"), roots)
+    assert policy.evaluate(event(f"git --no-pager -C {sibling} blame file"), roots) is None
     assert policy.evaluate(event(
         f"git --no-pager --no-optional-locks -C {sibling} show --no-textconv --no-ext-diff HEAD:file"),
         roots) is None
@@ -344,6 +349,14 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
+    for subcommand in ("log", "show", "diff", "blame"):
+        assert policy.evaluate(event(f"git -C ../sibling {subcommand}"), roots) is None
+        with patch.object(policy.Path, "home", return_value=sibling.parent):
+            for target in ("~/sibling", "$HOME/sibling", "${HOME}/sibling"):
+                assert policy.evaluate(event(f"git -C {target} {subcommand}"), roots) is None, target
+        for flag in ("--ext-diff", "--textconv"):
+            reason = policy.evaluate(event(f"git -C ../sibling {subcommand} {flag}"), roots)
+            assert reason == "External diff and textconv are blocked across repositories."
     for command in (
         f"git -C {outsider} status", f"git -C {link} status",
         "git -C nested -C ../../sibling add file",
@@ -380,7 +393,6 @@ with tempfile.TemporaryDirectory() as temp:
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv -wS/tmp/revisions file",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --ext-diff",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --textconv",
-        "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv",
         "git --no-pager --no-optional-locks -C ../sibling grep -f/etc/file needle",
         "git --no-pager --no-optional-locks -C ../sibling grep -foutside-link needle",
         "git --no-pager --no-optional-locks -C ../sibling ls-files -X/etc/file",
@@ -388,13 +400,8 @@ with tempfile.TemporaryDirectory() as temp:
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --contents=outside-link file",
         "git --no-pager --no-optional-locks -C ../sibling blame --no-textconv --ignore-revs-file=outside-link file",
         "git --no-pager --no-optional-locks -C ../sibling show --no-textconv --no-ext-diff outside-link",
-        "git --no-pager --no-optional-locks -C ../sibling log -p",
         "git push ../sibling HEAD", "git push file:///tmp/repo HEAD",
         "git -C ~ status", "git -C '$HOME' status", "git -C ../* status",
-        "git -C ../sibling status",
-        f"git -C --no-pager -C --no-optional-locks -C {sibling} status",
-        "git --no-pager -C ../sibling status",
-        "git --no-pager --no-optional-locks -C ../sibling diff",
         "git --no-pager --no-optional-locks -C ../sibling diff --no-textconv --no-ext-diff --out=/tmp/no-write",
         "git --no-pager --no-optional-locks -C ../sibling grep -Ocat needle",
         "git --no-pager --no-optional-locks -C ../sibling grep --open-files-in-pager=cat needle",
@@ -761,6 +768,14 @@ with tempfile.TemporaryDirectory() as temp:
             "cat 'C:\\Windows\\file.md'", "cat /mnt/c/file.md",
             "cat '\\\\host\\share\\file.md'", "cp safe.txt 'C:\\Windows\\file.md'",
             "env fixture.com", "command fixture.exe", "bash -c 'fixture.com'"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in (r"rg '\d+\.\d+' src", r"grep -E '\bfoo\b'",
+                    r"sed -n '/\bfoo\b/p' src", r"awk '/\bfoo\b/' src",
+                    r"rg -e 'C:\Users\x' src", r"grep -E 'C:\Users\x' src",
+                    r"rg -F '\\srv\share' src", r"printf '\bfoo\b'"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in (r"cat 'C:\Users\x'", r"cat '\\srv\share'",
+                    r"rg foo 'C:\Users\x'", r"grep -e foo '\\srv\share'"):
         assert policy.evaluate(event(command), roots) is not None, command
     # A Linux data filename or prose argument is not a Windows executable.
     for command in ("cat fixture.com", "cat fixture.exe", "printf 'wsl.exe'",

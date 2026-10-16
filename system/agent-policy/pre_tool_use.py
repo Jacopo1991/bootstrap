@@ -24,11 +24,10 @@ HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
             "mount", "umount", "shutdown", "reboot", "modprobe", "useradd",
             "adduser", "usermod", "passwd", "visudo"}
 # Inspect paths in argv, never a substring in an entire shell/body string.
-# Unquoted Windows backslashes can be consumed by shlex, so drive prefixes
-# remain blocked even after that normalization.
+# Inspect before shell escape removal as well, so unquoted paths stay visible.
 WINDOWS_PATH = re.compile(r"(?i)(?:(?<![A-Za-z0-9_])[A-Z]:[\\/](?!/)|"
-                          r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:|/mnt/[a-z](?:/|$)|"
-                          r"(?:^|=)(?:-[A-Za-z]+)?\\(?:\\|[A-Za-z0-9_-]))")
+                          r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:[\\/]|/mnt/[a-z](?:/|$)|"
+                          r"(?:^|=)(?:-[A-Za-z]+)?\\\\[^\\/\s]+\\[^\\/\s]+)")
 HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
@@ -64,7 +63,8 @@ READ_ONLY_COMMANDS = {"cd", "echo", "printf", "true", "false", "pwd", "ls", "cat
 STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
-READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame",
+                 "rev-list", "ls-tree", "show-ref", "describe", "cat-file", "merge-base", "name-rev"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -119,7 +119,7 @@ def protected_git_path(path_text: str, cwd: str, metadata: tuple[Path, ...]) -> 
                          or (ancestor / "objects").is_dir() and (ancestor / "refs").is_dir())):
                 return True
         return False
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return True
 
 
@@ -131,7 +131,7 @@ def git_metadata(root: Path) -> tuple[Path, ...] | None:
             stderr=subprocess.DEVNULL, text=True, check=True, timeout=3)
         paths = tuple(Path(line).resolve() for line in result.stdout.splitlines())
         return paths if len(paths) == 2 and all(path.is_absolute() for path in paths) else None
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return None
 
 
@@ -142,8 +142,12 @@ def folder_delete_reason(folder: Path, root: Path | None,
     or a Git directory under any name) may be deleted or staged as a folder."""
     if root is None or metadata is None:
         return f"Cannot identify the repository safely; {action.lower()} folders is blocked."
-    target = folder.resolve()
-    if target == Path(root).resolve():
+    try:
+        target = folder.resolve()
+        resolved_root = Path(root).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return f"Cannot resolve folder safely; {action.lower()} folders is blocked."
+    if target == resolved_root:
         return f"{action} the repository root as a folder is blocked."
     if any(path == target or target in path.parents for path in metadata):
         return f"{action} Git metadata is blocked."
@@ -245,13 +249,16 @@ def git_config_read_only(arguments: list[str]) -> bool:
 
 
 def root_for(cwd: str, approved_roots: tuple[Path, ...] | None = None) -> Path:
-    here = Path(cwd).resolve()
+    try:
+        here = Path(cwd).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return Path("/__bootstrap_outside_approved_roots__")
     try:
         result = policy_subprocess(["git", "rev-parse", "--show-toplevel"], cwd=here,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
         root = Path(result.stdout.strip()).resolve()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         root = here
     approved = approved_roots or (
         Path("/home/agent/dev_workspace").resolve(),
@@ -268,15 +275,6 @@ CROSS_REPO_HINT = ("If the task needs another repository's files, ask the PM for
                    "this repository's .work/ instead.")
 
 
-def cross_repo_read_message(subcommand: str, missing: list[str]) -> str:
-    """Name every missing flag at once, with the full command, so one retry is enough."""
-    tail = {"log": " --no-textconv --no-ext-diff", "show": " --no-textconv --no-ext-diff",
-            "diff": " --no-textconv --no-ext-diff", "blame": " --no-textconv"}.get(subcommand, "")
-    return (f"Reading another repository needs all of these flags, missing: {' '.join(missing)}. "
-            f"Use: `git --no-pager --no-optional-locks -C <repo> {subcommand}{tail} ...`. "
-            + CROSS_REPO_HINT)
-
-
 def same_repository(first: Path, second: Path) -> bool:
     """True when both checkouts share one Git common directory (main checkout and its worktrees)."""
     def common(path: Path) -> Path | None:
@@ -284,9 +282,9 @@ def same_repository(first: Path, second: Path) -> bool:
             result = policy_subprocess(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                     cwd=path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
-        except (OSError, subprocess.SubprocessError):
+            return Path(result.stdout.strip()).resolve()
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             return None
-        return Path(result.stdout.strip()).resolve()
     left, right = common(first), common(second)
     return left is not None and left == right
 
@@ -294,16 +292,19 @@ def same_repository(first: Path, second: Path) -> bool:
 def managed_worktree_of_approved_repo(root: Path, approved: tuple[Path, ...]) -> bool:
     """A worktree the Codex app made under ~/.codex/worktrees counts as its own root when it
     belongs to a repository under an approved root. The root stays the worktree itself."""
-    bases = [base.resolve() for base in MANAGED_WORKTREE_BASES]
+    try:
+        bases = [base.resolve() for base in MANAGED_WORKTREE_BASES]
+    except (OSError, ValueError, RuntimeError):
+        return False
     if not any(base in root.parents for base in bases):
         return False
     try:
         result = policy_subprocess(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
                                 cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, timeout=3, check=True)
-    except (OSError, subprocess.SubprocessError):
+        common = Path(result.stdout.strip()).resolve()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return False
-    common = Path(result.stdout.strip()).resolve()
     if common.name != ".git" or (root / ".git").is_dir():
         return False                      # bare repositories and independent clones do not count
     repository = common.parent
@@ -317,13 +318,16 @@ def inside(path_text: str, cwd: str, root: Path) -> bool:
     try:
         p.resolve().relative_to(root)
         return True
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return False
+
+
+DENIAL_SUFFIX = " Rewrite the command; this is a policy limit, not missing access."
 
 
 def deny(message: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-            "permissionDecision": "deny", "permissionDecisionReason": message}}
+            "permissionDecision": "deny", "permissionDecisionReason": message + DENIAL_SUFFIX}}
 
 
 class Denial(str):
@@ -360,7 +364,10 @@ def secret_scan(root: Path) -> str | None:
 
 def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[str]] | None:
     """Resolve repeated -C options without permitting config/worktree overrides."""
-    target = Path(cwd).resolve()
+    try:
+        target = Path(cwd).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
     selectors: set[str] = set()
     index = 1
     while index < len(tokens):
@@ -381,10 +388,17 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[s
         else:
             return target, token, tokens[index + 1:], selectors
         # Git resolves each relative -C against the preceding effective directory.
+        for prefix in ("~", "$HOME", "${HOME}"):
+            if value == prefix or value.startswith(prefix + "/"):
+                value = str(Path.home()) + value[len(prefix):]
+                break
         if SHELL_EXPANSION.search(value):
             return None
         if value:
-            target = (target / value).resolve()
+            try:
+                target = (target / value).resolve()
+            except (OSError, ValueError, RuntimeError):
+                return None
         index += 1
     return None
 
@@ -697,7 +711,18 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return "Sibling fetch permits only fetch or fetch origin; options/refspecs are blocked."
     if sibling_fetch and sibling_fetch_has_submodules(target_root):
         return "Sibling fetch with submodules is blocked to avoid unchecked recursive destinations."
-    if cross_repo and subcommand not in READ_ONLY_GIT and not sibling_fetch:
+    read_only = (subcommand in READ_ONLY_GIT | {"for-each-ref"}
+                 or subcommand == "branch" and (not arguments or all(
+                     arg in {"--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv",
+                             "--show-current"}
+                     or not arg.startswith("-") and "--list" in arguments
+                     for arg in arguments))
+                 or subcommand == "config" and git_config_read_only(arguments)
+                 or subcommand == "remote" and (arguments == ["-v"] or
+                     arguments[:1] == ["show"] and "-n" in arguments and all(
+                         arg == "-n" or not arg.startswith("-") for arg in arguments[1:]))
+                 or subcommand == "worktree" and arguments[:1] == ["list"])
+    if cross_repo and not read_only and not sibling_fetch:
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
         return git_default_branch_merge(arguments, target)
@@ -710,7 +735,7 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
             return None
         return ("Only `git worktree list` is allowed; the Codex app or `claude --worktree` "
                 "creates and removes worktrees.")
-    if subcommand not in CURRENT_REPO_GIT:
+    if subcommand not in CURRENT_REPO_GIT and not read_only:
         return "Git topology changes and unsupported write primitives require separate setup."
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.
     def option_matches(argument: str, option: str) -> bool:
@@ -758,16 +783,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if subcommand == "config" and not git_config_read_only(arguments):
         return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
     if cross_repo and not sibling_fetch:
-        before = [flag for flag in ("--no-pager", "--no-optional-locks") if flag not in selectors]
-        after = [flag for flag, commands in (("--no-textconv", {"log", "show", "diff", "blame"}),
-                                             ("--no-ext-diff", {"log", "show", "diff"}))
-                 if subcommand in commands and flag not in arguments]
-        if before or after:
-            return cross_repo_read_message(subcommand, before + after)
+        if any(option_matches(arg, option) for arg in arguments
+               for option in ("--ext-diff", "--textconv")):
+            return "External diff and textconv are blocked across repositories."
         if any(arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
                and not arg[1:].isdigit() for arg in arguments):
             return "Spell cross-repository short options separately; aggregation is blocked."
-        forbidden = ("--ext-diff", "--textconv", "--no-index", "--open-files-in-pager")
+        forbidden = ("--no-index", "--open-files-in-pager")
         external_files = {
             "grep": ("--file",),
             "ls-files": ("--exclude-from",),
@@ -1056,13 +1078,79 @@ def gh_prose_positions(tokens: list[str]) -> set[int]:
     return prose
 
 
+def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
+    """Recognize explicit expressions and the first positional expression."""
+    if executable not in {"rg", "grep", "sed"} | AWK_NAMES:
+        return set()
+    expressions: set[int] = set()
+    has_expression = False
+    options = True
+    index = 1
+    value_options = {"-f", "--file", "-g", "--glob", "--iglob", "-t", "--type",
+                     "-T", "--type-not", "-A", "-B", "-C", "-m", "--max-count",
+                     "--field-separator", "--assign"}
+    if executable in AWK_NAMES:
+        value_options |= {"-F", "-v"}
+    switches = {"-i", "--ignore-case", "-v", "--invert-match", "-n",
+                "--line-number", "-l", "--files-with-matches", "-q", "--quiet",
+                "-r", "-R", "--recursive", "-E", "-F", "-P", "-w", "-x",
+                "-c", "-o", "-H", "-h", "--hidden", "--no-heading",
+                "--fixed-strings", "--extended-regexp", "--perl-regexp",
+                "-S", "--smart-case", "-I", "-s", "-L", "-u", "-uu", "-.",
+                "--no-ignore", "-z", "-U", "--multiline", "--json", "-a", "--text"}
+    while index < len(tokens):
+        token = tokens[index]
+        if options and token == "--":
+            options = False
+        elif options and token in {"-e", "--regexp", "--expression"}:
+            if index + 1 < len(tokens):
+                expressions.add(index + 1)
+            has_expression = True
+            index += 1
+        elif options and token.startswith(("--regexp=", "--expression=", "-e")):
+            expressions.add(index)
+            has_expression = True
+        elif options and token in value_options:
+            if token in {"-f", "--file"}:
+                has_expression = True
+            index += 1
+        elif options and token.startswith("--") and "=" in token:
+            if token.startswith("--file="):
+                has_expression = True
+            # Self-contained options consume no following operand.
+        elif options and token.startswith("-"):
+            if token not in switches:
+                if token.startswith("--"):
+                    return set()
+                for offset, letter in enumerate(token[1:], 1):
+                    option = "-" + letter
+                    if option == "-e" or option in value_options:
+                        if option in {"-e", "-f"}:
+                            has_expression = True
+                        if offset == len(token) - 1:
+                            index += 1
+                            if option == "-e" and index < len(tokens):
+                                expressions.add(index)
+                        elif option == "-e":
+                            expressions.add(index)
+                        break
+                    if option not in switches:
+                        return set()  # Unknown arity cannot identify an expression.
+        else:
+            if not has_expression:
+                expressions.add(index)
+            break
+        index += 1
+    return expressions
+
+
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
     """Block host execution and real Windows path arguments, not gh prose."""
     if (SHELL_EXPANSION.search(tokens[0]) or executable in HOST_NAMES | HOST_OPS
             or HOST_EXECUTABLE.search(tokens[0])
             or WINDOWS_PATH.search(tokens[0])):
         return "Host, Windows, and operating-system commands are blocked."
-    prose = gh_prose_positions(tokens) if executable == "gh" else set()
+    prose = gh_prose_positions(tokens) if executable == "gh" else regex_prose_positions(tokens, executable)
     if any(WINDOWS_PATH.search(token) for index, token in enumerate(tokens[1:], 1)
            if index not in prose):
         return "Windows path arguments are blocked."
@@ -1071,19 +1159,24 @@ def host_command_reason(tokens: list[str], executable: str) -> str | None:
 
 def task_state_path(path_text: str, cwd: str) -> bool:
     """True for an operand inside the PM's private task-state directory."""
-    target = Path(path_text).expanduser()
-    if not target.is_absolute():
-        target = Path(cwd) / target
     try:
+        target = Path(path_text).expanduser()
+        if not target.is_absolute():
+            target = Path(cwd) / target
         root = (Path.home() / ".local/state/task").resolve()
         resolved = target.resolve(strict=False)
         return resolved == root or root in resolved.parents
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return ".local/state/task" in path_text.replace("\\", "/")
 
 
 def task_state_write_reason(tokens: list[str], cwd: str) -> str | None:
-    """Reject shell commands that name private task state, including redirect targets."""
+    """Permit read commands, while protecting private state from writes."""
+    unwrapped = unwrap_command(tokens)
+    if isinstance(unwrapped, list) and unwrapped and Path(unwrapped[0]).name in {
+            "cat", "ls", "head", "tail", "grep", "wc", "stat"} and not any(
+            token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"} for token in tokens):
+        return None
     if any(task_state_path(token, cwd) for token in tokens if not token.startswith("-")):
         return "Writing or accessing PM task state from an agent command is blocked."
     return None
@@ -1131,7 +1224,30 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     reason = evaluate_command(command, cwd, root, approved_roots)
     if not reason or isinstance(reason, Denial):
         return reason
-    return Denial("command.policy", reason)
+    return Denial(command_rule(reason), reason)
+
+
+def command_rule(reason: str) -> str:
+    """Stable cause identifiers for the existing command denials."""
+    for words, rule in (
+            (("Multi-line", "Shell syntax", "Empty command", "Command chain", "Only ;"), "shell.syntax"),
+            (("Shell constructs",), "shell.construct"),
+            (("Inline shell", "Piping into", "Feeding a program"), "shell.interpreter"),
+            (("Shell output", "Shell writes"), "filesystem.write_boundary"),
+            (("Direct shell writes", "Git metadata", "repository root"), "filesystem.git_metadata"),
+            (("Run git/gh network",), "command.network_chain"),
+            (("A chain containing",), "command.mixed_chain"),
+            (("git commit/merge",), "git.state_chain"),
+            (("cd ",), "filesystem.cd_boundary"),
+            (("sed ",), "command.sed"), (("awk ",), "command.awk"),
+            (("sort ", "uniq "), "command.output_file"),
+            (("Expanded file", "Recursive permission", "Ambiguous options"), "filesystem.operands"),
+            (("env ", "Unsupported env"), "command.environment"),
+            (("Unsupported timeout", "Unsupported nice", "Unsupported stdbuf", "timeout needs",
+              "xargs, setsid"), "command.wrapper")):
+        if any(word in reason for word in words):
+            return rule
+    return "command.other"
 
 
 def split_command(command: str) -> tuple[list[str], list[str]] | str:
@@ -1310,6 +1426,27 @@ def evaluate_command(command: str, cwd: str, root: Path,
                      approved_roots: tuple[Path, ...] | None) -> str | None:
     if "\n" in command or "\r" in command or "$(" in command or "`" in command:
         return "Multi-line or dynamic ($(...), backtick) shell commands are blocked."
+    loop = re.fullmatch(r"for ([A-Za-z_][A-Za-z0-9_]*) in (.+?);\s*do (.+?);\s*done\s*", command)
+    if loop:
+        variable, values, body = loop.groups()
+        try:
+            operands = shlex.split(values)
+            body_tokens = shlex.split(body)
+        except ValueError:
+            operands, body_tokens = [], []
+        if (operands and body_tokens and body_tokens[0] in {
+                "cat", "ls", "head", "tail", "grep", "wc", "stat"}
+                and all(re.fullmatch(r"[A-Za-z0-9_./:+-]+", value) for value in operands)
+                and not any(char in body for char in ";&|<>")
+                and all(not SHELL_EXPANSION.search(token.replace("${" + variable + "}", "").replace(
+                    "$" + variable, "")) for token in body_tokens)):
+            for value in operands:
+                expanded = body.replace("${" + variable + "}", shlex.quote(value)).replace(
+                    "$" + variable, shlex.quote(value))
+                reason = evaluate_command(expanded, cwd, root, approved_roots)
+                if reason:
+                    return reason
+            return None
     split = split_command(command)
     if isinstance(split, str):
         return split
@@ -1319,6 +1456,15 @@ def evaluate_command(command: str, cwd: str, root: Path,
     all_tokens: list[list[str]] = []
     for text in segments:
         try:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            lexer.escape = ""
+            raw_tokens = unwrap_command(list(lexer))
+            if isinstance(raw_tokens, list) and raw_tokens:
+                reason = host_command_reason(raw_tokens, Path(raw_tokens[0]).name.lower())
+                if reason:
+                    return Denial("host.command_boundary", reason)
             lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
             lexer.whitespace_split = True
             lexer.commenters = ""
@@ -1360,7 +1506,10 @@ def evaluate_command(command: str, cwd: str, root: Path,
             if not plain_chain or len(unwrapped) != 2 or unwrapped[1].startswith("-") \
                     or SHELL_EXPANSION.search(unwrapped[1]) or unwrapped != tokens:
                 return "cd is allowed only as cd <literal path> joined by ; or &&."
-            effective = str((Path(effective) / unwrapped[1]).resolve())
+            try:
+                effective = str((Path(effective) / unwrapped[1]).resolve())
+            except (OSError, ValueError, RuntimeError):
+                return "Cannot resolve cd path safely; blocked by policy."
             if not inside(effective, effective, root):
                 return "cd outside the current repository is blocked."
             continue
@@ -1532,13 +1681,35 @@ def event_vendor(event: dict, vendor: str | None = None) -> str:
     return vendor if vendor in {"claude", "codex"} else "unknown"
 
 
+def audit_text(value: str) -> str:
+    value = str(value)
+    def redact_run(match):
+        token_start = re.split(r"\s", value[:match.start()])[-1]
+        token = token_start + match[0]
+        path = token.startswith(("/", "./", "../", "~/", "$HOME/"))
+        return match[0] if path else "[REDACTED]"
+
+    # Redact before truncating: a token may cross the audit length boundary.
+    value = re.sub(
+        r"(?i)(?:ghp_|ghs_|ghu_|ghr_|github_pat_|gho_|sk-or-|sk-|xox[a-z]-)[A-Za-z0-9_-]+"
+        r"|AKIA[A-Z0-9]+|Bearer\s+[^\s\"']+"
+        , "[REDACTED]", value)
+    value = re.sub(r"[A-Za-z0-9+/=_-]{32,}",
+                   redact_run, value)
+    value = re.sub(
+        r"(?i)((?:token|key|secret|password|passwd|authorization)\b\s*[=:]\s*"
+        r"|--[\w-]*(?:token|key|secret|password|passwd)\b\s+)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)", r"\1[REDACTED]", value)
+    return value[:200]
+
+
 def log_denial(event: dict, denial: str | None = None, vendor: str | None = None):
-    """Best-effort denial audit; record a command category, never its arguments."""
+    """Best-effort denial audit with bounded, redacted context."""
     try:
         data = event.get("tool_input", {})
         command = data.get("command", "") if isinstance(data, dict) else ""
         category = first_command_category(command) if isinstance(command, str) else ""
-        cwd = Path(str(event.get("cwd") or os.getcwd())).resolve()
+        cwd = Path(str(event.get("cwd") or os.getcwd()))
         repo = ""
         try:
             result = policy_subprocess(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
@@ -1554,7 +1725,9 @@ def log_denial(event: dict, denial: str | None = None, vendor: str | None = None
         rule_id = getattr(denial, "rule_id", "policy.command_evaluation")
         entry = {"time": datetime.now(timezone.utc).isoformat(), "vendor": vendor, "repo": repo,
                  "tool": str(event.get("tool_name", "")), "rule_id": rule_id,
-                 "category": category}
+                 "category": category, "reason": audit_text(str(denial or "")),
+                 "command": audit_text(command if command else str(next((
+                     data[key] for key in ("file_path", "path", "filename") if key in data), "")))}
         target = Path.home() / ".local/state/agent-policy/denials.jsonl"
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as out:
@@ -1567,21 +1740,29 @@ def log_denial(event: dict, denial: str | None = None, vendor: str | None = None
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--vendor", choices=("claude", "codex"))
-    options, _unknown = parser.parse_known_args(argv)
+    options = argparse.Namespace(vendor=None)
     try:
+        options, _unknown = parser.parse_known_args(argv)
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
             raise ValueError
-    except (json.JSONDecodeError, ValueError):
-        print(json.dumps(deny("Hook input invalid; blocked by policy."), separators=(",", ":")))
+    except (Exception, SystemExit) as error:
+        reason = (Denial("hook.input", "Hook input invalid; blocked by policy.")
+                  if isinstance(error, (json.JSONDecodeError, ValueError)) else
+                  Denial("hook.error", f"policy hook error: {type(error).__name__}: {audit_text(str(error))}"))
+        log_denial({}, reason, options.vendor)
+        print(json.dumps(deny(reason), separators=(",", ":")))
         return 0
     permission_request = event.get("hook_event_name") == "PermissionRequest"
-    reason = permission_reason(event) if permission_request else evaluate(event)
+    try:
+        reason = permission_reason(event) if permission_request else evaluate(event)
+    except Exception as error:
+        reason = Denial("hook.error", f"policy hook error: {type(error).__name__}: {audit_text(str(error))}")
     if reason:
-        log_denial(event, Denial("permission.policy", reason) if permission_request else reason,
+        log_denial(event, Denial("permission.policy", reason) if permission_request and not isinstance(reason, Denial) else reason,
                    options.vendor)
         response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                    "decision": {"behavior": "deny", "message": reason}}}
+                    "decision": {"behavior": "deny", "message": reason + DENIAL_SUFFIX}}}
                     if permission_request else deny(reason))
         print(json.dumps(response, separators=(",", ":")))
     return 0

@@ -7,6 +7,7 @@ Claude Code: system/claude-managed-guardrails.json -> /etc/claude-code/managed-s
 either may limit bypass/auto mode, approval policy, sandbox choice or the user's own hooks.
 """
 import ast
+import io
 import importlib.util
 import json
 import os
@@ -271,7 +272,9 @@ with tempfile.TemporaryDirectory() as temp:
     entry = json.loads(log.read_text())
     assert entry["category"] == "sudo" and entry["vendor"] == "claude"
     assert entry["rule_id"] == "command.unsafe_environment"
-    assert "ghp_x" not in log.read_text() and "/sensitive/argument" not in log.read_text()
+    assert "ghp_x" not in log.read_text()
+    assert entry["reason"] and "[REDACTED]" in entry["command"]
+    assert len(entry["reason"]) <= 200 and len(entry["command"]) <= 200
     assert policy.first_command_category("GITHUB_TOKEN=ghp_x sudo ls") == "sudo"
     assert policy.event_vendor({"hook_event_name": "PreToolUse", "codex_event": "PreToolUse"}) == "unknown"
     assert policy.event_vendor({}, "codex") == "codex"
@@ -287,6 +290,63 @@ with tempfile.TemporaryDirectory() as temp:
     codex_log = [json.loads(line) for line in log.read_text().splitlines()][-1]
     assert codex_log["vendor"] == "codex"
     assert codex_log["rule_id"] == "host.command_boundary"
+    # Synthetic fixtures only: every requested secret shape in both audit fields.
+    fixtures = [prefix + "testvalue" for prefix in (
+        "ghp_", "ghs_", "ghu_", "ghr_", "github_pat_", "gho_", "sk-", "sk-or-",
+        "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxe-", "xoxc-", "xoxd-", "AKIA")]
+    fixtures += ["Bearer testvalue", "a" * 32, "0123456789abcdef" * 2, "Ab9+" * 10 + "=="]
+    for path in ("/home/agent/dev_workspace/bootstrap/system/agent-policy/pre_tool_use.py",
+                 "/home/agent/dev_workspace/bootstrap/", "src/some/normal/path.py",
+                 *(prefix + "a" * 40 for prefix in ("/", "./", "../", "~/", "$HOME/"))):
+        assert policy.audit_text(path) == path
+    fixtures += ["relative/" + "a" * 40, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                 "relative/" + "abc/" * 10, "'./" + "a" * 40 + "'"]
+    assert policy.audit_text(None) == "None"
+    assert policy.audit_text(123) == "123"
+    assert policy.audit_text({"message": "ok"}) == str({"message": "ok"})
+    fixtures += [name + separator + "testvalue" for name in (
+        "token", "KEY", "Secret", "password", "passwd") for separator in ("=", ":", ": ")]
+    fixtures += ["--" + name + " testvalue" for name in (
+        "token", "api-key", "secret", "password", "passwd")]
+    for fixture in fixtures:
+        secret_event = {"tool_name": "Bash", "cwd": temp,
+                        "tool_input": {"command": "sudo true " + fixture}}
+        with patch.object(policy.Path, "home", return_value=home):
+            policy.log_denial(secret_event, policy.Denial("test.redaction", fixture), "codex")
+        redacted = json.loads(log.read_text().splitlines()[-1])
+        for field in ("reason", "command"):
+            assert fixture not in redacted[field], (fixture, field)
+            assert "testvalue" not in redacted[field], (fixture, field)
+            assert "[REDACTED]" in redacted[field], (fixture, field)
+    for command in (r"rg --foo C:\Users\x pat", r"grep --weird X \\srv\share"):
+        assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
+    for executable in ("grep", "rg"):
+        for option in ("--file=pats", "-fpats", "-nfpats"):
+            for operand in (r"'C:\Users\x'", r"'\\srv\share'"):
+                command = executable + " " + option + " " + operand
+                assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
+    for command in (r"rg '\d+' src", r"grep -e '\bx\b' f",
+                    r"rg -S '\w\s' src", r"grep -rIn '\s\d' .",
+                    r"rg --unknown=value '\w\s' src"):
+        assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    for switch in ("-S", "--smart-case", "-I", "-s", "-L", "-u", "-uu", "-.",
+                   "--no-ignore", "-z", "-U", "--multiline", "--json", "-a", "--text",
+                   "--unknown=value"):
+        assert policy.evaluate_command("rg " + switch + r" '\w\s' src", temp, Path(temp), (Path(temp),)) is None
+        for operand in (r"C:\Users\x", r"\\srv\share"):
+            command = "rg " + switch + r" '\w\s' " + operand
+            assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
+    for switches in ("-rn", "-ni", "-Ei", "-rne", "-rnm 2", "-rnm2"):
+        command = "grep " + switches + r" 'C:\\' src"
+        assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    command = r"grep -rneC:\\ src"
+    assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    command = r"grep '-rneC:\' 'C:\\' src"
+    assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
+    for switches in ("-rn", "-ni", "-Ei", "-rne", "-rnefoo", "-rnf patterns", "-rnfpatterns", "-rnm2"):
+        for path in (r"'C:\Users\x'", r"'\\srv\share'"):
+            command = "grep " + switches + " needle " + path
+            assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     broken_home = Path(temp) / "broken-home"
     broken_home.mkdir()
     (broken_home / ".local").write_text("not a directory")
@@ -294,6 +354,78 @@ with tempfile.TemporaryDirectory() as temp:
     result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
                             cwd=temp, env=env, check=True, timeout=30)
     assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+# Hardening regressions: reads stay frictionless; errors never escape the hook.
+with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, clear=True):
+    root = Path(temp)
+    loop_path = root / "loop"
+    loop_path.symlink_to(loop_path)
+    state = Path.home() / ".local/state/task/proj/check.json"
+    def read_event(command):
+        return {"tool_name": "Bash", "cwd": temp, "tool_input": {"command": command}}
+    for executable in ("cat", "ls", "head", "grep", "wc", "stat"):
+        for path in (str(state), "~/.local/state/task/proj/check.json",
+                     "~/cortex/cortex-kb-proj/STATUS.md", "~/cortex/cortex-core/catalogs/TOOLS.md"):
+            reason = policy.evaluate(read_event(f"{executable} {path}"), (root,))
+            assert reason is None, (executable, path, reason)
+    for command in (f"touch {state}", f"cat file > {state}", f"tee {state}"):
+        assert policy.evaluate(read_event(command), (root,))
+    for command in ("for x in README.md LICENSE; do cat $x; done",
+                    'for x in README.md LICENSE; do head "$x"; done'):
+        assert policy.evaluate(read_event(command), (root,)) is None, command
+    for command in ("for x in README.md; do touch $x; done",
+                    "for x in README.md; do cat $x > /outside; done",
+                    "for x in README.md; do sudo cat $x; done"):
+        assert policy.evaluate(read_event(command), (root,)), command
+    for path in ("~unknownuser/file", str(loop_path)):
+        event = read_event(f"touch {path}")
+        with patch.object(policy, "root_for", return_value=root), patch.object(policy, "git_metadata", return_value=()):
+            assert policy.evaluate(event, (root,))
+    for function, hook_event in (("evaluate", "PreToolUse"), ("permission_reason", "PermissionRequest")):
+        event = read_event("cat file") | {"hook_event_name": hook_event}
+        with patch.object(policy.sys, "stdin", io.StringIO(json.dumps(event))), \
+                patch.object(policy.sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(policy, function, side_effect=RuntimeError("test failure")), \
+                patch.object(policy, "log_denial") as logged:
+            assert policy.main([]) == 0
+            assert "policy hook error: RuntimeError: test failure" in output.getvalue()
+            response = json.loads(output.getvalue())["hookSpecificOutput"]
+            message = (response["decision"]["message"] if hook_event == "PermissionRequest"
+                       else response["permissionDecisionReason"])
+            assert message == "policy hook error: RuntimeError: test failure" + policy.DENIAL_SUFFIX
+            assert logged.call_args.args[1].rule_id == "hook.error"
+    assert policy.deny("Original reason.")["hookSpecificOutput"]["permissionDecisionReason"] == (
+        "Original reason." + policy.DENIAL_SUFFIX)
+    for text in ("token=synthetic", "key=synthetic", "password=synthetic", "Authorization: synthetic"):
+        assert "synthetic" not in policy.audit_text(text)
+    assert policy.audit_text("x" * 300) == "[REDACTED]"
+    assert len(policy.audit_text("word " * 100)) == 200
+    assert policy.command_rule("Inline shell and interpreter programs are blocked.") == "shell.interpreter"
+    assert policy.command_rule(policy.MIXED_CHAIN_MESSAGE) == "command.mixed_chain"
+    assert policy.command_rule("An unmapped reason " * 20) == "command.other"
+    with patch.object(policy.sys, "stdout", new_callable=io.StringIO) as output, \
+            patch.object(policy.sys, "stderr", new_callable=io.StringIO), \
+            patch.object(policy, "log_denial") as logged:
+        assert policy.main(["--vendor", "invalid"]) == 0
+        assert json.loads(output.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert logged.call_args.args[1].rule_id == "hook.error"
+    for failure, rule in ((json.JSONDecodeError("bad", "", 0), "hook.input"),
+                          (ValueError(), "hook.input"), (OSError("read failed"), "hook.error"),
+                          (RuntimeError("parse failed"), "hook.error")):
+        with patch.object(policy.json, "load", side_effect=failure), \
+                patch.object(policy.sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(policy, "log_denial") as logged:
+            assert policy.main(["--vendor", "codex"]) == 0
+            assert json.loads(output.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny"
+            assert logged.call_args.args[1].rule_id == rule
+            assert logged.call_args.args[2] == "codex"
+    for path in ("~unknownuser/file", str(loop_path)):
+        event = {"tool_name": "Bash", "cwd": str(ROOT), "tool_input": {"command": f"touch {path}"}}
+        result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
+                                env=clean_env | {"HOME": temp}, check=True, timeout=30)
+        assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert "Traceback" not in result.stderr
+assert 'sudo python3 -m compileall -q "$policy_dir"' in install
 
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
 assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""
