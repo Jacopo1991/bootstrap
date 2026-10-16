@@ -199,6 +199,49 @@ with tempfile.TemporaryDirectory() as temp:
     (sibling / "outside-link").symlink_to(outsider / "file")
     def event(command):
         return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(current)}
+    # Round-two lane friction: ordinary reads, wrappers and separate lines use
+    # the same command policy in the current and sibling repositories.
+    for target in (current, sibling):
+        for sub in ("check-ignore file", "ls-files", "rev-parse HEAD", "status",
+                    "cat-file -p HEAD", "cat-file -t HEAD", "cat-file -s HEAD",
+                    "for-each-ref", "grep needle", "shortlog", "count-objects"):
+            command = f"git -C {target} {sub}"
+            for wrapped in (command, "time " + command,
+                            "timeout -s TERM -k 2 10s " + command,
+                            "LANE_LABEL=review " + command):
+                assert policy.evaluate(event(wrapped), roots) is None, wrapped
+    for read in ("pwd", "ls", "find . -name README.md", "rg needle", "stat README.md",
+                 "file README.md", "wc README.md", "diff a b", "test -f README.md",
+                 "[ -f README.md ]", "echo ok", "printf ok", "true"):
+        for separator in ("; ", "\n"):
+            command = "git status" + separator + read
+            assert policy.evaluate(event(command), roots) is None, command
+    for command in ("git log 2>&1 | head", "git log > out.txt && git status",
+                    "git status > output; pwd", "git status; rg --pre-glob '*.txt' needle",
+                    "git status; rg --search-zip needle", "git status; rg -z needle",
+                    "UV_CACHE_DIR=.work/uv-cache uv sync", "time timeout 5s uv sync",
+                    "\npwd\n\nls\n", "pwd;\nls"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for helper in ("find . -fls output", "find . -fprint output", "find . -fprint0 output",
+                   "find . -fprintf output x", "find . -exec true +", "find . -execdir true +",
+                   "find . -ok true +", "find . -okdir true +", "find . -delete",
+                   "rg --pre cat needle", "rg --pre=cat needle", "file -C", "file --compile",
+                   "file -bC"):
+        command = "git status; " + helper
+        assert policy.evaluate(event(command), roots), command
+    for command in ("git status; echo x > output",
+                    "git status; find . -exec touch file \\;", "git status; find . -delete",
+                    "git status; find . -fprint output", "git status; find . -fprintf output x",
+                    "time sudo true", "timeout -s TERM -k 1 5 sudo true",
+                    "PYTHONHASHSEED=0 uv sync", "PATH=/tmp uv sync", "pwd\nsudo true",
+                    "echo 'one\ntwo'", "echo one\\\ntwo", "cat <<EOF\nx\nEOF"):
+        assert policy.evaluate(event(command), roots), command
+    for option in ("--text", "--textc", "--textconv", "--ext", "--ext-diff",
+                   "--filt", "--filters"):
+        command = f"git -C {sibling} cat-file {option} HEAD:file"
+        assert policy.evaluate(event(command), roots), command
+    for sub in ("diff", "log"):
+        assert policy.evaluate(event(f"git -C {sibling} {sub} --text"), roots) is None
     for target in (sibling, knowledge):
         for subcommand in ("log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"):
             extra = " --no-textconv" if subcommand in {"log", "show", "diff", "blame"} else ""
@@ -347,6 +390,18 @@ with tempfile.TemporaryDirectory() as temp:
     print("PASS: sibling fetch/default remote allowed in both roots; checkout/pull/merge/switch and unsafe fetches denied")
 
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
+    for tail in ("log -n5", "diff -U3", "grep -iE needle", "diff --text"):
+        assert policy.evaluate(event("git -C ../sibling " + tail), roots) is None, tail
+    for tail in ("cat-file --filters HEAD:file", "cat-file --textconv HEAD:file"):
+        assert policy.evaluate(event("git -C ../sibling " + tail), roots) is not None, tail
+    for values in ("$(seq 1 20)", "{1..20}"):
+        command = f"for i in {values}; do python3 ci/x.py || exit 1; done"
+        assert policy.evaluate(event(command), roots) is None, command
+        assert policy.evaluate(event(f"for i in {values}; do sudo true; done"), roots) is not None
+    assert policy.evaluate(event("for i in $(echo 20); do python3 ci/x.py; done"), roots) is not None
+    for message in ("Cannot identify the repository safely; deleting folders is blocked.",
+                    "Cannot resolve folder safely; staging folders is blocked."):
+        assert policy.command_rule(message) == "filesystem.folder_resolution"
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
     for subcommand in ("log", "show", "diff", "blame"):
@@ -792,7 +847,7 @@ with tempfile.TemporaryDirectory() as temp:
     # Chains (; && || |) are evaluated segment by segment with the ordinary rules;
     # env/timeout/nice/stdbuf and VAR=value prefixes evaluate the wrapped command.
     for command in ("git status && git log --oneline", "git diff | head -5", "git status; git log",
-                    "git log | grep fix | wc -l",
+                    "git log | grep fix | wc -l", 'wc -l <<< "one two"',
                     "cat safe.txt | sort > copied2.txt", "cd nested; ls",
                     "git log | head -5", "git status && git diff", "git diff | sort | uniq -c | tail -3",
                     "git log --oneline | cut -c1-7 | cat",
@@ -899,12 +954,12 @@ with tempfile.TemporaryDirectory() as temp:
             "echo x | env bash", "echo x | timeout 5 python3 -", "echo x | /bin/bash", "echo x | node",
             "echo x | nice perl", "bash <<< 'touch x'", "bash < safe.txt",
             # Dynamic or ambiguous syntax stays refused.
-            "git status $(id)", "echo `id`", "git status\ngit log", "git status & git log",
+            "git status $(id)", "echo `id`", "git status & git log",
             "git status |& cat", "&& git status", "git status &&", "git status ;; git log",
             "git status && && git log", "git status | | cat", "echo 'unterminated",
             "(touch .git/config)", "echo ok && (touch .git/config)", "diff <(ls) <(ls)",
             "eval 'touch x'", "export GIT_DIR=.git && git status", "source safe.txt",
-            "for f in a; do touch .git/x; done", "if true; then touch .git/x; fi", "time git status",
+            "for f in a; do touch .git/x; done", "if true; then touch .git/x; fi",
             # Wrappers that stay refused, and wrapper option abuse.
             "xargs git status", "echo x | xargs rm", "setsid git status", "nohup git status",
             "command git status", "exec git status", "busybox sh", "env", "env -S 'git status'",
@@ -933,13 +988,13 @@ with tempfile.TemporaryDirectory() as temp:
             "cd nested && rm -r ../scratch/deep ../.git", "env cd nested && ls", "cd a b && ls",
             "cd nested && git -C ../../sibling add safe.txt"):
         assert policy.evaluate(event(command), roots) is not None, command
-    # Mixed chains: git/gh (sandbox-excluded) may only be chained with git/gh and read-only text tools.
-    for command in ("git status && python3 x.py", "git add f && touch y", "git status || true",
-                    "git status 2>/dev/null || echo none", "cd nested && git status",
-                    "git log | awk '{print $1}'", "git log | sed s/a/b/", "git status && ls",
-                    "git status; rm safe.txt", "ls && git status", "python3 x.py | git status",
+    # Mixed chains still refuse writes and commands outside the read-only set.
+    for command in ("git status && python3 x.py", "git add f && touch y",
+                    "cd nested && git status",
+                    "git log | awk '{print $1}'", "git log | sed s/a/b/",
+                    "git status; rm safe.txt", "python3 x.py | git status",
                     "git log | sort > out.txt", "git log | cat >> out.txt", "git log | head > out.txt",
-                    "git status && env FOO=1 python3 x.py", "git status && FOO=1", "git status && printf x",
+                    "git status && env FOO=1 python3 x.py", "git status && FOO=1",
                     "git log | tee out.txt", "gh pr list | xargs echo", "git status && cp safe.txt y.txt",
                     "git log | sort -o out.txt", "git log | sort --output=out.txt", "git log | uniq in out"):
         assert policy.evaluate(event(command), roots) is not None, command
@@ -1004,7 +1059,7 @@ with tempfile.TemporaryDirectory() as temp:
             assert policy.permission_reason(event(command), roots) is not None, command
         for tail in ("push -u origin HEAD", "push origin HEAD:refs/heads/task"):
             assert policy.evaluate(event(executable + " " + tail), roots) is None, tail
-    print("PASS: chains/pipes/wrappers evaluated per segment; shells, interpreters, $(), backticks, multi-line, xargs/setsid/nohup, Git override variables, cd escapes and staging-before-commit denied")
+    print("PASS: chains/pipes/wrappers evaluated per segment; unsafe shell syntax, interpreters, dynamic commands, execution overrides, cd escapes and staging-before-commit denied")
 
     # Founder decision: ordinary Git/gh has native allow rules; forbidden
     # operations are denied independently of flag position or inherited selectors.

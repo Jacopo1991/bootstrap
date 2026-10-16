@@ -297,8 +297,12 @@ with tempfile.TemporaryDirectory() as temp:
     fixtures += ["Bearer testvalue", "a" * 32, "0123456789abcdef" * 2, "Ab9+" * 10 + "=="]
     for path in ("/home/agent/dev_workspace/bootstrap/system/agent-policy/pre_tool_use.py",
                  "/home/agent/dev_workspace/bootstrap/", "src/some/normal/path.py",
-                 *(prefix + "a" * 40 for prefix in ("/", "./", "../", "~/", "$HOME/"))):
+                 *(prefix + "a" * 40 for prefix in ("/home/agent/", "./src/lib/", "../src/", "~/src/", "$HOME/src/"))):
         assert policy.audit_text(path) == path
+    for text in ("task-state", "disk-usage", "axoxb-value"):
+        assert policy.audit_text(text) == text
+    fixtures += ["/" + "a" * 40, "/" + "Ab9+" * 10,
+                 "/aaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb"]
     fixtures += ["relative/" + "a" * 40, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
                  "relative/" + "abc/" * 10, "'./" + "a" * 40 + "'"]
     assert policy.audit_text(None) == "None"
@@ -425,7 +429,8 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
                                 env=clean_env | {"HOME": temp}, check=True, timeout=30)
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "Traceback" not in result.stderr
-assert 'sudo python3 -m compileall -q "$policy_dir"' in install
+compile_check = 'python3 -I -m compileall -q "$ROOT/system/agent-policy"'
+assert install.index(compile_check) < install.index('sudo install -d -m 0755 "$public_source"')
 
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
 assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""
