@@ -32,10 +32,11 @@ HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
 # Wrappers whose wrapped command is evaluated with the ordinary rules.
-EVALUATED_WRAPPERS = {"env", "timeout", "nice", "stdbuf"}
+EVALUATED_WRAPPERS = {"env", "timeout", "nice", "stdbuf", "time"}
 # Wrappers that stay refused: they hide or detach the command they run.
 REFUSED_WRAPPERS = {"command", "exec", "nohup", "setsid", "xargs", "busybox"}
 WRAPPER_OPTIONS = {  # (switches, options taking a value)
+    "time": ({"-p"}, set()),
     "timeout": ({"--preserve-status", "--foreground", "-v", "--verbose"},
                 {"-k", "-s", "--kill-after", "--signal"}),
     "nice": (set(), {"-n", "--adjustment"}),
@@ -61,10 +62,13 @@ CHAIN_SEPARATORS = {";", "&&", "||", "|"}
 READ_ONLY_COMMANDS = {"cd", "echo", "printf", "true", "false", "pwd", "ls", "cat", "head",
                       "tail", "wc", "grep", "sort", "uniq", "date", "stat", "basename", "dirname"}
 STATE_DEPENDENT_GIT = {"commit", "merge"}
-MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
+MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat",
+                        "pwd", "ls", "find", "rg", "stat", "file", "diff", "test", "[",
+                        "echo", "printf", "true"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame",
-                 "rev-list", "ls-tree", "show-ref", "describe", "cat-file", "merge-base", "name-rev"}
+                 "rev-list", "ls-tree", "show-ref", "describe", "cat-file", "merge-base", "name-rev",
+                 "check-ignore", "for-each-ref", "shortlog", "count-objects"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -740,7 +744,9 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.
     def option_matches(argument: str, option: str) -> bool:
         key = argument.split("=", 1)[0]
-        known = {"--text", "--textconv", "--ext-diff"}
+        known = {"--textconv", "--ext-diff", "--filters"}
+        if subcommand != "cat-file":
+            known.add("--text")
         return key == option or (key not in known and key.startswith("--")
                                  and len(key) > 2 and option.startswith(key))
 
@@ -1148,7 +1154,7 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
 
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
     """Block host execution and real Windows path arguments, not gh prose."""
-    if (SHELL_EXPANSION.search(tokens[0]) or executable in HOST_NAMES | HOST_OPS
+    if ((tokens[0] != "[" and SHELL_EXPANSION.search(tokens[0])) or executable in HOST_NAMES | HOST_OPS
             or HOST_EXECUTABLE.search(tokens[0])
             or WINDOWS_PATH.search(tokens[0])):
         return "Host, Windows, and operating-system commands are blocked."
@@ -1268,24 +1274,37 @@ def split_command(command: str) -> tuple[list[str], list[str]] | str:
         char = command[index]
         was_redirect, redirect = redirect, False
         if quote:
+            if char in "\n\r":
+                return "Quoted multi-line shell strings are blocked."
             current += char
             if char == "\\" and quote == '"' and index + 1 < len(command):
+                if command[index + 1] in "\n\r":
+                    return "Shell line continuations are blocked."
                 index += 1
                 current += command[index]
             elif char == quote:
                 quote = None
         elif char == "\\" and index + 1 < len(command):
+            if command[index + 1] in "\n\r":
+                return "Shell line continuations are blocked."
             index += 1
             current += char + command[index]
         elif char in "'\"":
             quote = char
             current += char
+        elif command[index:index + 2] == "<<":
+            return "Heredocs are blocked; use the edit tool."
         elif char in "<>":
             redirect = True
             current += char
         elif char in ";&|" and (was_redirect and char in "&|"
                                 or char == "&" and command[index + 1:index + 2] == ">"):
             current += char
+        elif char in "\n\r":
+            if current.strip():
+                segments.append(current)
+                operators.append(";")
+                current = ""
         elif char in ";&|":
             end = index
             while end < len(command) and command[end] in ";&|":
@@ -1432,8 +1451,8 @@ def evaluate_command(command: str, cwd: str, root: Path,
         command)
     if repeat:
         return evaluate_command(repeat[1], cwd, root, approved_roots)
-    if "\n" in command or "\r" in command or "$(" in command or "`" in command:
-        return "Multi-line or dynamic ($(...), backtick) shell commands are blocked."
+    if "$(" in command or "`" in command:
+        return "Dynamic ($(...), backtick) shell commands are blocked."
     loop = re.fullmatch(r"for ([A-Za-z_][A-Za-z0-9_]*) in (.+?);\s*do (.+?);\s*done\s*", command)
     if loop:
         variable, values, body = loop.groups()
@@ -1496,12 +1515,15 @@ def evaluate_command(command: str, cwd: str, root: Path,
         if any(head in {"git", "gh"} for head, _ in heads):
             # git/gh are excluded from the sandbox; do not let a chain smuggle anything else along.
             for head, unwrapped in heads:
-                if head in {"git", "gh"}:
-                    continue
                 writes = any(token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
                              and (i + 1 >= len(unwrapped) or unwrapped[i + 1] not in NULL_DEVICES)
                              for i, token in enumerate(unwrapped))
-                if (head not in MIXED_CHAIN_TEXT_TOOLS and not pure_lookup(unwrapped)) or writes:
+                find_writes = head == "find" and any(
+                    token in {"-exec", "-execdir", "-ok", "-okdir", "-delete"}
+                    or token.startswith("-fprint") or token == "-fprintf"
+                    for token in unwrapped[1:])
+                if (head not in MIXED_CHAIN_TEXT_TOOLS | {"git", "gh"}
+                        and not pure_lookup(unwrapped)) or writes or find_writes:
                     return MIXED_CHAIN_MESSAGE
     seen_changing = False
     for position, tokens in enumerate(all_tokens):
