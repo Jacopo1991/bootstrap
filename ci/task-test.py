@@ -137,6 +137,154 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_reliability_lane_timeout_cancel_and_restart(self):
+        import json
+        import time
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / ".work/prompt.md").write_text("do the task")
+        env = dict(self.env, LANE_STUB_RELEASE=str(self.home / "release"))
+        self.raw_task("lane", "proj", "5", "--timeout", "0.002", env=env)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = json.loads((wt / ".work/lane.json").read_text())
+            if run["state"] == "timed_out":
+                break
+            time.sleep(0.02)
+        self.assertEqual(run["state"], "timed_out")
+        self.assertTrue(wt.exists())
+        self.raw_task("lane", "proj", "5", env=env)
+        self.wait_for_lane(wt, finished=False)
+        out = self.raw_task("cancel", "proj", "5")
+        self.assertIn("process group", out)
+        self.assertEqual(json.loads((wt / ".work/lane.json").read_text())["state"], "cancelled")
+        self.raw_task("lane", "proj", "5")
+        self.wait_for_lane(wt)
+
+    def test_reliability_wait_lane_and_detached_state(self):
+        import json
+        wt, _ = self.started()
+        file = wt / ".work/lane.json"
+        file.write_text(json.dumps({"state": "running", "pid": os.getpid()}))
+        self.assertIn("still running", self.raw_task("wait", "proj", "5", "--max", "0", code=3))
+        file.write_text(json.dumps({"state": "timed_out"}))
+        self.assertIn("timed_out", self.raw_task("wait", "proj", "5"))
+        run = self.state() / "run.json"
+        run.write_text(json.dumps({"state": "running", "pid": os.getpid()}))
+        self.raw_task("wait", "proj", "5", "--max", "0", code=3)
+        run.write_text(json.dumps({"state": "passed"}))
+        self.assertIn("passed", self.raw_task("wait", "proj", "5"))
+
+    def test_reliability_status_does_not_write_and_repair_does(self):
+        import json
+        self.started()
+        run = self.state() / "run.json"
+        lock = self.state() / "run.lock"
+        run.write_text(json.dumps({"state": "running", "pid": 99999999}))
+        lock.write_text(json.dumps({"pid": 99999999}))
+        before = {p: p.read_bytes() for p in self.state().iterdir() if p.is_file()}
+        self.sandbox_state()
+        self.assertIn("repair available", self.raw_task("status", "proj"))
+        self.assertEqual(before, {p: p.read_bytes() for p in self.state().iterdir() if p.is_file()})
+        (self.home / ".local/state/task").chmod(0o755)
+        self.assertIn("Repaired", self.raw_task("repair", "proj"))
+        self.assertFalse(lock.exists())
+        self.assertEqual(json.loads(run.read_text())["state"], "interrupted")
+
+    def test_reliability_context_and_review_range(self):
+        (self.kb / "INTENT.md").write_text("intent")
+        (self.kb / "STATUS.md").write_text("status")
+        decisions = self.kb / "backlog/decisions"
+        decisions.mkdir(parents=True, exist_ok=True)
+        decision = decisions / "decision-1 - scope.md"
+        decision.write_text("binding decision")
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text() + "\nDecision: decision-1\n")
+        wt, out = self.started()
+        self.assertIn("Context: .work/context/", out)
+        context = wt / ".work/context"
+        self.assertEqual((context / "INTENT.md").read_text(), "intent")
+        self.assertEqual((context / "backlog/decisions" / decision.name).read_text(), "binding decision")
+        self.assertEqual((context / "INTENT.md").stat().st_mode & 0o222, 0)
+        (self.kb / "STATUS.md").write_text("updated")
+        self.stub_models()
+        (wt / ".work/prompt.md").write_text("task")
+        self.raw_task("lane", "proj", "5")
+        self.wait_for_lane(wt)
+        self.assertEqual((context / "STATUS.md").read_text(), "updated")
+        self.assertIn("...", self.raw_task("review", "proj", "5"))
+
+    def test_reliability_special_files_archive_manifest_and_publication(self):
+        import json
+        import socket
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        sock.bind(str(wt / ".work/service.sock"))
+        os.mkfifo(wt / ".work/pipe")
+        self.task("merge", "proj", "5")
+        self.assertTrue((self.state() / "merge.json").exists())
+        manifests = list(self.work_archives().glob("*/manifest.json"))
+        self.assertTrue(manifests)
+        self.assertEqual(set(json.loads(manifests[-1].read_text())["skipped_special_files"]),
+                         {"service.sock", "pipe"})
+
+    def test_reliability_setup_ids_are_atomic(self):
+        import json
+        processes = [subprocess.Popen([sys.executable, str(TOOL), "note", "proj", "-", "setup", str(i)],
+                                      env=self.env, cwd=self.home, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE) for i in range(2)]
+        for process in processes:
+            out, err = process.communicate(timeout=10)
+            self.assertEqual(process.returncode, 0, (out, err))
+        events = (self.home / ".local/state/task/setup-requests.jsonl").read_text().splitlines()
+        self.assertEqual(sorted(json.loads(line)["id"] for line in events), [1, 2])
+
+    def test_reliability_lock_timeout_uses_kernel_holder(self):
+        import json
+        self.started()
+        lock = self.gate_dir / "agent-task-gate.lock"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            holder = self.gate_dir / "agent-task-gate.holder"
+            holder.write_text(json.dumps({"repo": "proj", "task": "T-9", "pid": 99999999,
+                                          "since": "2026-01-01"}))
+            with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                    mock.patch.object(TASK_MODULE, "GATE_LOCK_WAIT", 0):
+                self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stop:
+                    with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, "5")):
+                        self.fail("must never enter unlocked")
+                self.assertEqual(stop.exception.code, 3)
+                self.assertIn("gate busy: held by proj/T-9 since 2026-01-01", output.getvalue())
+        self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
+
+    def test_reliability_close_without_merge_requires_reason(self):
+        wt, _ = self.started()
+        self.prepare_merge_evidence("5")
+        command = [sys.executable, str(TOOL), "close", "proj", "5", "-m", "done", "--retro", "fine"]
+        result = subprocess.run(command, cwd=self.home, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('--no-merge "reason"', result.stderr)
+        self.raw_task("close", "proj", "5", "-m", "done", "--retro", "fine", "--no-merge", "abandoned")
+        self.assertIn("Done (not merged: abandoned)", next((self.kb / "backlog/tasks").glob("t-5 *")).read_text())
+
+    def test_reliability_noticed_import_lists_only_and_deduplicates(self):
+        self.started()
+        self.prepare_merge_evidence("5")
+        (self.state() / "report.md").write_text(
+            "## Noticed\nprose\n- real improvement\n```sh\n- shell line\necho bad\n```\n"
+            "- existing improvement\n- real improvement\n## Other\n- unrelated\n")
+        (self.kb / "improvements.md").write_text("- old | T-1 | report | existing improvement | open\n")
+        self.raw_task("close", "proj", "5", "-m", "done", "--retro", "fine")
+        text = (self.kb / "improvements.md").read_text()
+        self.assertEqual(text.count("real improvement"), 1)
+        self.assertEqual(text.count("existing improvement"), 1)
+        self.assertNotIn("shell line", text)
+        self.assertNotIn("unrelated", text)
+
     def test_flatten_review_links_handles_windows_drive_and_unc_targets(self):
         self.assertEqual(TASK_MODULE.flatten_review_links(
             r"[drive](C:\Users\agent\report.md) [slash](d:/reports/final.md) "
@@ -212,6 +360,8 @@ class TaskTool(unittest.TestCase):
         return self.raw_task(*args, cwd=cwd, code=code)
 
     def raw_task(self, *args, cwd=None, code=0, env=None):
+        if args and args[0] == "close" and "--no-merge" not in args:
+            args = (*args, "--no-merge", "legacy fixture closes without publishing")
         result = subprocess.run([sys.executable, str(TOOL), *args], env=env or self.env, cwd=cwd or self.home,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
@@ -376,11 +526,13 @@ class TaskTool(unittest.TestCase):
         (gate / ".work/paid-transcript").write_text("gate evidence")
         archive_root = self.home / ".local/state/task/archive"
         archive_root.write_text("not a directory")
-        out = self.raw_task("status", "proj", code=1)
+        out = self.raw_task("status", "proj")
+        self.assertIn("repair available", out)
+        out = self.raw_task("repair", "proj", code=1)
         self.assertIn("refusing to remove", out)
         self.assertTrue(gate.is_dir())
         archive_root.unlink()
-        out = self.raw_task("status", "proj")
+        out = self.raw_task("repair", "proj")
         self.assertFalse(gate.exists(), out)
         saved = list(self.work_archives().glob("*/.work/paid-transcript"))
         self.assertEqual([path.read_text() for path in saved], ["gate evidence"])
@@ -773,12 +925,11 @@ class TaskTool(unittest.TestCase):
             env = dict(self.env, **{marker: value},
                        TASK_GATE_DIR=str(self.home / (marker + "-missing") / "gate"))
             args = ("check", "proj", "5", "--detach") if index == 0 else ("check", "proj", "5")
-            out = self.raw_task(*args, env=env)
+            out = self.raw_task(*args, env=env, code=1)
             self.assertNotIn("Started detached", out)
-            self.assertIn("advisory lane check (not evidence for merge)", out)
-            self.assertNotIn("shared gate lock unavailable", out)
-            self.assertIn("PASS", out)
+            self.assertIn("Cannot open shared gate lock", out)
             self.assertFalse((self.state() / "check.json").exists())
+        self.raw_task("check", "proj", "5")
         lane_result = __import__("json").loads((wt / ".work/check.json").read_text())
         self.assertTrue(lane_result["advisory"])
         read_only.chmod(0o755)
@@ -1057,13 +1208,12 @@ class TaskTool(unittest.TestCase):
         module.fcntl.flock = lambda *_args: (_ for _ in ()).throw(OSError("probe failure"))
         output = io.StringIO()
         try:
-            with contextlib.redirect_stdout(output):
+            with contextlib.redirect_stdout(output), self.assertRaisesRegex(module.Stop, "probe failure"):
                 with module.exclusive_gate_lock(task):
                     pass
         finally:
             module.fcntl.flock = original_flock
-        self.assertEqual(output.getvalue().count(
-            "shared gate lock unavailable in this sandbox; running without it"), 1)
+        self.assertNotIn("running without it", output.getvalue())
         self.assertNotIn("Traceback", output.getvalue())
 
     def test_shared_gate_symlink_is_refused(self):
@@ -1075,8 +1225,8 @@ class TaskTool(unittest.TestCase):
         lock_path = self.gate_dir / "agent-task-gate.lock"
         lock_path.symlink_to(self.home / "other-file")
         (self.home / "other-file").touch()
-        out = self.raw_task("check", "proj", "5")
-        self.assertIn("shared gate lock unavailable in this sandbox; running without it", out)
+        out = self.raw_task("check", "proj", "5", code=1)
+        self.assertIn("Cannot open shared gate lock", out)
         lock_path.unlink()
 
     def test_start_rejects_redundant_just_check_verify_line(self):
@@ -1187,10 +1337,11 @@ class TaskTool(unittest.TestCase):
         out = self.raw_task("merge", "proj", "5", "--override", "approved failing-gate exception")
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
         self.assertIn("FAIL (log:", out)
-        self.assertIn("failed merge gate overridden", out)
+        self.assertIn("check:just check waived: approved failing-gate exception", out)
         self.assertIn("Merged", out)
         exception = __import__("json").loads((self.state() / "exception.json").read_text())
         self.assertTrue(exception["gate_failed"])
+        self.assertEqual(exception["waived"], [{"step": "check:just check", "reason": "approved failing-gate exception"}])
 
     def test_merge_warns_when_dependency_change_has_no_sync_recipe(self):
         wt, _ = self.started()
@@ -1818,9 +1969,9 @@ esac
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable exclusive gate")
         env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
-        out = self.raw_task("check", "proj", "5", env=env)
-        self.assertEqual(out.count("shared gate lock unavailable in this sandbox; running without it"), 1)
-        self.assertIn("PASS", out)
+        out = self.raw_task("check", "proj", "5", env=env, code=1)
+        self.assertIn("Cannot open shared gate lock", out)
+        self.assertNotIn("PASS", out)
 
     def test_close_pr_worktree_is_inside_knowledge_repo(self):
         origin = self.home / "knowledge-origin.git"
@@ -2287,7 +2438,7 @@ exit 1
     def test_round2_private_state_and_tracked_work_refusal(self):
         wt, _ = self.started()
         self.assertTrue((self.state() / "task.json").is_file())
-        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()), ["report.md"])
+        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()), ["context", "report.md"])
         self.assertFalse((wt / ".work/task.json").exists())
         (wt / ".work/leak.json").write_text("{}")
         self.git(wt, "add", "-f", ".work/leak.json")
