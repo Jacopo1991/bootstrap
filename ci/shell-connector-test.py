@@ -289,7 +289,7 @@ def agent_session_references(path):
     return [marker for marker in drift.SHELL_CONNECTOR_MARKERS if marker in text.lower()]
 
 
-AGENT_SESSION_CONFIGS = sorted(
+AGENT_SESSION_CONFIGS = [ROOT / "home/.chezmoitemplates/codex-config.toml"] + sorted(
     [path for base in ("home/dot_claude", "home/dot_codex", "home/dot_config")
      # remove_ entries are empty: chezmoi deletes their targets.
      for path in (ROOT / base).rglob("*") if path.is_file() and not path.name.startswith("remove_")]
@@ -302,7 +302,7 @@ AGENT_SESSION_CONFIGS = sorted(
 class AgentSessionTests(unittest.TestCase):
     def test_no_agent_session_config_references_the_connector(self):
         self.assertIn(ROOT / "home/dot_claude/settings.json", AGENT_SESSION_CONFIGS)
-        self.assertIn(ROOT / "home/dot_codex/config.toml", AGENT_SESSION_CONFIGS)
+        self.assertIn(ROOT / "home/.chezmoitemplates/codex-config.toml", AGENT_SESSION_CONFIGS)
         for path in AGENT_SESSION_CONFIGS:
             self.assertEqual(agent_session_references(path), [], path.relative_to(ROOT))
 
