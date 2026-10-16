@@ -991,6 +991,8 @@ class TaskTool(unittest.TestCase):
         for contents, expected in (
             ("1. docs: builder codex, model sonnet\n", "not available for the codex builder"),
             ("1. docs: builder codex, model gpt-6-luna, seed absent\n", "Seed does not exist"),
+            ("1. docs: builder codex, model gpt-6-luna, seed ..\n", "Invalid seed name"),
+            ("1. docs: builder codex, model gpt-6-luna, seed ../README.md\n", "Invalid seed name"),
             ("1. docs: builder codex, model gpt-6-luna, after: second\n"
              "2. second: builder codex, model gpt-6-luna\n", "must name an earlier task"),
             ("task lane <repo> <id> --model <model>\n", "no task lines found"),
@@ -1002,10 +1004,13 @@ class TaskTool(unittest.TestCase):
                      "task lane proj plain --builder codex --model sonnet",
                      "task lane proj plain --builder claude --model unknown",
                      "cat <<EOF", "cp -a source target", "cp -r source target",
+                     "cp -ra", "cp -aR x y", "cp -va x y",
                      "cp --recursive source target", "cp --archive source target",
                      "nohup task check", "setsid task check", "xargs task", "sudo ls"):
             runner.write_text(line + "\n")
             self.assertIn("line 1:", self.raw_task("runner-check", "proj", str(runner), code=1))
+        runner.write_text("1. docs: builder codex, model gpt-6-luna\ncp -v x y\n")
+        self.assertIn("runner file OK (1 tasks)", self.raw_task("runner-check", "proj", str(runner)))
 
     def test_agent_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
         blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}

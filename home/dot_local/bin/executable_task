@@ -934,22 +934,27 @@ def advisory_pre_commit_environment(path: Path, child_env):
 
 # --- commands ----------------------------------------------------------------------------------
 
+def seed_source(repo, name):
+    source_root = repo / ".work"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
+        raise Stop(f"Invalid seed name: {name!r}.")
+    if source_root.is_symlink():
+        raise Stop("Seed .work directories must not be symlinks.")
+    source = source_root / name
+    if not source.exists():
+        raise Stop(f"Seed does not exist: {source}.")
+    for entry in [source] + (list(source.rglob("*")) if source.is_dir() else []):
+        if not entry.resolve().is_relative_to(source_root.resolve()):
+            raise Stop(f"Seed symlink escapes .work: {entry}.")
+    return source
+
+
 def seed_worktree(repo, path, names):
     source_root = repo / ".work"
     destination_root = path / ".work"
-    if source_root.is_symlink() or destination_root.is_symlink():
+    if destination_root.is_symlink():
         raise Stop("Seed .work directories must not be symlinks.")
-    sources = []
-    for name in names:
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
-            raise Stop(f"Invalid seed name: {name!r}.")
-        source = source_root / name
-        if not source.exists():
-            raise Stop(f"Seed does not exist: {source}.")
-        for entry in [source] + (list(source.rglob("*")) if source.is_dir() else []):
-            if not entry.resolve().is_relative_to(source_root.resolve()):
-                raise Stop(f"Seed symlink escapes .work: {entry}.")
-        sources.append(source)
+    sources = [seed_source(repo, name) for name in names]
     destination_root.mkdir(parents=True, exist_ok=True)
     for source in sources:
         destination = destination_root / source.name
@@ -979,7 +984,7 @@ def runner_check(args):
                 in_text_rules = False
             continue
         # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
-        if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])\b", line):
+        if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
         parsed = task_line.match(line)
         if parsed:
@@ -990,8 +995,8 @@ def runner_check(args):
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")
                 resolve_model(builder.lower(), model)
-                if seed and not (repo / ".work" / seed).exists():
-                    raise Stop(f"Seed does not exist in the main checkout's .work/: {seed}.")
+                if seed:
+                    seed_source(repo, seed)
                 if after:
                     normalized_after = Task(repo, after).id.lower()
                     if normalized_after not in seen_tasks:
