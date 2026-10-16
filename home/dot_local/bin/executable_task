@@ -963,16 +963,52 @@ def seed_worktree(repo, path, names):
 
 def runner_check(args):
     repo = resolve_repo(args.repo)
-    problems, builders = [], {}
+    problems, builders, seen_tasks = [], {}, set()
+    task_lines = 0
+    in_text_rules = False
+    task_line = re.compile(
+        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
+        r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?(?:\b.*)?$"
+    )
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
+        if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
+            in_text_rules = True
+            continue
+        if in_text_rules:
+            if re.match(r"^\s*```\s*$", line):
+                in_text_rules = False
+            continue
         # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
-        if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+-[A-Za-z]*[arR]", line):
+        if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])\b", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
+        parsed = task_line.match(line)
+        if parsed:
+            task_lines += 1
+            ident, builder, model, seed, after = parsed.groups()
+            try:
+                task = Task(repo, ident)
+                if task.number is not None and task.file is None:
+                    raise Stop(f"No Backlog.md task {task.id}")
+                resolve_model(builder.lower(), model)
+                if seed and not (repo / ".work" / seed).exists():
+                    raise Stop(f"Seed does not exist in the main checkout's .work/: {seed}.")
+                if after:
+                    normalized_after = Task(repo, after).id.lower()
+                    if normalized_after not in seen_tasks:
+                        raise Stop(f"after: {after} must name an earlier task in the file.")
+                seen_tasks.add(task.id.lower())
+            except Stop as error:
+                problems.append(f"line {number}: {error}")
+            continue
         for match in re.finditer(r"\btask\s+(start|lane)\s+([^`\n;&|]+)", line):
             try:
                 tokens = shlex.split(match.group(2))
                 if len(tokens) < 2:
                     raise Stop("task command needs a repo and task id")
+                model_token = (tokens[tokens.index("--model") + 1]
+                               if "--model" in tokens and tokens.index("--model") + 1 < len(tokens) else "")
+                if any("<" in token or ">" in token for token in (tokens[0], tokens[1], model_token)):
+                    continue
                 ident = tokens[1]
                 task = Task(repo, ident)
                 if task.number is not None and task.file is None:
@@ -993,10 +1029,12 @@ def runner_check(args):
                     builders[task.id] = builder
             except (Stop, ValueError, IndexError) as error:
                 problems.append(f"line {number}: {error}")
+    if task_lines == 0:
+        problems.append("no task lines found (format: N. <id>: builder <b>, model <m>[, seed <s>][, after: <id>])")
     if problems:
         print("\n".join(problems))
         return 1
-    print(f"runner file OK ({len(builders)} tasks)")
+    print(f"runner file OK ({task_lines} tasks)")
     return 0
 
 

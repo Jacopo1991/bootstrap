@@ -975,15 +975,34 @@ class TaskTool(unittest.TestCase):
 
     def test_runner_check_models_ids_and_blocked_constructs(self):
         runner = self.home / "runner.md"
-        runner.write_text("`task start proj 5 --builder claude`\n"
-                          "`task lane proj 5 --model claude-fable-5-1`\n"
-                          "task start proj plain --builder codex\n"
-                          "task lane proj plain --model gpt-6.1-sol\n")
+        (self.kb / "backlog/tasks").mkdir(parents=True, exist_ok=True)
+        (self.kb / "backlog/tasks/task-5.md").write_text("---\ntitle: Task five\n---\n")
+        (self.repo / ".work").mkdir(exist_ok=True)
+        (self.repo / ".work/pinned").write_text("seed")
+        runner.write_text(
+            "1. 5: builder claude, model claude-fable-5-1\n"
+            "2. docs: builder codex, model gpt-6.1-sol, seed pinned, after: 5\n"
+            "```text\n"
+            "task start <repo> <id> --builder codex|claude\n"
+            "task lane <repo> <id> --model <model>\n"
+            "nohup task check\n"
+            "```\n")
         self.assertIn("runner file OK (2 tasks)", self.raw_task("runner-check", "proj", str(runner)))
-        for line in ("task start proj 999 --builder codex", "task start proj ../bad --builder codex",
+        for contents, expected in (
+            ("1. docs: builder codex, model sonnet\n", "not available for the codex builder"),
+            ("1. docs: builder codex, model gpt-6-luna, seed absent\n", "Seed does not exist"),
+            ("1. docs: builder codex, model gpt-6-luna, after: second\n"
+             "2. second: builder codex, model gpt-6-luna\n", "must name an earlier task"),
+            ("task lane <repo> <id> --model <model>\n", "no task lines found"),
+        ):
+            runner.write_text(contents)
+            self.assertIn(expected, self.raw_task("runner-check", "proj", str(runner), code=1))
+        for line in ("1. plain: builder codex, model gpt-6-luna, after: later\n",
+                     "task start proj 999 --builder codex", "task start proj ../bad --builder codex",
                      "task lane proj plain --builder codex --model sonnet",
                      "task lane proj plain --builder claude --model unknown",
                      "cat <<EOF", "cp -a source target", "cp -r source target",
+                     "cp --recursive source target", "cp --archive source target",
                      "nohup task check", "setsid task check", "xargs task", "sudo ls"):
             runner.write_text(line + "\n")
             self.assertIn("line 1:", self.raw_task("runner-check", "proj", str(runner), code=1))
