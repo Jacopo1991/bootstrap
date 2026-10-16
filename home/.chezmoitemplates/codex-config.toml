@@ -6,7 +6,7 @@ sandbox_mode = "workspace-write"
 # Tool caches needed by sandboxed project checks. Keep these roots limited to caches.
 writable_roots = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
 # Network on inside the sandbox, but only through Codex's own proxy (below), which allows the
-# exact host openrouter.ai for paid probes: tests can also bind and reach 127.0.0.1.
+# package registries, GitHub downloads and openrouter.ai; tests can reach 127.0.0.1.
 # git and gh network commands keep running outside the sandbox (policy hook).
 network_access = true
 
@@ -14,6 +14,6 @@ network_access = true
 [features.network_proxy]
 enabled = true
 allow_local_binding = true
-domains = { "openrouter.ai" = "allow" }
+domains = { "pypi.org" = "allow", "files.pythonhosted.org" = "allow", "registry.npmjs.org" = "allow", "github.com" = "allow", "objects.githubusercontent.com" = "allow", "codeload.github.com" = "allow", "raw.githubusercontent.com" = "allow", "release-assets.githubusercontent.com" = "allow", "openrouter.ai" = "allow" }
 # Keep the HTTP proxy and its domain policy, but do not expose a SOCKS proxy to commands.
 enable_socks5 = false

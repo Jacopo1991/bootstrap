@@ -168,6 +168,14 @@ class Tidy(unittest.TestCase):
                      "project-data/old-archive"):
             self.assertTrue((self.home / path).exists(), path)
 
+    def test_project_data_reports_only_new_folders(self):
+        self.tidy("--apply")
+        self.assertNotIn("project-data/", self.tidy("--apply"))
+        (self.home / "project-data/new-folder").mkdir()
+        out = self.tidy("--apply")
+        self.assertIn("project-data/new-folder: not declared", out)
+        self.assertNotIn("project-data/old-archive", out)
+
 
 
 class Safety(unittest.TestCase):
@@ -226,6 +234,37 @@ class Safety(unittest.TestCase):
         self.assertEqual((hidden / "notes.md").read_text(), "mine", out)
         self.assertEqual((flagged / "a.txt").read_text(), "edited", out)
         self.assertTrue(merging.exists(), out)
+
+    def test_merged_session_files_archived_databases_and_work_caches_removed(self):
+        run(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD", old=True)
+        paths = []
+        for name in ("session", "archived", "caches", "dirty-archived", "open-archived"):
+            path = self.worktree(name, "-b", name)
+            paths.append(path)
+            if name == "session":
+                (path / ".claude").mkdir()
+                (path / ".claude/settings.local.json").write_text("{}")
+            elif name == "caches":
+                (path / ".work/.cache/tools").mkdir(parents=True)
+                (path / ".work/.cache/tools/download").write_text("cache")
+            else:
+                (path / ".work").mkdir()
+                (path / ".work/live.sqlite").write_bytes(b"x" * 2_000_000)
+                archive = self.home / ".local/state/task/archive/proj" / name / "snapshot/.work"
+                archive.mkdir(parents=True)
+                (archive / "report.md").write_text("archived")
+            if name == "dirty-archived":
+                (path / "a.txt").write_text("dirty")
+            if name == "open-archived":
+                (path / "a.txt").write_text("unmerged")
+                run(path, "commit", "-qam", "unmerged", old=True)
+            age(path)
+        out = self.tidy()
+        for path in paths[:3]:
+            self.assertFalse(path.exists(), out)
+        for path in paths[3:]:
+            self.assertTrue(path.exists(), out)
+        self.assertTrue((self.home / ".local/state/task/archive/proj/archived/snapshot/.work/report.md").exists())
 
     def test_moved_worktree_is_not_pruned(self):
         moved = self.worktree("moved", "--detach")

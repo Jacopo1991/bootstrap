@@ -115,7 +115,7 @@ assert codex_hooks == {
     ("UserPromptSubmit", None): "context_reminder.py",
 }, codex_hooks
 assert not (ROOT / "home/dot_codex/hooks.json").exists()
-codex_user = tomllib.loads((ROOT / "home/dot_codex/config.toml").read_text(encoding="utf-8"))
+codex_user = tomllib.loads((ROOT / "home/.chezmoitemplates/codex-config.toml").read_text(encoding="utf-8"))
 assert "hooks" not in codex_user and "hooks" not in codex_user.get("features", {})
 
 # Requirements rules: the schema Codex 0.159 accepts (codex-rs/config/src/requirements_exec_policy.rs).
