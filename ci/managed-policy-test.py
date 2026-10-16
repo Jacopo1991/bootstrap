@@ -296,8 +296,13 @@ with tempfile.TemporaryDirectory() as temp:
         "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxe-", "xoxc-", "xoxd-", "AKIA")]
     fixtures += ["Bearer testvalue", "a" * 32, "0123456789abcdef" * 2, "Ab9+" * 10 + "=="]
     for path in ("/home/agent/dev_workspace/bootstrap/system/agent-policy/pre_tool_use.py",
-                 "relative/" + "a" * 40):
+                 "/home/agent/dev_workspace/bootstrap/", "src/some/normal/path.py",
+                 *(prefix + "a" * 40 for prefix in ("/", "./", "../", "~/", "$HOME/"))):
         assert policy.audit_text(path) == path
+    fixtures += ["relative/" + "a" * 40, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"]
+    assert policy.audit_text(None) == "None"
+    assert policy.audit_text(123) == "123"
+    assert policy.audit_text({"message": "ok"}) == str({"message": "ok"})
     fixtures += [name + separator + "testvalue" for name in (
         "token", "KEY", "Secret", "password", "passwd") for separator in ("=", ":", ": ")]
     fixtures += ["--" + name + " testvalue" for name in (
@@ -314,8 +319,17 @@ with tempfile.TemporaryDirectory() as temp:
             assert "[REDACTED]" in redacted[field], (fixture, field)
     for command in (r"rg --foo C:\Users\x pat", r"grep --weird X \\srv\share"):
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
-    for command in (r"rg '\d+' src", r"grep -e '\bx\b' f"):
+    for command in (r"rg '\d+' src", r"grep -e '\bx\b' f",
+                    r"rg -S '\w\s' src", r"grep -rIn '\s\d' .",
+                    r"rg --unknown=value '\w\s' src"):
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    for switch in ("-S", "--smart-case", "-I", "-s", "-L", "-u", "-uu", "-.",
+                   "--no-ignore", "-z", "-U", "--multiline", "--json", "-a", "--text",
+                   "--unknown=value"):
+        assert policy.evaluate_command("rg " + switch + r" '\w\s' src", temp, Path(temp), (Path(temp),)) is None
+        for operand in (r"C:\Users\x", r"\\srv\share"):
+            command = "rg " + switch + r" '\w\s' " + operand
+            assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     for switches in ("-rn", "-ni", "-Ei", "-rne", "-rnm 2", "-rnm2"):
         command = "grep " + switches + r" 'C:\\' src"
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
@@ -383,6 +397,12 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
     assert policy.command_rule("Inline shell and interpreter programs are blocked.") == "shell.interpreter"
     assert policy.command_rule(policy.MIXED_CHAIN_MESSAGE) == "command.mixed_chain"
     assert policy.command_rule("An unmapped reason " * 20) == "command.other"
+    with patch.object(policy.sys, "stdout", new_callable=io.StringIO) as output, \
+            patch.object(policy.sys, "stderr", new_callable=io.StringIO), \
+            patch.object(policy, "log_denial") as logged:
+        assert policy.main(["--vendor", "invalid"]) == 0
+        assert json.loads(output.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert logged.call_args.args[1].rule_id == "hook.error"
     for failure, rule in ((json.JSONDecodeError("bad", "", 0), "hook.input"),
                           (ValueError(), "hook.input"), (OSError("read failed"), "hook.error"),
                           (RuntimeError("parse failed"), "hook.error")):

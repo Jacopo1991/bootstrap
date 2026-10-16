@@ -63,7 +63,8 @@ READ_ONLY_COMMANDS = {"cd", "echo", "printf", "true", "false", "pwd", "ls", "cat
 STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat"}
 NULL_DEVICES = {"/dev/null"}
-READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame"}
+READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame",
+                 "rev-list", "ls-tree", "show-ref", "describe", "cat-file", "merge-base", "name-rev"}
 WORKTREE_LIST_OPTIONS = {"--porcelain", "-v", "--verbose", "-z"}
 # Where the Codex app (agent on the AgentDev SSH host) creates its worktrees ($CODEX_HOME/worktrees).
 MANAGED_WORKTREE_BASES = (Path("/home/agent/.codex/worktrees"),)
@@ -716,7 +717,10 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
                              "--show-current"}
                      or not arg.startswith("-") and "--list" in arguments
                      for arg in arguments))
-                 or subcommand == "cat-file" and len(arguments) == 2 and arguments[:1] == ["-p"]
+                 or subcommand == "config" and git_config_read_only(arguments)
+                 or subcommand == "remote" and (arguments == ["-v"] or
+                     arguments[:1] == ["show"] and "-n" in arguments and all(
+                         arg == "-n" or not arg.startswith("-") for arg in arguments[1:]))
                  or subcommand == "worktree" and arguments[:1] == ["list"])
     if cross_repo and not read_only and not sibling_fetch:
         return "Git writes outside the current repository are blocked."
@@ -1091,7 +1095,9 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
                 "--line-number", "-l", "--files-with-matches", "-q", "--quiet",
                 "-r", "-R", "--recursive", "-E", "-F", "-P", "-w", "-x",
                 "-c", "-o", "-H", "-h", "--hidden", "--no-heading",
-                "--fixed-strings", "--extended-regexp", "--perl-regexp"}
+                "--fixed-strings", "--extended-regexp", "--perl-regexp",
+                "-S", "--smart-case", "-I", "-s", "-L", "-u", "-uu", "-.",
+                "--no-ignore", "-z", "-U", "--multiline", "--json", "-a", "--text"}
     while index < len(tokens):
         token = tokens[index]
         if options and token == "--":
@@ -1108,6 +1114,8 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
             if token in {"-f", "--file"}:
                 has_expression = True
             index += 1
+        elif options and token.startswith("--") and "=" in token:
+            pass  # Self-contained unknown option: it consumes no following operand.
         elif options and token.startswith("-"):
             if token not in switches:
                 if token.startswith("--"):
@@ -1672,13 +1680,21 @@ def event_vendor(event: dict, vendor: str | None = None) -> str:
 
 
 def audit_text(value: str) -> str:
+    value = str(value)
+    def redact_run(match):
+        token_start = re.split(r"[\s\"']", value[:match.start()])[-1]
+        token = token_start + match[0]
+        path = token.startswith(("/", "./", "../", "~/", "$HOME/"))
+        return match[0] if "/" in match[0] and (path or all(
+            len(segment) < 32 for segment in match[0].split("/"))) else "[REDACTED]"
+
     # Redact before truncating: a token may cross the audit length boundary.
     value = re.sub(
         r"(?i)(?:ghp_|ghs_|ghu_|ghr_|github_pat_|gho_|sk-or-|sk-|xox[a-z]-)[A-Za-z0-9_-]+"
         r"|AKIA[A-Z0-9]+|Bearer\s+[^\s\"']+"
         , "[REDACTED]", value)
     value = re.sub(r"[A-Za-z0-9+/=_-]{32,}",
-                   lambda match: match[0] if "/" in match[0] else "[REDACTED]", value)
+                   redact_run, value)
     value = re.sub(
         r"(?i)((?:token|key|secret|password|passwd|authorization)\b\s*[=:]\s*"
         r"|--[\w-]*(?:token|key|secret|password|passwd)\b\s+)"
@@ -1723,12 +1739,13 @@ def log_denial(event: dict, denial: str | None = None, vendor: str | None = None
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--vendor", choices=("claude", "codex"))
-    options, _unknown = parser.parse_known_args(argv)
+    options = argparse.Namespace(vendor=None)
     try:
+        options, _unknown = parser.parse_known_args(argv)
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
             raise ValueError
-    except Exception as error:
+    except (Exception, SystemExit) as error:
         reason = (Denial("hook.input", "Hook input invalid; blocked by policy.")
                   if isinstance(error, (json.JSONDecodeError, ValueError)) else
                   Denial("hook.error", f"policy hook error: {type(error).__name__}: {audit_text(str(error))}"))

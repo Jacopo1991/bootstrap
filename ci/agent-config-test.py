@@ -220,8 +220,14 @@ with tempfile.TemporaryDirectory() as temp:
     for target in (sibling, knowledge):
         for sub in ("log", "show HEAD:file", "diff", "status", "branch", "branch --list",
                     "branch --show-current", "branch --list main", "for-each-ref", "rev-parse",
-                    "worktree list", "ls-files", "cat-file -p HEAD"):
+                    "worktree list", "ls-files", "cat-file -p HEAD", "cat-file -t HEAD",
+                    "rev-list HEAD", "ls-tree HEAD", "show-ref", "describe HEAD",
+                    "remote -v", "remote show -n origin", "config --get remote.origin.url",
+                    "config --list", "merge-base HEAD HEAD", "name-rev HEAD"):
             assert policy.evaluate(event(f"git -C {target} {sub}"), roots) is None, sub
+        for sub in ("remote show origin", "remote update", "remote add other https://github.com/example/repo",
+                    "config remote.origin.url value", "config --unset remote.origin.url"):
+            assert policy.evaluate(event(f"git -C {target} {sub}"), roots), sub
         assert policy.evaluate(event(f"git -C {target} branch -D main"), roots)
     assert policy.evaluate(event(f"git --no-pager -C {sibling} blame file"), roots) is None
     assert policy.evaluate(event(
