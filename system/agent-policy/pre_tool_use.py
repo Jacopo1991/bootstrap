@@ -1292,6 +1292,9 @@ def split_command(command: str) -> tuple[list[str], list[str]] | str:
         elif char in "'\"":
             quote = char
             current += char
+        elif command[index:index + 3] == "<<<":
+            current += "<<<"
+            index += 2
         elif command[index:index + 2] == "<<":
             return "Heredocs are blocked; use the edit tool."
         elif char in "<>":

@@ -847,7 +847,7 @@ with tempfile.TemporaryDirectory() as temp:
     # Chains (; && || |) are evaluated segment by segment with the ordinary rules;
     # env/timeout/nice/stdbuf and VAR=value prefixes evaluate the wrapped command.
     for command in ("git status && git log --oneline", "git diff | head -5", "git status; git log",
-                    "git log | grep fix | wc -l",
+                    "git log | grep fix | wc -l", 'wc -l <<< "one two"',
                     "cat safe.txt | sort > copied2.txt", "cd nested; ls",
                     "git log | head -5", "git status && git diff", "git diff | sort | uniq -c | tail -3",
                     "git log --oneline | cut -c1-7 | cat",
