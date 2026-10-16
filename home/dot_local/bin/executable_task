@@ -709,6 +709,16 @@ def agent_environment():
             if name not in GIT_OVERRIDE_ENV and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
 
 
+def lane_environment(task):
+    env = agent_environment()
+    state = task.path / ".work/state"
+    state.mkdir(parents=True, exist_ok=True)
+    env["XDG_STATE_HOME"] = str(state)
+    if not env.get("SECRETSPEC_REASON", "").strip():
+        env["SECRETSPEC_REASON"] = f"lane {task.repo.name}/{task.id}"
+    return env
+
+
 MODELS = {"codex": {"gpt-6-luna": "gpt-6-luna", "gpt-6.1-sol": "gpt-6.1-sol"},
           "claude": {"sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
                      "opus": "opus", "claude-opus-5-5": "opus",
@@ -789,6 +799,9 @@ def lane(args):
     prompt = work / "prompt.md"
     if not prompt.is_file():
         raise Stop(f"Missing lane prompt: {prompt}; the PM must write it before dispatch.")
+    request = work / "request.md"
+    if not request.exists():
+        request.write_bytes(prompt.read_bytes())
     binary = builder
     if not shutil.which(binary):
         raise Stop(f"{binary} is not installed or available on PATH.")
@@ -840,7 +853,7 @@ def lane(args):
             source.write(b"Read the pinned task context in .work/context/ before working.\n\n" + prompt.read_bytes())
             source.seek(0)
             with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output:
-                child = subprocess.Popen(command, cwd=path, env=agent_environment(), stdin=source,
+                child = subprocess.Popen(command, cwd=path, env=lane_environment(task), stdin=source,
                                          stdout=subprocess.PIPE if output else None)
                 try:
                     deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
@@ -1425,7 +1438,10 @@ def check(args):
     advisory = CHECK_ADVISORY if CHECK_ADVISORY is not None else advisory_check_for(task)
     tracked_work = git(path, "ls-files", "--", ".work")
     if tracked_work:
-        raise Stop("Tracked files under .work/ are forbidden; remove them from the index and keep evidence out of the repository.")
+        raise Stop(
+            f"Tracked files under .work/ ({tracked_work}): run `git rm --cached -r .work` "
+            "and commit, then rerun `task check`. Never `git add -f` under .work/."
+        )
     record = load_record(task, required=False)
     if task.number is not None and record is None:
         raise Stop("This worktree has no pinned task record; PM must run `task start ... --refresh --builder ...` first.")
@@ -1743,8 +1759,6 @@ def run_reviewer(command, path, prompt_file, reply_file):
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
     if code:
         raise Stop(f"Reviewer exited with status {code}; no review recorded. Reply: {reply_file}")
-    if not reply_file.read_text().strip():
-        raise Stop(f"Reviewer returned an empty reply; no review recorded. Reply: {reply_file}")
 
 
 def review(args):
@@ -1755,20 +1769,17 @@ def review(args):
     head = sha(path, "HEAD")
     task_text = task.file.read_text() if task.file else ""
     request_text = ""
-    request_label = "Direct request:"
+    request_label = "Original request:"
+    lane_prompt = path / ".work/prompt.md"
+    original = path / ".work/request.md"
+    latest_text = lane_prompt.read_text() if lane_prompt.is_file() else ""
     if args.request:
         try:
             request_text = Path(args.request).read_text()
         except OSError as error:
             raise Stop(f"Cannot read request file {args.request}: {error}.")
-    elif not task.file:
-        lane_prompt = path / ".work/prompt.md"
-        if lane_prompt.is_file():
-            lane_request = lane_prompt.read_text()
-            request_text = lane_request[:8000]
-            request_label = "Request (lane prompt):"
-            if len(lane_request) > 8000:
-                request_text += "\n[Request truncated at 8000 characters.]"
+    else:
+        request_text = original.read_text() if original.is_file() else latest_text
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
@@ -1776,10 +1787,14 @@ def review(args):
                           else ("codex", "gpt-6-luna"))
         if reviewer_route[0] == record["builder"]:
             raise Stop("reviewer vendor must differ from builder")
-        prompt = [f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
+        prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
+                  f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
         if request_text:
             prompt.extend([request_label, request_text.rstrip()])
+        if latest_text and latest_text != request_text:
+            prompt.extend(["Latest fix-round instructions to the builder (context only; judge the whole change against the original request):",
+                           latest_text.rstrip()])
         if record.get("verify"):
             prompt.append("Pinned verification commands: " + " ; ".join(record["verify"]))
         if record["criteria"]:
@@ -1838,7 +1853,21 @@ def review(args):
             print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
             return 0
-        run_reviewer(command, path, prompt_file, reply_file)
+        for attempt in range(2):
+            run_reviewer(command, path, prompt_file, reply_file)
+            head = sha(path, "HEAD")
+            try:
+                verdict, commit, _, _ = parse_review_reply(
+                    reply_file.read_text(), {item["number"] for item in record["criteria"]})
+                if verdict and commit:
+                    matches = run_git(path, "rev-parse", "--verify", f"{commit}^{{commit}}")
+                    if (matches.returncode == 0 and matches.stdout.strip().startswith(commit)
+                            and matches.stdout.strip() == head):
+                        break
+            except ReviewParseError:
+                pass
+            if attempt:
+                raise Stop("review produced no verdict; rerun `task review`")
         args.record = str(reply_file)
         head = sha(path, "HEAD")
     try:
@@ -1923,7 +1952,7 @@ def merge_gate(task, path, head):
         content = report.read_text()
         section = re.search(r"(?ms)^## Criteria\s*\n(.*?)(?=^## |\Z)", content)
         criteria_text = section.group(1) if section else ""
-        if any(not re.search(rf"(?m)^\s*#?{item['number']}\s+(?:met|not met):\s*\S.+$",
+        if any(not re.search(rf"(?m)^\s*(?:(?:[-*]|\d+\.)\s+)?#?{item['number']}\s+(?:met|not met):\s*\S.+$",
                              criteria_text, re.I) for item in record["criteria"]):
             missing.append("criterion evidence in .work/report.md")
     if missing:
@@ -2249,6 +2278,8 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
             if line.startswith("## "):
                 active = bool(re.match(r"## Noticed(?:, not done)?\s*$", line, re.I))
                 continue
+            line = re.sub(r"\[([^\]]*)\]\(<?((?:/|file://)[^)>]+)>?\)",
+                          lambda match: "`" + re.sub(r"^file://", "", match[2]) + "`", line)
             item = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$", line) if active else None
             if item and item[1] not in noticed and f"| {item[1]} |" not in existing:
                 noticed.append(item[1])

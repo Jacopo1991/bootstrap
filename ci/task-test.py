@@ -94,6 +94,8 @@ prompt = sys.stdin.read()
 (work / 'model-call.json').write_text(json.dumps({
     'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt,
     'env_names': sorted(os.environ),
+    'state_home': os.environ.get('XDG_STATE_HOME'),
+    'reason': os.environ.get('SECRETSPEC_REASON'),
 }))
 release = os.environ.get('LANE_STUB_RELEASE')
 if release:
@@ -138,7 +140,13 @@ if os.environ.get('REVIEW_STUB_POLICY'):
         sys.exit(1)
     diff = subprocess.run(command, check=True, capture_output=True, text=True).stdout
     (work / 'reviewer-diff.txt').write_text(diff)
-print(os.environ.get('REVIEW_STUB_REPLY', ''), end='', flush=True)
+counter = work / 'reviewer-count'
+count = int(counter.read_text()) + 1 if counter.exists() else 1
+counter.write_text(str(count))
+reply = os.environ.get('REVIEW_STUB_REPLY', '')
+if count == 1:
+    reply = os.environ.get('REVIEW_STUB_FIRST_REPLY', reply)
+print(reply, end='', flush=True)
 time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
 sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 """
@@ -1122,7 +1130,7 @@ store.write_text(json.dumps(prs))
         self.raw_task("check", "proj", "codex/direct-request")
         prompt = self.raw_task("review", "proj", "codex/direct-request")
         self.assertIn("Outcome: Direct request for branch codex/direct-request", prompt)
-        self.assertIn("Request (lane prompt):\n" + lane_prompt, prompt)
+        self.assertIn("Original request:\n" + lane_prompt, prompt)
         self.assertIn("Criteria: none; judge the stated request above against the diff.", prompt)
         self.assertIn("judge the stated request above against the diff", prompt)
         self.assertIn("Diff range:", prompt)
@@ -1510,6 +1518,80 @@ store.write_text(json.dumps(prs))
         reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n```\n"
         self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
         self.assertEqual(json.loads((self.state() / "review-routing.json").read_text())["vendor"], "codex")
+
+    def test_lane_preserves_original_request_and_sets_local_state_and_reason(self):
+        import json
+        self.stub_models()
+        wt, _ = self.started()
+        prompt = wt / ".work/prompt.md"
+        prompt.write_text("Original outcome\n")
+        self.raw_task("lane", "proj", "5", env=dict(self.env, SECRETSPEC_REASON=""))
+        self.wait_for_lane(wt)
+        call = json.loads((wt / ".work/model-call.json").read_text())
+        self.assertEqual(call["state_home"], str(wt / ".work/state"))
+        self.assertEqual(call["reason"], "lane proj/T-5")
+        self.assertTrue((wt / ".work/state").is_dir())
+        prompt.write_text("Re-run, fix, commit\n")
+        self.raw_task("lane", "proj", "5", env=dict(self.env, SECRETSPEC_REASON="specific reason"))
+        self.wait_for_lane(wt)
+        self.assertEqual((wt / ".work/request.md").read_text(), "Original outcome\n")
+        call = json.loads((wt / ".work/model-call.json").read_text())
+        self.assertEqual(call["reason"], "specific reason")
+        self.raw_task("review", "proj", "5")
+        review = (self.state() / "review-prompt.md").read_text()
+        self.assertTrue(review.startswith("You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.\n"))
+        self.assertIn("Original request:\nOriginal outcome", review)
+        self.assertIn("Latest fix-round instructions to the builder (context only; judge the whole change against the original request):\nRe-run, fix, commit", review)
+
+    def test_review_run_retries_invalid_reply_once_and_can_recover(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: source\n#2 pass: evidence\n```\n"
+        for first in ("I am the builder", reply.replace(head, "a" * 40)):
+            (wt / ".work/reviewer-count").unlink(missing_ok=True)
+            out = self.raw_task("review", "proj", "5", "--run",
+                                env=dict(self.env, REVIEW_STUB_FIRST_REPLY=first, REVIEW_STUB_REPLY=reply))
+            self.assertEqual((wt / ".work/reviewer-count").read_text(), "2")
+            self.assertIn("Recorded PASS", out)
+            self.assertNotIn("I am the builder", out)
+
+    def test_review_run_records_unfenced_reply_on_first_try(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        reply = f"Verdict: PASS\nCommit: {head[:12]}\n#1 pass: source\n#2 pass: evidence\n"
+        out = self.raw_task("review", "proj", "5", "--run",
+                            env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((wt / ".work/reviewer-count").read_text(), "1")
+        self.assertIn("Recorded PASS", out)
+        review = __import__("json").loads((self.state() / "review.json").read_text())
+        self.assertEqual(review["commit"], head)
+        self.assertEqual((self.state() / "review.md").read_text(), reply)
+
+    def test_review_run_without_verdict_retries_once_then_stops(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        reply = f"Commit: {head}\n#1 pass: source\n#2 pass: evidence\n"
+        out = self.raw_task("review", "proj", "5", "--run", code=1,
+                            env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((wt / ".work/reviewer-count").read_text(), "2")
+        self.assertIn("review produced no verdict", out)
+        self.assertNotIn(reply, out)
+        self.assertFalse((self.state() / "review.json").exists())
+        self.assertFalse((self.state() / "review.md").exists())
+
+    def test_report_criteria_list_markers_merge_and_check(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        report = wt / ".work/report.md"
+        content = report.read_text()
+        for marker in ("- ", "* ", "1. "):
+            report.write_text(content.replace("#1 met:", marker + "#1 met:").replace("#2 met:", marker + "#2 met:"))
+            self.raw_task("check", "proj", "5")
+        self.raw_task("merge", "proj", "5")
 
     def test_start_seeds_files_directories_existing_worktree_and_refuses_escape(self):
         source = self.repo / ".work"
@@ -1955,12 +2037,12 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         head = self.git(wt, "rev-parse", "HEAD")
         valid_reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: b\n#2 pass: checked\n```\n"
-        cases = (({"REVIEW_STUB_REPLY": " \n\t"}, "empty reply"),
+        cases = (({"REVIEW_STUB_REPLY": " \n\t"}, "review produced no verdict; rerun `task review`"),
                  ({"REVIEW_STUB_REPLY": valid_reply, "REVIEW_STUB_DELAY": "10",
                    "TASK_REVIEW_TIMEOUT": "1"}, "timed out after 1s"),
                  ({"REVIEW_STUB_REPLY": valid_reply, "REVIEW_STUB_EXIT": "7"}, "status 7"),
-                 ({"REVIEW_STUB_REPLY": "Finding: parser rejected this reply\nnot a verdict"}, "Review rejected"),
-                 ({"REVIEW_STUB_REPLY": valid_reply.replace(head, "a" * 40)}, "Commit does not match"))
+                 ({"REVIEW_STUB_REPLY": "Finding: parser rejected this reply\nnot a verdict"}, "review produced no verdict; rerun `task review`"),
+                 ({"REVIEW_STUB_REPLY": valid_reply.replace(head, "a" * 40)}, "review produced no verdict; rerun `task review`"))
         for previous in (False, True):
             if previous:
                 self.prepare_merge_evidence("5")
@@ -1970,9 +2052,9 @@ store.write_text(json.dumps(prs))
                 with self.subTest(previous=previous, message=message):
                     out = self.raw_task("review", "proj", "5", "--run", code=1, env=dict(self.env, **env))
                     self.assertIn(message, out)
-                    if message == "Review rejected":
-                        self.assertIn("--- reviewer reply ---", out)
-                        self.assertIn("Finding: parser rejected this reply", out)
+                    if message.startswith("review produced no verdict"):
+                        self.assertNotIn("--- reviewer reply ---", out)
+                        self.assertNotIn("Finding: parser rejected this reply", out)
                     after = {name: (self.state() / name).read_bytes() if (self.state() / name).exists() else None
                              for name in before}
                     self.assertEqual(after, before)
@@ -2128,7 +2210,9 @@ store.write_text(json.dumps(prs))
             "Verdict: PASS\n#1 pass: [absolute](/home/agent/report.md) "
             "[file](file:///tmp/review.md) [web](https://example.com/review) "
             "[relative](../report.md) evidence inspected\n")
-        (archive / "report.md").write_text("## Noticed, not done\n\n- Slow startup could be improved\n")
+        (archive / "report.md").write_text("## Noticed, not done\n\n- Slow startup could be improved\n"
+                                           "- Inspect [source](/abs/path) and [report](file:///tmp/report.md) "
+                                           "or [web](https://example.com).\n")
         out = self.task("close", "proj", "T-5", "-m", "Built b; check green.", "--retro",
                         "went well: evidence / went wrong: none / change: keep it", "--partial")
         self.assertIn("1 criteria ticked", out)
@@ -2146,6 +2230,8 @@ store.write_text(json.dumps(prs))
         self.assertIn("[relative](../report.md)", text)
         self.assertEqual(self.git(self.kb, "log", "-1", "--format=%s"), "Close T-5: Add the b file")
         self.assertIn("Slow startup", (self.kb / "improvements.md").read_text())
+        self.assertIn("Inspect `/abs/path` and `/tmp/report.md` or [web](https://example.com).",
+                      (self.kb / "improvements.md").read_text())
         self.assertIn("improvements.md", self.git(self.kb, "show", "--name-only", "--format=", "HEAD"))
         self.assertEqual(self.git(self.kb, "status", "--porcelain"), "")
 
@@ -2856,7 +2942,12 @@ exit 1
         (wt / ".work/leak.json").write_text("{}")
         self.git(wt, "add", "-f", ".work/leak.json")
         self.git(wt, "commit", "-qm", "track private evidence")
-        self.assertIn("Tracked files under .work/", self.raw_task("check", "proj", "5", code=1))
+        message = self.raw_task("check", "proj", "5", code=1)
+        self.assertIn(
+            "Tracked files under .work/ (.work/leak.json): run `git rm --cached -r .work` "
+            "and commit, then rerun `task check`. Never `git add -f` under .work/.",
+            message,
+        )
 
     def test_round2_moved_main_other_files_merges_but_same_file_stops_for_re_review(self):
         wt, _ = self.started()
