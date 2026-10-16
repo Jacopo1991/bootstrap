@@ -1438,7 +1438,10 @@ def check(args):
     advisory = CHECK_ADVISORY if CHECK_ADVISORY is not None else advisory_check_for(task)
     tracked_work = git(path, "ls-files", "--", ".work")
     if tracked_work:
-        raise Stop("Tracked files under .work/ are forbidden; remove them from the index and keep evidence out of the repository.")
+        raise Stop(
+            f"Tracked files under .work/ ({tracked_work}): run `git rm --cached -r .work` "
+            "and commit, then rerun `task check`. Never `git add -f` under .work/."
+        )
     record = load_record(task, required=False)
     if task.number is not None and record is None:
         raise Stop("This worktree has no pinned task record; PM must run `task start ... --refresh --builder ...` first.")

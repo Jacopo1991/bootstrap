@@ -2942,7 +2942,12 @@ exit 1
         (wt / ".work/leak.json").write_text("{}")
         self.git(wt, "add", "-f", ".work/leak.json")
         self.git(wt, "commit", "-qm", "track private evidence")
-        self.assertIn("Tracked files under .work/", self.raw_task("check", "proj", "5", code=1))
+        message = self.raw_task("check", "proj", "5", code=1)
+        self.assertIn(
+            "Tracked files under .work/ (.work/leak.json): run `git rm --cached -r .work` "
+            "and commit, then rerun `task check`. Never `git add -f` under .work/.",
+            message,
+        )
 
     def test_round2_moved_main_other_files_merges_but_same_file_stops_for_re_review(self):
         wt, _ = self.started()
