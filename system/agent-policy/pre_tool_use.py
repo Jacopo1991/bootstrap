@@ -740,7 +740,9 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     # Reject abbreviated as well as full long options. Git accepts unique prefixes.
     def option_matches(argument: str, option: str) -> bool:
         key = argument.split("=", 1)[0]
-        return key.startswith("--") and len(key) > 2 and option.startswith(key)
+        known = {"--text", "--textconv", "--ext-diff"}
+        return key == option or (key not in known and key.startswith("--")
+                                 and len(key) > 2 and option.startswith(key))
 
     if any(option_matches(arg, "--output") for arg in arguments):
         return "Git output-file options are blocked; redirect only inside the current repository."
@@ -786,9 +788,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if any(option_matches(arg, option) for arg in arguments
                for option in ("--ext-diff", "--textconv")):
             return "External diff and textconv are blocked across repositories."
-        if any(arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
-               and not arg[1:].isdigit() for arg in arguments):
-            return "Spell cross-repository short options separately; aggregation is blocked."
+        if subcommand == "cat-file" and any(option_matches(arg, "--filters") for arg in arguments):
+            return "External diff and textconv are blocked across repositories."
         forbidden = ("--no-index", "--open-files-in-pager")
         external_files = {
             "grep": ("--file",),
@@ -796,12 +797,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
             "blame": ("--contents", "--ignore-revs-file"),
         }.get(subcommand, ())
         if any(any(option_matches(arg, option) for option in external_files)
-               or (subcommand == "grep" and arg.startswith("-f"))
-               or (subcommand == "ls-files" and arg.startswith("-X"))
+               or (subcommand == "grep" and re.match(r"^-[^-]*f", arg))
+               or (subcommand == "ls-files" and re.match(r"^-[^-]*X", arg))
                for arg in arguments):
             return "External input-file options are blocked across repositories."
         if any(any(option_matches(arg, option) for option in forbidden)
-               or arg.startswith("-O") or (subcommand == "blame" and arg.startswith("-S"))
+               or re.match(r"^-[^-]*O", arg)
+               or (subcommand == "blame" and re.match(r"^-[^-]*S", arg))
                for arg in arguments):
             return "Side-effecting or external-file read options are blocked across repositories."
     # Check filesystem operands, including attached option values, in the effective
@@ -1234,6 +1236,7 @@ def command_rule(reason: str) -> str:
             (("Shell constructs",), "shell.construct"),
             (("Inline shell", "Piping into", "Feeding a program"), "shell.interpreter"),
             (("Shell output", "Shell writes"), "filesystem.write_boundary"),
+            (("Cannot identify the repository safely", "Cannot resolve folder safely"), "filesystem.folder_resolution"),
             (("Direct shell writes", "Git metadata", "repository root"), "filesystem.git_metadata"),
             (("Run git/gh network",), "command.network_chain"),
             (("A chain containing",), "command.mixed_chain"),
@@ -1424,6 +1427,11 @@ def network_command(head: str, tokens: list[str], cwd: str) -> bool:
 
 def evaluate_command(command: str, cwd: str, root: Path,
                      approved_roots: tuple[Path, ...] | None) -> str | None:
+    repeat = re.fullmatch(
+        r"for [A-Za-z_][A-Za-z0-9_]* in (?:\$\(seq 1 [0-9]+\)|\{1\.\.[0-9]+\});\s*do (.+?);\s*done\s*",
+        command)
+    if repeat:
+        return evaluate_command(repeat[1], cwd, root, approved_roots)
     if "\n" in command or "\r" in command or "$(" in command or "`" in command:
         return "Multi-line or dynamic ($(...), backtick) shell commands are blocked."
     loop = re.fullmatch(r"for ([A-Za-z_][A-Za-z0-9_]*) in (.+?);\s*do (.+?);\s*done\s*", command)
@@ -1686,12 +1694,14 @@ def audit_text(value: str) -> str:
     def redact_run(match):
         token_start = re.split(r"\s", value[:match.start()])[-1]
         token = token_start + match[0]
-        path = token.startswith(("/", "./", "../", "~/", "$HOME/"))
+        path = (token.startswith(("/", "./", "../", "~/", "$HOME/"))
+                and sum(bool(segment) and (len(segment) < 32 or bool(re.search(r"[._-]", segment)))
+                        for segment in token.split("/")) >= 2)
         return match[0] if path else "[REDACTED]"
 
     # Redact before truncating: a token may cross the audit length boundary.
     value = re.sub(
-        r"(?i)(?:ghp_|ghs_|ghu_|ghr_|github_pat_|gho_|sk-or-|sk-|xox[a-z]-)[A-Za-z0-9_-]+"
+        r"(?i)(?:ghp_|ghs_|ghu_|ghr_|github_pat_|gho_|\bsk-or-|\bsk-|\bxox[a-z]-)[A-Za-z0-9_-]+"
         r"|AKIA[A-Z0-9]+|Bearer\s+[^\s\"']+"
         , "[REDACTED]", value)
     value = re.sub(r"[A-Za-z0-9+/=_-]{32,}",

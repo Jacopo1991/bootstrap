@@ -347,6 +347,18 @@ with tempfile.TemporaryDirectory() as temp:
     print("PASS: sibling fetch/default remote allowed in both roots; checkout/pull/merge/switch and unsafe fetches denied")
 
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
+    for tail in ("log -n5", "diff -U3", "grep -iE needle", "diff --text"):
+        assert policy.evaluate(event("git -C ../sibling " + tail), roots) is None, tail
+    for tail in ("cat-file --filters HEAD:file", "cat-file --textconv HEAD:file"):
+        assert policy.evaluate(event("git -C ../sibling " + tail), roots) is not None, tail
+    for values in ("$(seq 1 20)", "{1..20}"):
+        command = f"for i in {values}; do python3 ci/x.py || exit 1; done"
+        assert policy.evaluate(event(command), roots) is None, command
+        assert policy.evaluate(event(f"for i in {values}; do sudo true; done"), roots) is not None
+    assert policy.evaluate(event("for i in $(echo 20); do python3 ci/x.py; done"), roots) is not None
+    for message in ("Cannot identify the repository safely; deleting folders is blocked.",
+                    "Cannot resolve folder safely; staging folders is blocked."):
+        assert policy.command_rule(message) == "filesystem.folder_resolution"
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
     for subcommand in ("log", "show", "diff", "blame"):
