@@ -301,7 +301,8 @@ with tempfile.TemporaryDirectory() as temp:
         assert policy.audit_text(path) == path
     for text in ("task-state", "disk-usage", "axoxb-value"):
         assert policy.audit_text(text) == text
-    fixtures += ["/" + "a" * 40, "/" + "Ab9+" * 10]
+    fixtures += ["/" + "a" * 40, "/" + "Ab9+" * 10,
+                 "/aaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb"]
     fixtures += ["relative/" + "a" * 40, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
                  "relative/" + "abc/" * 10, "'./" + "a" * 40 + "'"]
     assert policy.audit_text(None) == "None"

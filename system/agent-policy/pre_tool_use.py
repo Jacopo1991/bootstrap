@@ -1515,15 +1515,24 @@ def evaluate_command(command: str, cwd: str, root: Path,
         if any(head in {"git", "gh"} for head, _ in heads):
             # git/gh are excluded from the sandbox; do not let a chain smuggle anything else along.
             for head, unwrapped in heads:
+                if head in {"git", "gh"}:
+                    continue
                 writes = any(token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
                              and (i + 1 >= len(unwrapped) or unwrapped[i + 1] not in NULL_DEVICES)
                              for i, token in enumerate(unwrapped))
                 find_writes = head == "find" and any(
-                    token in {"-exec", "-execdir", "-ok", "-okdir", "-delete"}
-                    or token.startswith("-fprint") or token == "-fprintf"
+                    token.startswith(("-exec", "-ok", "-fprint"))
+                    or token in {"-delete", "-fls"}
+                    for token in unwrapped[1:])
+                rg_executes = head == "rg" and any(
+                    token == "--pre" or token.startswith("--pre=")
+                    for token in unwrapped[1:])
+                file_writes = head == "file" and any(
+                    token == "--compile" or (token.startswith("-")
+                                             and not token.startswith("--") and "C" in token)
                     for token in unwrapped[1:])
                 if (head not in MIXED_CHAIN_TEXT_TOOLS | {"git", "gh"}
-                        and not pure_lookup(unwrapped)) or writes or find_writes:
+                        and not pure_lookup(unwrapped)) or writes or find_writes or rg_executes or file_writes:
                     return MIXED_CHAIN_MESSAGE
     seen_changing = False
     for position, tokens in enumerate(all_tokens):
@@ -1716,9 +1725,11 @@ def audit_text(value: str) -> str:
     def redact_run(match):
         token_start = re.split(r"\s", value[:match.start()])[-1]
         token = token_start + match[0]
-        path = (token.startswith(("/", "./", "../", "~/", "$HOME/"))
-                and sum(bool(segment) and (len(segment) < 32 or bool(re.search(r"[._-]", segment)))
-                        for segment in token.split("/")) >= 2)
+        path = (token.startswith(("./", "../", "~/", "$HOME/", "/home/", "/tmp/", "/usr/",
+                                  "/opt/", "/etc/", "/var/", "/mnt/", "/proc/", "/run/",
+                                  "/srv/", "/root/"))
+                or token.startswith("/") and any(re.search(r"[._-]", segment)
+                                                  for segment in token.split("/")))
         return match[0] if path else "[REDACTED]"
 
     # Redact before truncating: a token may cross the audit length boundary.

@@ -216,10 +216,20 @@ with tempfile.TemporaryDirectory() as temp:
         for separator in ("; ", "\n"):
             command = "git status" + separator + read
             assert policy.evaluate(event(command), roots) is None, command
-    for command in ("UV_CACHE_DIR=.work/uv-cache uv sync", "time timeout 5s uv sync",
+    for command in ("git log 2>&1 | head", "git log > out.txt && git status",
+                    "git status > output; pwd", "git status; rg --pre-glob '*.txt' needle",
+                    "git status; rg --search-zip needle", "git status; rg -z needle",
+                    "UV_CACHE_DIR=.work/uv-cache uv sync", "time timeout 5s uv sync",
                     "\npwd\n\nls\n", "pwd;\nls"):
         assert policy.evaluate(event(command), roots) is None, command
-    for command in ("git status; echo x > output", "git status > output; pwd",
+    for helper in ("find . -fls output", "find . -fprint output", "find . -fprint0 output",
+                   "find . -fprintf output x", "find . -exec true +", "find . -execdir true +",
+                   "find . -ok true +", "find . -okdir true +", "find . -delete",
+                   "rg --pre cat needle", "rg --pre=cat needle", "file -C", "file --compile",
+                   "file -bC"):
+        command = "git status; " + helper
+        assert policy.evaluate(event(command), roots), command
+    for command in ("git status; echo x > output",
                     "git status; find . -exec touch file \\;", "git status; find . -delete",
                     "git status; find . -fprint output", "git status; find . -fprintf output x",
                     "time sudo true", "timeout -s TERM -k 1 5 sudo true",
