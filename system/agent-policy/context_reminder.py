@@ -19,10 +19,10 @@ PROMPT_REMINDER = "\n".join((
     "Reminders (bootstrap hook):",
     "- Follow the slim-workflow skill.",
     "- Stop after two failed attempts at the same problem or at the time box; report what you have.",
-    "- Report in chat and in the PR description.",
+    "- Report as the task or skill asks. Work in the worktree you were given; the PM adopts direct requests with `task start <repo> <branch>`.",
     "- Run git and gh on their own: `git -C <path> ...`, never `cd <path> && git`, and no builds, "
     "tests or writes in the same call; git/gh network commands (fetch, pull, push, gh ...) never chained.",
-    "- Verification: use the verify-ui skill.",
+    "- Verification: use the verify-ui skill only when the task has a UI to verify.",
     "- Anything under .github or GitHub settings: read the github-ci skill first.",
 ))
 

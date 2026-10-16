@@ -246,7 +246,8 @@ class Reminder(unittest.TestCase):
         self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
         text = specific["additionalContext"]
         self.assertLessEqual(len(text.splitlines()), 8)
-        for needle in ("slim-workflow", "two failed attempts", "time box", "chat", "PR description",
+        for needle in ("slim-workflow", "two failed attempts", "time box", "Report as the task or skill asks", "task start <repo> <branch>",
+                       "worktree you were given", "only when the task has a UI to verify",
                        "git/gh network commands", "on their own", "git -C <path>", "verify-ui", "github-ci",
                        ".github"):
             self.assertIn(needle, text)
