@@ -76,6 +76,7 @@ i = 3
 while i < len(args):
     flag, value = args[i], args[i + 1]
     if flag == "-s":
+        assert value in {"Done", "In Progress", "To Do"}, value
         text = re.sub(r"(?m)^status: .*$", "status: " + value, text)
     elif flag == "--check-ac":
         text = text.replace(f"- [ ] #{value} ", f"- [x] #{value} ")
@@ -144,6 +145,65 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_reliability_override_records_timed_out_gate_step(self):
+        import json
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        (self.state() / 'check.json').unlink()
+        script = self.home / 'during-check.sh'
+        script.write_text('#!/bin/sh\nsleep 3\n')
+        script.chmod(0o755)
+        out = self.raw_task('merge', 'proj', '5', '--override', 'approved timeout',
+                            env=dict(self.env, TASK_CHECK_TIMEOUT='1'))
+        check = json.loads((self.state() / 'gate-check.json').read_text())
+        self.assertIsNone(check['steps'][0]['exit'])
+        self.assertTrue(check['steps'][0]['timeout'])
+        exception = json.loads((self.state() / 'exception.json').read_text())
+        self.assertEqual(exception['waived'], [
+            {'step': 'check:just check', 'reason': 'approved timeout'}])
+        self.assertIn('check:just check waived: approved timeout', out)
+
+    def test_reliability_cancel_lane_already_stopped(self):
+        import json
+        from types import SimpleNamespace
+        wt, _ = self.started()
+        lane = wt / '.work/lane.json'
+        for error in (ProcessLookupError, PermissionError):
+            with self.subTest(error=error):
+                lane.write_text(json.dumps({'state': 'running', 'pid': 99999999}))
+                output = io.StringIO()
+                with mock.patch.object(TASK_MODULE, 'resolve_repo', return_value=self.repo), \
+                        mock.patch.object(TASK_MODULE, 'prune_stale_gate_worktrees'), \
+                        mock.patch.object(TASK_MODULE, 'Task', return_value=SimpleNamespace(path=wt)), \
+                        mock.patch.object(TASK_MODULE, 'pid_alive', return_value=True), \
+                        mock.patch.object(TASK_MODULE.os, 'killpg', side_effect=error), \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(TASK_MODULE.cancel(SimpleNamespace(repo='proj', id='5')), 0)
+                self.assertIn('already stopped', output.getvalue())
+                record = json.loads(lane.read_text())
+                self.assertEqual(record['state'], 'interrupted')
+                self.assertTrue(record['ended_at'])
+
+    def test_reliability_repair_dead_lane_status_read_only(self):
+        import json
+        wt, _ = self.started()
+        lane = wt / '.work/lane.json'
+        for alive in (True, False):
+            with self.subTest(alive=alive):
+                lane.write_text(json.dumps({'state': 'running',
+                                            'pid': os.getpid() if alive else 99999999}))
+                before = lane.read_bytes()
+                self.raw_task('status', 'proj')
+                self.assertEqual(lane.read_bytes(), before)
+                self.raw_task('repair', 'proj')
+                if alive:
+                    self.assertEqual(lane.read_bytes(), before)
+                else:
+                    record = json.loads(lane.read_text())
+                    self.assertEqual(record['state'], 'interrupted')
+                    self.assertTrue(record['ended_at'])
+
     def test_reliability_override_names_every_missing_item(self):
         import json
         wt, _ = self.started()
@@ -201,7 +261,8 @@ store.write_text(json.dumps(prs))
         task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
         self.assertIn('status: In Progress', task_file.read_text())
         self.raw_task('close', 'proj', '5', '-m', 'final', '--retro', retro, '--no-merge', 'abandoned')
-        self.assertIn('status: Done (not merged: abandoned)', task_file.read_text())
+        self.assertIn('status: Done\n', task_file.read_text())
+        self.assertIn('not merged: abandoned', task_file.read_text())
         prs = json.loads((self.home / 'close-prs.json').read_text())
         self.assertEqual([p['state'] for p in prs], ['MERGED', 'MERGED'])
         self.assertEqual(prs[1]['headRefName'], 'task-close-t5-final')
@@ -492,10 +553,12 @@ store.write_text(json.dumps(prs))
                     mock.patch.object(TASK_MODULE, "GATE_LOCK_WAIT", 0):
                 self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
                 output = io.StringIO()
-                with contextlib.redirect_stdout(output), self.assertRaises(SystemExit) as stop:
+                stdout = io.StringIO()
+                with contextlib.redirect_stderr(output), contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as stop:
                     with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, "5")):
                         self.fail("must never enter unlocked")
                 self.assertEqual(stop.exception.code, 3)
+                self.assertEqual(stdout.getvalue(), '')
                 self.assertIn("gate busy: held by proj/T-9 since 2026-01-01", output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
@@ -572,7 +635,7 @@ store.write_text(json.dumps(prs))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('merge not recorded', result.stdout)
         closed = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
-        self.assertIn('Done', closed)
+        self.assertIn('status: Done\n', closed)
         self.assertIn('merge not recorded', closed)
 
     def test_reliability_noticed_import_lists_only_and_deduplicates(self):
@@ -580,12 +643,14 @@ store.write_text(json.dumps(prs))
         self.prepare_merge_evidence("5")
         (self.state() / "report.md").write_text(
             "## Noticed\nprose\n- real improvement\n```sh\n- shell line\necho bad\n```\n"
-            "- existing improvement\n- real improvement\n## Other\n- unrelated\n")
+            "- existing improvement\n1. numbered dot\n2) numbered paren\n3. real improvement\n- real improvement\n## Other\n- unrelated\n")
         (self.kb / "improvements.md").write_text("- old | T-1 | report | existing improvement | open\n")
         self.raw_task("close", "proj", "5", "-m", "done", "--retro", "fine")
         text = (self.kb / "improvements.md").read_text()
         self.assertEqual(text.count("real improvement"), 1)
         self.assertEqual(text.count("existing improvement"), 1)
+        self.assertEqual(text.count("numbered dot"), 1)
+        self.assertEqual(text.count("numbered paren"), 1)
         self.assertNotIn("shell line", text)
         self.assertNotIn("unrelated", text)
 

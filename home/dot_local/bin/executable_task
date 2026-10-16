@@ -486,7 +486,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                     except (OSError, ValueError):
                         holder = {}
                     print(f"gate busy: held by {holder.get('repo', '?')}/{holder.get('task', '?')} "
-                          f"since {holder.get('since', '?')}", flush=True)
+                          f"since {holder.get('since', '?')}", file=sys.stderr, flush=True)
                     raise SystemExit(3)
                 if not waiting:
                     waiting = True
@@ -2048,7 +2048,7 @@ def merge(args):
                         exception = {"waived": []}
                     gate_check = json.loads((archive / "gate-check.json").read_text())
                     for step in gate_check.get("steps", []):
-                        if step.get("exit"):
+                        if step.get("exit") or step.get("timeout"):
                             name = "check:" + " ".join(step["command"])
                             exception.setdefault("waived", []).append({"step": name, "reason": args.override})
                             print(f"exception: {name} waived: {args.override}")
@@ -2226,7 +2226,7 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
             if line.startswith("## "):
                 active = bool(re.match(r"## Noticed(?:, not done)?\s*$", line, re.I))
                 continue
-            item = re.match(r"^\s*[-*+]\s+(.+)$", line) if active else None
+            item = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$", line) if active else None
             if item and item[1] not in noticed and f"| {item[1]} |" not in existing:
                 noticed.append(item[1])
     if noticed:
@@ -2463,13 +2463,11 @@ def close(args):
         merge_evidence = {}
     head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else review.get("commit")
     if not args.partial and (not head or merge_evidence.get("head") != head):
-        if args.no_merge:
-            status = f"Done (not merged: {args.no_merge})"
-        else:
+        if not args.no_merge:
             print("Notice: merge not recorded for the task head.")
     summary = args.message + "\n\nRetro: " + args.retro
     if not args.partial and (not head or merge_evidence.get("head") != head):
-        summary += f"\n\nMerge: {args.no_merge or 'merge not recorded'}"
+        summary += "\n\nMerge: " + (f"not merged: {args.no_merge}" if args.no_merge else 'merge not recorded')
     if exception_path.is_file():
         try:
             exception_reason = json.loads(exception_path.read_text()).get("reason", "unspecified override")
@@ -2735,7 +2733,13 @@ def cancel(args):
     except (OSError, json.JSONDecodeError):
         lane_run = {}
     if lane_run.get("state") == "running" and pid_alive(lane_run.get("pid")):
-        os.killpg(int(lane_run["pid"]), signal.SIGKILL)
+        try:
+            os.killpg(int(lane_run["pid"]), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            lane_run.update(state="interrupted", ended_at=utc_now())
+            atomic_json(lane_path, lane_run)
+            print(f"Lane process group {lane_run['pid']} already stopped; kept {task.path}.")
+            return 0
         lane_run.update(state="cancelled", ended_at=utc_now())
         atomic_json(lane_path, lane_run)
         print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
@@ -2816,6 +2820,15 @@ def repair(args):
         names.update(p.name for p in (HOME / ".local/state/task" / repo.name).glob("*") if p.is_dir())
         for name in sorted(names):
             task = Task(repo, name)
+            lane_path = task.path / ".work/lane.json"
+            try:
+                lane_run = json.loads(lane_path.read_text())
+            except (OSError, ValueError):
+                lane_run = {}
+            if lane_run.get("state") == "running" and not pid_alive(lane_run.get("pid")):
+                lane_run.update(state="interrupted", ended_at=utc_now())
+                atomic_json(lane_path, lane_run)
+                print(f"Repaired interrupted lane: {repo.name}/{task.id}")
             lock = task_state(task) / "run.lock"
             had_lock = lock.exists()
             result = task_lock_status(task, repair=True)
