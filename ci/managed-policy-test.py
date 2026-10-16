@@ -294,7 +294,7 @@ with tempfile.TemporaryDirectory() as temp:
     fixtures = [prefix + "testvalue" for prefix in (
         "ghp_", "ghs_", "ghu_", "ghr_", "github_pat_", "gho_", "sk-", "sk-or-",
         "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxe-", "xoxc-", "xoxd-", "AKIA")]
-    fixtures += ["Bearer testvalue", "a" * 32, "Ab9+" * 10 + "=="]
+    fixtures += ["Bearer testvalue", "a" * 32, "0123456789abcdef" * 2, "Ab9+" * 10 + "=="]
     for path in ("/home/agent/dev_workspace/bootstrap/system/agent-policy/pre_tool_use.py",
                  "relative/" + "a" * 40):
         assert policy.audit_text(path) == path
@@ -309,15 +309,20 @@ with tempfile.TemporaryDirectory() as temp:
             policy.log_denial(secret_event, policy.Denial("test.redaction", fixture), "codex")
         redacted = json.loads(log.read_text().splitlines()[-1])
         for field in ("reason", "command"):
+            assert fixture not in redacted[field], (fixture, field)
             assert "testvalue" not in redacted[field], (fixture, field)
             assert "[REDACTED]" in redacted[field], (fixture, field)
     for command in (r"rg --foo C:\Users\x pat", r"grep --weird X \\srv\share"):
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     for command in (r"rg '\d+' src", r"grep -e '\bx\b' f"):
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
-    for switches in ("-rn", "-ni", "-Ei", "-rne", "'-rneC:\\'", "-rnm 2", "-rnm2"):
+    for switches in ("-rn", "-ni", "-Ei", "-rne", "-rnm 2", "-rnm2"):
         command = "grep " + switches + r" 'C:\\' src"
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    command = r"grep -rneC:\\ src"
+    assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    command = r"grep '-rneC:\' 'C:\\' src"
+    assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     for switches in ("-rn", "-ni", "-Ei", "-rne", "-rnefoo", "-rnf patterns", "-rnfpatterns", "-rnm2"):
         for path in (r"'C:\Users\x'", r"'\\srv\share'"):
             command = "grep " + switches + " needle " + path
