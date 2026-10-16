@@ -1258,6 +1258,10 @@ class TaskTool(unittest.TestCase):
                          {"vendor": "claude", "model": "haiku"})
         self.assertTrue(prompt.read_text().endswith(
             "Return exactly this final fenced block, with plain text only inside it:\n"
+            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
+            "or the change breaks something that worked. Everything else is a non-blocking "
+            "note: list it under 'Notes', never as a reason to FAIL.\n"
+            "Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.\n"
             "```review\nVerdict: PASS|FAIL\nCommit: <full sha>\n"
             "#1 pass|fail|unclear: <one line of evidence>\n"
             "#2 pass|fail|unclear: <one line of evidence>\n```\n"
