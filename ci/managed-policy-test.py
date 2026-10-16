@@ -273,7 +273,7 @@ with tempfile.TemporaryDirectory() as temp:
     assert entry["category"] == "sudo" and entry["vendor"] == "claude"
     assert entry["rule_id"] == "command.unsafe_environment"
     assert "ghp_x" not in log.read_text()
-    assert entry["reason"] and entry["command"].endswith("[REDACTED]")
+    assert entry["reason"] and "[REDACTED]" in entry["command"]
     assert len(entry["reason"]) <= 200 and len(entry["command"]) <= 200
     assert policy.first_command_category("GITHUB_TOKEN=ghp_x sudo ls") == "sudo"
     assert policy.event_vendor({"hook_event_name": "PreToolUse", "codex_event": "PreToolUse"}) == "unknown"
@@ -290,6 +290,27 @@ with tempfile.TemporaryDirectory() as temp:
     codex_log = [json.loads(line) for line in log.read_text().splitlines()][-1]
     assert codex_log["vendor"] == "codex"
     assert codex_log["rule_id"] == "host.command_boundary"
+    # Synthetic fixtures only: every requested secret shape in both audit fields.
+    fixtures = [prefix + "testvalue" for prefix in (
+        "ghp_", "github_pat_", "gho_", "sk-", "sk-or-", "xoxb-", "xoxa-", "xoxp-", "AKIA")]
+    fixtures += ["Bearer testvalue", "a" * 32, "Ab9+/" * 8]
+    fixtures += [name + separator + "testvalue" for name in (
+        "token", "KEY", "Secret", "password", "passwd") for separator in ("=", ":", ": ")]
+    fixtures += ["--" + name + " testvalue" for name in (
+        "token", "api-key", "secret", "password", "passwd")]
+    for fixture in fixtures:
+        secret_event = {"tool_name": "Bash", "cwd": temp,
+                        "tool_input": {"command": "sudo true " + fixture}}
+        with patch.object(policy.Path, "home", return_value=home):
+            policy.log_denial(secret_event, policy.Denial("test.redaction", fixture), "codex")
+        redacted = json.loads(log.read_text().splitlines()[-1])
+        for field in ("reason", "command"):
+            assert "testvalue" not in redacted[field], (fixture, field)
+            assert "[REDACTED]" in redacted[field], (fixture, field)
+    for command in (r"rg --foo C:\Users\x pat", r"grep --weird X \\srv\share"):
+        assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
+    for command in (r"rg '\d+' src", r"grep -e '\bx\b' f"):
+        assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
     broken_home = Path(temp) / "broken-home"
     broken_home.mkdir()
     (broken_home / ".local").write_text("not a directory")
@@ -341,7 +362,8 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
         "Original reason." + policy.DENIAL_SUFFIX)
     for text in ("token=synthetic", "key=synthetic", "password=synthetic", "Authorization: synthetic"):
         assert "synthetic" not in policy.audit_text(text)
-    assert len(policy.audit_text("x" * 300)) == 200
+    assert policy.audit_text("x" * 300) == "[REDACTED]"
+    assert len(policy.audit_text("word " * 100)) == 200
     assert policy.command_rule("Inline shell and interpreter programs are blocked.") == "shell.interpreter"
     assert policy.command_rule(policy.MIXED_CHAIN_MESSAGE) == "command.mixed_chain"
     for path in ("~unknownuser/file", str(loop_path)):

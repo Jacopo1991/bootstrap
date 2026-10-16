@@ -1092,6 +1092,11 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
                      "--field-separator", "--assign"}
     if executable in AWK_NAMES:
         value_options |= {"-F", "-v"}
+    switches = {"-i", "--ignore-case", "-v", "--invert-match", "-n",
+                "--line-number", "-l", "--files-with-matches", "-q", "--quiet",
+                "-r", "-R", "--recursive", "-E", "-F", "-P", "-w", "-x",
+                "-c", "-o", "-H", "-h", "--hidden", "--no-heading",
+                "--fixed-strings", "--extended-regexp", "--perl-regexp"}
     while index < len(tokens):
         token = tokens[index]
         if options and token == "--":
@@ -1109,7 +1114,8 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
                 has_expression = True
             index += 1
         elif options and token.startswith("-"):
-            pass
+            if token not in switches:
+                return set()  # Unknown option arity cannot identify an expression.
         else:
             if not has_expression:
                 expressions.add(index)
@@ -1656,8 +1662,16 @@ def event_vendor(event: dict, vendor: str | None = None) -> str:
 
 
 def audit_text(value: str) -> str:
-    return re.sub(r"(?i)((?:token|key|password)=|Authorization:).*", r"\1[REDACTED]",
-                  value, flags=re.DOTALL)[:200]
+    # Redact before truncating: a token may cross the audit length boundary.
+    value = re.sub(
+        r"(?i)(?:ghp_|github_pat_|gho_|sk-or-|sk-|xox[bap]-)[A-Za-z0-9_-]+"
+        r"|AKIA[A-Z0-9]+|Bearer\s+[^\s\"']+"
+        r"|[A-Za-z0-9+/=_-]{32,}", "[REDACTED]", value)
+    value = re.sub(
+        r"(?i)((?:token|key|secret|password|passwd|authorization)\b\s*[=:]\s*"
+        r"|--[\w-]*(?:token|key|secret|password|passwd)\b\s+)"
+        r"(?:\"[^\"]*\"|'[^']*'|[^\s]+)", r"\1[REDACTED]", value)
+    return value[:200]
 
 
 def log_denial(event: dict, denial: str | None = None, vendor: str | None = None):
