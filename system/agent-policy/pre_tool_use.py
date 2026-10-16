@@ -24,11 +24,10 @@ HOST_OPS = {"sudo", "su", "systemctl", "service", "apt", "apt-get", "dpkg",
             "mount", "umount", "shutdown", "reboot", "modprobe", "useradd",
             "adduser", "usermod", "passwd", "visudo"}
 # Inspect paths in argv, never a substring in an entire shell/body string.
-# Unquoted Windows backslashes can be consumed by shlex, so drive prefixes
-# remain blocked even after that normalization.
+# Inspect before shell escape removal as well, so unquoted paths stay visible.
 WINDOWS_PATH = re.compile(r"(?i)(?:(?<![A-Za-z0-9_])[A-Z]:[\\/](?!/)|"
-                          r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:|/mnt/[a-z](?:/|$)|"
-                          r"(?:^|=)(?:-[A-Za-z]+)?\\(?:\\|[A-Za-z0-9_-]))")
+                          r"(?:^|=)(?:-[A-Za-z]+)?[A-Z]:[\\/]|/mnt/[a-z](?:/|$)|"
+                          r"(?:^|=)(?:-[A-Za-z]+)?\\\\[^\\/\s]+\\[^\\/\s]+)")
 HOST_EXECUTABLE = re.compile(r"(?i)\.(?:exe|com)$")
 WRITERS = {"touch", "mkdir", "rmdir", "rm", "cp", "mv", "install", "ln", "tee",
            "truncate", "dd", "chmod", "chown"}
@@ -331,9 +330,12 @@ def inside(path_text: str, cwd: str, root: Path) -> bool:
         return False
 
 
+DENIAL_SUFFIX = " Rewrite the command; this is a policy limit, not missing access."
+
+
 def deny(message: str) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-            "permissionDecision": "deny", "permissionDecisionReason": message}}
+            "permissionDecision": "deny", "permissionDecisionReason": message + DENIAL_SUFFIX}}
 
 
 class Denial(str):
@@ -782,10 +784,13 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     if subcommand == "config" and not git_config_read_only(arguments):
         return "Agent Git configuration writes are blocked; only --get/--list reads are permitted."
     if cross_repo and not sibling_fetch:
+        if any(option_matches(arg, option) for arg in arguments
+               for option in ("--ext-diff", "--textconv")):
+            return "External diff and textconv are blocked across repositories."
         if any(arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
                and not arg[1:].isdigit() for arg in arguments):
             return "Spell cross-repository short options separately; aggregation is blocked."
-        forbidden = ("--ext-diff", "--textconv", "--no-index", "--open-files-in-pager")
+        forbidden = ("--no-index", "--open-files-in-pager")
         external_files = {
             "grep": ("--file",),
             "ls-files": ("--exclude-from",),
@@ -1074,13 +1079,52 @@ def gh_prose_positions(tokens: list[str]) -> set[int]:
     return prose
 
 
+def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
+    """Recognize explicit expressions and the first positional expression."""
+    if executable not in {"rg", "grep", "sed"} | AWK_NAMES:
+        return set()
+    expressions: set[int] = set()
+    has_expression = False
+    options = True
+    index = 1
+    value_options = {"-f", "--file", "-g", "--glob", "--iglob", "-t", "--type",
+                     "-T", "--type-not", "-A", "-B", "-C", "-m", "--max-count",
+                     "--field-separator", "--assign"}
+    if executable in AWK_NAMES:
+        value_options |= {"-F", "-v"}
+    while index < len(tokens):
+        token = tokens[index]
+        if options and token == "--":
+            options = False
+        elif options and token in {"-e", "--regexp", "--expression"}:
+            if index + 1 < len(tokens):
+                expressions.add(index + 1)
+            has_expression = True
+            index += 1
+        elif options and token.startswith(("--regexp=", "--expression=", "-e")):
+            expressions.add(index)
+            has_expression = True
+        elif options and token in value_options:
+            if token in {"-f", "--file"}:
+                has_expression = True
+            index += 1
+        elif options and token.startswith("-"):
+            pass
+        else:
+            if not has_expression:
+                expressions.add(index)
+            break
+        index += 1
+    return expressions
+
+
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
     """Block host execution and real Windows path arguments, not gh prose."""
     if (SHELL_EXPANSION.search(tokens[0]) or executable in HOST_NAMES | HOST_OPS
             or HOST_EXECUTABLE.search(tokens[0])
             or WINDOWS_PATH.search(tokens[0])):
         return "Host, Windows, and operating-system commands are blocked."
-    prose = gh_prose_positions(tokens) if executable == "gh" else set()
+    prose = gh_prose_positions(tokens) if executable == "gh" else regex_prose_positions(tokens, executable)
     if any(WINDOWS_PATH.search(token) for index, token in enumerate(tokens[1:], 1)
            if index not in prose):
         return "Windows path arguments are blocked."
@@ -1389,6 +1433,15 @@ def evaluate_command(command: str, cwd: str, root: Path,
             lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
             lexer.whitespace_split = True
             lexer.commenters = ""
+            lexer.escape = ""
+            raw_tokens = unwrap_command(list(lexer))
+            if isinstance(raw_tokens, list) and raw_tokens:
+                reason = host_command_reason(raw_tokens, Path(raw_tokens[0]).name.lower())
+                if reason:
+                    return Denial("host.command_boundary", reason)
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
             all_tokens.append(list(lexer))
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
@@ -1661,7 +1714,7 @@ def main(argv=None) -> int:
         log_denial(event, Denial("permission.policy", reason) if permission_request and not isinstance(reason, Denial) else reason,
                    options.vendor)
         response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                    "decision": {"behavior": "deny", "message": reason}}}
+                    "decision": {"behavior": "deny", "message": reason + DENIAL_SUFFIX}}}
                     if permission_request else deny(reason))
         print(json.dumps(response, separators=(",", ":")))
     return 0

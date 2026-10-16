@@ -341,6 +341,11 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C.. -Csibling status"), roots) is None
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
+    for subcommand in ("log", "show", "diff", "blame"):
+        assert policy.evaluate(event(f"git -C ../sibling {subcommand}"), roots) is None
+        for flag in ("--ext-diff", "--textconv"):
+            reason = policy.evaluate(event(f"git -C ../sibling {subcommand} {flag}"), roots)
+            assert reason == "External diff and textconv are blocked across repositories."
     for command in (
         f"git -C {outsider} status", f"git -C {link} status",
         "git -C nested -C ../../sibling add file",
@@ -752,6 +757,14 @@ with tempfile.TemporaryDirectory() as temp:
             "cat 'C:\\Windows\\file.md'", "cat /mnt/c/file.md",
             "cat '\\\\host\\share\\file.md'", "cp safe.txt 'C:\\Windows\\file.md'",
             "env fixture.com", "command fixture.exe", "bash -c 'fixture.com'"):
+        assert policy.evaluate(event(command), roots) is not None, command
+    for command in (r"rg '\d+\.\d+' src", r"grep -E '\bfoo\b'",
+                    r"sed -n '/\bfoo\b/p' src", r"awk '/\bfoo\b/' src",
+                    r"rg -e 'C:\Users\x' src", r"grep -E 'C:\Users\x' src",
+                    r"rg -F '\\srv\share' src", r"printf '\bfoo\b'"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in (r"cat 'C:\Users\x'", r"cat '\\srv\share'",
+                    r"rg foo 'C:\Users\x'", r"grep -e foo '\\srv\share'"):
         assert policy.evaluate(event(command), roots) is not None, command
     # A Linux data filename or prose argument is not a Windows executable.
     for command in ("cat fixture.com", "cat fixture.exe", "printf 'wsl.exe'",

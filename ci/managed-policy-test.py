@@ -332,7 +332,13 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
                 patch.object(policy, "log_denial") as logged:
             assert policy.main([]) == 0
             assert "policy hook error: RuntimeError: test failure" in output.getvalue()
+            response = json.loads(output.getvalue())["hookSpecificOutput"]
+            message = (response["decision"]["message"] if hook_event == "PermissionRequest"
+                       else response["permissionDecisionReason"])
+            assert message == "policy hook error: RuntimeError: test failure" + policy.DENIAL_SUFFIX
             assert logged.call_args.args[1].rule_id == "hook.error"
+    assert policy.deny("Original reason.")["hookSpecificOutput"]["permissionDecisionReason"] == (
+        "Original reason." + policy.DENIAL_SUFFIX)
     for text in ("token=synthetic", "key=synthetic", "password=synthetic", "Authorization: synthetic"):
         assert "synthetic" not in policy.audit_text(text)
     assert len(policy.audit_text("x" * 300)) == 200
