@@ -577,6 +577,16 @@ def signal_task_run(run_id, signum):
 def task_lock_status(task: Task, repair=False):
     lock = task_state(task) / "run.lock"
     if not lock.exists():
+        if repair:
+            run_path = run_record_path(task)
+            try:
+                run = json.loads(run_path.read_text())
+            except (OSError, ValueError):
+                return ""
+            if run.get("state") in {"running", "foreground", "starting"} and not pid_alive(run.get("pid")):
+                run.update(state="interrupted", ended_at=utc_now())
+                atomic_json(run_path, run)
+                return "interrupted"
         return ""
     try:
         lock_record = json.loads(lock.read_text())
@@ -710,6 +720,12 @@ def refresh_context(task):
         for decision in (task.kb / "backlog/decisions").glob("*.md"):
             if decision.name in text or re.search(r"\b" + re.escape(decision.stem.split(" - ")[0]) + r"\b", text, re.I):
                 sources.append(decision)
+    expected = {source.relative_to(task.kb) for source in sources if source.is_file()}
+    for target in destination.rglob("*"):
+        if target.is_file() and target.relative_to(destination) not in expected:
+            target.chmod(0o644)
+            target.unlink()
+            print(f"Context source removed: {target.relative_to(destination)}")
     for source in sources:
         if not source.is_file():
             continue
@@ -782,7 +798,9 @@ def lane(args):
     code = 1
     timed_out = False
     try:
-        with prompt.open("rb") as source:
+        with tempfile.TemporaryFile() as source:
+            source.write(b"Read the pinned task context in .work/context/ before working.\n\n" + prompt.read_bytes())
+            source.seek(0)
             with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output:
                 child = subprocess.Popen(command, cwd=path, env=agent_environment(), stdin=source,
                                          stdout=subprocess.PIPE if output else None)
@@ -1720,7 +1738,9 @@ def review(args):
                 prompt.append(f"#{item['number']} {item['text']}")
         else:
             prompt.append("Criteria: none; judge the stated request above against the diff.")
-        prompt.append(f"Diff range: {record['base_sha']}...{head}")
+        review_base = sha(task.repo, f"origin/{default_branch(task.repo)}" if has_origin(task.repo)
+                          else default_branch(task.repo))
+        prompt.append(f"Diff range: {review_base}...{head}")
         prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
                       "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
@@ -1967,9 +1987,10 @@ def merge(args):
             raise
         atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
                                                    "missing_gate": True,
-                                                   "waived": [{"step": "review", "reason": args.override,
-                                                               "detail": str(error)}]})
-        print(f"exception: review waived: {args.override} ({error})")
+                                                   "waived": [{"step": item, "reason": args.override}
+                                                              for item in str(error).split("missing: ", 1)[-1].split(". Use --override", 1)[0].split("; ")]})
+        for item in json.loads((archive / "exception.json").read_text())["waived"]:
+            print(f"exception: {item['step']} waived: {args.override}")
     task_event(task, "merge")
     if is_ancestor(repo, lane_head, base):
         commit = base
@@ -2294,7 +2315,8 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         current = task.file
         if args.partial or current and re.search(r"(?m)^status: [\"']?Done", current.read_text()):
             return 0
-        existing = None
+        branch += "-final"
+        existing = close_pr(repo, branch)
     if existing and str(existing.get("state", "")).upper() != "OPEN":
         raise Stop(f"Close PR #{existing.get('number')} is {existing.get('state')}; branch {branch} is preserved for inspection.")
     if existing and (existing.get("headRefName") != branch or existing.get("baseRefName") != default):
@@ -2757,12 +2779,15 @@ def repair(args):
         p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     for repo in repos:
         prune_stale_gate_worktrees(repo)
-        for path in (repo / ".worktrees").glob("*"):
-            if not path.name.startswith(".") and real_worktree(repo, path):
-                task = Task(repo, path.name)
-                if task_lock_status(task) == "interrupted":
-                    task_lock_status(task, repair=True)
-                    print(f"Repaired interrupted run lock: {repo.name}/{task.id}")
+        names = {p.name for p in (repo / ".worktrees").glob("*") if not p.name.startswith(".")}
+        names.update(p.name for p in (HOME / ".local/state/task" / repo.name).glob("*") if p.is_dir())
+        for name in sorted(names):
+            task = Task(repo, name)
+            lock = task_state(task) / "run.lock"
+            had_lock = lock.exists()
+            result = task_lock_status(task, repair=True)
+            if result == "interrupted" or had_lock and not lock.exists():
+                print(f"Repaired interrupted run lock: {repo.name}/{task.id}")
     return 0
 
 
@@ -2918,6 +2943,9 @@ def main(argv=None):
                 ACTIVE_FOREGROUND_TASK = None
         finish_detached(result)
         return result
+    except SystemExit as stop:
+        finish_detached(stop.code or 0)
+        raise
     except Stop as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
