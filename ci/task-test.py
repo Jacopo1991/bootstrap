@@ -1260,7 +1260,10 @@ class TaskTool(unittest.TestCase):
             "Return exactly this final fenced block, with plain text only inside it:\n"
             "```review\nVerdict: PASS|FAIL\nCommit: <full sha>\n"
             "#1 pass|fail|unclear: <one line of evidence>\n"
-            "#2 pass|fail|unclear: <one line of evidence>\n```\nThen list findings.\n"))
+            "#2 pass|fail|unclear: <one line of evidence>\n```\n"
+            "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
+            "Blocking finding must identify its criterion or the breakage. Put all other "
+            "observations under Notes.\n"))
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
