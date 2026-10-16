@@ -292,8 +292,12 @@ with tempfile.TemporaryDirectory() as temp:
     assert codex_log["rule_id"] == "host.command_boundary"
     # Synthetic fixtures only: every requested secret shape in both audit fields.
     fixtures = [prefix + "testvalue" for prefix in (
-        "ghp_", "github_pat_", "gho_", "sk-", "sk-or-", "xoxb-", "xoxa-", "xoxp-", "AKIA")]
-    fixtures += ["Bearer testvalue", "a" * 32, "Ab9+/" * 8]
+        "ghp_", "ghs_", "ghu_", "ghr_", "github_pat_", "gho_", "sk-", "sk-or-",
+        "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxe-", "xoxc-", "xoxd-", "AKIA")]
+    fixtures += ["Bearer testvalue", "a" * 32, "Ab9+" * 10 + "=="]
+    for path in ("/home/agent/dev_workspace/bootstrap/system/agent-policy/pre_tool_use.py",
+                 "relative/" + "a" * 40):
+        assert policy.audit_text(path) == path
     fixtures += [name + separator + "testvalue" for name in (
         "token", "KEY", "Secret", "password", "passwd") for separator in ("=", ":", ": ")]
     fixtures += ["--" + name + " testvalue" for name in (
@@ -311,6 +315,13 @@ with tempfile.TemporaryDirectory() as temp:
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     for command in (r"rg '\d+' src", r"grep -e '\bx\b' f"):
         assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    for switches in ("-rn", "-ni", "-Ei", "-rne", "'-rneC:\\'", "-rnm 2", "-rnm2"):
+        command = "grep " + switches + r" 'C:\\' src"
+        assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)) is None, command
+    for switches in ("-rn", "-ni", "-Ei", "-rne", "-rnefoo", "-rnf patterns", "-rnfpatterns", "-rnm2"):
+        for path in (r"'C:\Users\x'", r"'\\srv\share'"):
+            command = "grep " + switches + " needle " + path
+            assert policy.evaluate_command(command, temp, Path(temp), (Path(temp),)), command
     broken_home = Path(temp) / "broken-home"
     broken_home.mkdir()
     (broken_home / ".local").write_text("not a directory")
@@ -366,6 +377,17 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
     assert len(policy.audit_text("word " * 100)) == 200
     assert policy.command_rule("Inline shell and interpreter programs are blocked.") == "shell.interpreter"
     assert policy.command_rule(policy.MIXED_CHAIN_MESSAGE) == "command.mixed_chain"
+    assert policy.command_rule("An unmapped reason " * 20) == "command.other"
+    for failure, rule in ((json.JSONDecodeError("bad", "", 0), "hook.input"),
+                          (ValueError(), "hook.input"), (OSError("read failed"), "hook.error"),
+                          (RuntimeError("parse failed"), "hook.error")):
+        with patch.object(policy.json, "load", side_effect=failure), \
+                patch.object(policy.sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(policy, "log_denial") as logged:
+            assert policy.main(["--vendor", "codex"]) == 0
+            assert json.loads(output.getvalue())["hookSpecificOutput"]["permissionDecision"] == "deny"
+            assert logged.call_args.args[1].rule_id == rule
+            assert logged.call_args.args[2] == "codex"
     for path in ("~unknownuser/file", str(loop_path)):
         event = {"tool_name": "Bash", "cwd": str(ROOT), "tool_input": {"command": f"touch {path}"}}
         result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,

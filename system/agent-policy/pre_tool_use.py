@@ -274,15 +274,6 @@ CROSS_REPO_HINT = ("If the task needs another repository's files, ask the PM for
                    "this repository's .work/ instead.")
 
 
-def cross_repo_read_message(subcommand: str, missing: list[str]) -> str:
-    """Name every missing flag at once, with the full command, so one retry is enough."""
-    tail = {"log": " --no-textconv --no-ext-diff", "show": " --no-textconv --no-ext-diff",
-            "diff": " --no-textconv --no-ext-diff", "blame": " --no-textconv"}.get(subcommand, "")
-    return (f"Reading another repository needs all of these flags, missing: {' '.join(missing)}. "
-            f"Use: `git --no-pager --no-optional-locks -C <repo> {subcommand}{tail} ...`. "
-            + CROSS_REPO_HINT)
-
-
 def same_repository(first: Path, second: Path) -> bool:
     """True when both checkouts share one Git common directory (main checkout and its worktrees)."""
     def common(path: Path) -> Path | None:
@@ -396,6 +387,10 @@ def git_target(tokens: list[str], cwd: str) -> tuple[Path, str, list[str], set[s
         else:
             return target, token, tokens[index + 1:], selectors
         # Git resolves each relative -C against the preceding effective directory.
+        for prefix in ("~", "$HOME", "${HOME}"):
+            if value == prefix or value.startswith(prefix + "/"):
+                value = str(Path.home()) + value[len(prefix):]
+                break
         if SHELL_EXPANSION.search(value):
             return None
         if value:
@@ -1115,7 +1110,22 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
             index += 1
         elif options and token.startswith("-"):
             if token not in switches:
-                return set()  # Unknown option arity cannot identify an expression.
+                if token.startswith("--"):
+                    return set()
+                for offset, letter in enumerate(token[1:], 1):
+                    option = "-" + letter
+                    if option == "-e" or option in value_options:
+                        if option in {"-e", "-f"}:
+                            has_expression = True
+                        if offset == len(token) - 1:
+                            index += 1
+                            if option == "-e" and index < len(tokens):
+                                expressions.add(index)
+                        elif option == "-e":
+                            expressions.add(index)
+                        break
+                    if option not in switches:
+                        return set()  # Unknown arity cannot identify an expression.
         else:
             if not has_expression:
                 expressions.add(index)
@@ -1227,7 +1237,7 @@ def command_rule(reason: str) -> str:
               "xargs, setsid"), "command.wrapper")):
         if any(word in reason for word in words):
             return rule
-    return "command." + re.sub(r"[^a-z0-9]+", "_", reason.lower()).strip("_")[:80]
+    return "command.other"
 
 
 def split_command(command: str) -> tuple[list[str], list[str]] | str:
@@ -1664,9 +1674,11 @@ def event_vendor(event: dict, vendor: str | None = None) -> str:
 def audit_text(value: str) -> str:
     # Redact before truncating: a token may cross the audit length boundary.
     value = re.sub(
-        r"(?i)(?:ghp_|github_pat_|gho_|sk-or-|sk-|xox[bap]-)[A-Za-z0-9_-]+"
+        r"(?i)(?:ghp_|ghs_|ghu_|ghr_|github_pat_|gho_|sk-or-|sk-|xox[a-z]-)[A-Za-z0-9_-]+"
         r"|AKIA[A-Z0-9]+|Bearer\s+[^\s\"']+"
-        r"|[A-Za-z0-9+/=_-]{32,}", "[REDACTED]", value)
+        , "[REDACTED]", value)
+    value = re.sub(r"[A-Za-z0-9+/=_-]{32,}",
+                   lambda match: match[0] if "/" in match[0] else "[REDACTED]", value)
     value = re.sub(
         r"(?i)((?:token|key|secret|password|passwd|authorization)\b\s*[=:]\s*"
         r"|--[\w-]*(?:token|key|secret|password|passwd)\b\s+)"
@@ -1716,8 +1728,12 @@ def main(argv=None) -> int:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
             raise ValueError
-    except (json.JSONDecodeError, ValueError):
-        print(json.dumps(deny("Hook input invalid; blocked by policy."), separators=(",", ":")))
+    except Exception as error:
+        reason = (Denial("hook.input", "Hook input invalid; blocked by policy.")
+                  if isinstance(error, (json.JSONDecodeError, ValueError)) else
+                  Denial("hook.error", f"policy hook error: {type(error).__name__}: {audit_text(str(error))}"))
+        log_denial({}, reason, options.vendor)
+        print(json.dumps(deny(reason), separators=(",", ":")))
         return 0
     permission_request = event.get("hook_event_name") == "PermissionRequest"
     try:

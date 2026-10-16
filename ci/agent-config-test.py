@@ -345,6 +345,9 @@ with tempfile.TemporaryDirectory() as temp:
     assert policy.evaluate(event("git --no-pager --no-optional-locks -C ../sibling log --no-textconv --no-ext-diff"), roots) is None
     for subcommand in ("log", "show", "diff", "blame"):
         assert policy.evaluate(event(f"git -C ../sibling {subcommand}"), roots) is None
+        with patch.object(policy.Path, "home", return_value=sibling.parent):
+            for target in ("~/sibling", "$HOME/sibling", "${HOME}/sibling"):
+                assert policy.evaluate(event(f"git -C {target} {subcommand}"), roots) is None, target
         for flag in ("--ext-diff", "--textconv"):
             reason = policy.evaluate(event(f"git -C ../sibling {subcommand} {flag}"), roots)
             assert reason == "External diff and textconv are blocked across repositories."
