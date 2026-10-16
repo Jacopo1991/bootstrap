@@ -922,16 +922,64 @@ class TaskTool(unittest.TestCase):
         self.assertIn("not available for the claude builder", out)
         self.assertFalse((wt / ".work/lane.json").exists())
 
-    def test_lane_refuses_missing_prompt_invalid_model_and_builder_mismatch(self):
+    def test_lane_refuses_missing_prompt_and_invalid_model(self):
         self.stub_models()
         wt, _ = self.started()
         self.assertIn("Missing lane prompt", self.raw_task("lane", "proj", "5", code=1))
         self.assertFalse((wt / ".work/lane.json").exists())
         self.assertFalse((wt / ".work/lane.log").exists())
         (wt / ".work/prompt.md").write_text("task\n")
-        self.assertIn("invalid choice", self.raw_task("lane", "proj", "5", "--model", "other", code=2))
-        self.assertIn("must match", self.raw_task("lane", "proj", "5", "--builder", "claude", code=1))
+        self.assertIn("choose one of", self.raw_task("lane", "proj", "5", "--model", "other", code=1))
         self.assertFalse((wt / ".work/model-call.json").exists())
+
+    def test_lane_full_model_ids_and_builder_override_review_route(self):
+        import json
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / ".work/prompt.md").write_text("task\n")
+        for model, cli in TASK_MODULE.MODELS["claude"].items():
+            out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model)
+            record = self.wait_for_lane(wt)
+            self.assertEqual((record["model"], record["cli_model"]), (model, cli))
+            call = json.loads((wt / ".work/model-call.json").read_text())
+            self.assertEqual(call["args"][:3], ["-p", "--model", cli])
+        self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "claude")
+        self.stub_reviewers()
+        head = self.git(wt, "rev-parse", "HEAD")
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n```\n"
+        self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual(json.loads((self.state() / "review-routing.json").read_text())["vendor"], "codex")
+
+    def test_start_seeds_files_directories_existing_worktree_and_refuses_escape(self):
+        source = self.repo / ".work"
+        source.mkdir(exist_ok=True)
+        (source / "pinned").mkdir()
+        (source / "pinned/code").write_text("original")
+        (source / "single").write_text("file")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "pinned", "--seed", "single")
+        wt = self.repo / ".worktrees/t5"
+        self.assertEqual((wt / ".work/pinned/code").read_text(), "original")
+        (source / "single").write_text("changed")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "single")
+        self.assertEqual((wt / ".work/single").read_text(), "file")
+        (source / "escape").symlink_to(self.home)
+        for name in ("..", "../outside", str(self.home), "escape"):
+            self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", name, code=1)
+
+    def test_runner_check_models_ids_and_blocked_constructs(self):
+        runner = self.home / "runner.md"
+        runner.write_text("`task start proj 5 --builder claude`\n"
+                          "`task lane proj 5 --model claude-fable-5-1`\n"
+                          "task start proj plain --builder codex\n"
+                          "task lane proj plain --model gpt-6.1-sol\n")
+        self.assertIn("runner file OK (2 tasks)", self.raw_task("runner-check", "proj", str(runner)))
+        for line in ("task start proj 999 --builder codex", "task start proj ../bad --builder codex",
+                     "task lane proj plain --builder codex --model sonnet",
+                     "task lane proj plain --builder claude --model unknown",
+                     "cat <<EOF", "cp -a source target", "cp -r source target",
+                     "nohup task check", "setsid task check", "xargs task", "sudo ls"):
+            runner.write_text(line + "\n")
+            self.assertIn("line 1:", self.raw_task("runner-check", "proj", str(runner), code=1))
 
     def test_agent_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
         blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}

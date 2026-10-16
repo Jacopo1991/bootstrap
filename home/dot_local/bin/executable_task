@@ -4,8 +4,12 @@
 The sandbox protects private task state from lanes running as the same Unix user.
 Write capability there determines trust; vendor environment markers do not.
 
-  task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>]
+  task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
+  task runner-check <repo> <file>
   task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|sonnet|opus|fable] [--builder codex|claude]
+    Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
+    --builder overrides the pinned builder and updates subsequent review routing.
+    --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach]
   task review <repo> <id> [--request <file>] [--run | --record <file>] [--reviewer <vendor> <model>]
@@ -648,19 +652,26 @@ def agent_environment():
             if name not in GIT_OVERRIDE_ENV and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
 
 
+MODELS = {"codex": {"gpt-6-luna": "gpt-6-luna", "gpt-6.1-sol": "gpt-6.1-sol"},
+          "claude": {"sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
+                     "opus": "opus", "claude-opus-5-5": "opus",
+                     "fable": "fable", "claude-fable-5-1": "fable"}}
+
+
+def resolve_model(builder, model):
+    if model not in MODELS[builder]:
+        raise Stop(f"Model {model!r} is not available for the {builder} builder; "
+                   f"choose one of: {', '.join(MODELS[builder])}.")
+    return MODELS[builder][model]
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
     path = task.worktree()
     record = load_record(task)
     builder = args.builder or record["builder"]
-    if builder != record["builder"]:
-        raise Stop("--builder must match the pinned task builder; ask the PM to refresh the task.")
-    models = {"codex": ("gpt-6-luna", "gpt-6.1-sol"),
-              "claude": ("sonnet", "opus", "fable")}
     model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
-    if model not in models[builder]:
-        raise Stop(f"Model {model!r} is not available for the {builder} builder; "
-                   f"choose one of: {', '.join(models[builder])}.")
+    cli_model = resolve_model(builder, model)
     work = path / ".work"
     prompt = work / "prompt.md"
     if not prompt.is_file():
@@ -669,9 +680,9 @@ def lane(args):
     if not shutil.which(binary):
         raise Stop(f"{binary} is not installed or available on PATH.")
     final = work / "final.md"
-    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", model,
+    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
                 "--output-last-message", str(final), "-"] if builder == "codex" else
-               ["claude", "-p", "--model", model, "--effort", "high",
+               ["claude", "-p", "--model", cli_model, "--effort", "high",
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
@@ -697,8 +708,13 @@ def lane(args):
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                                      "builder": builder, "model": model,
+                                      "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
+            if builder != record["builder"]:
+                print(f"Updating task builder from {record['builder']} to {builder}.")
+                record["builder"] = builder
+                record["revision"] = record_revision(record)
+                atomic_json(task_state(task) / "task.json", record)
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
                   f"see {work / 'lane.log'} and {final}; track it with `task status`.")
             return 0
@@ -918,6 +934,72 @@ def advisory_pre_commit_environment(path: Path, child_env):
 
 # --- commands ----------------------------------------------------------------------------------
 
+def seed_worktree(repo, path, names):
+    source_root = repo / ".work"
+    destination_root = path / ".work"
+    if source_root.is_symlink() or destination_root.is_symlink():
+        raise Stop("Seed .work directories must not be symlinks.")
+    sources = []
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or name in {".", ".."}:
+            raise Stop(f"Invalid seed name: {name!r}.")
+        source = source_root / name
+        if not source.exists():
+            raise Stop(f"Seed does not exist: {source}.")
+        for entry in [source] + (list(source.rglob("*")) if source.is_dir() else []):
+            if not entry.resolve().is_relative_to(source_root.resolve()):
+                raise Stop(f"Seed symlink escapes .work: {entry}.")
+        sources.append(source)
+    destination_root.mkdir(parents=True, exist_ok=True)
+    for source in sources:
+        destination = destination_root / source.name
+        if destination.exists() or destination.is_symlink():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            shutil.copy2(source, destination)
+
+
+def runner_check(args):
+    repo = resolve_repo(args.repo)
+    problems, builders = [], {}
+    for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
+        # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
+        if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+-[A-Za-z]*[arR]", line):
+            problems.append(f"line {number}: construct blocked by the policy hook")
+        for match in re.finditer(r"\btask\s+(start|lane)\s+([^`\n;&|]+)", line):
+            try:
+                tokens = shlex.split(match.group(2))
+                if len(tokens) < 2:
+                    raise Stop("task command needs a repo and task id")
+                ident = tokens[1]
+                task = Task(repo, ident)
+                if task.number is not None and task.file is None:
+                    raise Stop(f"No Backlog.md task {task.id}")
+                def option(flag, default=None):
+                    if flag in tokens:
+                        return tokens[tokens.index(flag) + 1]
+                    return default
+                builder = option("--builder", builders.get(task.id))
+                if match.group(1) == "start":
+                    if builder not in MODELS:
+                        raise Stop("task start requires --builder codex|claude")
+                    builders[task.id] = builder
+                else:
+                    if builder not in MODELS:
+                        raise Stop("lane needs a preceding start or --builder codex|claude")
+                    resolve_model(builder, option("--model", "gpt-6-luna" if builder == "codex" else "sonnet"))
+                    builders[task.id] = builder
+            except (Stop, ValueError, IndexError) as error:
+                problems.append(f"line {number}: {error}")
+    if problems:
+        print("\n".join(problems))
+        return 1
+    print(f"runner file OK ({len(builders)} tasks)")
+    return 0
+
+
 def start(args):
     repo = resolve_repo(args.repo)
     ensure_origin_head(repo)
@@ -997,6 +1079,7 @@ def start(args):
             branch = task.branch_name()
             git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
             print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
+    seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
     exclude(task.path, ".work/")
     branch = git(task.path, "branch", "--show-current")
@@ -2498,10 +2581,11 @@ def main(argv=None):
         if name == "start":
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
+            sub.add_argument("--seed", action="append", default=[], metavar="NAME")
             sub.add_argument("--no-verify", metavar="REASON")
         if name == "lane":
             sub.add_argument("--builder", choices=("codex", "claude"))
-            sub.add_argument("--model", choices=("gpt-6-luna", "gpt-6.1-sol", "sonnet", "opus", "fable"))
+            sub.add_argument("--model", help="Claude aliases sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
             sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
@@ -2519,6 +2603,9 @@ def main(argv=None):
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
+    sub = commands.add_parser("runner-check", help="validate a runner file without launching it")
+    sub.add_argument("repo")
+    sub.add_argument("file")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
@@ -2587,7 +2674,7 @@ def main(argv=None):
         try:
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
-                      "denials": denials}[args.command](args) or 0
+                      "denials": denials, "runner-check": runner_check}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"
