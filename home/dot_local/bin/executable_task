@@ -727,6 +727,18 @@ GATE_LOCK_WAIT = 45
 
 def refresh_context(task):
     destination = task.path / ".work/context"
+    # Never traverse lane-controlled links, including dangling links and links
+    # to directories. Clean recursively before reading or changing permissions.
+    def clean(path):
+        if path.is_symlink() or (path.exists() and not path.is_dir() and not path.is_file()):
+            path.unlink()
+        elif path.is_dir():
+            for entry in path.iterdir():
+                clean(entry)
+
+    clean(destination)
+    if destination.is_file():
+        destination.unlink()
     destination.mkdir(parents=True, exist_ok=True)
     sources = [task.kb / "INTENT.md", task.kb / "STATUS.md"]
     if task.file:
@@ -745,12 +757,23 @@ def refresh_context(task):
         if not source.is_file():
             continue
         target = destination / source.relative_to(task.kb)
+        for parent in reversed(target.relative_to(destination).parents):
+            directory = destination / parent
+            if directory.is_symlink() or directory.is_file():
+                directory.unlink()
+            directory.mkdir(exist_ok=True)
         target.parent.mkdir(parents=True, exist_ok=True)
         content = source.read_bytes()
+        if target.is_symlink():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
         if not target.exists() or target.read_bytes() != content:
             if target.exists():
                 target.chmod(0o644)
-            target.write_bytes(content)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "wb") as output:
+                output.write(content)
         target.chmod(0o444)
 
 
@@ -2735,10 +2758,11 @@ def cancel(args):
     if lane_run.get("state") == "running" and pid_alive(lane_run.get("pid")):
         try:
             os.killpg(int(lane_run["pid"]), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError) as error:
             lane_run.update(state="interrupted", ended_at=utc_now())
             atomic_json(lane_path, lane_run)
-            print(f"Lane process group {lane_run['pid']} already stopped; kept {task.path}.")
+            reason = "could not stop (permission denied)" if isinstance(error, PermissionError) else "already stopped"
+            print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
             return 0
         lane_run.update(state="cancelled", ended_at=utc_now())
         atomic_json(lane_path, lane_run)

@@ -180,7 +180,10 @@ class TaskTool(unittest.TestCase):
                         mock.patch.object(TASK_MODULE.os, 'killpg', side_effect=error), \
                         contextlib.redirect_stdout(output):
                     self.assertEqual(TASK_MODULE.cancel(SimpleNamespace(repo='proj', id='5')), 0)
-                self.assertIn('already stopped', output.getvalue())
+                message = 'could not stop (permission denied)' if error is PermissionError else 'already stopped'
+                self.assertIn(message, output.getvalue())
+                if error is PermissionError:
+                    self.assertNotIn('already stopped', output.getvalue())
                 record = json.loads(lane.read_text())
                 self.assertEqual(record['state'], 'interrupted')
                 self.assertTrue(record['ended_at'])
@@ -339,7 +342,7 @@ store.write_text(json.dumps(prs))
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
                     run = json.loads((self.state() / 'run.json').read_text())
-                    if run['state'] != 'running':
+                    if run['state'] != 'running' and not (self.state() / 'run.lock').exists():
                         break
                     time.sleep(0.02)
                 self.assertEqual(run['state'], 'failed')
@@ -449,6 +452,35 @@ store.write_text(json.dumps(prs))
         self.assertIn("Repaired", self.raw_task("repair", "proj"))
         self.assertFalse(lock.exists())
         self.assertEqual(json.loads(run.read_text())["state"], "interrupted")
+
+    def test_reliability_context_replaces_symlinks(self):
+        from types import SimpleNamespace
+        (self.kb / 'INTENT.md').write_text('intent')
+        wt, _ = self.started()
+        context = wt / '.work/context'
+        outside = self.home / 'outside-context'
+        outside.mkdir()
+        victim = outside / 'INTENT.md'
+        victim.write_text('outside untouched')
+        mode = victim.stat().st_mode
+        shutil.rmtree(context)
+        context.symlink_to(outside, target_is_directory=True)
+        task = SimpleNamespace(path=wt, kb=self.kb, file=None)
+        TASK_MODULE.refresh_context(task)
+        self.assertFalse(context.is_symlink())
+        self.assertEqual((context / 'INTENT.md').read_text(), 'intent')
+        (context / 'INTENT.md').unlink()
+        (context / 'INTENT.md').symlink_to(victim)
+        (context / 'stale-link').symlink_to(victim)
+        (context / 'nested').symlink_to(outside, target_is_directory=True)
+        TASK_MODULE.refresh_context(task)
+        self.assertFalse((context / 'INTENT.md').is_symlink())
+        self.assertEqual((context / 'INTENT.md').read_text(), 'intent')
+        self.assertFalse((context / 'stale-link').exists())
+        self.assertFalse((context / 'nested').exists())
+        self.assertEqual(victim.read_text(), 'outside untouched')
+        self.assertEqual(victim.stat().st_mode, mode)
+        self.assertEqual(list(outside.iterdir()), [victim])
 
     def test_reliability_context_and_review_range(self):
         (self.kb / "INTENT.md").write_text("intent")
