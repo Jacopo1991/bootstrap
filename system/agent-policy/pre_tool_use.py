@@ -822,7 +822,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if SHELL_EXPANSION.search(arg) and (cross_repo or subcommand not in READ_ONLY_GIT):
             return "Expanded Git operands are blocked; use literal repository paths."
         value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else arg
-        if subcommand == "diff" and "--no-index" in arguments and value.startswith(("~", "$")):
+        if (subcommand == "diff" and "--no-index" in arguments
+                and (value.startswith("~") or "$" in value or "`" in value)):
             return "Expanded Git diff operands are blocked; use literal repository paths."
         if subcommand == "diff" and "--no-index" in arguments and value == "/dev/null":
             continue
