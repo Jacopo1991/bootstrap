@@ -1527,17 +1527,49 @@ def evaluate_command(command: str, cwd: str, root: Path,
             lexer.commenters = ""
             tokens = list(lexer)
             if tokens and Path(tokens[0]).name not in {"git", "gh"}:
-                # Consume quotes and escapes intact so only raw, adjacent 2>
-                # redirects disappear. In `2 >/dev/null`, 2 is an operand.
-                text = re.sub(
-                    r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.|"
-                    r"(?<!\S)2>(?:\s*/dev/null|&1)(?=\s|$)",
-                    lambda match: " " if match[0].startswith("2>") else match[0],
-                    text)
-                lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
-                lexer.whitespace_split = True
-                lexer.commenters = ""
-                tokens = list(lexer)
+                # Keep the original text intact. Only discard shlex tokens
+                # proven to start at an unquoted, unescaped new word.
+                drop = set()
+                quote = None
+                escaped = False
+                word_start = True
+                for offset, char in enumerate(text):
+                    if escaped:
+                        escaped = False
+                        continue
+                    if char == "\\" and quote != "'":
+                        escaped = True
+                        word_start = False
+                        continue
+                    if quote:
+                        if char == quote:
+                            quote = None
+                        continue
+                    if char in {"'", '"'}:
+                        quote = char
+                        word_start = False
+                        continue
+                    if word_start and char == "2":
+                        target = offset + 2
+                        while target < len(text) and text[target].isspace():
+                            target += 1
+                        for spelling, expected in (
+                                (text[offset:target] + "/dev/null",
+                                 ["2", ">", "/dev/null"]),
+                                ("2>&1", ["2", ">&", "1"])):
+                            end = offset + len(spelling)
+                            if (text.startswith("2>", offset)
+                                    and text.startswith(spelling, offset)
+                                    and (end == len(text) or text[end].isspace())):
+                                prefix = shlex.shlex(text[:offset], posix=True,
+                                                     punctuation_chars=";&|<>")
+                                prefix.whitespace_split = True
+                                prefix.commenters = ""
+                                index = len(list(prefix))
+                                if tokens[index:index + len(expected)] == expected:
+                                    drop.update(range(index, index + len(expected)))
+                    word_start = char.isspace()
+                tokens = [token for index, token in enumerate(tokens) if index not in drop]
             all_tokens.append(tokens)
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."

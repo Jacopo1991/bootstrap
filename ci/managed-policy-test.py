@@ -443,11 +443,13 @@ with tempfile.TemporaryDirectory() as temp:
     (root / "outside-link").symlink_to(root.parent / "outside")
     (root / "--outside-link").symlink_to(root.parent / "outside")
     (root / "2" / ".git").mkdir(parents=True)
+    (root / "a 2" / ".git").mkdir(parents=True)
     allowed = (
         "ls -la .work/ && echo --- && git --no-optional-locks check-ignore -v .work/report.md; echo --- && du -sh .work/uv-cache",
         "ls -la .work/context/ 2>&1; echo ---; cat docs/x.md 2>&1; echo ---; git status --short",
         "git status --short; ls missing 2>/dev/null",
         "ls 2>/dev/null",
+        "ls 2> /dev/null",
         "git log 2>&1 | head",
         f"git -C {temp} status --short && sed -n '1,80p' {temp}/file",
         "set -o pipefail; cat file | tee output",
@@ -461,6 +463,9 @@ with tempfile.TemporaryDirectory() as temp:
         "git diff --no-index docs/x.md docs/y.md",
     )
     denied = (
+        r"rm -rf a\ 2>/dev/null",
+        'rm -rf "a 2">/dev/null',
+        r"chmod -R 777 a\ 2>/dev/null",
         "rm -rf 2", "rm -rf 2 >/dev/null",
         "chmod -R 777 2", "chmod -R 777 2 >/dev/null",
         "rm -rf '2' >/dev/null", "rm -rf 2 > /dev/null",
