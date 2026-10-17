@@ -92,6 +92,30 @@ def archive_inventory(root):
         if item != root:
             sizes[item.parent] = sizes.get(item.parent, 0) + sizes[item]
     return entries, sizes, errors
+
+
+def archive_evidence(item, info):
+    name = item.name.lower()
+    return (item.suffix.lower() in {'.md', '.jsonl'} or
+            (item.suffix.lower() == '.log' and info.st_size < 50 * 1024 ** 2) or
+            any(word in name for word in ('prompt', 'request', 'check', 'review', 'merge', 'manifest')))
+
+
+def oversized_contents(entries, sizes, protected):
+    """Select non-evidence contents, retaining directories needed by evidence."""
+    roots, retained, covered, runtime = set(), set(), set(), set()
+    for item, info in entries:
+        if item.parent in runtime or archive_runtime(item, info):
+            runtime.add(item)
+        if (stat.S_ISDIR(info.st_mode) and item not in protected and
+                sizes.get(item, 0) > 200 * 1024 ** 2):
+            roots.add(item)
+        if item in roots or item.parent in covered:
+            covered.add(item)
+        if item not in runtime and not stat.S_ISDIR(info.st_mode) and archive_evidence(item, info):
+            retained.add(item)
+            retained.update(item.parents)
+    return roots, covered - retained
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
 # Keep this set aligned with the hook's GIT_OVERRIDE_ENV; other Git variables
@@ -429,6 +453,7 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
         saved = pending / ".work"
 
         entries, sizes, errors = archive_inventory(source)
+        oversized, disposable = oversized_contents(entries, sizes, {source, source / 'reports'})
         skipped, special, excluded, size = [], [], set(), 0
         for item, info in entries:
             if item.parent in excluded:
@@ -442,8 +467,7 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
                 reason = "special file"
             elif item != source and archive_runtime(item, info):
                 reason = "cache/runtime"
-            elif (item != source and item != source / 'reports' and
-                  stat.S_ISDIR(mode) and sizes[item] > 200 * 1024 ** 2):
+            elif item in disposable:
                 reason = "directory over 200 MB"
             elif stat.S_ISREG(mode) and item.suffix == '.log' and sizes[item] >= 50 * 1024 ** 2:
                 reason = "log over 50 MB"
@@ -451,6 +475,9 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
                 excluded.add(item)
                 skipped.append({"path": relative, "size": sizes[item], "reason": reason})
                 continue
+            if item in oversized:
+                skipped.append({"path": relative, "size": sizes[item],
+                                "reason": "non-evidence contents over 200 MB"})
             target = saved / item.relative_to(source)
             try:
                 if stat.S_ISDIR(mode):
@@ -3022,6 +3049,11 @@ def prune_archive(repo, dry_run=False):
     containers = {item.parent for item, _info in entries
                   if item.name == 'manifest.json' and
                   '.work' not in item.relative_to(root).parts} | set(finishing)
+    protected = {root} | containers
+    for container in containers:
+        protected.update({container / '.work', container / 'reports', container / '.work/reports'})
+        protected.update(container.parents)
+    _oversized, disposable = oversized_contents(entries, sizes, protected)
     for item, info in entries:
         if item in temporary:
             continue
@@ -3032,14 +3064,10 @@ def prune_archive(repo, dry_run=False):
         if container is None:
             continue
         runtime = archive_runtime(item, info)
-        evidence_location = item in {container / '.work', container / 'reports',
-                                    container / '.work/reports'}
-        oversized = (stat.S_ISDIR(info.st_mode) and not evidence_location and
-                     sizes.get(item, 0) > 200 * 1024 ** 2)
         large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
                      info.st_size >= 50 * 1024 ** 2)
-        # A disposable directory is removed whole, regardless of file suffixes inside.
-        if not (runtime or oversized or large_log):
+        # Named runtime trees are removed whole; generic contents preserve evidence.
+        if not (runtime or item in disposable or large_log):
             continue
         removed.add(item)
         freed += allocated.get(item, 0)
