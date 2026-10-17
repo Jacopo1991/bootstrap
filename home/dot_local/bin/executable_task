@@ -64,7 +64,28 @@ DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", 
               ".ruff_cache", ".cache", ".tox", ".next", ".astro", ".turbo", "dist", "build",
               "coverage", "target", ".parcel-cache"}
 # .work is removable only after preservation; its outputs are not disposable.
-WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv"}
+WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
+               "node_modules", "hermes-home", "fakehome"}
+
+
+def archive_inventory(root):
+    """Iterative, no-follow inventory: runtime trees may be deep or disappearing."""
+    entries, sizes, errors = [], {}, {}
+    stack = [root]
+    while stack:
+        item = stack.pop()
+        try:
+            info = item.lstat()
+            entries.append((item, info))
+            sizes[item] = info.st_size if not stat.S_ISDIR(info.st_mode) else 0
+            if stat.S_ISDIR(info.st_mode):
+                stack.extend(item.iterdir())
+        except OSError as error:
+            errors[item] = str(error)
+    for item, info in reversed(entries):
+        if item != root:
+            sizes[item.parent] = sizes.get(item.parent, 0) + sizes[item]
+    return entries, sizes, errors
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
 # Keep this set aligned with the hook's GIT_OVERRIDE_ENV; other Git variables
@@ -381,37 +402,75 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
-def preserve_work(task: Task, path: Path):
-    """Snapshot all task evidence before deletion, without size limits or overwrites."""
+def preserve_work(task: Task, path: Path, reuse_head=None):
+    """Preserve evidence; list runtime data and individual copy failures."""
     source = path / ".work"
     if not source.exists() and not source.is_symlink():
         return
     archive = HOME / ".local/state/task/archive" / task.repo.name / task.name
     try:
         archive.mkdir(parents=True, exist_ok=True)
+        if reuse_head:
+            for manifest in archive.glob(f"{path.name}-*/manifest.json"):
+                try:
+                    record = json.loads(manifest.read_text())
+                except (OSError, ValueError):
+                    continue
+                if record.get('head') == reuse_head and (manifest.parent / '.work').is_dir():
+                    print(f"Reusing archive {manifest.parent} for {reuse_head}.")
+                    return
         pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=archive))
         saved = pending / ".work"
 
-        skipped = []
-
-        def caches(directory, names):
-            ignored = []
-            for name in names:
-                item = Path(directory) / name
-                mode = item.lstat().st_mode
-                if stat.S_ISLNK(mode):
-                    continue
-                if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-                    skipped.append(str(item.relative_to(source)))
-                    ignored.append(name)
-                elif name in WORK_CACHES and item.is_dir():
-                    ignored.append(name)
-            return ignored
-
-        shutil.copytree(source, saved, symlinks=True, ignore=caches)
-        atomic_json(pending / "manifest.json", {"skipped_special_files": skipped})
-        size = sum(item.lstat().st_size for item in saved.rglob("*")
-                   if item.is_symlink() or not item.is_dir())
+        entries, sizes, errors = archive_inventory(source)
+        skipped, special, excluded, size = [], [], set(), 0
+        evidence_only = set()
+        for item, info in entries:
+            if item.parent in excluded:
+                excluded.add(item)
+                continue
+            relative = str(item.relative_to(source))
+            mode = info.st_mode
+            reason = None
+            if item.parent in evidence_only:
+                evidence_only.add(item)
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                special.append(relative)
+                reason = "special file"
+            elif item != source and (item.name in WORK_CACHES or item.name.endswith('.sock')):
+                reason = "cache/runtime"
+            elif item != source and stat.S_ISDIR(mode) and sizes[item] > 200 * 1024 ** 2:
+                evidence_only.add(item)
+                skipped.append({"path": relative, "size": sizes[item],
+                                "reason": "directory over 200 MB (keeping evidence only)"})
+            elif stat.S_ISREG(mode) and item.suffix == '.log' and sizes[item] >= 50 * 1024 ** 2:
+                reason = "log over 50 MB"
+            if (not reason and item in evidence_only and not stat.S_ISDIR(mode) and
+                    not (item.suffix in {'.md', '.json', '.log', '.jsonl'} and
+                         sizes[item] < 50 * 1024 ** 2)):
+                reason = "data in directory over 200 MB"
+            if reason:
+                excluded.add(item)
+                skipped.append({"path": relative, "size": sizes[item], "reason": reason})
+                continue
+            target = saved / item.relative_to(source)
+            try:
+                if stat.S_ISDIR(mode):
+                    target.mkdir(parents=True, exist_ok=True)
+                elif stat.S_ISLNK(mode):
+                    target.symlink_to(os.readlink(item))
+                    size += info.st_size
+                else:
+                    shutil.copy2(item, target)
+                    size += info.st_size
+            except OSError as error:
+                errors[item] = str(error)
+        skipped.extend({"path": str(item.relative_to(source)), "size": sizes.get(item, 0),
+                        "reason": error} for item, error in errors.items())
+        head = run_git(path, 'rev-parse', '--verify', 'HEAD^{commit}')
+        atomic_json(pending / "manifest.json", {"skipped_special_files": special, "skipped": skipped,
+                                                "head": reuse_head or (head.stdout.strip()
+                                                                       if not head.returncode else None)})
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except (OSError, shutil.Error) as error:
@@ -1994,20 +2053,41 @@ def overlap_message(files):
             "branch, then `task check` and a new review")
 
 
+def gate_worktree_match(name):
+    # Split the PID greedily so numeric task-name components stay in the task.
+    match = re.fullmatch(r"\.task-gate-(.+)-(\d+)", name)
+    if match:
+        return match
+    # Archived snapshots append a random component after the original gate name.
+    original, _separator, _suffix = name.rpartition("-")
+    return re.fullmatch(r"\.task-gate-(.+)-(\d+)", original)
+
+
 def prune_stale_gate_worktrees(repo: Path):
     worktrees = repo / ".worktrees"
     if not worktrees.is_dir():
         return
     for gate in worktrees.glob(".task-gate-*"):
-        match = re.fullmatch(r"\.task-gate-(.+)-(\d+)", gate.name)
+        match = gate_worktree_match(gate.name)
         if not match or pid_alive(match.group(2)):
             continue
-        preserve_work(Task(repo, match.group(1)), gate)
-        result = run_git(repo, "worktree", "remove", "--force", str(gate))
-        if result.returncode and gate.exists():
-            shutil.rmtree(gate, ignore_errors=True)
-            run_git(repo, "worktree", "prune")
+        remove_gate_worktree(Task(repo, match.group(1)), gate)
         print(f"Removed stale gate worktree {gate}.")
+
+
+def remove_gate_worktree(task, gate):
+    try:
+        preserve_work(task, gate)
+    except Stop as error:
+        print(f"Gate archive warning: {error}", file=sys.stderr)
+    finally:
+        result = run_git(task.repo, 'worktree', 'remove', '--force', str(gate))
+        if result.returncode and gate.exists():
+            try:
+                shutil.rmtree(gate)
+            except OSError as error:
+                print(f"Gate cleanup warning: {gate}: {error}", file=sys.stderr)
+            run_git(task.repo, 'worktree', 'prune')
 
 
 def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record):
@@ -2036,8 +2116,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
         completed_step(task, "gate")
         return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
     finally:
-        preserve_work(task, gate)
-        run_git(repo, "worktree", "remove", "--force", str(gate))
+        remove_gate_worktree(task, gate)
 
 
 def merge(args):
@@ -2069,6 +2148,9 @@ def merge(args):
                    "them first:\n" + "\n".join(changes))
     lane_head = sha(path, "HEAD")
     record = load_record(task)
+    if lane_head != record.get('base_sha') and is_ancestor(repo, lane_head, base):
+        repair_published(task, base)
+        return 0
     try:
         record = merge_gate(task, path, lane_head)
     except Stop as error:
@@ -2886,11 +2968,171 @@ def cancel(args):
     return 0
 
 
+def prune_archive(repo, dry_run=False):
+    root = HOME / '.local/state/task/archive' / repo.name
+    entries, sizes, _errors = archive_inventory(root)
+    allocated = {item: info.st_blocks * 512 for item, info in entries}
+    for item, _info in reversed(entries):
+        if item != root:
+            allocated[item.parent] = allocated.get(item.parent, 0) + allocated[item]
+    # Temporary snapshots are handled whole, before finished-archive filtering.
+    lock_path = Path(os.environ.get('TASK_GATE_DIR', '/tmp')) / 'agent-task-gate.lock'
+    try:
+        live_gate = gate_holder_alive(lock_path)
+    except FileNotFoundError:
+        live_gate = False
+    temporary, freed = set(), 0
+    for item, info in entries:
+        if item.parent in temporary:
+            temporary.add(item)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        pending = item.name.startswith('.pending-')
+        gate = gate_worktree_match(item.name)
+        if not pending and not gate:
+            continue
+        temporary.add(item)
+        if gate and live_gate:
+            continue
+        if pending and not any(
+                sibling.is_dir() and not sibling.name.startswith('.') and
+                (sibling / 'manifest.json').is_file() for sibling in item.parent.iterdir()):
+            destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
+            print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
+            if not dry_run:
+                contents, content_sizes, errors = archive_inventory(item)
+                atomic_json(item / 'manifest.json', {
+                    'note': 'finished by repair',
+                    'contents': [{'path': str(path.relative_to(item)),
+                                  'size': content_sizes.get(path, 0)}
+                                 for path, _info in contents if path != item],
+                    'skipped': [{'path': str(path.relative_to(item)), 'reason': error}
+                                for path, error in errors.items()]})
+                item.rename(destination)
+            continue
+        freed += allocated.get(item, 0)
+        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
+        if not dry_run:
+            shutil.rmtree(item)
+    protected = set()
+    for item, info in entries:
+        if item in temporary:
+            continue
+        if not stat.S_ISDIR(info.st_mode) and (
+                item.suffix in {'.md', '.log', '.jsonl'} or item.name in {
+                    'manifest.json', 'check.json', 'review.json', 'merge.json', 'task.json',
+                    'run.json', 'exception.json', 'gate-check.json', 'request.md'}):
+            protected.add(item)
+            protected.update(item.parents)
+    removed = set()
+    selected = set()
+    for item, info in entries:
+        if item in temporary:
+            continue
+        if item.parent in removed:
+            removed.add(item)
+            continue
+        runtime = item.name in WORK_CACHES or item.name.endswith('.sock')
+        oversized = (stat.S_ISDIR(info.st_mode) and item.name != '.work' and
+                     '.work' in item.parts and sizes.get(item, 0) > 200 * 1024 ** 2)
+        # Keep evidence even inside an otherwise disposable directory.
+        if not (runtime or oversized or item.parent in selected):
+            continue
+        selected.add(item)
+        if item in protected:
+            continue
+        removed.add(item)
+        freed += allocated.get(item, 0)
+        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
+        if not dry_run:
+            if not stat.S_ISDIR(info.st_mode):
+                item.unlink()
+            else:
+                shutil.rmtree(item)
+    print(f"{'Would free' if dry_run else 'Freed'} {freed} bytes.")
+
+
+def repair_published(task, base):
+    if task.path.exists() and not real_worktree(task.repo, task.path):
+        print(f"{task.path}: not a worktree; left as is")
+        return
+    state = task_state(task)
+    head = sha(task.path, 'HEAD') if task.path.exists() else None
+    try:
+        pinned = json.loads((state / 'task.json').read_text())
+    except (OSError, ValueError):
+        pinned = {}
+    # A freshly started lane at its original base has not published any work.
+    if head and head == pinned.get('base_sha') and not (state / 'merge.json').exists():
+        return
+    if task.path.exists():
+        try:
+            lane = json.loads((task.path / '.work/lane.json').read_text())
+        except (OSError, ValueError):
+            lane = {}
+        if lane.get('state') == 'running' and pid_alive(lane.get('pid')):
+            return
+    if not head:
+        for filename, key in (('merge.json', 'head'), ('check.json', 'sha')):
+            try:
+                head = json.loads((state / filename).read_text()).get(key)
+            except (OSError, ValueError):
+                continue
+            if head:
+                break
+    if not head or not is_ancestor(task.repo, head, base):
+        return
+    try:
+        old_run = json.loads((state / 'run.json').read_text())
+    except (OSError, ValueError):
+        old_run = {}
+    if ((state / 'merge.json').exists() and not task.path.exists() and
+            not (old_run.get('command') == 'merge' and old_run.get('state') != 'passed')):
+        return
+    merges = git(task.repo, 'rev-list', '--merges', '--ancestry-path', '--reverse',
+                 f'{head}..{base}').splitlines()
+    commit = merges[0] if merges else base
+    atomic_json(state / 'merge.json', {'head': head, 'commit': commit, 'time': utc_now()})
+    print(update_local_default(task.repo, default_branch(task.repo), base))
+    if task.path.exists():
+        for name in ('report.md', 'check.log'):
+            source = task.path / '.work' / name
+            if source.is_file():
+                shutil.copy2(source, state / name)
+        if not (untracked(task.path) + ignored_leftovers(task.path)):
+            preserve_work(task, task.path, reuse_head=head)
+            branch = git(task.path, 'branch', '--show-current')
+            git(task.repo, 'worktree', 'remove', '--force', str(task.path))
+            if branch:
+                run_git(task.repo, 'branch', '-D', branch)
+    run_path = state / 'run.json'
+    try:
+        record = json.loads(run_path.read_text())
+    except (OSError, ValueError):
+        record = {}
+    if record.get('command') == 'merge' or record.get('kind') == 'merge':
+        record.update(state='passed', ended_at=utc_now())
+        atomic_json(run_path, record)
+    print(f"Repaired published merge: {task.repo.name}/{task.id}")
+
+
 def repair(args):
     repos = [resolve_repo(args.repo)] if args.repo else sorted(
         p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     for repo in repos:
+        if getattr(args, 'prune_archive', False):
+            prune_archive(repo, args.dry_run)
+            continue
         prune_stale_gate_worktrees(repo)
+        try:
+            fetch(repo)
+        except Stop:
+            print(f"Repair warning: fetch failed for {repo.name}; using the local default branch.",
+                  file=sys.stderr)
+            base = sha(repo, default_branch(repo))
+        else:
+            base, _label = base_commit(repo, default_branch(repo))
         names = {p.name for p in (repo / ".worktrees").glob("*") if not p.name.startswith(".")}
         names.update(p.name for p in (HOME / ".local/state/task" / repo.name).glob("*") if p.is_dir())
         for name in sorted(names):
@@ -2909,6 +3151,7 @@ def repair(args):
             result = task_lock_status(task, repair=True)
             if result == "interrupted" or had_lock and not lock.exists():
                 print(f"Repaired interrupted run lock: {repo.name}/{task.id}")
+            repair_published(task, base)
     return 0
 
 
@@ -2989,6 +3232,8 @@ def main(argv=None):
     sub.add_argument("repo", nargs="?")
     sub = commands.add_parser("repair", help="explicitly repair stale task state and gate worktrees")
     sub.add_argument("repo", nargs="?")
+    sub.add_argument("--prune-archive", action="store_true")
+    sub.add_argument("--dry-run", action="store_true")
     sub = commands.add_parser("denials")
     sub.add_argument("--days", type=int, default=30)
     sub.add_argument("--rule")
