@@ -1062,26 +1062,52 @@ store.write_text(json.dumps(prs))
         pending = root / '.pending-old'
         pending.mkdir()
         (pending / 'partial').write_text('partial')
-        stale = root / '.task-gate-t5-99999999-copy'
+        # A live numeric PID alone is not a live kernel gate holder.
+        stale = root / f'.task-gate-t5-{os.getpid()}-copy'
         stale.mkdir()
         (stale / 'cache').write_text('cache')
         orphan = root / 'other/.pending-unfinished'
         orphan.mkdir(parents=True)
+        for copy in (pending, stale, orphan):
+            (copy / '.work/records').mkdir(parents=True)
+            (copy / '.work/check.log').write_text('check evidence')
+            (copy / '.work/report.md').write_text('report evidence')
+            (copy / '.work/records/run.jsonl').write_text('{}\n')
+            (copy / 'manifest.json').write_text('{}')
         out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
         self.assertIn('Would free', out)
         self.assertTrue(pending.exists())
+        self.assertTrue(stale.exists())
+        self.assertTrue(orphan.exists())
+        self.assertIn('Would finish', out)
         self.assertTrue((saved / '.work/fakehome').exists())
         out = self.raw_task('repair', '--prune-archive', 'proj')
         self.assertIn('Freed', out)
         self.assertFalse(pending.exists())
         self.assertFalse(stale.exists())
-        self.assertTrue(orphan.exists())
+        self.assertFalse(orphan.exists())
+        recovered = orphan.with_name('other-unfinished')
+        for name in ('.work/check.log', '.work/report.md', '.work/records/run.jsonl', 'manifest.json'):
+            self.assertTrue((recovered / name).is_file())
         self.assertFalse((saved / '.work/fakehome/state').exists())
         self.assertTrue((saved / '.work/fakehome/gateway.log').exists())
         self.assertFalse((saved / '.work/large/data').exists())
         self.assertTrue((saved / '.work/large/merge.json').exists())
         for name in ('.work/report.md', '.work/gateway.log', 'manifest.json'):
             self.assertTrue((saved / name).is_file())
+
+    def test_prune_archive_retains_gate_with_kernel_holder(self):
+        gate = self.work_archives() / '.task-gate-t5-99999999-copy'
+        (gate / '.work/records').mkdir(parents=True)
+        (gate / '.work/check.log').write_text('check')
+        (gate / '.work/report.md').write_text('report')
+        (gate / '.work/records/run.jsonl').write_text('{}\n')
+        with (self.gate_dir / 'agent-task-gate.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.raw_task('repair', '--prune-archive', 'proj')
+            self.assertTrue((gate / '.work/check.log').exists())
+        self.raw_task('repair', '--prune-archive', 'proj')
+        self.assertFalse(gate.exists())
 
     def test_merge_preserves_all_work_including_large_data_and_harness(self):
         wt, _ = self.started()

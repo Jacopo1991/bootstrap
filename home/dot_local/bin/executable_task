@@ -2947,30 +2947,61 @@ def prune_archive(repo, dry_run=False):
     for item, _info in reversed(entries):
         if item != root:
             allocated[item.parent] = allocated.get(item.parent, 0) + allocated[item]
+    # Temporary snapshots are handled whole, before finished-archive filtering.
+    lock_path = Path(os.environ.get('TASK_GATE_DIR', '/tmp')) / 'agent-task-gate.lock'
+    try:
+        live_gate = gate_holder_alive(lock_path)
+    except FileNotFoundError:
+        live_gate = False
+    temporary, freed = set(), 0
+    for item, info in entries:
+        if item.parent in temporary:
+            temporary.add(item)
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        pending = item.name.startswith('.pending-')
+        gate = gate_worktree_match(item.name)
+        if not pending and not gate:
+            continue
+        temporary.add(item)
+        if gate and live_gate:
+            continue
+        if pending and not any(
+                sibling.is_dir() and not sibling.name.startswith('.') and
+                (sibling / 'manifest.json').is_file() for sibling in item.parent.iterdir()):
+            destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
+            print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
+            if not dry_run:
+                item.rename(destination)
+            continue
+        freed += allocated.get(item, 0)
+        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
+        if not dry_run:
+            shutil.rmtree(item)
     protected = set()
     for item, info in entries:
+        if item in temporary:
+            continue
         if not stat.S_ISDIR(info.st_mode) and (
                 item.suffix in {'.md', '.log', '.jsonl'} or item.name in {
                     'manifest.json', 'check.json', 'review.json', 'merge.json', 'task.json',
                     'run.json', 'exception.json', 'gate-check.json', 'request.md'}):
             protected.add(item)
             protected.update(item.parents)
-    removed, freed = set(), 0
+    removed = set()
     selected = set()
     for item, info in entries:
+        if item in temporary:
+            continue
         if item.parent in removed:
             removed.add(item)
             continue
-        pending_done = (item.name.startswith('.pending-') and any(
-            sibling.is_dir() and not sibling.name.startswith('.') and
-            (sibling / 'manifest.json').is_file() for sibling in item.parent.iterdir()))
-        gate = gate_worktree_match(item.name)
-        stale_gate = gate and not pid_alive(gate.group(2))
         runtime = item.name in WORK_CACHES or item.name.endswith('.sock')
         oversized = (stat.S_ISDIR(info.st_mode) and item.name != '.work' and
                      '.work' in item.parts and sizes.get(item, 0) > 200 * 1024 ** 2)
         # Keep evidence even inside an otherwise disposable directory.
-        if not (runtime or pending_done or stale_gate or oversized or item.parent in selected):
+        if not (runtime or oversized or item.parent in selected):
             continue
         selected.add(item)
         if item in protected:
