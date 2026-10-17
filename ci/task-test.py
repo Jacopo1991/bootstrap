@@ -14,6 +14,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1194,6 +1195,71 @@ store.write_text(json.dumps(prs))
             self.assertTrue((gate / '.work/check.log').exists())
         self.raw_task('repair', '--prune-archive', 'proj')
         self.assertFalse(gate.exists())
+
+    def test_archive_and_prune_named_virtualenv_and_runtime(self):
+        wt, _ = self.started()
+        venv = wt / '.work/t8venv'
+        (venv / 'lib').mkdir(parents=True)
+        (venv / 'pyvenv.cfg').write_text('home = /usr/bin\n')
+        (venv / 'lib/package.py').write_text('runtime')
+        (venv / 'report.md').write_text('venv evidence')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+        archived = next(self.work_archives().glob('*/.work'))
+        self.assertFalse((archived / 't8venv/lib').exists())
+        self.assertFalse((archived / 't8venv/pyvenv.cfg').exists())
+        self.assertEqual((archived / 't8venv/report.md').read_text(), 'venv evidence')
+
+        root = self.work_archives()
+        finished = root / 'old-finished'
+        pending = root / 'other/.pending-runtime'
+        for container in (finished, pending):
+            work = container / '.work'
+            (work / 't8venv/lib').mkdir(parents=True)
+            (work / 't8venv/pyvenv.cfg').write_text('home = /usr/bin\n')
+            (work / 't8venv/lib/package.py').write_text('runtime')
+            (work / 'runtime').mkdir()
+            with (work / 'runtime/data').open('wb') as stream:
+                stream.truncate(201 * 1024 ** 2)
+            for name in ('report.md', 'prompt.md', 'request.md', 'check.json',
+                         'review.json', 'merge.json', 'small.log', 'manifest.json'):
+                (work / 'runtime' / name).write_text('evidence')
+            (work / 't8venv/request.md').write_text('keep nested evidence')
+        (finished / 'manifest.json').write_text('{"head": "original"}')
+        before = {path: (path.stat().st_size,
+                         path.read_bytes() if path.stat().st_size < 1024 else None)
+                  for path in root.rglob('*') if path.is_file()}
+        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
+        self.assertIn(str(pending / '.work/t8venv/lib'), out)
+        self.assertIn(str(finished / '.work/runtime/data'), out)
+        for path, (size, content) in before.items():
+            self.assertEqual(path.stat().st_size, size)
+            if content is not None:
+                self.assertEqual(path.read_bytes(), content)
+        self.raw_task('repair', '--prune-archive', 'proj')
+        recovered = pending.with_name('other-runtime')
+        for container in (finished, recovered):
+            self.assertFalse((container / '.work/t8venv/lib').exists())
+            self.assertFalse((container / '.work/t8venv/pyvenv.cfg').exists())
+            self.assertFalse((container / '.work/runtime/data').exists())
+            self.assertTrue((container / '.work/t8venv/request.md').exists())
+            for name in ('report.md', 'prompt.md', 'request.md', 'check.json',
+                         'review.json', 'merge.json', 'small.log', 'manifest.json'):
+                self.assertEqual((container / '.work/runtime' / name).read_text(), 'evidence')
+            record = json.loads((container / 'manifest.json').read_text())
+            self.assertTrue(any(line.startswith('pruned: .work/runtime/data ')
+                                for line in record['pruned']))
+            self.assertTrue(any(line.startswith('pruned: .work/t8venv/lib ')
+                                for line in record['pruned']))
+        self.assertEqual(json.loads((finished / 'manifest.json').read_text())['head'], 'original')
+        manifest = (finished / 'manifest.json').read_bytes()
+        self.raw_task('repair', '--prune-archive', 'proj')
+        self.assertEqual((finished / 'manifest.json').read_bytes(), manifest)
+
+    def test_archive_runtime_detects_socket_without_suffix(self):
+        # The lane sandbox prohibits socket creation; use its lstat mode directly.
+        info = mock.Mock(st_mode=stat.S_IFSOCK | 0o600)
+        self.assertTrue(TASK_MODULE.archive_runtime(Path('gateway'), info))
 
     def test_merge_preserves_all_work_including_large_data_and_harness(self):
         wt, _ = self.started()
