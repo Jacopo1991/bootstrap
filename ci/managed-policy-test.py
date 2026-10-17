@@ -429,6 +429,55 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
                                 env=clean_env | {"HOME": temp}, check=True, timeout=30)
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "Traceback" not in result.stderr
+# Proof-batch friction: inspect commands, never execute their payloads.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    subprocess.run(["git", "init", "-q", temp], check=True)
+    (root / "outside-link").symlink_to(root.parent / "outside")
+    (root / "--outside-link").symlink_to(root.parent / "outside")
+    allowed = (
+        "ls -la .work/ && echo --- && git --no-optional-locks check-ignore -v .work/report.md; echo --- && du -sh .work/uv-cache",
+        "ls -la .work/context/ 2>&1; echo ---; cat docs/x.md 2>&1; echo ---; git status --short",
+        "git status --short; ls missing 2>/dev/null",
+        f"git -C {temp} status --short && sed -n '1,80p' {temp}/file",
+        "set -o pipefail; cat file | tee output",
+        "set -e; set -u; set -o pipefail; cat file | tee /tmp/hook-friction-output",
+        "set -euo pipefail; cat file | tee output",
+        "if [ -d .work/context ]; then find .work/context -maxdepth 1 -type f -printf '%f\\n' | sort; else printf 'X\\n'; fi",
+        "if test -f file; then cat file; fi",
+        "set -eu; if test -f file; then cat file; fi",
+        "git --no-optional-locks diff --no-index /dev/null docs/x.md",
+        "git diff --no-index docs/x.md /dev/null",
+    )
+    denied = (
+        "git status; ls > output", "git status; printf X >> output",
+        "git status; ls 2> errors", "git status; ls 2>&2",
+        "git status && sed -i 's/a/b/' file",
+        "git status && sed -n -Ei 's/a/b/' file",
+        "git status && sed -n --in-p 's/a/b/' file",
+        "git status && sed -n 'w output' file",
+        "git status && sed -n 'e touch output' file",
+        "set +e; cat file", "set -o history; cat file",
+        "set -e; git push origin HEAD",
+        "set -euo pipefail; cat file | tee /outside",
+        "if test -f file; then touch /outside; else cat file; fi",
+        "if test -f file; then cat file; else sudo true; fi",
+        "if test -f file; then git add file; else git commit -m fixture; fi",
+        "git add file; git commit -m fixture",
+        "git diff --no-index /dev/null /outside",
+        "git diff --no-index /dev/null ../outside",
+        "git diff --no-index /dev/null outside-link",
+        "git diff --no-index -- /dev/null --outside-link",
+        "set -e; cat <<EOF",
+    )
+    for command in allowed:
+        reason = policy.evaluate_command(command, temp, root, (root,))
+        assert reason is None, (command, reason)
+    for command in denied:
+        assert policy.evaluate_command(command, temp, root, (root,)), command
+    for helper in policy.MIXED_CHAIN_TEXT_TOOLS:
+        assert helper in policy.MIXED_CHAIN_MESSAGE, helper
+
 compile_check = 'python3 -I -m compileall -q "$ROOT/system/agent-policy"'
 assert install.index(compile_check) < install.index('sudo install -d -m 0755 "$public_source"')
 

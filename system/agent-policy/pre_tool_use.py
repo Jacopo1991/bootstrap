@@ -60,11 +60,11 @@ SHELL_CONSTRUCTS = {"eval", "source", ".", "export", "declare", "typeset", "read
 CHAIN_SEPARATORS = {";", "&&", "||", "|"}
 # Segments that cannot change repository state before a state-dependent Git command.
 READ_ONLY_COMMANDS = {"cd", "echo", "printf", "true", "false", "pwd", "ls", "cat", "head",
-                      "tail", "wc", "grep", "sort", "uniq", "date", "stat", "basename", "dirname"}
+                      "tail", "wc", "grep", "sort", "uniq", "date", "stat", "basename", "dirname", "du"}
 STATE_DEPENDENT_GIT = {"commit", "merge"}
 MIXED_CHAIN_TEXT_TOOLS = {"grep", "head", "tail", "wc", "sort", "uniq", "cut", "jq", "cat",
                         "pwd", "ls", "find", "rg", "stat", "file", "diff", "test", "[",
-                        "echo", "printf", "true"}
+                        "echo", "printf", "true", "du", "sed"}
 NULL_DEVICES = {"/dev/null"}
 READ_ONLY_GIT = {"log", "show", "diff", "status", "rev-parse", "ls-files", "grep", "blame",
                  "rev-list", "ls-tree", "show-ref", "describe", "cat-file", "merge-base", "name-rev",
@@ -815,15 +815,22 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     # Check filesystem operands, including attached option values, in the effective
     # repository. Remote URLs are reviewed by the native prompt; local remote
     # destinations are forbidden so a push cannot write a sibling repository.
+    literal_diff_paths = False
     for arg in arguments:
+        if arg == "--":
+            literal_diff_paths = True
         if SHELL_EXPANSION.search(arg) and (cross_repo or subcommand not in READ_ONLY_GIT):
             return "Expanded Git operands are blocked; use literal repository paths."
         value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else arg
+        if subcommand == "diff" and "--no-index" in arguments and value == "/dev/null":
+            continue
         if value.startswith("file://"):
             return "Local filesystem Git remotes are blocked."
         if "://" in value or re.match(r"^[^/]+@[^:]+:", value):
             continue
-        if cross_repo or value.startswith(("/", "../", "./")):
+        if (cross_repo or value.startswith(("/", "../", "./"))
+                or subcommand == "diff" and "--no-index" in arguments
+                and (literal_diff_paths or not value.startswith("-"))):
             if not inside(value, str(target), target_root):
                 return "Git path is outside the inspected repository."
         if subcommand in {"push", "fetch", "pull", "remote"} and value.startswith(("/", "../", "./")):
@@ -963,6 +970,14 @@ def sed_policy(tokens: list[str]) -> str | None:
     if any(sed_script_runs_commands(script) for script in scripts):
         return "sed scripts using the e or w commands/flags run commands or write files and are blocked."
     return None
+
+
+def readonly_sed(tokens: list[str]) -> bool:
+    return ("-n" in tokens and sed_policy(tokens) is None and not any(
+        token.startswith("--") and "--in-place".startswith(token.split("=", 1)[0])
+        or token.startswith("--in-place=")
+        or token.startswith("-") and not token.startswith("--") and "i" in token[1:]
+        for token in tokens[1:]))
 
 
 AWK_NAMES = {"awk", "gawk", "mawk", "nawk"}
@@ -1424,7 +1439,9 @@ NETWORK_CHAIN_MESSAGE = ("Run git/gh network commands on their own; only then do
                          "outside the sandbox. Use one call per command, e.g. "
                          "`git -C <path> push origin <branch>`, not `cd <path> && git push`.")
 MIXED_CHAIN_MESSAGE = ("A chain containing git or gh may only add other git/gh commands or read-only "
-                       "text tools (grep, head, tail, wc, sort, uniq, cut, jq, cat) without redirects. "
+                       "helpers (" + ", ".join(sorted(MIXED_CHAIN_TEXT_TOOLS - {"sed"})) +
+                       "), sed -n, or command -v/-V, type and which lookups without file redirects "
+                       "(stderr 2>&1 and 2>/dev/null are permitted). "
                        "Run git on its own instead: use `git -C <path> <command>` rather than "
                        "`cd <path> && git ...`, and run builds, tests and file writes as a separate call.")
 STATE_CHAIN_MESSAGE = ("git commit/merge must not follow commands that may change the index or branch "
@@ -1505,7 +1522,60 @@ def evaluate_command(command: str, cwd: str, root: Path,
         state_reason = task_state_write_reason(tokens, cwd)
         if state_reason:
             return Denial("task.private_state_write", state_reason)
-    if len(all_tokens) > 1:
+    had_chain = len(all_tokens) > 1
+    while all_tokens and all_tokens[0][:1] == ["set"]:
+        options = all_tokens[0][1:]
+        valid = bool(options)
+        while options and valid:
+            option, *options = options
+            if re.fullmatch(r"-[eu]+", option):
+                continue
+            if re.fullmatch(r"-[eu]*o", option) and options[:1] == ["pipefail"]:
+                options = options[1:]
+                continue
+            valid = False
+        if not valid or not operators or operators[0] not in {";", "&&"}:
+            return "Shell constructs: unsupported set options."
+        all_tokens.pop(0)
+        operators.pop(0)
+    # Recognize a bounded single-line conditional, then inspect every branch in
+    # order. Keeping one list preserves the conservative index-state chain guard.
+    conditional_else = None
+    conditional = all_tokens and all_tokens[0][:1] == ["if"] and "\n" not in command
+    if conditional:
+        if (len(all_tokens) < 3 or all_tokens[-1] != ["fi"]
+                or any(op != ";" for op in (operators[0], operators[-1]))):
+            return "Shell constructs: unsupported conditional."
+        all_tokens[0] = all_tokens[0][1:]
+        if all_tokens[1][:1] != ["then"]:
+            return "Shell constructs: conditional needs then."
+        all_tokens[1] = all_tokens[1][1:]
+        seen_else = False
+        for index in range(2, len(all_tokens) - 1):
+            if all_tokens[index][:1] == ["else"]:
+                if seen_else or operators[index - 1] != ";":
+                    return "Shell constructs: unsupported else."
+                seen_else = True
+                conditional_else = index
+                all_tokens[index] = all_tokens[index][1:]
+        all_tokens.pop()
+        operators.pop()
+        if any(not tokens for tokens in all_tokens):
+            return "Shell constructs: empty conditional part."
+    # These exact stderr redirects neither write a file nor change argv. Leave
+    # every other redirect visible to the existing boundary checks.
+    for index, tokens in enumerate(all_tokens):
+        if tokens and Path(tokens[0]).name not in {"git", "gh"}:
+            cleaned = []
+            cursor = 0
+            while cursor < len(tokens):
+                if tokens[cursor:cursor + 3] in (["2", ">&", "1"], ["2", ">", "/dev/null"]):
+                    cursor += 3
+                else:
+                    cleaned.append(tokens[cursor])
+                    cursor += 1
+            all_tokens[index] = cleaned
+    if had_chain:
         heads: list[tuple[str, list[str]]] = []
         for tokens in all_tokens:
             unwrapped = unwrap_command(tokens)
@@ -1534,11 +1604,19 @@ def evaluate_command(command: str, cwd: str, root: Path,
                     token == "--compile" or (token.startswith("-")
                                              and not token.startswith("--") and "C" in token)
                     for token in unwrapped[1:])
+                sed_writes = head == "sed" and not readonly_sed(unwrapped)
                 if (head not in MIXED_CHAIN_TEXT_TOOLS | {"git", "gh"}
                         and not pure_lookup(unwrapped)) or writes or find_writes or rg_executes or file_writes:
                     return MIXED_CHAIN_MESSAGE
+                if sed_writes:
+                    return MIXED_CHAIN_MESSAGE
     seen_changing = False
+    branch_cwd = effective
     for position, tokens in enumerate(all_tokens):
+        if conditional and position == 1:
+            branch_cwd = effective
+        if position == conditional_else:
+            effective = branch_cwd
         piped = position > 0 and operators[position - 1] == "|"
         unwrapped = unwrap_command(tokens)
         if isinstance(unwrapped, str):
@@ -1565,7 +1643,8 @@ def evaluate_command(command: str, cwd: str, root: Path,
             return reason
         if unwrapped:
             sub = git_subcommand(unwrapped, effective) if head == "git" else None
-            if not (head in READ_ONLY_COMMANDS or sub in READ_ONLY_GIT or pure_lookup(unwrapped)):
+            if not (head in READ_ONLY_COMMANDS or head == "sed" and readonly_sed(unwrapped)
+                    or sub in READ_ONLY_GIT or pure_lookup(unwrapped)):
                 seen_changing = True
     return None
 
@@ -1663,7 +1742,11 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if any(SHELL_EXPANSION.search(t) or metadata is None or protected_git_path(t, cwd, metadata)
            for t in inspected):
         return "Direct shell writes to Git metadata or expanded file operands are blocked."
-    if any(SHELL_EXPANSION.search(t) or not writable(t, cwd, root, metadata) for t in targets):
+    if any(SHELL_EXPANSION.search(t) or not (
+            writable(t, cwd, root, metadata)
+            or executable == "tee" and metadata is not None
+            and inside(t, cwd, Path("/tmp"))
+            and not protected_git_path(t, cwd, metadata)) for t in targets):
         return "Shell writes outside the current repository or into Git metadata are blocked."
     if executable == "git":
         reason = git_policy(tokens, cwd, root, approved_roots)
