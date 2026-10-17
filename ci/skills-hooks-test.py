@@ -75,13 +75,16 @@ class Install(unittest.TestCase):
         line = install[install.index("skills-setup.sh") - 400:install.index("skills-setup.sh")]
         self.assertIn("sudo -H -u agent", line)
 
-    def test_setup_installs_all_skills_for_both_agents_with_force_once(self):
+    def test_setup_installs_all_skills_and_repairs_legacy_verify_ui(self):
         setup = SETUP.read_text()
         self.assertIn("gh skill install \"$repository\" --all --agent \"$agent\" --scope user --force", setup)
         self.assertIn("for agent in claude-code codex", setup)
         self.assertIn("repository=Jacopo1991/cortex-core", setup)
-        self.assertEqual(len(re.findall(r"^\s*gh skill install .*--force", setup, re.M)), 1)
-        self.assertIn('if [[ ! -e $stamp ]]', setup)  # --force only on the first install
+        self.assertEqual(len(re.findall(r"^\s*gh skill install .*--force", setup, re.M)), 2)
+        self.assertIn('if [[ ! -e $stamp ]]', setup)
+        repair = 'gh skill install "$repository" verify-ui --agent "$agent" --scope user --force'
+        self.assertIn(repair, setup)
+        self.assertLess(setup.index(repair), setup.index("  gh-skill-update\n"))
         steps = ["enable --now gh-skill-update.timer", "is-active --quiet gh-skill-update.timer"]
         positions = [setup.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions))
