@@ -448,6 +448,7 @@ with tempfile.TemporaryDirectory() as temp:
         "set -eu; if test -f file; then cat file; fi",
         "git --no-optional-locks diff --no-index /dev/null docs/x.md",
         "git diff --no-index docs/x.md /dev/null",
+        "git diff --no-index docs/*.md docs/x?.md",
     )
     denied = (
         "git status; ls > output", "git status; printf X >> output",
@@ -465,6 +466,11 @@ with tempfile.TemporaryDirectory() as temp:
         "if test -f file; then git add file; else git commit -m fixture; fi",
         "git add file; git commit -m fixture",
         "git diff --no-index /dev/null /outside",
+        "git diff --no-index ~/x docs/x.md",
+        "git diff --no-index $HOME/x docs/x.md",
+        "git diff --no-index ${HOME}/x docs/x.md",
+        "git diff --no-index docs/x.md ~/x",
+        "git diff --no-index -- docs/x.md $HOME/x",
         "git diff --no-index /dev/null ../outside",
         "git diff --no-index /dev/null outside-link",
         "git diff --no-index -- /dev/null --outside-link",
