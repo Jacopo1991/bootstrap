@@ -68,10 +68,15 @@ WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
                "node_modules", "hermes-home", "fakehome"}
 
 
-def archive_runtime(item, info):
-    return (item.name in WORK_CACHES or item.name.endswith('.sock') or
-            stat.S_ISSOCK(info.st_mode) or
-            (stat.S_ISDIR(info.st_mode) and (item / 'pyvenv.cfg').is_file()))
+def archive_runtime(item, info, errors=None):
+    try:
+        return (item.name in WORK_CACHES or item.name.endswith('.sock') or
+                stat.S_ISSOCK(info.st_mode) or
+                (stat.S_ISDIR(info.st_mode) and (item / 'pyvenv.cfg').is_file()))
+    except OSError as error:
+        if errors is not None:
+            errors[item] = f"cannot inspect: {error}"
+        return False
 
 
 def archive_inventory(root):
@@ -103,11 +108,11 @@ def archive_evidence(item, info):
                                           'merge', 'manifest', 'run', 'task', 'exception', 'gate')))
 
 
-def oversized_contents(entries, sizes, protected):
+def oversized_contents(entries, sizes, protected, errors):
     """Select non-evidence contents, retaining directories needed by evidence."""
     roots, retained, covered, runtime = set(), set(), set(), set()
     for item, info in entries:
-        if item.parent in runtime or archive_runtime(item, info):
+        if item.parent in runtime or archive_runtime(item, info, errors):
             runtime.add(item)
         if (stat.S_ISDIR(info.st_mode) and item not in protected and
                 sizes.get(item, 0) > 200 * 1024 ** 2):
@@ -117,6 +122,9 @@ def oversized_contents(entries, sizes, protected):
         if item not in runtime and not stat.S_ISDIR(info.st_mode) and archive_evidence(item, info):
             retained.add(item)
             retained.update(item.parents)
+    for item in errors:
+        retained.add(item)
+        retained.update(item.parents)
     return roots, covered - retained
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
@@ -455,7 +463,7 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
         saved = pending / ".work"
 
         entries, sizes, errors = archive_inventory(source)
-        oversized, disposable = oversized_contents(entries, sizes, {source, source / 'reports'})
+        oversized, disposable = oversized_contents(entries, sizes, {source, source / 'reports'}, errors)
         skipped, special, excluded, size = [], [], set(), 0
         for item, info in entries:
             if item.parent in excluded:
@@ -467,13 +475,16 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                 special.append(relative)
                 reason = "special file"
-            elif item != source and archive_runtime(item, info):
+            elif item != source and archive_runtime(item, info, errors):
                 reason = "cache/runtime"
             elif item in disposable:
                 reason = "directory over 200 MB"
             elif (stat.S_ISREG(mode) and item.suffix == '.log' and
                   sizes[item] >= 50 * 1024 ** 2 and not archive_evidence(item, info)):
                 reason = "log over 50 MB"
+            if item in errors:
+                excluded.add(item)
+                continue
             if reason:
                 excluded.add(item)
                 skipped.append({"path": relative, "size": sizes[item], "reason": reason})
@@ -2998,7 +3009,8 @@ def cancel(args):
 
 def prune_archive(repo, dry_run=False):
     root = HOME / '.local/state/task/archive' / repo.name
-    entries, sizes, _errors = archive_inventory(root)
+    entries, sizes, errors = archive_inventory(root)
+    known = {item: info for item, info in entries}
     allocated = {item: info.st_blocks * 512 for item, info in entries}
     for item, _info in reversed(entries):
         if item != root:
@@ -3020,26 +3032,30 @@ def prune_archive(repo, dry_run=False):
         gate = gate_worktree_match(item.name)
         if not pending and not gate:
             continue
+        if any(path == item or item in path.parents for path in errors):
+            continue
         if gate and live_gate:
             temporary.add(item)
             continue
         if pending and not any(
-                sibling.is_dir() and not sibling.name.startswith('.') and
-                (sibling / 'manifest.json').is_file() for sibling in item.parent.iterdir()):
+                sibling.parent == item.parent and stat.S_ISDIR(sibling_info.st_mode) and
+                not sibling.name.startswith('.') and
+                stat.S_ISREG(known[sibling / 'manifest.json'].st_mode)
+                for sibling, sibling_info in entries if sibling / 'manifest.json' in known):
             destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
             print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
             finishing[item] = destination
             if not dry_run:
-                contents, content_sizes, errors = archive_inventory(item)
+                contents, content_sizes, content_errors = archive_inventory(item)
                 manifest = item / 'manifest.json'
-                record = json.loads(manifest.read_text()) if manifest.exists() else {}
+                record = json.loads(manifest.read_text()) if manifest in known else {}
                 record.setdefault('note', 'finished by repair')
                 record.setdefault('contents', [{'path': str(path.relative_to(item)),
                                   'size': content_sizes.get(path, 0)}
                                  for path, _info in contents if path != item])
                 record.setdefault('skipped', []).extend(
                     {'path': str(path.relative_to(item)), 'reason': error}
-                    for path, error in errors.items())
+                    for path, error in content_errors.items())
                 atomic_json(manifest, record)
             continue
         temporary.add(item)
@@ -3056,7 +3072,7 @@ def prune_archive(repo, dry_run=False):
     for container in containers:
         protected.update({container / '.work', container / 'reports', container / '.work/reports'})
         protected.update(container.parents)
-    _oversized, disposable = oversized_contents(entries, sizes, protected)
+    _oversized, disposable = oversized_contents(entries, sizes, protected, errors)
     for item, info in entries:
         if item in temporary:
             continue
@@ -3066,7 +3082,9 @@ def prune_archive(repo, dry_run=False):
         container = next((parent for parent in item.parents if parent in containers), None)
         if container is None:
             continue
-        runtime = archive_runtime(item, info)
+        runtime = archive_runtime(item, info, errors)
+        if any(path == item or item in path.parents for path in errors):
+            continue
         large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
                      info.st_size >= 50 * 1024 ** 2 and not archive_evidence(item, info))
         # Named runtime trees are removed whole; generic contents preserve evidence.
@@ -3082,10 +3100,19 @@ def prune_archive(repo, dry_run=False):
                 shutil.rmtree(item)
             pruned.setdefault(container, []).append(
                 f"pruned: {item.relative_to(container)} {allocated.get(item, 0)}")
-    for container, records in pruned.items():
+    skipped = {}
+    for item, error in errors.items():
+        print(f"Skipped {item}: {error}")
+        container = next((parent for parent in item.parents if parent in containers), None)
+        if container is not None:
+            skipped.setdefault(container, []).append(
+                {'path': str(item.relative_to(container)), 'reason': error})
+    for container in (set(pruned) | set(skipped)) if not dry_run else ():
         manifest = container / 'manifest.json'
         record = json.loads(manifest.read_text())
-        record.setdefault('pruned', []).extend(records)
+        record.setdefault('pruned', []).extend(pruned.get(container, []))
+        existing = record.setdefault('skipped', [])
+        existing.extend(entry for entry in skipped.get(container, []) if entry not in existing)
         atomic_json(manifest, record)
     if not dry_run:
         for pending, destination in finishing.items():
