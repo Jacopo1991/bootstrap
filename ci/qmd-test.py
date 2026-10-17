@@ -118,7 +118,7 @@ class RenderedConfigTests(unittest.TestCase):
             (home / "cortex" / ".worktrees").mkdir()
             (home / "dest").mkdir()
             env = {**os.environ, "HOME": str(home)}
-            template = (ROOT / "home/dot_config/qmd/index.yml.tmpl").read_text()
+            template = (ROOT / "home/.chezmoitemplates/qmd-index.yml").read_text()
             def chezmoi(*args, **kwargs):
                 result = subprocess.run(
                     [CHEZMOI, "--source", str(ROOT), "--destination", str(home / "dest"),
@@ -134,6 +134,26 @@ class RenderedConfigTests(unittest.TestCase):
                 input=template, capture_output=True, text=True, env=env)
             self.assertEqual(rendered.returncode, 0, rendered.stderr)
             self.warnings = rendered.stderr
+            # Exercise real modify application with closed stdin: initial creation,
+            # tool-rewritten YAML, and an unchanged repeat must all avoid prompts.
+            source = home / "source"
+            target_source = source / "dot_config/qmd"
+            target_source.mkdir(parents=True)
+            shutil.copytree(ROOT / "home/.chezmoitemplates", source / ".chezmoitemplates")
+            shutil.copy(ROOT / "home/dot_config/qmd/modify_index.yml.tmpl", target_source)
+            target = home / "dest/.config/qmd/index.yml"
+            rewritten = "\n".join(line for line in rendered.stdout.splitlines()
+                                  if not line.startswith("#")) + "\n"
+            rewritten = rewritten.replace('pattern: "**/*.md"', "pattern: '**/*.md'")
+            for contents in (None, rewritten, "collections: {}\n", rendered.stdout):
+                if contents is not None:
+                    target.write_text(contents)
+                applied = subprocess.run(
+                    [CHEZMOI, "--source", str(source), "--destination", str(home / "dest"),
+                     "--config", str(home / "chezmoi.toml"), "apply"],
+                    input="", capture_output=True, text=True, env=env, timeout=15)
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                self.assertEqual(target.read_text(), rendered.stdout)
             index.write_text(rendered.stdout)
             parsed = chezmoi(f'{{{{ output "cat" "{index}" | fromYaml | toJson }}}}')
             return str(home), json.loads(parsed)
@@ -175,7 +195,7 @@ class RenderedConfigTests(unittest.TestCase):
         self.assertEqual(contexts["cortex-kb-nofm"], "Cortex knowledge repository cortex-kb-nofm")
 
     def test_bootstrap_source_holds_no_project_descriptions(self):
-        text = (ROOT / "home/dot_config/qmd/index.yml.tmpl").read_text()
+        text = (ROOT / "home/.chezmoitemplates/qmd-index.yml").read_text()
         self.assertNotIn("cortex-kb-", text)
 
     def test_reference_folder_becomes_a_read_only_collection(self):
