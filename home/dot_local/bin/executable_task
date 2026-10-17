@@ -402,7 +402,7 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
-def preserve_work(task: Task, path: Path):
+def preserve_work(task: Task, path: Path, reuse_head=None):
     """Preserve evidence; list runtime data and individual copy failures."""
     source = path / ".work"
     if not source.exists() and not source.is_symlink():
@@ -410,6 +410,15 @@ def preserve_work(task: Task, path: Path):
     archive = HOME / ".local/state/task/archive" / task.repo.name / task.name
     try:
         archive.mkdir(parents=True, exist_ok=True)
+        if reuse_head:
+            for manifest in archive.glob(f"{path.name}-*/manifest.json"):
+                try:
+                    record = json.loads(manifest.read_text())
+                except (OSError, ValueError):
+                    continue
+                if record.get('head') == reuse_head and (manifest.parent / '.work').is_dir():
+                    print(f"Reusing archive {manifest.parent} for {reuse_head}.")
+                    return
         pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=archive))
         saved = pending / ".work"
 
@@ -458,7 +467,10 @@ def preserve_work(task: Task, path: Path):
                 errors[item] = str(error)
         skipped.extend({"path": str(item.relative_to(source)), "size": sizes.get(item, 0),
                         "reason": error} for item, error in errors.items())
-        atomic_json(pending / "manifest.json", {"skipped_special_files": special, "skipped": skipped})
+        head = run_git(path, 'rev-parse', '--verify', 'HEAD^{commit}')
+        atomic_json(pending / "manifest.json", {"skipped_special_files": special, "skipped": skipped,
+                                                "head": reuse_head or (head.stdout.strip()
+                                                                       if not head.returncode else None)})
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except (OSError, shutil.Error) as error:
@@ -2071,7 +2083,10 @@ def remove_gate_worktree(task, gate):
     finally:
         result = run_git(task.repo, 'worktree', 'remove', '--force', str(gate))
         if result.returncode and gate.exists():
-            shutil.rmtree(gate)
+            try:
+                shutil.rmtree(gate)
+            except OSError as error:
+                print(f"Gate cleanup warning: {gate}: {error}", file=sys.stderr)
             run_git(task.repo, 'worktree', 'prune')
 
 
@@ -2973,6 +2988,14 @@ def prune_archive(repo, dry_run=False):
             destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
             print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
             if not dry_run:
+                contents, content_sizes, errors = archive_inventory(item)
+                atomic_json(item / 'manifest.json', {
+                    'note': 'finished by repair',
+                    'contents': [{'path': str(path.relative_to(item)),
+                                  'size': content_sizes.get(path, 0)}
+                                 for path, _info in contents if path != item],
+                    'skipped': [{'path': str(path.relative_to(item)), 'reason': error}
+                                for path, error in errors.items()]})
                 item.rename(destination)
             continue
         freed += allocated.get(item, 0)
@@ -3061,8 +3084,8 @@ def repair_published(task, base):
             source = task.path / '.work' / name
             if source.is_file():
                 shutil.copy2(source, state / name)
-        preserve_work(task, task.path)
         if not (untracked(task.path) + ignored_leftovers(task.path)):
+            preserve_work(task, task.path, reuse_head=head)
             branch = git(task.path, 'branch', '--show-current')
             git(task.repo, 'worktree', 'remove', '--force', str(task.path))
             if branch:

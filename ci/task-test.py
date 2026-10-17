@@ -1046,6 +1046,41 @@ store.write_text(json.dumps(prs))
         self.raw_task('repair', 'proj')
         self.assertEqual(json.loads((self.state() / 'run.json').read_text())['state'], 'passed')
 
+    def test_repair_kept_worktree_and_reuses_finished_head_archive(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'published.txt')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'merge', '--no-ff', '-m', 'published', head)
+        self.git(self.repo, 'push', '-q', 'origin', 'main')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+        original = list(self.work_archives().glob('*/manifest.json'))
+        (wt / 'leftover.txt').write_text('keep worktree')
+        for _ in range(2):
+            self.raw_task('repair', 'proj')
+            self.assertTrue(wt.exists())
+            self.assertEqual(list(self.work_archives().glob('*/manifest.json')), original)
+        (wt / 'leftover.txt').unlink()
+        out = self.raw_task('repair', 'proj')
+        self.assertIn('Reusing archive', out)
+        self.assertFalse(wt.exists())
+        self.assertEqual(list(self.work_archives().glob('*/manifest.json')), original)
+
+    def test_gate_cleanup_warns_for_undeletable_subdirectory(self):
+        self.started()
+        gate = self.repo / '.worktrees/.task-gate-t5-99999999'
+        (gate / 'locked').mkdir(parents=True)
+        (gate / 'locked/file').write_text('held')
+        (gate / 'locked').chmod(0o500)
+        self.addCleanup(lambda: (gate / 'locked').chmod(0o700))
+        failed = subprocess.CompletedProcess([], 1)
+        warning = io.StringIO()
+        with mock.patch.object(TASK_MODULE, 'run_git', return_value=failed), \
+                contextlib.redirect_stderr(warning):
+            TASK_MODULE.remove_gate_worktree(TASK_MODULE.Task(self.repo, '5'), gate)
+        self.assertIn('Gate cleanup warning:', warning.getvalue())
+        self.assertTrue((gate / 'locked/file').exists())
+
     def test_prune_archive_dry_run_and_preserves_evidence(self):
         root = self.work_archives()
         saved = root / 't5-finished'
@@ -1073,7 +1108,8 @@ store.write_text(json.dumps(prs))
             (copy / '.work/check.log').write_text('check evidence')
             (copy / '.work/report.md').write_text('report evidence')
             (copy / '.work/records/run.jsonl').write_text('{}\n')
-            (copy / 'manifest.json').write_text('{}')
+            if copy != orphan:
+                (copy / 'manifest.json').write_text('{}')
         out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
         self.assertIn('Would free', out)
         self.assertTrue(pending.exists())
@@ -1087,6 +1123,14 @@ store.write_text(json.dumps(prs))
         self.assertFalse(stale.exists())
         self.assertFalse(orphan.exists())
         recovered = orphan.with_name('other-unfinished')
+        manifest = json.loads((recovered / 'manifest.json').read_text())
+        self.assertEqual(manifest['note'], 'finished by repair')
+        self.assertIn('.work/report.md', [entry['path'] for entry in manifest['contents']])
+        duplicate = recovered.parent / '.pending-later'
+        duplicate.mkdir()
+        (duplicate / 'partial').write_text('duplicate')
+        self.raw_task('repair', '--prune-archive', 'proj')
+        self.assertFalse(duplicate.exists())
         for name in ('.work/check.log', '.work/report.md', '.work/records/run.jsonl', 'manifest.json'):
             self.assertTrue((recovered / name).is_file())
         self.assertFalse((saved / '.work/fakehome/state').exists())
