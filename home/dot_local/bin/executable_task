@@ -96,9 +96,11 @@ def archive_inventory(root):
 
 def archive_evidence(item, info):
     name = item.name.lower()
-    return (item.suffix.lower() in {'.md', '.jsonl'} or
+    return (item.suffix.lower() in {'.md', '.json', '.jsonl', '.txt', '.html',
+                                    '.toml', '.yaml', '.yml', '.csv'} or
             (item.suffix.lower() == '.log' and info.st_size < 50 * 1024 ** 2) or
-            any(word in name for word in ('prompt', 'request', 'check', 'review', 'merge', 'manifest')))
+            any(word in name for word in ('report', 'prompt', 'request', 'check', 'review',
+                                          'merge', 'manifest', 'run', 'task', 'exception', 'gate')))
 
 
 def oversized_contents(entries, sizes, protected):
@@ -469,7 +471,8 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
                 reason = "cache/runtime"
             elif item in disposable:
                 reason = "directory over 200 MB"
-            elif stat.S_ISREG(mode) and item.suffix == '.log' and sizes[item] >= 50 * 1024 ** 2:
+            elif (stat.S_ISREG(mode) and item.suffix == '.log' and
+                  sizes[item] >= 50 * 1024 ** 2 and not archive_evidence(item, info)):
                 reason = "log over 50 MB"
             if reason:
                 excluded.add(item)
@@ -3065,7 +3068,7 @@ def prune_archive(repo, dry_run=False):
             continue
         runtime = archive_runtime(item, info)
         large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
-                     info.st_size >= 50 * 1024 ** 2)
+                     info.st_size >= 50 * 1024 ** 2 and not archive_evidence(item, info))
         # Named runtime trees are removed whole; generic contents preserve evidence.
         if not (runtime or item in disposable or large_log):
             continue

@@ -1311,6 +1311,39 @@ store.write_text(json.dumps(prs))
         self.raw_task('repair', '--prune-archive', 'proj')
         self.assertEqual((finished / 'manifest.json').read_bytes(), manifest)
 
+    def test_oversized_directory_keeps_broad_evidence_in_archive_and_repair(self):
+        wt, _ = self.started()
+        finished = self.work_archives() / 'old-finished'
+        pending = self.work_archives() / 'other/.pending-broad'
+        names = ['report.json', 'report.txt', 'run.json', 'exception.json',
+                 'task.json', 'gate-check.json', 'arbitrary.json']
+        names += ['notes' + suffix for suffix in
+                  ('.md', '.jsonl', '.txt', '.html', '.toml', '.yaml', '.yml', '.csv', '.log')]
+        names += [word + '.dat' for word in
+                  ('report', 'prompt', 'request', 'check', 'review', 'merge',
+                   'manifest', 'run', 'task', 'exception', 'gate')]
+        for container in (wt, finished, pending):
+            directory = container / '.work/big'
+            directory.mkdir(parents=True)
+            for name in names:
+                (directory / name).write_text('evidence')
+            for name, megabytes in (('payload.bin', 150), ('state.sqlite', 100)):
+                with (directory / name).open('wb') as stream:
+                    stream.truncate(megabytes * 1024 ** 2)
+            (directory / 'empty').mkdir()
+        (finished / 'manifest.json').write_text('{}')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+        archived = next(path.parent.parent for path in self.work_archives().glob('*/.work/big')
+                        if path.parent.parent != finished)
+        self.raw_task('repair', '--prune-archive', 'proj')
+        for container in (archived, finished, pending.with_name('other-broad')):
+            directory = container / '.work/big'
+            for name in names:
+                self.assertEqual((directory / name).read_text(), 'evidence')
+            for name in ('payload.bin', 'state.sqlite', 'empty'):
+                self.assertFalse((directory / name).exists())
+
     def test_archive_runtime_detects_socket_without_suffix(self):
         # The lane sandbox prohibits socket creation; use its lstat mode directly.
         info = mock.Mock(st_mode=stat.S_IFSOCK | 0o600)
