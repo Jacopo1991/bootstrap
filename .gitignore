@@ -4,5 +4,7 @@ node_modules/
 *.vhdx
 *.wsl
 *.env
+__pycache__/
+*.pyc
 !home/.chezmoitemplates/pins.env
 !checks/gpu-image.env
