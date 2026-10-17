@@ -493,28 +493,31 @@ def timeout_for(path: Path):
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
-def exclusive_gate_enabled(path: Path) -> bool:
+def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     config = path / ".task.toml"
     if not config.is_file():
-        return False
+        return not advisory
     try:
         values = tomllib.loads(config.read_text())
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise Stop(f"Cannot read {config}: {error}.")
-    return values.get("exclusive_gate") is True
+    return values.get("exclusive_gate", not advisory) is True
 
 
 @contextmanager
-def exclusive_gate_lock(task: Task, silent_unavailable=False):
-    """Serialize opted-in checks across the host and Codex sandboxes sharing /tmp."""
+def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=None):
+    """Serialize gates across the host and Codex sandboxes sharing /tmp."""
+    allow_unavailable = silent_unavailable or not exclusive_gate_enabled(
+        config_path if config_path is not None else task.repo, advisory=True)
+    unlocked_notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
     gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
     lock_path = gate_dir / "agent-task-gate.lock"
     holder_path = gate_dir / "agent-task-gate.holder"
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
     except OSError as error:
-        if silent_unavailable:
-            print(f"Cannot open shared gate lock: {error}; running advisory check unlocked.", flush=True)
+        if allow_unavailable:
+            print(f"Cannot open shared gate lock: {error}; {unlocked_notice}.", flush=True)
             yield
             return
         raise Stop(f"Cannot open shared gate lock: {error}")
@@ -540,14 +543,14 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                     try:
                         holder_record = json.loads(holder_path.read_text())
                         detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
-                                  f"pid {holder_record['pid']} since {holder_record['since']}")
+                                  f"pid {gate_holder_pid(lock_path)} since {holder_record['since']}")
                     except (OSError, KeyError, json.JSONDecodeError, TypeError):
                         detail = "another gate (holder details unavailable)"
                     print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
                 time.sleep(0.1)
             except OSError as error:
-                if silent_unavailable:
-                    print(f"Cannot acquire shared gate lock: {error}; running advisory check unlocked.", flush=True)
+                if allow_unavailable:
+                    print(f"Cannot acquire shared gate lock: {error}; {unlocked_notice}.", flush=True)
                     os.close(descriptor)
                     descriptor = None
                     yield
@@ -574,6 +577,10 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
 
 
 def gate_holder_alive(lock_path):
+    return gate_holder_pid(lock_path) is not None
+
+
+def gate_holder_pid(lock_path):
     """Kernel lock identity survives PID namespace differences."""
     info = lock_path.stat()
     for line in Path("/proc/locks").read_text().splitlines():
@@ -584,8 +591,8 @@ def gate_holder_alive(lock_path):
             match = re.fullmatch(r"([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)", field)
             if match and (int(match[1], 16), int(match[2], 16), int(match[3])) == (
                     os.major(info.st_dev), os.minor(info.st_dev), info.st_ino):
-                return True
-    return False
+                return int(fields[4])
+    return None
 
 
 def run_record_path(task: Task):
@@ -1505,13 +1512,13 @@ def check(args):
         print(f"exception: verification omitted: {record['no_verify']}")
     if advisory:
         with advisory_check_lock(path):
-            if exclusive_gate_enabled(path):
+            if exclusive_gate_enabled(path, advisory=True):
                 with exclusive_gate_lock(task, silent_unavailable=True):
                     passed = run_check(path, base, record, None, advisory=True)
             else:
                 passed = run_check(path, base, record, None, advisory=True)
     elif exclusive_gate_enabled(path):
-        with exclusive_gate_lock(task, silent_unavailable=advisory):
+        with exclusive_gate_lock(task, config_path=path):
             passed = run_check(path, base, record, task_state(task), advisory=False)
     else:
         passed = run_check(path, base, record, task_state(task), advisory=False)
@@ -2074,7 +2081,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
         gated_head = sha(gate, "HEAD")
         archived_log = task_state(task) / "gate-check.log"
         if exclusive_gate_enabled(gate):
-            with exclusive_gate_lock(task):
+            with exclusive_gate_lock(task, config_path=gate):
                 passed = run_check(gate, base, record, task_state(task),
                                    evidence_name="gate-check.json", display_log=archived_log)
         else:
@@ -2543,14 +2550,14 @@ def close(args):
     try:
         review = json.loads((archive / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
-        if exception_path.is_file():
+        if exception_path.is_file() or args.no_merge:
             review = {}
         else:
             raise Stop("Close requires a recorded review, or an explicit merge exception.")
     passed = {int(n) for n, verdict in review.get("judgments", {}).items() if verdict == "pass"}
     criteria = [str(item["number"]) for item in record.get("criteria", []) if item["number"] in passed]
     not_passed = [str(item["number"]) for item in record.get("criteria", []) if item["number"] not in passed]
-    if not_passed and not args.partial and not exception_path.is_file():
+    if not_passed and not args.partial and not exception_path.is_file() and not args.no_merge:
         raise Stop("Cannot mark Done: criteria not passed in review: #" + ", #".join(not_passed) + ". Use --partial to keep In Progress.")
     exception = exception_path.exists() or bool(record.get("no_verify"))
     try:
@@ -2577,7 +2584,7 @@ def close(args):
         if not args.no_merge:
             print("Notice: merge not recorded for the task head.")
     summary = args.message + "\n\nRetro: " + args.retro
-    if not args.partial and (not head or merge_evidence.get("head") != head):
+    if args.no_merge or (not args.partial and (not head or merge_evidence.get("head") != head)):
         summary += "\n\nMerge: " + (f"not merged: {args.no_merge}" if args.no_merge else 'merge not recorded')
     if exception_path.is_file():
         try:
