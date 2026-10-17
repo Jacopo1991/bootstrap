@@ -436,6 +436,92 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, clean_env, cl
                                 env=clean_env | {"HOME": temp}, check=True, timeout=30)
         assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
         assert "Traceback" not in result.stderr
+# Proof-batch friction: inspect commands, never execute their payloads.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    subprocess.run(["git", "init", "-q", temp], check=True)
+    (root / "outside-link").symlink_to(root.parent / "outside")
+    (root / "--outside-link").symlink_to(root.parent / "outside")
+    (root / "2" / ".git").mkdir(parents=True)
+    (root / "a 2" / ".git").mkdir(parents=True)
+    allowed = (
+        "ls -la .work/ && echo --- && git --no-optional-locks check-ignore -v .work/report.md; echo --- && du -sh .work/uv-cache",
+        "ls -la .work/context/ 2>&1; echo ---; cat docs/x.md 2>&1; echo ---; git status --short",
+        "git status --short; ls missing 2>/dev/null",
+        "ls 2>/dev/null",
+        "ls 2> /dev/null",
+        "git log 2>&1 | head",
+        f"git -C {temp} status --short && sed -n '1,80p' {temp}/file",
+        "set -o pipefail; cat file | tee output",
+        "set -e; set -u; set -o pipefail; cat file | tee /tmp/hook-friction-output",
+        "set -euo pipefail; cat file | tee output",
+        "if [ -d .work/context ]; then find .work/context -maxdepth 1 -type f -printf '%f\\n' | sort; else printf 'X\\n'; fi",
+        "if test -f file; then cat file; fi",
+        "set -eu; if test -f file; then cat file; fi",
+        "git --no-optional-locks diff --no-index /dev/null docs/x.md",
+        "git diff --no-index docs/x.md /dev/null",
+        "git diff --no-index docs/x.md docs/y.md",
+    )
+    denied = (
+        r"rm -rf a\ 2>/dev/null",
+        'rm -rf "a 2">/dev/null',
+        r"chmod -R 777 a\ 2>/dev/null",
+        "rm -rf 2", "rm -rf 2 >/dev/null",
+        "chmod -R 777 2", "chmod -R 777 2 >/dev/null",
+        "rm -rf '2' >/dev/null", "rm -rf 2 > /dev/null",
+        "rm -rf 2 >/dev/null 2>/dev/null",
+        "rm -rf 2>/dev/null 2 >/dev/null",
+        "rm -rf '2>/dev/null' 2 >/dev/null",
+        "git status; ls > output", "git status; printf X >> output",
+        "git status; ls 2> errors", "git status; ls 2>&2",
+        "git status && sed -i 's/a/b/' file",
+        "git status && sed -n -Ei 's/a/b/' file",
+        "git status && sed -n --in-p 's/a/b/' file",
+        "git status && sed -n 'w output' file",
+        "git status && sed -n 'e touch output' file",
+        "set +e; cat file", "set -o history; cat file",
+        "set -e; git push origin HEAD",
+        "set -euo pipefail; cat file | tee /outside",
+        "if test -f file; then touch /outside; else cat file; fi",
+        "if test -f file; then cat file; else sudo true; fi",
+        "if test -f file; then git add file; else git commit -m fixture; fi",
+        "git add file; git commit -m fixture",
+        "git diff --no-index /dev/null /outside",
+        "git diff --no-index 'a@b:/hostname' /dev/null",
+        "git diff --no-index 'file:///etc/hostname' /dev/null",
+        "git diff --no-index /dev/null 'a@b:/hostname'",
+        "git diff --no-index /dev/null 'https://example.invalid/hostname'",
+        "git diff --no-index {docs/x.md,/etc/hostname} docs/x.md",
+        "git diff --no-index {../../..,docs}/x docs/x.md",
+        "git diff --no-index -- docs/x.md {docs/x.md,/etc/hostname}",
+        "git diff --no-index docs/x.md {../../..,docs}/x",
+        "git diff --no-index docs/*.md docs/x.md",
+        "git diff --no-index docs/x.md docs/x?.md",
+        "git diff --no-index docs/[xy].md docs/x.md",
+        "git diff --no-index ~/x docs/x.md",
+        "git diff --no-index $HOME/x docs/x.md",
+        "git diff --no-index ${HOME}/x docs/x.md",
+        "git diff --no-index docs/${X:-../../..}/etc/hostname docs/x.md",
+        "git diff --no-index docs/$(pwd)/x docs/x.md",
+        "git diff --no-index docs/`pwd`/x docs/x.md",
+        "git diff --no-index -- docs/x.md docs/${X:-../../..}/etc/hostname",
+        "git diff --no-index docs/x.md docs/$(pwd)/x",
+        "git diff --no-index docs/x.md docs/`pwd`/x",
+        "git diff --no-index docs/x.md ~/x",
+        "git diff --no-index -- docs/x.md $HOME/x",
+        "git diff --no-index /dev/null ../outside",
+        "git diff --no-index /dev/null outside-link",
+        "git diff --no-index -- /dev/null --outside-link",
+        "set -e; cat <<EOF",
+    )
+    for command in allowed:
+        reason = policy.evaluate_command(command, temp, root, (root,))
+        assert reason is None, (command, reason)
+    for command in denied:
+        assert policy.evaluate_command(command, temp, root, (root,)), command
+    for helper in policy.MIXED_CHAIN_TEXT_TOOLS:
+        assert helper in policy.MIXED_CHAIN_MESSAGE, helper
+
 # Exercise every response route against the actual audit writer, including failures.
 with tempfile.TemporaryDirectory() as audit_temp:
     with patch.dict(os.environ, {"AGENT_POLICY_STATE_DIR": audit_temp}):
