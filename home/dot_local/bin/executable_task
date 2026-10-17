@@ -3041,6 +3041,9 @@ def prune_archive(repo, dry_run=False):
 
 
 def repair_published(task, base):
+    if task.path.exists() and not real_worktree(task.repo, task.path):
+        print(f"{task.path}: not a worktree; left as is")
+        return
     state = task_state(task)
     head = sha(task.path, 'HEAD') if task.path.exists() else None
     try:

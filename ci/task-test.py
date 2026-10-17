@@ -1046,6 +1046,23 @@ store.write_text(json.dumps(prs))
         self.raw_task('repair', 'proj')
         self.assertEqual(json.loads((self.state() / 'run.json').read_text())['state'], 'passed')
 
+    def test_repair_skips_non_worktree_and_continues(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'published.txt')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'merge', '--no-ff', '-m', 'published', head)
+        self.git(self.repo, 'push', '-q', 'origin', 'main')
+        leftover = self.repo / '.worktrees/aaa-leftover'
+        leftover.mkdir()
+        (leftover / 'evidence.txt').write_text('keep')
+        out = self.raw_task('repair', 'proj')
+        self.assertIn(f'{leftover}: not a worktree; left as is', out)
+        self.assertEqual((leftover / 'evidence.txt').read_text(), 'keep')
+        self.assertFalse((self.state('aaa-leftover') / 'merge.json').exists())
+        self.assertIn('Repaired published merge', out)
+        self.assertEqual(json.loads((self.state() / 'merge.json').read_text())['head'], head)
+        self.assertFalse(wt.exists())
+
     def test_repair_kept_worktree_and_reuses_finished_head_archive(self):
         wt, _ = self.started()
         self.commit_in(wt, 'published.txt')
