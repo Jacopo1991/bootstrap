@@ -68,6 +68,17 @@ WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
                "node_modules", "hermes-home", "fakehome"}
 
 
+def archive_runtime(item, info, errors=None):
+    try:
+        return (item.name in WORK_CACHES or item.name.endswith('.sock') or
+                stat.S_ISSOCK(info.st_mode) or
+                (stat.S_ISDIR(info.st_mode) and (item / 'pyvenv.cfg').is_file()))
+    except OSError as error:
+        if errors is not None:
+            errors[item] = f"cannot inspect: {error}"
+        return False
+
+
 def archive_inventory(root):
     """Iterative, no-follow inventory: runtime trees may be deep or disappearing."""
     entries, sizes, errors = [], {}, {}
@@ -86,6 +97,35 @@ def archive_inventory(root):
         if item != root:
             sizes[item.parent] = sizes.get(item.parent, 0) + sizes[item]
     return entries, sizes, errors
+
+
+def archive_evidence(item, info):
+    name = item.name.lower()
+    return (item.suffix.lower() in {'.md', '.json', '.jsonl', '.txt', '.html',
+                                    '.toml', '.yaml', '.yml', '.csv'} or
+            (item.suffix.lower() == '.log' and info.st_size < 50 * 1024 ** 2) or
+            any(word in name for word in ('report', 'prompt', 'request', 'check', 'review',
+                                          'merge', 'manifest', 'run', 'task', 'exception', 'gate')))
+
+
+def oversized_contents(entries, sizes, protected, errors):
+    """Select non-evidence contents, retaining directories needed by evidence."""
+    roots, retained, covered, runtime = set(), set(), set(), set()
+    for item, info in entries:
+        if item.parent in runtime or archive_runtime(item, info, errors):
+            runtime.add(item)
+        if (stat.S_ISDIR(info.st_mode) and item not in protected and
+                sizes.get(item, 0) > 200 * 1024 ** 2):
+            roots.add(item)
+        if item in roots or item.parent in covered:
+            covered.add(item)
+        if item not in runtime and not stat.S_ISDIR(info.st_mode) and archive_evidence(item, info):
+            retained.add(item)
+            retained.update(item.parents)
+    for item in errors:
+        retained.add(item)
+        retained.update(item.parents)
+    return roots, covered - retained
 ACTIVE_FOREGROUND_TASK = None
 CHECK_ADVISORY = None
 # Keep this set aligned with the hook's GIT_OVERRIDE_ENV; other Git variables
@@ -423,8 +463,8 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
         saved = pending / ".work"
 
         entries, sizes, errors = archive_inventory(source)
+        oversized, disposable = oversized_contents(entries, sizes, {source, source / 'reports'}, errors)
         skipped, special, excluded, size = [], [], set(), 0
-        evidence_only = set()
         for item, info in entries:
             if item.parent in excluded:
                 excluded.add(item)
@@ -432,27 +472,26 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
             relative = str(item.relative_to(source))
             mode = info.st_mode
             reason = None
-            if item.parent in evidence_only:
-                evidence_only.add(item)
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                 special.append(relative)
                 reason = "special file"
-            elif item != source and (item.name in WORK_CACHES or item.name.endswith('.sock')):
+            elif item != source and archive_runtime(item, info, errors):
                 reason = "cache/runtime"
-            elif item != source and stat.S_ISDIR(mode) and sizes[item] > 200 * 1024 ** 2:
-                evidence_only.add(item)
-                skipped.append({"path": relative, "size": sizes[item],
-                                "reason": "directory over 200 MB (keeping evidence only)"})
-            elif stat.S_ISREG(mode) and item.suffix == '.log' and sizes[item] >= 50 * 1024 ** 2:
+            elif item in disposable:
+                reason = "directory over 200 MB"
+            elif (stat.S_ISREG(mode) and item.suffix == '.log' and
+                  sizes[item] >= 50 * 1024 ** 2 and not archive_evidence(item, info)):
                 reason = "log over 50 MB"
-            if (not reason and item in evidence_only and not stat.S_ISDIR(mode) and
-                    not (item.suffix in {'.md', '.json', '.log', '.jsonl'} and
-                         sizes[item] < 50 * 1024 ** 2)):
-                reason = "data in directory over 200 MB"
+            if item in errors:
+                excluded.add(item)
+                continue
             if reason:
                 excluded.add(item)
                 skipped.append({"path": relative, "size": sizes[item], "reason": reason})
                 continue
+            if item in oversized:
+                skipped.append({"path": relative, "size": sizes[item],
+                                "reason": "non-evidence contents over 200 MB"})
             target = saved / item.relative_to(source)
             try:
                 if stat.S_ISDIR(mode):
@@ -2970,7 +3009,8 @@ def cancel(args):
 
 def prune_archive(repo, dry_run=False):
     root = HOME / '.local/state/task/archive' / repo.name
-    entries, sizes, _errors = archive_inventory(root)
+    entries, sizes, errors = archive_inventory(root)
+    known = {item: info for item, info in entries}
     allocated = {item: info.st_blocks * 512 for item, info in entries}
     for item, _info in reversed(entries):
         if item != root:
@@ -2981,7 +3021,7 @@ def prune_archive(repo, dry_run=False):
         live_gate = gate_holder_alive(lock_path)
     except FileNotFoundError:
         live_gate = False
-    temporary, freed = set(), 0
+    temporary, freed, finishing = set(), 0, {}
     for item, info in entries:
         if item.parent in temporary:
             temporary.add(item)
@@ -2992,55 +3032,63 @@ def prune_archive(repo, dry_run=False):
         gate = gate_worktree_match(item.name)
         if not pending and not gate:
             continue
-        temporary.add(item)
+        if any(path == item or item in path.parents for path in errors):
+            continue
         if gate and live_gate:
+            temporary.add(item)
             continue
         if pending and not any(
-                sibling.is_dir() and not sibling.name.startswith('.') and
-                (sibling / 'manifest.json').is_file() for sibling in item.parent.iterdir()):
+                sibling.parent == item.parent and stat.S_ISDIR(sibling_info.st_mode) and
+                not sibling.name.startswith('.') and
+                stat.S_ISREG(known[sibling / 'manifest.json'].st_mode)
+                for sibling, sibling_info in entries if sibling / 'manifest.json' in known):
             destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
             print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
+            finishing[item] = destination
             if not dry_run:
-                contents, content_sizes, errors = archive_inventory(item)
-                atomic_json(item / 'manifest.json', {
-                    'note': 'finished by repair',
-                    'contents': [{'path': str(path.relative_to(item)),
+                contents, content_sizes, content_errors = archive_inventory(item)
+                manifest = item / 'manifest.json'
+                record = json.loads(manifest.read_text()) if manifest in known else {}
+                record.setdefault('note', 'finished by repair')
+                record.setdefault('contents', [{'path': str(path.relative_to(item)),
                                   'size': content_sizes.get(path, 0)}
-                                 for path, _info in contents if path != item],
-                    'skipped': [{'path': str(path.relative_to(item)), 'reason': error}
-                                for path, error in errors.items()]})
-                item.rename(destination)
+                                 for path, _info in contents if path != item])
+                record.setdefault('skipped', []).extend(
+                    {'path': str(path.relative_to(item)), 'reason': error}
+                    for path, error in content_errors.items())
+                atomic_json(manifest, record)
             continue
+        temporary.add(item)
         freed += allocated.get(item, 0)
         print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
         if not dry_run:
             shutil.rmtree(item)
-    protected = set()
-    for item, info in entries:
-        if item in temporary:
-            continue
-        if not stat.S_ISDIR(info.st_mode) and (
-                item.suffix in {'.md', '.log', '.jsonl'} or item.name in {
-                    'manifest.json', 'check.json', 'review.json', 'merge.json', 'task.json',
-                    'run.json', 'exception.json', 'gate-check.json', 'request.md'}):
-            protected.add(item)
-            protected.update(item.parents)
     removed = set()
-    selected = set()
+    pruned = {}
+    containers = {item.parent for item, _info in entries
+                  if item.name == 'manifest.json' and
+                  '.work' not in item.relative_to(root).parts} | set(finishing)
+    protected = {root} | containers
+    for container in containers:
+        protected.update({container / '.work', container / 'reports', container / '.work/reports'})
+        protected.update(container.parents)
+    _oversized, disposable = oversized_contents(entries, sizes, protected, errors)
     for item, info in entries:
         if item in temporary:
             continue
         if item.parent in removed:
             removed.add(item)
             continue
-        runtime = item.name in WORK_CACHES or item.name.endswith('.sock')
-        oversized = (stat.S_ISDIR(info.st_mode) and item.name != '.work' and
-                     '.work' in item.parts and sizes.get(item, 0) > 200 * 1024 ** 2)
-        # Keep evidence even inside an otherwise disposable directory.
-        if not (runtime or oversized or item.parent in selected):
+        container = next((parent for parent in item.parents if parent in containers), None)
+        if container is None:
             continue
-        selected.add(item)
-        if item in protected:
+        runtime = archive_runtime(item, info, errors)
+        if any(path == item or item in path.parents for path in errors):
+            continue
+        large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
+                     info.st_size >= 50 * 1024 ** 2 and not archive_evidence(item, info))
+        # Named runtime trees are removed whole; generic contents preserve evidence.
+        if not (runtime or item in disposable or large_log):
             continue
         removed.add(item)
         freed += allocated.get(item, 0)
@@ -3050,6 +3098,25 @@ def prune_archive(repo, dry_run=False):
                 item.unlink()
             else:
                 shutil.rmtree(item)
+            pruned.setdefault(container, []).append(
+                f"pruned: {item.relative_to(container)} {allocated.get(item, 0)}")
+    skipped = {}
+    for item, error in errors.items():
+        print(f"Skipped {item}: {error}")
+        container = next((parent for parent in item.parents if parent in containers), None)
+        if container is not None:
+            skipped.setdefault(container, []).append(
+                {'path': str(item.relative_to(container)), 'reason': error})
+    for container in (set(pruned) | set(skipped)) if not dry_run else ():
+        manifest = container / 'manifest.json'
+        record = json.loads(manifest.read_text())
+        record.setdefault('pruned', []).extend(pruned.get(container, []))
+        existing = record.setdefault('skipped', [])
+        existing.extend(entry for entry in skipped.get(container, []) if entry not in existing)
+        atomic_json(manifest, record)
+    if not dry_run:
+        for pending, destination in finishing.items():
+            pending.rename(destination)
     print(f"{'Would free' if dry_run else 'Freed'} {freed} bytes.")
 
 
