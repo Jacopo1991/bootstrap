@@ -6,6 +6,7 @@ passes unless the worktree holds a file named FAIL; `backlog task edit` applies 
 final summary the way Backlog.md does; `gh pr list` finds no PR.
 """
 import fcntl
+import atexit
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -20,6 +21,10 @@ import threading
 import unittest
 from unittest import mock
 from pathlib import Path
+
+audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
+atexit.register(audit_state.cleanup)
+os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
@@ -153,6 +158,26 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_denials_filters_and_top_commands(self):
+        import json
+        from datetime import datetime, timezone, timedelta
+        path = self.home / '.local/state/agent-policy/denials.jsonl'
+        path.parent.mkdir(parents=True)
+        now = datetime.now(timezone.utc)
+        base = {'time': now.isoformat(), 'rule_id': 'shell.rule', 'repo': '/work/proj'}
+        rows = [dict(base, command=command) for command in ['a', 'a', 'b', 'b', 'b', 'c', 'd']]
+        rows += [dict(base, command='test-only', **marker) for marker in
+                 ({'test': True}, {'is_test': True}, {'session_type': 'test'})]
+        rows += [dict(base, command='old', time=(now - timedelta(days=10)).isoformat()),
+                 dict(base, command='other-repo', repo='/work/else'),
+                 dict(base, command='other-rule', rule_id='other.rule')]
+        path.write_text('\n'.join(json.dumps(row) for row in rows) + '\ninvalid\n')
+        out = self.task('denials', '--days', '2', '--rule', 'shell.rule', '--repo', 'proj')
+        self.assertEqual(out.strip(), 'shell.rule: 7\n  3: b\n  2: a\n  1: c')
+        self.assertEqual(out, self.task('denials', '--days', '2', '--rule', 'shell.rule', '--repo', '/work/proj'))
+        self.assertIn('other.rule: 1', self.task('denials', '--days', '2'))
+        self.assertEqual(self.task('denials', '--rule', 'missing').strip(), 'No denials in range.')
+
     def test_reliability_override_records_timed_out_gate_step(self):
         import json
         wt, _ = self.started()
@@ -677,6 +702,104 @@ store.write_text(json.dumps(prs))
         closed = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
         self.assertIn('status: Done\n', closed)
         self.assertIn('merge not recorded', closed)
+
+    def test_no_merge_close_accepts_missing_or_failed_review(self):
+        import json
+        self.started()
+        review = self.state() / "review.json"
+        for verdict in (None, "fail"):
+            with self.subTest(verdict=verdict):
+                if verdict is None:
+                    review.unlink(missing_ok=True)
+                else:
+                    review.write_text(json.dumps({"judgments": {"1": verdict}}))
+                self.raw_task("close", "proj", "5", "--no-merge", "superseded by new task",
+                              "-m", "superseded", "--retro", "routine")
+                closed = next((self.kb / "backlog/tasks").glob("t-5 *")).read_text()
+                self.assertIn("status: Done\n", closed)
+                self.assertIn("not merged: superseded by new task", closed)
+                self.assertNotIn("- [x]", closed)
+
+    def test_gate_defaults_and_advisory_compatibility(self):
+        path = self.home / "gate-config"
+        path.mkdir()
+        for config, trusted, advisory in ((None, True, False), ("", True, False),
+                ("exclusive_gate = false\n", False, False),
+                ("exclusive_gate = true\n", True, True)):
+            with self.subTest(config=config):
+                file = path / ".task.toml"
+                if config is None:
+                    file.unlink(missing_ok=True)
+                else:
+                    file.write_text(config)
+                self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path), trusted)
+                self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path, advisory=True), advisory)
+
+    def test_gate_os_errors_fall_back_only_without_explicit_opt_in(self):
+        config_path = self.home / "gate-config"
+        config_path.mkdir()
+        task = TASK_MODULE.Task(self.repo, "5")
+        for explicit in (False, True):
+            (config_path / ".task.toml").write_text("exclusive_gate = true\n" if explicit else "")
+            for operation in ("open", "flock"):
+                with self.subTest(explicit=explicit, operation=operation):
+                    target = TASK_MODULE.os if operation == "open" else TASK_MODULE.fcntl
+                    output = io.StringIO()
+                    ran = []
+                    with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                            mock.patch.object(target, operation, side_effect=PermissionError("permission denied")), \
+                            contextlib.redirect_stdout(output):
+                        if explicit:
+                            with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
+                                with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
+                                    ran.append(True)
+                        else:
+                            with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
+                                ran.append(True)
+                    self.assertEqual(ran, [] if explicit else [True])
+                    if not explicit:
+                        self.assertEqual(len(output.getvalue().splitlines()), 1)
+                        self.assertIn("running trusted gate unlocked", output.getvalue())
+
+    def test_skills_setup_repairs_verify_ui_before_updating_existing_install(self):
+        stamp = self.home / ".local/state/bootstrap/skills-installed"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        environment = self.home / "skills-test-env.sh"
+        environment.write_text(
+            'id() { echo agent; }\n'
+            'gh() { echo "gh $*" >> "$HOME/skills-calls"; }\n'
+            'gh-skill-update() { echo update >> "$HOME/skills-calls"; }\n')
+        result = subprocess.run(["bash", str(ROOT / "home/dot_local/share/bootstrap/executable_skills-setup.sh")],
+                                env=dict(self.env, BASH_ENV=str(environment), XDG_STATE_HOME=str(self.home / ".local/state"),
+                                         XDG_RUNTIME_DIR=str(self.home / "no-bus")),
+                                capture_output=True, text=True)
+        self.assertIn("No user systemd bus", result.stderr)
+        self.assertEqual((self.home / "skills-calls").read_text().splitlines(), [
+            "gh auth status",
+            "gh skill install Jacopo1991/cortex-core verify-ui --agent claude-code --scope user --force",
+            "gh skill install Jacopo1991/cortex-core verify-ui --agent codex --scope user --force",
+            "update"])
+
+    def test_wait_message_uses_kernel_pid_instead_of_namespaced_record(self):
+        import json
+        lock = self.gate_dir / "agent-task-gate.lock"
+        holder = self.gate_dir / "agent-task-gate.holder"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            holder.write_text(json.dumps({"repo": "proj", "task": "T-9", "pid": 2, "since": "today"}))
+            self.assertEqual(TASK_MODULE.gate_holder_pid(lock), os.getpid())
+            output = io.StringIO()
+            def release(_):
+                fcntl.flock(held, fcntl.LOCK_UN)
+            with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                    mock.patch.object(TASK_MODULE.time, "sleep", side_effect=release), \
+                    mock.patch.object(TASK_MODULE, "pid_alive", side_effect=AssertionError("record PID used")), \
+                    contextlib.redirect_stdout(output):
+                with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, "5")):
+                    pass
+            self.assertIn(f"pid {os.getpid()} since today", output.getvalue())
+        self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_noticed_import_lists_only_and_deduplicates(self):
         self.started()
@@ -1689,6 +1812,7 @@ store.write_text(json.dumps(prs))
         self.assertNotIn("new-pattern-not-present/", exclude_path.read_text())
         exclude_path.chmod(0o644)
         task = module.Task(self.repo, "T-5")
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
         original_flock = module.fcntl.flock
         module.fcntl.flock = lambda *_args: (_ for _ in ()).throw(OSError("probe failure"))
         output = io.StringIO()
@@ -2387,14 +2511,14 @@ esac
         lock_path = self.gate_dir / "agent-task-gate.lock"
         holder_path = self.gate_dir / "agent-task-gate.holder"
         self.addCleanup(lambda: holder_path.unlink(missing_ok=True))
-        (self.repo / ".task.toml").write_text("exclusive_gate = true\ncheck_timeout = 3\n")
+        (self.repo / ".task.toml").write_text("check_timeout = 3\n")
         self.git(self.repo, "add", ".task.toml")
         self.git(self.repo, "commit", "-qm", "enable exclusive gate")
         self.git(self.repo, "push", "-q", "origin", "main")
         self.started()
         other = self.repo / ".worktrees/other"
         self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "other", str(other), "main")
-        (other / ".task.toml").write_text("exclusive_gate = true\ncheck_timeout = 1\n")
+        (other / ".task.toml").write_text("check_timeout = 1\n")
         self.git(other, "add", ".task.toml")
         self.git(other, "commit", "-qm", "short check timeout")
         (self.home / "during-check.sh").write_text(
@@ -2442,7 +2566,7 @@ esac
         nonexclusive = self.repo / ".worktrees/nonexclusive"
         self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "nonexclusive",
                  str(nonexclusive), "main")
-        (nonexclusive / ".task.toml").write_text("check_timeout = 1\n")
+        (nonexclusive / ".task.toml").write_text("exclusive_gate = false\ncheck_timeout = 1\n")
         self.git(nonexclusive, "add", ".task.toml")
         self.git(nonexclusive, "commit", "-qm", "leave gate opt-in off")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
@@ -2458,6 +2582,11 @@ esac
 
     def test_exclusive_gate_unavailable_prints_notice_and_runs_check(self):
         wt, _ = self.started()
+        env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
+        out = self.raw_task("check", "proj", "5", env=env)
+        self.assertEqual(out.count("Cannot open shared gate lock"), 1)
+        self.assertIn("running trusted gate unlocked", out)
+        self.assertIn("PASS", out)
         (wt / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable exclusive gate")

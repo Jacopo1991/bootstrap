@@ -23,6 +23,10 @@ if [[ ! -e $stamp ]]; then
   mkdir -p "${stamp%/*}"
   touch "$stamp"
 else
+  # Repair the legacy hand-copied verify-ui even on machines with an install stamp.
+  for agent in claude-code codex; do
+    gh skill install "$repository" verify-ui --agent "$agent" --scope user --force
+  done
   step 'already installed; updating'
   gh-skill-update
 fi

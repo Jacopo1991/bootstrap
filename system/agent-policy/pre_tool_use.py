@@ -329,7 +329,12 @@ def inside(path_text: str, cwd: str, root: Path) -> bool:
 DENIAL_SUFFIX = " Rewrite the command; this is a policy limit, not missing access."
 
 
-def deny(message: str) -> dict:
+def deny(message: str, event: dict | None = None, vendor: str | None = None) -> dict:
+    if event is not None:
+        log_denial(event, message, vendor)
+    if event is not None and event.get("hook_event_name") == "PermissionRequest":
+        return {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny", "message": message + DENIAL_SUFFIX}}}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse",
             "permissionDecision": "deny", "permissionDecisionReason": message + DENIAL_SUFFIX}}
 
@@ -830,6 +835,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if value.startswith("file://"):
             return "Local filesystem Git remotes are blocked."
         if "://" in value or re.match(r"^[^/]+@[^:]+:", value):
+            if subcommand == "diff" and "--no-index" in arguments:
+                return "Git diff operands must be literal repository paths or /dev/null."
             continue
         if (cross_repo or value.startswith(("/", "../", "./"))
                 or subcommand == "diff" and "--no-index" in arguments
@@ -1852,15 +1859,16 @@ def log_denial(event: dict, denial: str | None = None, vendor: str | None = None
         except (OSError, subprocess.SubprocessError):
             pass
         vendor = event_vendor(event, vendor)
-        if denial is None:
-            denial = evaluate(event)
+        if not denial:
+            denial = evaluate(event) or Denial("policy.command_evaluation", "Blocked by policy.")
         rule_id = getattr(denial, "rule_id", "policy.command_evaluation")
         entry = {"time": datetime.now(timezone.utc).isoformat(), "vendor": vendor, "repo": repo,
                  "tool": str(event.get("tool_name", "")), "rule_id": rule_id,
                  "category": category, "reason": audit_text(str(denial or "")),
                  "command": audit_text(command if command else str(next((
                      data[key] for key in ("file_path", "path", "filename") if key in data), "")))}
-        target = Path.home() / ".local/state/agent-policy/denials.jsonl"
+        state_dir = os.environ.get("AGENT_POLICY_STATE_DIR")
+        target = (Path(state_dir) if state_dir else Path.home() / ".local/state/agent-policy") / "denials.jsonl"
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("a", encoding="utf-8") as out:
             out.write(json.dumps(entry, separators=(",", ":")) + "\n")
@@ -1882,8 +1890,7 @@ def main(argv=None) -> int:
         reason = (Denial("hook.input", "Hook input invalid; blocked by policy.")
                   if isinstance(error, (json.JSONDecodeError, ValueError)) else
                   Denial("hook.error", f"policy hook error: {type(error).__name__}: {audit_text(str(error))}"))
-        log_denial({}, reason, options.vendor)
-        print(json.dumps(deny(reason), separators=(",", ":")))
+        print(json.dumps(deny(reason, {}, options.vendor), separators=(",", ":")))
         return 0
     permission_request = event.get("hook_event_name") == "PermissionRequest"
     try:
@@ -1891,11 +1898,9 @@ def main(argv=None) -> int:
     except Exception as error:
         reason = Denial("hook.error", f"policy hook error: {type(error).__name__}: {audit_text(str(error))}")
     if reason:
-        log_denial(event, Denial("permission.policy", reason) if permission_request and not isinstance(reason, Denial) else reason,
-                   options.vendor)
-        response = ({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
-                    "decision": {"behavior": "deny", "message": reason + DENIAL_SUFFIX}}}
-                    if permission_request else deny(reason))
+        if permission_request and not isinstance(reason, Denial):
+            reason = Denial("permission.policy", reason)
+        response = deny(reason, event, options.vendor)
         print(json.dumps(response, separators=(",", ":")))
     return 0
 

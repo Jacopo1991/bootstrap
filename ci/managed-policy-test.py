@@ -7,6 +7,7 @@ Claude Code: system/claude-managed-guardrails.json -> /etc/claude-code/managed-s
 either may limit bypass/auto mode, approval policy, sandbox choice or the user's own hooks.
 """
 import ast
+import atexit
 import io
 import importlib.util
 import json
@@ -17,6 +18,10 @@ import subprocess
 import tempfile
 import tomllib
 from unittest.mock import patch
+
+audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
+atexit.register(audit_state.cleanup)
+os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 ROOT = Path(__file__).resolve().parents[1]
 OPT = "/opt/machine-bootstrap/current"
@@ -179,7 +184,8 @@ with tempfile.TemporaryDirectory() as temp:
     (planted / "json.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
     hook_home = cwd / "hook-home"
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {
-        "PYTHONPATH": str(planted), "HOME": str(hook_home)}
+        "PYTHONPATH": str(planted), "HOME": str(hook_home),
+        "AGENT_POLICY_STATE_DIR": str(hook_home / ".local/state/agent-policy")}
     for command in ("wsl.exe -d AgentDev", "sudo true"):
         event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
                  "tool_input": {"command": command}, "cwd": str(cwd)}
@@ -264,7 +270,8 @@ with tempfile.TemporaryDirectory() as temp:
     home.mkdir()
     event = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "vendor": "claude",
              "tool_input": {"command": "GITHUB_TOKEN=ghp_x sudo ls /sensitive/argument"}, "cwd": temp}
-    clean_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    clean_env = {key: value for key, value in os.environ.items()
+                 if not key.startswith("GIT_") and key != "AGENT_POLICY_STATE_DIR"}
     with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, clean_env, clear=True):
         denial = policy.evaluate(event, (Path(temp),))
         policy.log_denial(event, denial, "claude")
@@ -315,7 +322,7 @@ with tempfile.TemporaryDirectory() as temp:
     for fixture in fixtures:
         secret_event = {"tool_name": "Bash", "cwd": temp,
                         "tool_input": {"command": "sudo true " + fixture}}
-        with patch.object(policy.Path, "home", return_value=home):
+        with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, clean_env, clear=True):
             policy.log_denial(secret_event, policy.Denial("test.redaction", fixture), "codex")
         redacted = json.loads(log.read_text().splitlines()[-1])
         for field in ("reason", "command"):
@@ -466,6 +473,10 @@ with tempfile.TemporaryDirectory() as temp:
         "if test -f file; then git add file; else git commit -m fixture; fi",
         "git add file; git commit -m fixture",
         "git diff --no-index /dev/null /outside",
+        "git diff --no-index 'a@b:/hostname' /dev/null",
+        "git diff --no-index 'file:///etc/hostname' /dev/null",
+        "git diff --no-index /dev/null 'a@b:/hostname'",
+        "git diff --no-index /dev/null 'https://example.invalid/hostname'",
         "git diff --no-index {docs/x.md,/etc/hostname} docs/x.md",
         "git diff --no-index {../../..,docs}/x docs/x.md",
         "git diff --no-index -- docs/x.md {docs/x.md,/etc/hostname}",
@@ -497,6 +508,32 @@ with tempfile.TemporaryDirectory() as temp:
     for helper in policy.MIXED_CHAIN_TEXT_TOOLS:
         assert helper in policy.MIXED_CHAIN_MESSAGE, helper
 
+# Exercise every response route against the actual audit writer, including failures.
+with tempfile.TemporaryDirectory() as audit_temp:
+    with patch.dict(os.environ, {"AGENT_POLICY_STATE_DIR": audit_temp}):
+        cases = [
+            ("{", None, None),
+            ("[]", None, None),
+            (json.dumps({"tool_name": "Bash", "tool_input": {"command": "sudo true password=fixture"}}),
+             "evaluate", policy.Denial("test.command", "Command denied.")),
+            (json.dumps({"hook_event_name": "PermissionRequest"}), "permission_reason", "Permission denied."),
+        ]
+        for payload, function, reason in cases:
+            with patch.object(policy.sys, "stdin", io.StringIO(payload)), \
+                    patch.object(policy.sys, "stdout", new_callable=io.StringIO):
+                if function:
+                    with patch.object(policy, function, return_value=reason):
+                        policy.main([])
+                    with patch.object(policy.sys, "stdin", io.StringIO(payload)), \
+                            patch.object(policy, function, side_effect=RuntimeError("fixture")):
+                        policy.main([])
+                else:
+                    policy.main([])
+        rows = [json.loads(line) for line in (Path(audit_temp) / "denials.jsonl").read_text().splitlines()]
+        assert len(rows) == 6
+        assert {row["rule_id"] for row in rows} == {"hook.input", "hook.error", "test.command", "permission.policy"}
+        assert all(row["rule_id"] and row["reason"] and "command" in row for row in rows)
+        assert all("fixture" not in row["command"] for row in rows)
 compile_check = 'python3 -I -m compileall -q "$ROOT/system/agent-policy"'
 assert install.index(compile_check) < install.index('sudo install -d -m 0755 "$public_source"')
 
