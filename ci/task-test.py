@@ -1029,8 +1029,7 @@ store.write_text(json.dumps(prs))
         self.assertIn('unreadable', skipped)
         self.assertEqual(skipped['big']['size'], 201 * 1024 ** 2 + len('keep report'))
         saved = manifest.parent / '.work'
-        self.assertEqual((saved / 'big/report.md').read_text(), 'keep report')
-        self.assertFalse((saved / 'big/data').exists())
+        self.assertFalse((saved / 'big').exists())
         self.assertTrue((saved / 'outside').is_symlink())
         self.assertEqual((saved / deep.relative_to(work) / 'request.md').read_text(), 'keep')
         self.assertFalse(list(self.work_archives().glob('.pending-*')))
@@ -1177,9 +1176,9 @@ store.write_text(json.dumps(prs))
         for name in ('.work/check.log', '.work/report.md', '.work/records/run.jsonl', 'manifest.json'):
             self.assertTrue((recovered / name).is_file())
         self.assertFalse((saved / '.work/fakehome/state').exists())
-        self.assertTrue((saved / '.work/fakehome/gateway.log').exists())
+        self.assertFalse((saved / '.work/fakehome').exists())
         self.assertFalse((saved / '.work/large/data').exists())
-        self.assertTrue((saved / '.work/large/merge.json').exists())
+        self.assertFalse((saved / '.work/large').exists())
         for name in ('.work/report.md', '.work/gateway.log', 'manifest.json'):
             self.assertTrue((saved / name).is_file())
 
@@ -1203,12 +1202,31 @@ store.write_text(json.dumps(prs))
         (venv / 'pyvenv.cfg').write_text('home = /usr/bin\n')
         (venv / 'lib/package.py').write_text('runtime')
         (venv / 'report.md').write_text('venv evidence')
+        for name in ('node_modules', '.pytest_cache'):
+            (wt / '.work' / name).mkdir()
+        (wt / '.work/node_modules/.package-lock.json').write_text('{}')
+        (wt / '.work/node_modules/package.json').write_text('{}')
+        (wt / '.work/.pytest_cache/README.md').write_text('cache')
+        (venv / 'lib/README.md').write_text('package readme')
+        (venv / 'lib/direct_url.json').write_text('{}')
+        for name in ('report.md', 'check.log', 'merge.json'):
+            (wt / '.work' / name).write_text('keep')
+        for name in ('large', 'reports'):
+            directory = wt / '.work' / name
+            directory.mkdir()
+            with (directory / 'large.log').open('wb') as stream:
+                stream.truncate(201 * 1024 ** 2)
+            (directory / 'report.md').write_text('report')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
             TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
         archived = next(self.work_archives().glob('*/.work'))
         self.assertFalse((archived / 't8venv/lib').exists())
         self.assertFalse((archived / 't8venv/pyvenv.cfg').exists())
-        self.assertEqual((archived / 't8venv/report.md').read_text(), 'venv evidence')
+        for name in ('t8venv', 'node_modules', '.pytest_cache', 'large'):
+            self.assertFalse((archived / name).exists())
+        self.assertEqual((archived / 'reports/report.md').read_text(), 'report')
+        for name in ('report.md', 'check.log', 'merge.json'):
+            self.assertEqual((archived / name).read_text(), 'keep')
 
         root = self.work_archives()
         finished = root / 'old-finished'
@@ -1218,6 +1236,19 @@ store.write_text(json.dumps(prs))
             (work / 't8venv/lib').mkdir(parents=True)
             (work / 't8venv/pyvenv.cfg').write_text('home = /usr/bin\n')
             (work / 't8venv/lib/package.py').write_text('runtime')
+            (work / 't8venv/lib/README.md').write_text('package readme')
+            (work / 't8venv/lib/direct_url.json').write_text('{}')
+            (work / 'node_modules').mkdir()
+            (work / 'node_modules/.package-lock.json').write_text('{}')
+            (work / 'node_modules/package.json').write_text('{}')
+            (work / '.pytest_cache').mkdir()
+            (work / '.pytest_cache/README.md').write_text('cache')
+            (work / 'reports').mkdir()
+            with (work / 'reports/large.log').open('wb') as stream:
+                stream.truncate(201 * 1024 ** 2)
+            for name in ('report.md', 'check.log', 'merge.json'):
+                (work / name).write_text('keep')
+                (work / 'reports' / name).write_text('keep report')
             (work / 'runtime').mkdir()
             with (work / 'runtime/data').open('wb') as stream:
                 stream.truncate(201 * 1024 ** 2)
@@ -1230,8 +1261,8 @@ store.write_text(json.dumps(prs))
                          path.read_bytes() if path.stat().st_size < 1024 else None)
                   for path in root.rglob('*') if path.is_file()}
         out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
-        self.assertIn(str(pending / '.work/t8venv/lib'), out)
-        self.assertIn(str(finished / '.work/runtime/data'), out)
+        self.assertIn(str(pending / '.work/t8venv'), out)
+        self.assertIn(str(finished / '.work/runtime'), out)
         for path, (size, content) in before.items():
             self.assertEqual(path.stat().st_size, size)
             if content is not None:
@@ -1242,14 +1273,15 @@ store.write_text(json.dumps(prs))
             self.assertFalse((container / '.work/t8venv/lib').exists())
             self.assertFalse((container / '.work/t8venv/pyvenv.cfg').exists())
             self.assertFalse((container / '.work/runtime/data').exists())
-            self.assertTrue((container / '.work/t8venv/request.md').exists())
-            for name in ('report.md', 'prompt.md', 'request.md', 'check.json',
-                         'review.json', 'merge.json', 'small.log', 'manifest.json'):
-                self.assertEqual((container / '.work/runtime' / name).read_text(), 'evidence')
+            for name in ('t8venv', 'node_modules', '.pytest_cache', 'runtime'):
+                self.assertFalse((container / '.work' / name).exists())
+            for name in ('report.md', 'check.log', 'merge.json'):
+                self.assertEqual((container / '.work' / name).read_text(), 'keep')
+                self.assertEqual((container / '.work/reports' / name).read_text(), 'keep report')
             record = json.loads((container / 'manifest.json').read_text())
-            self.assertTrue(any(line.startswith('pruned: .work/runtime/data ')
+            self.assertTrue(any(line.startswith('pruned: .work/runtime ')
                                 for line in record['pruned']))
-            self.assertTrue(any(line.startswith('pruned: .work/t8venv/lib ')
+            self.assertTrue(any(line.startswith('pruned: .work/t8venv ')
                                 for line in record['pruned']))
         self.assertEqual(json.loads((finished / 'manifest.json').read_text())['head'], 'original')
         manifest = (finished / 'manifest.json').read_bytes()

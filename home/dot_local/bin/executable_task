@@ -68,12 +68,6 @@ WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
                "node_modules", "hermes-home", "fakehome"}
 
 
-def archive_evidence(item, info):
-    return (stat.S_ISREG(info.st_mode) and
-            (item.suffix in {'.md', '.json', '.jsonl'} or
-             (item.suffix == '.log' and info.st_size < 50 * 1024 ** 2)))
-
-
 def archive_runtime(item, info):
     return (item.name in WORK_CACHES or item.name.endswith('.sock') or
             stat.S_ISSOCK(info.st_mode) or
@@ -436,12 +430,6 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
 
         entries, sizes, errors = archive_inventory(source)
         skipped, special, excluded, size = [], [], set(), 0
-        protected = set()
-        for item, info in entries:
-            if archive_evidence(item, info):
-                protected.add(item)
-                protected.update(item.parents)
-        evidence_only = set()
         for item, info in entries:
             if item.parent in excluded:
                 excluded.add(item)
@@ -449,30 +437,16 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
             relative = str(item.relative_to(source))
             mode = info.st_mode
             reason = None
-            if item.parent in evidence_only:
-                evidence_only.add(item)
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                 special.append(relative)
                 reason = "special file"
             elif item != source and archive_runtime(item, info):
-                evidence_only.add(item)
-                if item not in protected:
-                    reason = "cache/runtime"
-                else:
-                    skipped.append({"path": relative, "size": sizes[item],
-                                    "reason": "cache/runtime (keeping evidence only)"})
-            elif item != source and stat.S_ISDIR(mode) and sizes[item] > 200 * 1024 ** 2:
-                evidence_only.add(item)
-                skipped.append({"path": relative, "size": sizes[item],
-                                "reason": "directory over 200 MB (keeping evidence only)"})
+                reason = "cache/runtime"
+            elif (item != source and item != source / 'reports' and
+                  stat.S_ISDIR(mode) and sizes[item] > 200 * 1024 ** 2):
+                reason = "directory over 200 MB"
             elif stat.S_ISREG(mode) and item.suffix == '.log' and sizes[item] >= 50 * 1024 ** 2:
                 reason = "log over 50 MB"
-            if (not reason and item in evidence_only and not stat.S_ISDIR(mode) and
-                    not archive_evidence(item, info)):
-                reason = "data in cache/runtime or directory over 200 MB"
-            if (not reason and item in evidence_only and stat.S_ISDIR(mode) and
-                    item not in protected):
-                reason = "directory without evidence in cache/runtime or directory over 200 MB"
             if reason:
                 excluded.add(item)
                 skipped.append({"path": relative, "size": sizes[item], "reason": reason})
@@ -3043,15 +3017,7 @@ def prune_archive(repo, dry_run=False):
         print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
         if not dry_run:
             shutil.rmtree(item)
-    protected = set()
-    for item, info in entries:
-        if item in temporary:
-            continue
-        if archive_evidence(item, info):
-            protected.add(item)
-            protected.update(item.parents)
     removed = set()
-    selected = set()
     pruned = {}
     containers = {item.parent for item, _info in entries
                   if item.name == 'manifest.json' and
@@ -3066,15 +3032,14 @@ def prune_archive(repo, dry_run=False):
         if container is None:
             continue
         runtime = archive_runtime(item, info)
-        oversized = (stat.S_ISDIR(info.st_mode) and item.name != '.work' and
+        evidence_location = item in {container / '.work', container / 'reports',
+                                    container / '.work/reports'}
+        oversized = (stat.S_ISDIR(info.st_mode) and not evidence_location and
                      sizes.get(item, 0) > 200 * 1024 ** 2)
         large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
                      info.st_size >= 50 * 1024 ** 2)
-        # Keep evidence even inside an otherwise disposable directory.
-        if not (runtime or oversized or large_log or item.parent in selected):
-            continue
-        selected.add(item)
-        if item in protected:
+        # A disposable directory is removed whole, regardless of file suffixes inside.
+        if not (runtime or oversized or large_log):
             continue
         removed.add(item)
         freed += allocated.get(item, 0)
