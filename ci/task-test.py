@@ -1133,6 +1133,47 @@ store.write_text(json.dumps(prs))
         self.assertTrue(wt.is_dir())
         self.assertEqual((wt / ".work/paid-transcript").read_text(), "irreplaceable")
 
+    def test_gate_cleanup_preserves_numeric_task_name_and_live_pid(self):
+        self.started()
+        name = "pm-task-fixes-2"
+        live = self.repo / f".worktrees/.task-gate-{name}-{os.getpid()}"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(live), "main")
+        for suffix in ("", "-abc_1234"):
+            gate = self.repo / f".worktrees/.task-gate-{name}-99999999{suffix}"
+            self.git(self.repo, "worktree", "add", "-q", "--detach", str(gate), "main")
+            (gate / ".work").mkdir()
+            (gate / ".work/report.md").write_text(f"evidence{suffix}")
+        self.raw_task("repair", "proj")
+        self.assertTrue(live.is_dir())
+        gates = list((self.repo / ".worktrees").glob(".task-gate-*"))
+        self.assertEqual(gates, [live])
+        root = self.home / f".local/state/task/archive/proj/{name}"
+        reports = list(root.glob("*/.work/report.md"))
+        self.assertEqual({p.read_text() for p in reports}, {"evidence", "evidence-abc_1234"})
+
+    def test_offline_repair_fixes_locks_lanes_and_uses_local_default(self):
+        wt, _ = self.started()
+        lane = wt / ".work/lane.json"
+        lane.write_text(json.dumps({"state": "running", "pid": 99999999}))
+        lock = self.state() / "run.lock"
+        lock.write_text(json.dumps({"pid": 99999999}))
+        run = self.state() / "run.json"
+        run.write_text(json.dumps({"state": "running", "pid": 99999999}))
+        self.git(self.repo, "remote", "set-url", "origin", str(self.home / "missing-remote"))
+        out = self.raw_task("repair", "proj")
+        self.assertEqual(out.count("Repair warning:"), 1)
+        self.assertFalse(lock.exists())
+        self.assertEqual(json.loads(run.read_text())["state"], "interrupted")
+        self.assertEqual(json.loads(lane.read_text())["state"], "interrupted")
+        # The local default may contain published work absent from origin/main.
+        self.commit_in(wt, "offline-published.txt")
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.git(self.repo, "merge", "--no-ff", "-m", "published offline", head)
+        out = self.raw_task("repair", "proj")
+        self.assertIn("Repaired published merge", out)
+        self.assertFalse(wt.exists())
+        self.assertEqual(json.loads((self.state() / "merge.json").read_text())["head"], head)
+
     def test_stale_gate_cleanup_removes_copy_even_when_archive_unavailable(self):
         self.started()
         gate = self.repo / ".worktrees/.task-gate-t5-99999999"

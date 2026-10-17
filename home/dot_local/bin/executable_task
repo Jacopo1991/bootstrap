@@ -2041,12 +2041,22 @@ def overlap_message(files):
             "branch, then `task check` and a new review")
 
 
+def gate_worktree_match(name):
+    # Split the PID greedily so numeric task-name components stay in the task.
+    match = re.fullmatch(r"\.task-gate-(.+)-(\d+)", name)
+    if match:
+        return match
+    # Archived snapshots append a random component after the original gate name.
+    original, _separator, _suffix = name.rpartition("-")
+    return re.fullmatch(r"\.task-gate-(.+)-(\d+)", original)
+
+
 def prune_stale_gate_worktrees(repo: Path):
     worktrees = repo / ".worktrees"
     if not worktrees.is_dir():
         return
     for gate in worktrees.glob(".task-gate-*"):
-        match = re.fullmatch(r"\.task-gate-(.+?)-(\d+)(?:-.*)?", gate.name)
+        match = gate_worktree_match(gate.name)
         if not match or pid_alive(match.group(2)):
             continue
         remove_gate_worktree(Task(repo, match.group(1)), gate)
@@ -2954,7 +2964,7 @@ def prune_archive(repo, dry_run=False):
         pending_done = (item.name.startswith('.pending-') and any(
             sibling.is_dir() and not sibling.name.startswith('.') and
             (sibling / 'manifest.json').is_file() for sibling in item.parent.iterdir()))
-        gate = re.fullmatch(r'\.task-gate-(.+)-(\d+)(?:-.*)?', item.name)
+        gate = gate_worktree_match(item.name)
         stale_gate = gate and not pid_alive(gate.group(2))
         runtime = item.name in WORK_CACHES or item.name.endswith('.sock')
         oversized = (stat.S_ISDIR(info.st_mode) and item.name != '.work' and
@@ -3045,8 +3055,14 @@ def repair(args):
             prune_archive(repo, args.dry_run)
             continue
         prune_stale_gate_worktrees(repo)
-        fetch(repo)
-        base, _label = base_commit(repo, default_branch(repo))
+        try:
+            fetch(repo)
+        except Stop:
+            print(f"Repair warning: fetch failed for {repo.name}; using the local default branch.",
+                  file=sys.stderr)
+            base = sha(repo, default_branch(repo))
+        else:
+            base, _label = base_commit(repo, default_branch(repo))
         names = {p.name for p in (repo / ".worktrees").glob("*") if not p.name.startswith(".")}
         names.update(p.name for p in (HOME / ".local/state/task" / repo.name).glob("*") if p.is_dir())
         for name in sorted(names):
