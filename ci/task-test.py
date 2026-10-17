@@ -710,6 +710,32 @@ store.write_text(json.dumps(prs))
                 self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path), trusted)
                 self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path, advisory=True), advisory)
 
+    def test_gate_os_errors_fall_back_only_without_explicit_opt_in(self):
+        config_path = self.home / "gate-config"
+        config_path.mkdir()
+        task = TASK_MODULE.Task(self.repo, "5")
+        for explicit in (False, True):
+            (config_path / ".task.toml").write_text("exclusive_gate = true\n" if explicit else "")
+            for operation in ("open", "flock"):
+                with self.subTest(explicit=explicit, operation=operation):
+                    target = TASK_MODULE.os if operation == "open" else TASK_MODULE.fcntl
+                    output = io.StringIO()
+                    ran = []
+                    with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                            mock.patch.object(target, operation, side_effect=PermissionError("permission denied")), \
+                            contextlib.redirect_stdout(output):
+                        if explicit:
+                            with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
+                                with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
+                                    ran.append(True)
+                        else:
+                            with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
+                                ran.append(True)
+                    self.assertEqual(ran, [] if explicit else [True])
+                    if not explicit:
+                        self.assertEqual(len(output.getvalue().splitlines()), 1)
+                        self.assertIn("running trusted gate unlocked", output.getvalue())
+
     def test_skills_setup_repairs_verify_ui_before_updating_existing_install(self):
         stamp = self.home / ".local/state/bootstrap/skills-installed"
         stamp.parent.mkdir(parents=True, exist_ok=True)
@@ -1761,6 +1787,7 @@ store.write_text(json.dumps(prs))
         self.assertNotIn("new-pattern-not-present/", exclude_path.read_text())
         exclude_path.chmod(0o644)
         task = module.Task(self.repo, "T-5")
+        (self.repo / ".task.toml").write_text("exclusive_gate = true\n")
         original_flock = module.fcntl.flock
         module.fcntl.flock = lambda *_args: (_ for _ in ()).throw(OSError("probe failure"))
         output = io.StringIO()
@@ -2530,6 +2557,11 @@ esac
 
     def test_exclusive_gate_unavailable_prints_notice_and_runs_check(self):
         wt, _ = self.started()
+        env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
+        out = self.raw_task("check", "proj", "5", env=env)
+        self.assertEqual(out.count("Cannot open shared gate lock"), 1)
+        self.assertIn("running trusted gate unlocked", out)
+        self.assertIn("PASS", out)
         (wt / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable exclusive gate")
