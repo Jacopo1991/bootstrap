@@ -446,20 +446,20 @@ def timeout_for(path: Path):
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
-def exclusive_gate_enabled(path: Path) -> bool:
+def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     config = path / ".task.toml"
     if not config.is_file():
-        return False
+        return not advisory
     try:
         values = tomllib.loads(config.read_text())
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise Stop(f"Cannot read {config}: {error}.")
-    return values.get("exclusive_gate") is True
+    return values.get("exclusive_gate", not advisory) is True
 
 
 @contextmanager
 def exclusive_gate_lock(task: Task, silent_unavailable=False):
-    """Serialize opted-in checks across the host and Codex sandboxes sharing /tmp."""
+    """Serialize gates across the host and Codex sandboxes sharing /tmp."""
     gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
     lock_path = gate_dir / "agent-task-gate.lock"
     holder_path = gate_dir / "agent-task-gate.holder"
@@ -493,7 +493,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
                     try:
                         holder_record = json.loads(holder_path.read_text())
                         detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
-                                  f"pid {holder_record['pid']} since {holder_record['since']}")
+                                  f"pid {gate_holder_pid(lock_path)} since {holder_record['since']}")
                     except (OSError, KeyError, json.JSONDecodeError, TypeError):
                         detail = "another gate (holder details unavailable)"
                     print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
@@ -527,6 +527,10 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False):
 
 
 def gate_holder_alive(lock_path):
+    return gate_holder_pid(lock_path) is not None
+
+
+def gate_holder_pid(lock_path):
     """Kernel lock identity survives PID namespace differences."""
     info = lock_path.stat()
     for line in Path("/proc/locks").read_text().splitlines():
@@ -537,8 +541,8 @@ def gate_holder_alive(lock_path):
             match = re.fullmatch(r"([0-9a-fA-F]+):([0-9a-fA-F]+):(\d+)", field)
             if match and (int(match[1], 16), int(match[2], 16), int(match[3])) == (
                     os.major(info.st_dev), os.minor(info.st_dev), info.st_ino):
-                return True
-    return False
+                return int(fields[4])
+    return None
 
 
 def run_record_path(task: Task):
@@ -1458,7 +1462,7 @@ def check(args):
         print(f"exception: verification omitted: {record['no_verify']}")
     if advisory:
         with advisory_check_lock(path):
-            if exclusive_gate_enabled(path):
+            if exclusive_gate_enabled(path, advisory=True):
                 with exclusive_gate_lock(task, silent_unavailable=True):
                     passed = run_check(path, base, record, None, advisory=True)
             else:
@@ -2486,14 +2490,14 @@ def close(args):
     try:
         review = json.loads((archive / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
-        if exception_path.is_file():
+        if exception_path.is_file() or args.no_merge:
             review = {}
         else:
             raise Stop("Close requires a recorded review, or an explicit merge exception.")
     passed = {int(n) for n, verdict in review.get("judgments", {}).items() if verdict == "pass"}
     criteria = [str(item["number"]) for item in record.get("criteria", []) if item["number"] in passed]
     not_passed = [str(item["number"]) for item in record.get("criteria", []) if item["number"] not in passed]
-    if not_passed and not args.partial and not exception_path.is_file():
+    if not_passed and not args.partial and not exception_path.is_file() and not args.no_merge:
         raise Stop("Cannot mark Done: criteria not passed in review: #" + ", #".join(not_passed) + ". Use --partial to keep In Progress.")
     exception = exception_path.exists() or bool(record.get("no_verify"))
     try:
@@ -2520,7 +2524,7 @@ def close(args):
         if not args.no_merge:
             print("Notice: merge not recorded for the task head.")
     summary = args.message + "\n\nRetro: " + args.retro
-    if not args.partial and (not head or merge_evidence.get("head") != head):
+    if args.no_merge or (not args.partial and (not head or merge_evidence.get("head") != head)):
         summary += "\n\nMerge: " + (f"not merged: {args.no_merge}" if args.no_merge else 'merge not recorded')
     if exception_path.is_file():
         try:
