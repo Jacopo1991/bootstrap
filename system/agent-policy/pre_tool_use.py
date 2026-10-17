@@ -1525,7 +1525,20 @@ def evaluate_command(command: str, cwd: str, root: Path,
             lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
             lexer.whitespace_split = True
             lexer.commenters = ""
-            all_tokens.append(list(lexer))
+            tokens = list(lexer)
+            if tokens and Path(tokens[0]).name not in {"git", "gh"}:
+                # Consume quotes and escapes intact so only raw, adjacent 2>
+                # redirects disappear. In `2 >/dev/null`, 2 is an operand.
+                text = re.sub(
+                    r"'[^']*'|\"(?:\\.|[^\"\\])*\"|\\.|"
+                    r"(?<!\S)2>(?:\s*/dev/null|&1)(?=\s|$)",
+                    lambda match: " " if match[0].startswith("2>") else match[0],
+                    text)
+                lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
+                lexer.whitespace_split = True
+                lexer.commenters = ""
+                tokens = list(lexer)
+            all_tokens.append(tokens)
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
     for tokens in all_tokens:
@@ -1572,19 +1585,6 @@ def evaluate_command(command: str, cwd: str, root: Path,
         operators.pop()
         if any(not tokens for tokens in all_tokens):
             return "Shell constructs: empty conditional part."
-    # These exact stderr redirects neither write a file nor change argv. Leave
-    # every other redirect visible to the existing boundary checks.
-    for index, tokens in enumerate(all_tokens):
-        if tokens and Path(tokens[0]).name not in {"git", "gh"}:
-            cleaned = []
-            cursor = 0
-            while cursor < len(tokens):
-                if tokens[cursor:cursor + 3] in (["2", ">&", "1"], ["2", ">", "/dev/null"]):
-                    cursor += 3
-                else:
-                    cleaned.append(tokens[cursor])
-                    cursor += 1
-            all_tokens[index] = cleaned
     if had_chain:
         heads: list[tuple[str, list[str]]] = []
         for tokens in all_tokens:
