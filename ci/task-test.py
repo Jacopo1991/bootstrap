@@ -6,6 +6,7 @@ passes unless the worktree holds a file named FAIL; `backlog task edit` applies 
 final summary the way Backlog.md does; `gh pr list` finds no PR.
 """
 import fcntl
+import atexit
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -20,6 +21,10 @@ import threading
 import unittest
 from unittest import mock
 from pathlib import Path
+
+audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
+atexit.register(audit_state.cleanup)
+os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
