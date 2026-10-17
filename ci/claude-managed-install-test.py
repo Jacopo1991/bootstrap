@@ -97,6 +97,7 @@ assert "deny" not in user["permissions"] and "hooks" not in user
 pre_tool_use = next(argv for argv in argvs if argv[8].endswith("/pre_tool_use.py"))
 env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 with tempfile.TemporaryDirectory() as cwd:
+    env["AGENT_POLICY_STATE_DIR"] = str(Path(cwd) / "audit-state")
     for command in ("wsl.exe -d AgentDev", "sudo true"):
         event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}
         result = subprocess.run(pre_tool_use, input=json.dumps(event), capture_output=True,

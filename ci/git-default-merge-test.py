@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Hosted synthetic metadata tests; no remote connection or PR merge."""
 import importlib.util
+import atexit
 import os
 from pathlib import Path
 import subprocess
 import tempfile
 from unittest.mock import patch
+
+audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
+atexit.register(audit_state.cleanup)
+os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 # Agent sessions export Git overrides; the policy hook correctly refuses them.
 for name in [name for name in os.environ if name.startswith("GIT_")]:

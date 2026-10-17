@@ -21,7 +21,7 @@ Write capability there determines trust; vendor environment markers do not.
   task status [<repo>]
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
-  task denials [--days N]
+  task denials [--days N] [--rule R] [--repo R]
 
 <repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
 or a plain name for work without a task. `task start` pins criteria and Verify commands; `task
@@ -2776,10 +2776,23 @@ def denials(args):
             try:
                 item = json.loads(line)
                 stamp = datetime.fromisoformat(item["time"]).timestamp()
-                if stamp >= cutoff: totals[item.get("rule_id", "unknown")] = totals.get(item.get("rule_id", "unknown"), 0) + 1
-            except (ValueError, KeyError, json.JSONDecodeError):
+                if item.get("test") or item.get("is_test") or item.get("session_type") == "test":
+                    continue
+                rule = item.get("rule_id", "unknown")
+                repo = item.get("repo", "")
+                if stamp < cutoff or (args.rule and rule != args.rule):
+                    continue
+                if args.repo and args.repo not in (repo, Path(repo).name):
+                    continue
+                commands = totals.setdefault(rule, {})
+                command = item.get("command", "")
+                commands[command] = commands.get(command, 0) + 1
+            except (ValueError, KeyError, TypeError, AttributeError):
                 continue
-    for rule, count in sorted(totals.items()): print(f"{rule}: {count}")
+    for rule, commands in sorted(totals.items()):
+        print(f"{rule}: {sum(commands.values())}")
+        for command, count in sorted(commands.items(), key=lambda pair: (-pair[1], pair[0]))[:3]:
+            print(f"  {count}: {command}")
     if not totals: print("No denials in range.")
     return 0
 
@@ -2978,6 +2991,8 @@ def main(argv=None):
     sub.add_argument("repo", nargs="?")
     sub = commands.add_parser("denials")
     sub.add_argument("--days", type=int, default=30)
+    sub.add_argument("--rule")
+    sub.add_argument("--repo")
     args = parser.parse_args(argv)
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")

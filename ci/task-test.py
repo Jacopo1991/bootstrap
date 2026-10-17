@@ -6,6 +6,7 @@ passes unless the worktree holds a file named FAIL; `backlog task edit` applies 
 final summary the way Backlog.md does; `gh pr list` finds no PR.
 """
 import fcntl
+import atexit
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -20,6 +21,10 @@ import threading
 import unittest
 from unittest import mock
 from pathlib import Path
+
+audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
+atexit.register(audit_state.cleanup)
+os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
@@ -153,6 +158,26 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_denials_filters_and_top_commands(self):
+        import json
+        from datetime import datetime, timezone, timedelta
+        path = self.home / '.local/state/agent-policy/denials.jsonl'
+        path.parent.mkdir(parents=True)
+        now = datetime.now(timezone.utc)
+        base = {'time': now.isoformat(), 'rule_id': 'shell.rule', 'repo': '/work/proj'}
+        rows = [dict(base, command=command) for command in ['a', 'a', 'b', 'b', 'b', 'c', 'd']]
+        rows += [dict(base, command='test-only', **marker) for marker in
+                 ({'test': True}, {'is_test': True}, {'session_type': 'test'})]
+        rows += [dict(base, command='old', time=(now - timedelta(days=10)).isoformat()),
+                 dict(base, command='other-repo', repo='/work/else'),
+                 dict(base, command='other-rule', rule_id='other.rule')]
+        path.write_text('\n'.join(json.dumps(row) for row in rows) + '\ninvalid\n')
+        out = self.task('denials', '--days', '2', '--rule', 'shell.rule', '--repo', 'proj')
+        self.assertEqual(out.strip(), 'shell.rule: 7\n  3: b\n  2: a\n  1: c')
+        self.assertEqual(out, self.task('denials', '--days', '2', '--rule', 'shell.rule', '--repo', '/work/proj'))
+        self.assertIn('other.rule: 1', self.task('denials', '--days', '2'))
+        self.assertEqual(self.task('denials', '--rule', 'missing').strip(), 'No denials in range.')
+
     def test_reliability_override_records_timed_out_gate_step(self):
         import json
         wt, _ = self.started()

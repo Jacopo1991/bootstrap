@@ -5,6 +5,7 @@ The pinned Claude Code release may predate mods, so these checks assert the
 deployed policy and the hook's verdicts, not mod loading itself.
 """
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -41,8 +42,10 @@ assert "claude-managed.sh" in (ROOT / "install.sh").read_text(encoding="utf-8")
 
 
 def hook(event: dict, cwd: Path) -> dict:
-    result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event),
-                            capture_output=True, text=True, cwd=cwd, check=True)
+    with tempfile.TemporaryDirectory(prefix="agent-policy-test-") as state:
+        result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event),
+                                capture_output=True, text=True, cwd=cwd, check=True,
+                                env=dict(os.environ, AGENT_POLICY_STATE_DIR=state))
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
