@@ -10,6 +10,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -875,6 +876,115 @@ store.write_text(json.dumps(prs))
     def work_archives(self):
         return self.home / ".local/state/task/archive/proj/t5"
 
+    def test_archive_runtime_failures_and_deep_tree(self):
+        wt, _ = self.started()
+        work = wt / '.work'
+        for name in TASK_MODULE.WORK_CACHES:
+            (work / name).mkdir()
+            (work / name / 'state').write_text('runtime')
+        (work / 'outside').symlink_to(self.home)
+        (work / 'unreadable').write_text('private')
+        (work / 'unreadable').chmod(0)
+        self.addCleanup(lambda: (work / 'unreadable').chmod(0o600) if work.exists() else None)
+        os.mkfifo(work / 'pipe')
+        deep = work / 'deep'
+        for _ in range(400):
+            deep = deep / 'd'
+            deep.mkdir(parents=True, exist_ok=True)
+        (deep / 'request.md').write_text('keep')
+        (work / 'big').mkdir()
+        with (work / 'big/data').open('wb') as stream:
+            stream.truncate(201 * 1024 ** 2)
+        (work / 'big/report.md').write_text('keep report')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+        manifest = next(self.work_archives().glob('*/manifest.json'))
+        record = json.loads(manifest.read_text())
+        skipped = {entry['path']: entry for entry in record['skipped']}
+        self.assertIn('pipe', skipped)
+        self.assertIn('unreadable', skipped)
+        self.assertEqual(skipped['big']['size'], 201 * 1024 ** 2 + len('keep report'))
+        saved = manifest.parent / '.work'
+        self.assertEqual((saved / 'big/report.md').read_text(), 'keep report')
+        self.assertFalse((saved / 'big/data').exists())
+        self.assertTrue((saved / 'outside').is_symlink())
+        self.assertEqual((saved / deep.relative_to(work) / 'request.md').read_text(), 'keep')
+        self.assertFalse(list(self.work_archives().glob('.pending-*')))
+        for name in TASK_MODULE.WORK_CACHES:
+            self.assertFalse((saved / name).exists())
+
+    def test_archive_copy_error_finishes_manifest(self):
+        wt, _ = self.started()
+        (wt / '.work/disappearing').write_text('runtime')
+        original = TASK_MODULE.shutil.copy2
+
+        def copy(source, target):
+            if source.name == 'disappearing':
+                raise FileNotFoundError('runtime removed during archive')
+            return original(source, target)
+
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE.shutil, 'copy2', side_effect=copy):
+            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+        manifest = next(self.work_archives().glob('*/manifest.json'))
+        self.assertIn('disappearing', [entry['path'] for entry in json.loads(manifest.read_text())['skipped']])
+        self.assertFalse(list(self.work_archives().glob('.pending-*')))
+
+    def test_repair_published_merge_and_failed_run(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'published.txt')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'merge', '--no-ff', '-m', 'published', head)
+        self.git(self.repo, 'push', '-q', 'origin', 'main')
+        (wt / '.work/report.md').write_text('evidence')
+        (self.state() / 'run.json').write_text(json.dumps({'command': 'merge', 'state': 'failed'}))
+        out = self.raw_task('repair', 'proj')
+        self.assertIn('Repaired published merge', out)
+        self.assertFalse(wt.exists())
+        self.assertEqual(json.loads((self.state() / 'merge.json').read_text())['head'], head)
+        self.assertEqual(json.loads((self.state() / 'run.json').read_text())['state'], 'passed')
+        self.assertTrue(list(self.work_archives().glob('*/.work/report.md')))
+        (self.state() / 'run.json').write_text(json.dumps({'command': 'merge', 'state': 'failed'}))
+        self.raw_task('repair', 'proj')
+        self.assertEqual(json.loads((self.state() / 'run.json').read_text())['state'], 'passed')
+
+    def test_prune_archive_dry_run_and_preserves_evidence(self):
+        root = self.work_archives()
+        saved = root / 't5-finished'
+        (saved / '.work/fakehome').mkdir(parents=True)
+        (saved / '.work/fakehome/state').write_bytes(b'x' * 100)
+        (saved / '.work/fakehome/gateway.log').write_text('keep nested log')
+        (saved / '.work/large').mkdir()
+        with (saved / '.work/large/data').open('wb') as stream:
+            stream.truncate(201 * 1024 ** 2)
+        (saved / '.work/large/merge.json').write_text('{}')
+        (saved / '.work/report.md').write_text('report')
+        (saved / '.work/gateway.log').write_text('log')
+        (saved / 'manifest.json').write_text('{}')
+        pending = root / '.pending-old'
+        pending.mkdir()
+        (pending / 'partial').write_text('partial')
+        stale = root / '.task-gate-t5-99999999-copy'
+        stale.mkdir()
+        (stale / 'cache').write_text('cache')
+        orphan = root / 'other/.pending-unfinished'
+        orphan.mkdir(parents=True)
+        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
+        self.assertIn('Would free', out)
+        self.assertTrue(pending.exists())
+        self.assertTrue((saved / '.work/fakehome').exists())
+        out = self.raw_task('repair', '--prune-archive', 'proj')
+        self.assertIn('Freed', out)
+        self.assertFalse(pending.exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue(orphan.exists())
+        self.assertFalse((saved / '.work/fakehome/state').exists())
+        self.assertTrue((saved / '.work/fakehome/gateway.log').exists())
+        self.assertFalse((saved / '.work/large/data').exists())
+        self.assertTrue((saved / '.work/large/merge.json').exists())
+        for name in ('.work/report.md', '.work/gateway.log', 'manifest.json'):
+            self.assertTrue((saved / name).is_file())
+
     def test_merge_preserves_all_work_including_large_data_and_harness(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
@@ -925,7 +1035,7 @@ store.write_text(json.dumps(prs))
         self.assertTrue(wt.is_dir())
         self.assertEqual((wt / ".work/paid-transcript").read_text(), "irreplaceable")
 
-    def test_stale_gate_cleanup_preserves_work_and_refuses_failed_copy(self):
+    def test_stale_gate_cleanup_removes_copy_even_when_archive_unavailable(self):
         self.started()
         gate = self.repo / ".worktrees/.task-gate-t5-99999999"
         self.git(self.repo, "worktree", "add", "-q", "--detach", str(gate), "main")
@@ -935,14 +1045,9 @@ store.write_text(json.dumps(prs))
         archive_root.write_text("not a directory")
         out = self.raw_task("status", "proj")
         self.assertIn("repair available", out)
-        out = self.raw_task("repair", "proj", code=1)
-        self.assertIn("refusing to remove", out)
-        self.assertTrue(gate.is_dir())
-        archive_root.unlink()
         out = self.raw_task("repair", "proj")
         self.assertFalse(gate.exists(), out)
-        saved = list(self.work_archives().glob("*/.work/paid-transcript"))
-        self.assertEqual([path.read_text() for path in saved], ["gate evidence"])
+        archive_root.unlink()
 
     def test_close_cleanup_preserves_work_and_repeated_snapshots(self):
         self.started()
@@ -968,13 +1073,8 @@ store.write_text(json.dumps(prs))
         (path / ".work").mkdir()
         (path / ".work/evidence").write_text("irreplaceable")
 
-        def full_disk(_source, destination, **_kwargs):
-            destination.mkdir()
-            (destination / "evidence").write_text("partial")
-            raise OSError("No space left on device")
-
         with mock.patch.object(TASK_MODULE, "HOME", self.home), \
-                mock.patch.object(TASK_MODULE.shutil, "copytree", side_effect=full_disk):
+                mock.patch.object(TASK_MODULE, "atomic_json", side_effect=OSError("No space left on device")):
             with self.assertRaisesRegex(TASK_MODULE.Stop, "refusing to remove"):
                 TASK_MODULE.remove_completed_close_worktree(self.kb, branch, task=task)
         self.assertEqual((path / ".work/evidence").read_text(), "irreplaceable")
