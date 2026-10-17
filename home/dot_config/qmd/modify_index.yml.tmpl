@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+# qmd rewrites the YAML formatting; always regenerate it, ignoring stdin.
+import sys
+
+sys.stdout.write({{ includeTemplate ".chezmoitemplates/qmd-index.yml" . | toJson }})
