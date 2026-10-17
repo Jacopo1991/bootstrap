@@ -64,6 +64,7 @@ CHEZMOI_GIT_NAME='Bootstrap CI' CHEZMOI_GIT_EMAIL='bootstrap-ci@example.invalid'
   execute-template < home/dot_gitconfig.tmpl > "$tmp/gitconfig"
 python3 ci/git-credentials-test.py "$tmp/gitconfig"
 bash ci/git-ignore-test.sh
+bash ci/compile-cache-test.sh
 python3 ci/qmd-test.py "$tmp/chezmoi"
 "$tmp/gitleaks" git --redact --no-banner .
 bash ci/gitleaks-working-tree.sh "$tmp/gitleaks" "$ROOT" "$tmp/working-tree-scan"

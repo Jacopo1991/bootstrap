@@ -33,7 +33,7 @@ if ! cmp -s "$tmp/gitleaks" /usr/local/bin/gitleaks; then
 fi
 
 # Publish only committed public files, never the admin's .git config or home.
-python3 -I -m compileall -q "$ROOT/system/agent-policy"
+python3 -I -X pycache_prefix="$tmp/pycache" -m compileall -q "$ROOT/system/agent-policy"
 revision=$(git -C "$ROOT" rev-parse HEAD)
 public_source="/opt/machine-bootstrap/revisions/$revision"
 sudo install -d -m 0755 "$public_source"

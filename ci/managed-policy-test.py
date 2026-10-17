@@ -548,7 +548,7 @@ with tempfile.TemporaryDirectory() as audit_temp:
         assert {row["rule_id"] for row in rows} == {"hook.input", "hook.error", "test.command", "permission.policy"}
         assert all(row["rule_id"] and row["reason"] and "command" in row for row in rows)
         assert all("fixture" not in row["command"] for row in rows)
-compile_check = 'python3 -I -m compileall -q "$ROOT/system/agent-policy"'
+compile_check = 'python3 -I -X pycache_prefix="$tmp/pycache" -m compileall -q "$ROOT/system/agent-policy"'
 assert install.index(compile_check) < install.index('sudo install -d -m 0755 "$public_source"')
 
 # chezmoi removes the agent's stale copies (empty remove_ entries), so one copy remains.
