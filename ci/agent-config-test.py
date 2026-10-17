@@ -8,6 +8,11 @@ from pathlib import Path
 import subprocess
 import tempfile
 import tomllib
+import atexit
+
+audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
+atexit.register(audit_state.cleanup)
+os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 # Agent sessions export GIT_CONFIG_*/GIT_EDITOR/...; the hook (rightly) refuses them,
 # so the fixtures below need a clean Git environment.
