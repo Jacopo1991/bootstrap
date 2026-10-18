@@ -6,7 +6,7 @@ Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
-  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>]
+  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
@@ -19,6 +19,8 @@ Write capability there determines trust; vendor environment markers do not.
   task note <repo> <id> improve|intervention|setup <text>
   task note - - setup-done <n>
   task status [<repo>]
+  task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
+  task boost off [--claude] [--codex]
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -342,7 +344,53 @@ def frontmatter_value(text, key):
 
 
 def plan_hash(text):
-    return hashlib.sha256(re.sub(r"(?m)^(?:signed|signed_hash):[^\n]*(?:\n|$)", "", text).encode()).hexdigest()
+    header = re.match(r"\A---\r?\n.*?\r?\n(?:---|\.\.\.)(?:\r?\n|$)", text, re.S)
+    if header:
+        text = re.sub(r"(?m)^(?:signed|signed_hash):[^\n]*(?:\n|$)", "", header[0]) + text[header.end():]
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def read_json_object(path):
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def active_boosts():
+    now = datetime.now(timezone.utc)
+    return {vendor: until for vendor, until in read_json_object(HOME / ".local/state/task/boost.json").items()
+            if vendor in {"claude", "codex"} and plan_time(until) and now < plan_time(until)}
+
+
+def boost(args):
+    path = HOME / ".local/state/task/boost.json"
+    if args.action != "off" and (args.claude or args.codex):
+        raise Stop("--claude and --codex require boost off")
+    if args.action == "off" and (args.claude_until or args.codex_until):
+        raise Stop("boost off does not accept end times")
+    values = read_json_object(path)
+    if args.action == "off":
+        for vendor in ("claude", "codex"):
+            if not (args.claude or args.codex) or getattr(args, vendor):
+                values.pop(vendor, None)
+    else:
+        for vendor in ("claude", "codex"):
+            until = getattr(args, vendor + "_until")
+            if until:
+                when = plan_time(until)
+                if not when or when <= datetime.now(timezone.utc):
+                    raise Stop("Boost end time must be a future ISO datetime with offset")
+                values[vendor] = when.isoformat()
+    if args.action or args.claude_until or args.codex_until:
+        atomic_json(path, values)
+    print(boost_line() or "boost: off")
+
+
+def boost_line():
+    active = active_boosts()
+    return "boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items())) if active else ""
 
 
 def plan_time(value):
@@ -362,7 +410,7 @@ def plan_info(repo):
     since = plan_time(signed)
     reasons = []
     if not path.is_file():
-        reasons.append("INTENT.md missing")
+        reasons.append("INTENT.md missing; write INTENT.md and set current first")
     if not since or not frontmatter_value(text, "signed_hash"):
         reasons.append("plan not signed")
     elif plan_hash(text) != frontmatter_value(text, "signed_hash"):
@@ -379,11 +427,11 @@ def plan_info(repo):
         reasons.append("current must name an existing milestone")
     merged = []
     for evidence in sorted((HOME / ".local/state/task" / repo.name).glob("*/merge.json")):
-        data = json.loads(evidence.read_text())
+        data = read_json_object(evidence)
         when = plan_time(data.get("time", ""))
         if since and when and when > since:
             record_path = evidence.parent / "task.json"
-            record = json.loads(record_path.read_text()) if record_path.exists() else {}
+            record = read_json_object(record_path)
             task = Task(repo, record.get("id", evidence.parent.name))
             body = task.file.read_text() if task.file else ""
             merged.append(f"{task.id}: {record.get('title', task.title)}; milestone: "
@@ -468,11 +516,12 @@ def realign(args):
     directory = info["kb"] / "history/realign"
     directory.mkdir(parents=True, exist_ok=True)
     reply = directory / ("realign-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".md")
-    with tempfile.TemporaryDirectory() as temporary:
+    with tempfile.TemporaryDirectory(dir=directory) as temporary:
         source = Path(temporary) / "prompt.md"
         source.write_text(prompt)
         run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -",
-                     info["kb"], source, reply)
+                     info["kb"], source, Path(temporary) / "reply.md")
+        (Path(temporary) / "reply.md").replace(reply)
     print(reply.read_text(), end="")
 
 
@@ -965,7 +1014,7 @@ def lane_environment(task):
     return env
 
 
-MODELS = {"codex": {"gpt-6-luna": "gpt-6-luna", "gpt-6.1-sol": "gpt-6.1-sol"},
+MODELS = {"codex": {"gpt-6-luna": "gpt-6-luna", "gpt-6.1-sol": "gpt-6.1-sol", "gpt-6-astra": "gpt-6-astra"},
           "claude": {"sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
                      "opus": "opus", "claude-opus-5-5": "opus",
                      "fable": "fable", "claude-fable-5-1": "fable"}}
@@ -1041,6 +1090,11 @@ def lane(args):
     builder = args.builder or record["builder"]
     model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
     cli_model = resolve_model(builder, model)
+    until = active_boosts().get(builder)
+    if until and not args.no_boost and not args._worker:
+        upgraded = "gpt-6-astra" if builder == "codex" else "fable"
+        print(f"boost: {model} -> {upgraded} (until {until})")
+        model = cli_model = upgraded
     work = path / ".work"
     prompt = work / "prompt.md"
     if not prompt.is_file():
@@ -1073,7 +1127,7 @@ def lane(args):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
             final.unlink(missing_ok=True)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
-                      "--builder", builder, "--model", model, "--_worker"]
+                      "--builder", builder, "--model", model, "--no-boost", "--_worker"]
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
@@ -1449,6 +1503,8 @@ def start(args):
     repo = resolve_repo(args.repo)
     ensure_origin_head(repo)
     task = Task(repo, args.id)
+    if args.off_plan is not None and not args.refresh and real_worktree(repo, task.path) and (task_state(task) / "task.json").is_file():
+        raise Stop("--off-plan on a resumed task requires --refresh")
     check_plan(task, args.off_plan)
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
@@ -2044,6 +2100,8 @@ def review(args):
     if not args.record:
         reviewer_route = (("claude", "haiku") if record["builder"] == "codex"
                           else ("codex", "gpt-6-luna"))
+        if reviewer_route[0] in active_boosts():
+            reviewer_route = (reviewer_route[0], "opus" if reviewer_route[0] == "claude" else "gpt-6.1-sol")
         if reviewer_route[0] == record["builder"]:
             raise Stop("reviewer vendor must differ from builder")
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
@@ -2101,11 +2159,11 @@ def review(args):
         reply_file.unlink(missing_ok=True)
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         if record["builder"] == "codex":
-            command = (f"claude -p {add_dir}--permission-mode dontAsk --model haiku --effort high "
+            command = (f"claude -p {add_dir}--permission-mode dontAsk --model {reviewer_route[1]} --effort high "
                        "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
         else:
             command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
-                       "-m gpt-6-luna -c model_reasoning_effort=high -")
+                       f"-m {reviewer_route[1]} -c model_reasoning_effort=high -")
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
@@ -2916,6 +2974,9 @@ def note(args):
 
 
 def status(args):
+    active = boost_line()
+    if active:
+        print(active)
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
@@ -2935,7 +2996,11 @@ def status(args):
                 continue
             task = Task(repo, path.name)
             state = task_state(task)
-            record = load_record(task, required=False)
+            try:
+                record = load_record(task, required=False)
+            except Stop as error:
+                print(f"  {path.name}: {error}")
+                record = None
             head = sha(path, "HEAD")
             branch = git(path, "branch", "--show-current")
             check = {}
@@ -3019,7 +3084,7 @@ def status(args):
             for state in sorted(item for item in state_root.iterdir() if item.is_dir()):
                 pinned = state / "task.json"
                 if pinned.is_file():
-                    exception = json.loads(pinned.read_text()).get("off_plan")
+                    exception = read_json_object(pinned).get("off_plan")
                     if exception:
                         attention.append(f"{state.name}: off-plan exception: {exception}")
                 if (state / "exception.json").is_file() and not any(state.name in entry for entry in attention):
@@ -3424,9 +3489,10 @@ def main(argv=None):
             sub.add_argument("--no-verify", metavar="REASON")
             sub.add_argument("--off-plan", metavar="REASON")
         if name == "lane":
+            sub.add_argument("--no-boost", action="store_true")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
             sub.add_argument("--builder", choices=("codex", "claude"))
-            sub.add_argument("--model", help="Claude aliases sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol")
+            sub.add_argument("--model", help="Claude aliases sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
             sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
@@ -3446,6 +3512,12 @@ def main(argv=None):
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
+    sub = commands.add_parser("boost")
+    sub.add_argument("action", nargs="?", choices=("off",))
+    sub.add_argument("--claude-until")
+    sub.add_argument("--codex-until")
+    sub.add_argument("--claude", action="store_true")
+    sub.add_argument("--codex", action="store_true")
     sub = commands.add_parser("plan")
     sub.add_argument("repo")
     sub.add_argument("--sign", action="store_true")
@@ -3482,7 +3554,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign"} or args.command == "plan" and args.sign:
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign"} or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -3534,7 +3606,7 @@ def main(argv=None):
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "repair": repair,
-                      "wait": wait_task, "plan": plan, "realign": realign}[args.command](args) or 0
+                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"

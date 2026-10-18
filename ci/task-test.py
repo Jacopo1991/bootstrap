@@ -160,6 +160,60 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_boost_state_expiry_off_and_authority(self):
+        future = '2099-01-01T00:00:00+00:00'
+        self.assertIn('boost: off', self.task('boost'))
+        self.assertIn('future ISO', self.task('boost', '--codex-until', '2000-01-01T00:00:00+00:00', code=1))
+        self.assertIn('future ISO', self.task('boost', '--codex-until', '2099-01-01T00:00:00', code=1))
+        self.task('boost', '--claude-until', future, '--codex-until', future)
+        self.assertIn('boost: claude until', self.task('status', 'proj'))
+        self.task('boost', 'off', '--claude')
+        self.assertNotIn('claude', self.task('boost'))
+        self.task('boost', '--claude-until', future)
+        self.task('boost', 'off', '--codex')
+        self.assertNotIn('codex', self.task('boost'))
+        self.task('boost', 'off')
+        path = self.home / '.local/state/task/boost.json'
+        path.write_text(json.dumps({'claude': '2000-01-01T00:00:00+00:00', 'codex': '2000-01-01T00:00:00+00:00'}))
+        self.assertEqual(self.task('boost').strip(), 'boost: off')
+        before = path.read_bytes()
+        with mock.patch.object(TASK_MODULE, 'task_state_writable', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(TASK_MODULE.main(['boost', '--codex-until', future]), 1)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_boost_builder_models_opt_out_and_astra(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
+        for builder, requested, extra, expected in [
+                ('codex', 'gpt-6-luna', [], 'gpt-6-astra'),
+                ('claude', 'sonnet', [], 'fable'),
+                ('codex', 'gpt-6-luna', ['--no-boost'], 'gpt-6-luna'),
+                ('claude', 'sonnet', ['--no-boost'], 'sonnet'),
+                ('codex', 'gpt-6-astra', ['--no-boost'], 'gpt-6-astra')]:
+            out = self.task('lane', 'proj', '5', '--builder', builder, '--model', requested, *extra)
+            record = self.wait_for_lane(wt)
+            self.assertEqual(record['model'], expected)
+            self.assertEqual(record['cli_model'], expected)
+            call = json.loads((wt / '.work/model-call.json').read_text())
+            self.assertIn(expected, call['args'])
+            if not extra:
+                self.assertIn(f'boost: {requested} -> {expected}', out)
+
+    def test_boost_reviewer_models_and_recorded_identity(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        for builder, vendor, model in [('codex', 'claude', 'opus'), ('claude', 'codex', 'gpt-6.1-sol')]:
+            self.task('start', 'proj', '5', '--refresh', '--builder', builder)
+            self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+            metadata = json.loads((self.state() / 'review.json').read_text())
+            self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
+            self.assertIn(model, json.loads((wt / '.work/reviewer-call.json').read_text())['args'])
+
     def test_plan_refusals_exceptions_and_resume(self):
         plan = self.kb / 'INTENT.md'
         original = plan.read_text()
@@ -182,6 +236,9 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], 'founder ask')
         plan.unlink()
         self.started()  # Existing record and worktree resume even with no plan.
+        self.assertIn('requires --refresh', self.task('start', 'proj', '5', '--off-plan', 'new reason', code=1))
+        self.task('start', 'proj', '5', '--off-plan', 'new reason', '--refresh')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], 'new reason')
         self.assertIn('off-plan exception', self.task('status', 'proj'))
         self.task('start', 'proj', 'direct-ask')
 
@@ -201,6 +258,16 @@ class TaskTool(unittest.TestCase):
         (state / 'task.json').write_text(json.dumps({'id': 'direct', 'title': 'Direct ask'}))
         (state / 'merge.json').write_text(json.dumps({'time': '2099-01-01T00:00:00+00:00'}))
         self.assertIn('1/1', self.task('plan', 'proj'))
+        off = self.state('t99')
+        off.mkdir(parents=True)
+        (off / 'task.json').write_text(json.dumps({'id': 'T-99', 'off_plan': 'approved'}))
+        (off / 'merge.json').write_text(json.dumps({'time': '2099-01-01T00:00:00+00:00'}))
+        self.assertIn('2/1', self.task('plan', 'proj'))
+        self.assertIn('plan: stop:', self.task('status', 'proj'))
+        (off / 'merge.json').write_text('invalid json')
+        (off / 'task.json').write_text('invalid json')
+        self.assertIn('1/1', self.task('plan', 'proj'))
+        self.task('status', 'proj')
         self.assertIn('realignment due', self.task('start', 'proj', '5', code=1))
         from datetime import datetime, timezone
         (state / 'merge.json').write_text(json.dumps({'time': datetime.now(timezone.utc).isoformat()}))
@@ -228,6 +295,8 @@ class TaskTool(unittest.TestCase):
             self.assertEqual(signed.split('---\n', 2)[2], body)
             self.assertEqual(TASK_MODULE.frontmatter_value(signed, 'signed_hash'),
                              TASK_MODULE.plan_hash(signed))
+        plan.write_text(signed.replace('signed: body example', 'signed: changed body'))
+        self.assertIn('changed since sign-off', self.task('plan', 'proj'))
         plan.write_text(signed.replace('realign_every: 7', 'realign_every: 8'))
         self.assertIn('changed since sign-off', self.task('plan', 'proj'))
         plan.write_bytes((header + '---\n' + body).replace('\n', '\r\n').encode())
@@ -258,6 +327,10 @@ class TaskTool(unittest.TestCase):
         self.assertIn('--sandbox read-only', (self.kb / 'args-copy').read_text())
         self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
         self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
+        stub.write_text('#!/usr/bin/env python3\nimport sys\nprint("partial reply")\nsys.exit(1)\n')
+        self.task('realign', 'proj', code=1)
+        self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
+        self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
 
     def test_plan_without_knowledge_repo_is_exempt(self):
         from types import SimpleNamespace
