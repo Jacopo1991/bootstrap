@@ -13,6 +13,8 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import time
 import shutil
 import stat
 import subprocess
@@ -160,6 +162,30 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_close_update_checks_default_branch_holder_dirt(self):
+        holder = self.home / 'knowledge-holder'
+        self.git(self.kb, 'worktree', 'add', '-q', '-b', 'holder-main', str(holder))
+        task_file = next((holder / 'backlog/tasks').glob('*.md'))
+        original = task_file.read_bytes()
+        self.commit_in(self.kb, 'incoming.md', 'Incoming close\n')
+        incoming = self.git(self.kb, 'rev-parse', 'HEAD')
+        self.git(self.kb, 'update-ref', 'refs/remotes/origin/holder-main', incoming)
+        before = self.git(holder, 'rev-parse', 'HEAD')
+        task_file.write_bytes(original + b'Uncommitted task change\n')
+        output = TASK_MODULE.update_closed_knowledge_checkout(self.kb, 'holder-main')
+        self.assertEqual(output, f'local holder-main not updated in {holder}: it has uncommitted changes')
+        self.assertEqual(self.git(holder, 'rev-parse', 'HEAD'), before)
+        task_file.write_bytes(original)
+        (holder / 'INTENT.md').write_text('Local plan\n')
+        realign = holder / 'history/realign/review.md'
+        realign.parent.mkdir(parents=True)
+        realign.write_text('Local review\n')
+        output = TASK_MODULE.update_closed_knowledge_checkout(self.kb, 'holder-main')
+        self.assertEqual(output, f'{holder} fast-forwarded')
+        self.assertEqual(self.git(holder, 'rev-parse', 'HEAD'), incoming)
+        self.assertEqual((holder / 'INTENT.md').read_text(), 'Local plan\n')
+        self.assertEqual(realign.read_text(), 'Local review\n')
+
     def test_boost_state_expiry_off_and_authority(self):
         future = '2099-01-01T00:00:00+00:00'
         self.assertIn('boost: off', self.task('boost'))
@@ -479,6 +505,139 @@ class TaskTool(unittest.TestCase):
     def test_plan_without_knowledge_repo_is_exempt(self):
         from types import SimpleNamespace
         TASK_MODULE.check_plan(SimpleNamespace(kb=self.home / 'absent', number=5))
+    def runner_fixture(self, backend='systemd'):
+        work = self.repo / '.work'
+        work.mkdir(exist_ok=True)
+        runner = work / 'runner-b1.md'
+        runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
+        scripts = {
+            'systemctl': """#!/usr/bin/env python3
+import os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+if 'stop' in sys.argv:
+    (home / 'stopped').write_text(sys.argv[-1])
+else:
+    print('ActiveState=' + ('active' if (home / 'active').exists() else 'inactive'))
+    print('ExecMainStartTimestamp=test-start')
+""",
+            'systemd-run': """#!/usr/bin/env python3
+import json, os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+(home / 'service-args').write_text(json.dumps(sys.argv[1:]))
+sys.exit(int(os.environ.get('SERVICE_EXIT', '0')))
+""",
+            'codex': """#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+work = pathlib.Path.cwd() / '.work'
+(work / 'runner-call').write_text(json.dumps(dict(args=sys.argv[1:], prompt=sys.stdin.read(),
+    pid=os.getpid(), pgid=os.getpgrp(), sid=os.getsid(0))))
+while (work / 'hold').exists():
+    time.sleep(.02)
+print('runner stdout')
+print('runner stderr', file=sys.stderr)
+if os.environ.get('RUNNER_FINAL'):
+    with (work / 'runner-b1.done').open('a') as stream:
+        stream.write(os.environ['RUNNER_FINAL'] + '\\n')
+sys.exit(7)
+"""}
+        for name, body in scripts.items():
+            path = self.home / 'bin' / name
+            path.write_text(body)
+            path.chmod(0o755)
+        if backend == 'setsid':
+            self.env['SERVICE_EXIT'] = '1'
+        return runner
+
+    def wait_runner_file(self, path):
+        deadline = time.monotonic() + 10
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertTrue(path.exists(), str(path))
+        return path.read_text()
+
+    def test_runner_start_service_validation_status_cancel(self):
+        runner = self.runner_fixture()
+        runner.write_text('invalid\n')
+        self.raw_task('runner-start', 'proj', str(runner), code=1)
+        self.assertFalse((self.home / 'service-args').exists())
+        runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
+        out = self.raw_task('runner-start', 'proj', str(runner))
+        self.assertIn('task-runner-proj-b1', out)
+        args = json.loads((self.home / 'service-args').read_text())
+        self.assertEqual(args[:7], ['--user', '--unit', 'task-runner-proj-b1', '--collect',
+                                   '--working-directory', str(self.repo), '--property=StandardInput=null'])
+        self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
+        command = args[args.index(sys.executable):]
+        subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
+        call = json.loads((runner.parent / 'runner-call').read_text())
+        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
+                                        '-m', 'gpt-6-luna', '-'])
+        self.assertEqual(call['prompt'], runner.read_text())
+        self.assertIn('code 7', runner.with_suffix('.done').read_text())
+        (self.home / 'active').touch()
+        self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
+        status = self.raw_task('status', 'proj')
+        self.assertIn('task-runner-proj-b1: active started=test-start', status)
+        self.assertIn('last=batch: stopped: runner exited', status)
+        self.raw_task('cancel', 'proj', 'runner-b1')
+        self.assertEqual((self.home / 'stopped').read_text(), 'task-runner-proj-b1')
+        (self.home / 'active').unlink()
+        self.assertIn('task-runner-proj-b1: inactive', self.raw_task('status', 'proj'))
+        for final in ('batch: finished', 'batch: stopped: deliberate'):
+            for own_final in ('', final):
+                with self.subTest(stale=final, own_final=own_final):
+                    done = runner.with_suffix('.done')
+                    stale = done.read_text() + final + '\n'
+                    done.write_text(stale)
+                    self.raw_task('runner-start', 'proj', str(runner))
+                    self.assertIn('last=(no .done line)', self.raw_task('status', 'proj'))
+                    args = json.loads((self.home / 'service-args').read_text())
+                    command = args[args.index(sys.executable):]
+                    subprocess.run(command, cwd=self.repo,
+                                   env=dict(self.env, RUNNER_FINAL=own_final), capture_output=True)
+                    current = done.read_text()[len(stale):]
+                    self.assertTrue(done.read_text().startswith(stale))
+                    if own_final:
+                        self.assertEqual(current, own_final + '\n')
+                    else:
+                        self.assertEqual(current, 'batch: stopped: runner exited (code 7) '
+                                         f'without a final line; see {runner.with_suffix(".log")}\n')
+                    self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
+
+    def test_runner_fallback_survives_callers_group_and_cancel(self):
+        runner = self.runner_fixture('setsid')
+        hold = runner.parent / 'hold'
+        hold.touch()
+        # The launcher stays in the caller's session until that entire group is killed.
+        caller = subprocess.Popen([sys.executable, '-c',
+            'import subprocess,sys,time; subprocess.run(sys.argv[1:], check=True); time.sleep(30)',
+            sys.executable, str(TOOL), 'runner-start', 'proj', str(runner)],
+            env=self.env, cwd=self.home, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            call = json.loads(self.wait_runner_file(runner.parent / 'runner-call'))
+            self.assertNotEqual(call['sid'], caller.pid)
+            self.assertNotEqual(call['pgid'], caller.pid)
+            os.killpg(caller.pid, signal.SIGKILL)
+            caller.wait()
+            os.kill(call['pid'], 0)
+            self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
+            self.assertIn('task-runner-proj-b1: active', self.raw_task('status', 'proj'))
+            self.raw_task('cancel', 'proj', 'runner-b1')
+            self.assertIn('without a final line', self.wait_runner_file(runner.with_suffix('.done')))
+        finally:
+            hold.unlink(missing_ok=True)
+            if caller.poll() is None:
+                os.killpg(caller.pid, signal.SIGKILL)
+                caller.wait()
+
+    def test_runner_fallback_exit_guard_and_logs(self):
+        runner = self.runner_fixture('setsid')
+        self.assertIn('falling back to setsid', self.raw_task('runner-start', 'proj', str(runner)))
+        self.assertIn('code 7', self.wait_runner_file(runner.with_suffix('.done')))
+        log = runner.with_suffix('.log').read_text()
+        self.assertIn('runner stdout', log)
+        self.assertIn('runner stderr', log)
 
     def test_denials_filters_and_top_commands(self):
         import json
