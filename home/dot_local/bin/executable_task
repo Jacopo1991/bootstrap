@@ -335,6 +335,142 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def frontmatter_value(text, key):
+    # Reuse the scalar and quoted-value handling used for Backlog titles.
+    return frontmatter_title(re.sub(r"(?m)^" + re.escape(key) + r":", "title:",
+                                   re.sub(r"(?m)^title:.*$", "", text)))
+
+
+def plan_hash(text):
+    return hashlib.sha256(re.sub(r"(?m)^(?:signed|signed_hash):[^\n]*(?:\n|$)", "", text).encode()).hexdigest()
+
+
+def plan_time(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def plan_info(repo):
+    kb = CORTEX / f"cortex-kb-{repo.name}"
+    path = kb / "PLAN.md"
+    text = path.read_text() if path.is_file() else ""
+    current = frontmatter_value(text, "current").split(" #", 1)[0].strip()
+    signed = frontmatter_value(text, "signed")
+    since = plan_time(signed)
+    reasons = []
+    if not path.is_file():
+        reasons.append("PLAN.md missing")
+    if not since or not frontmatter_value(text, "signed_hash"):
+        reasons.append("plan not signed")
+    elif plan_hash(text) != frontmatter_value(text, "signed_hash"):
+        reasons.append("changed since sign-off")
+    try:
+        limit = int((frontmatter_value(text, "realign_every") or "15").split(" #", 1)[0])
+        if limit < 1:
+            raise ValueError
+    except ValueError:
+        limit = 15
+        reasons.append("realign_every must be positive")
+    milestones = sorted((kb / "backlog/milestones").glob(f"{current} - *.md")) if current else []
+    if not milestones:
+        reasons.append("current must name an existing milestone")
+    merged = []
+    for evidence in sorted((HOME / ".local/state/task" / repo.name).glob("*/merge.json")):
+        data = json.loads(evidence.read_text())
+        when = plan_time(data.get("time", ""))
+        if since and when and when > since:
+            record_path = evidence.parent / "task.json"
+            record = json.loads(record_path.read_text()) if record_path.exists() else {}
+            task = Task(repo, record.get("id", evidence.parent.name))
+            body = task.file.read_text() if task.file else ""
+            merged.append(f"{task.id}: {record.get('title', task.title)}; milestone: "
+                          f"{frontmatter_value(body, 'milestone') or record.get('milestone', '')}; "
+                          f"{markdown_section(body, 'Final Summary')}")
+    if len(merged) >= limit:
+        reasons.append("realignment due")
+    decisions = set()
+    for line in run_git(kb, "status", "--porcelain", "-z", "--untracked-files=all", "--", "backlog/decisions").stdout.split("\0") if kb.exists() else []:
+        if line:
+            decisions.add(line[3:] if line[2:3] == " " else line)
+    if since:
+        for commit in run_git(kb, "log", "--format=%H", "--", "backlog/decisions").stdout.splitlines():
+            when = plan_time(git(kb, "show", "-s", "--format=%cI", commit))
+            if when and when > since:
+                decisions.update(filter(None, run_git(kb, "diff-tree", "--root", "--no-commit-id", "--name-only", "-z", "-r", commit,
+                                     "--", "backlog/decisions").stdout.split("\0")))
+    if decisions:
+        reasons.append("decisions changed: " + ", ".join(sorted(decisions)))
+    return dict(kb=kb, path=path, text=text, current=current, signed=signed, limit=limit,
+                merged=merged, decisions=sorted(decisions), reasons=reasons,
+                title=frontmatter_title(milestones[0].read_text()) if milestones else "")
+
+
+def plan_verdict(info):
+    return "plan: stop: " + "; ".join(info["reasons"]) if info["reasons"] else "plan: ok"
+
+
+def check_plan(task, off_plan=None):
+    if off_plan is not None:
+        if not off_plan.strip():
+            raise Stop("--off-plan needs a reason")
+        return
+    if (not task.kb.exists() or task.number is None or
+            real_worktree(task.repo, task.path) and (task_state(task) / "task.json").is_file()):
+        return
+    info = plan_info(task.repo)
+    reasons = info["reasons"][:]
+    if not task.file or frontmatter_value(task.file.read_text(), "milestone") != info["current"] or not info["current"]:
+        reasons.append("task milestone must match current")
+    if reasons:
+        raise Stop("; ".join(reasons) + "; update PLAN.md and run `task plan " + task.repo.name + " --sign`, or use --off-plan with a reason.")
+
+
+def plan(args):
+    repo = resolve_repo(args.repo)
+    info = plan_info(repo)
+    if args.sign:
+        if not info["current"] or not list((info["kb"] / "backlog/milestones").glob(f"{info['current']} - *.md")):
+            raise Stop("current must name an existing Backlog milestone file")
+        text = re.sub(r"(?m)^(?:signed|signed_hash):[^\n]*(?:\n|$)", "", info["text"])
+        end = text.find("\n---", 3)
+        if end < 0:
+            raise Stop("PLAN.md needs YAML frontmatter")
+        text = text[:end] + f"\nsigned: {datetime.now(timezone.utc).isoformat()}\nsigned_hash: {plan_hash(text)}" + text[end:]
+        info["path"].write_text(text)
+        info = plan_info(repo)
+    print(f"current: {info['current']} {info['title']}")
+    print(f"signed: {info['signed'] or 'not signed'}")
+    print(f"merged since sign-off: {len(info['merged'])}/{info['limit']}")
+    print("decisions newer than sign-off: " + ", ".join(info["decisions"]))
+    print(plan_verdict(info))
+
+
+def realign(args):
+    info = plan_info(resolve_repo(args.repo))
+    if not info["path"].is_file():
+        raise Stop("Create PLAN.md before realignment")
+    prompt = ("Read-only drift review. Answer with Verdict: on plan | drifted | plan unclear, "
+              "then evidence per merged task: does it serve current and its pass test; contradictions "
+              "between PLAN, INTENT, STATUS and decisions; and what the founder must decide. "
+              "Do not edit files or sign anything.\n")
+    for name in ["PLAN.md", "INTENT.md", "STATUS.md", *info["decisions"]]:
+        source = info["kb"] / name
+        prompt += f"\n## {name}\n" + (source.read_text() if source.is_file() else "(missing or deleted)")
+    prompt += "\n## Tasks merged since sign-off\n" + "\n".join(info["merged"])
+    directory = info["kb"] / "history/realign"
+    directory.mkdir(parents=True, exist_ok=True)
+    reply = directory / ("realign-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".md")
+    with tempfile.TemporaryDirectory() as temporary:
+        source = Path(temporary) / "prompt.md"
+        source.write_text(prompt)
+        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -",
+                     info["kb"], source, reply)
+    print(reply.read_text(), end="")
+
+
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -855,7 +991,7 @@ def refresh_context(task):
     if destination.is_file():
         destination.unlink()
     destination.mkdir(parents=True, exist_ok=True)
-    sources = [task.kb / "INTENT.md", task.kb / "STATUS.md"]
+    sources = [task.kb / "INTENT.md", task.kb / "STATUS.md", task.kb / "PLAN.md"]
     if task.file:
         sources.append(task.file)
         text = task.file.read_text()
@@ -1222,6 +1358,7 @@ def runner_check(args):
     repo = resolve_repo(args.repo)
     problems, builders, seen_tasks = [], {}, set()
     task_lines = 0
+    pending = []
     in_text_rules = False
     task_line = re.compile(
         r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
@@ -1244,6 +1381,9 @@ def runner_check(args):
             ident, builder, model, seed, after = parsed.groups()
             try:
                 task = Task(repo, ident)
+                check_plan(task)
+                if not task.path.exists():
+                    pending.append(task.id)
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")
                 resolve_model(builder.lower(), model)
@@ -1288,6 +1428,11 @@ def runner_check(args):
                 problems.append(f"line {number}: {error}")
     if task_lines == 0:
         problems.append("no task lines found (format: N. <id>: builder <b>, model <m>[, seed <s>][, after: <id>])")
+    if (CORTEX / f"cortex-kb-{repo.name}").exists():
+        info = plan_info(repo)
+        remaining = info["limit"] - len(info["merged"])
+        if pending and len(pending) > remaining:
+            print(f"warning: realignment stop at {pending[max(0, remaining)]} ({info['limit']} merged tasks)")
     if problems:
         print("\n".join(problems))
         return 1
@@ -1299,6 +1444,7 @@ def start(args):
     repo = resolve_repo(args.repo)
     ensure_origin_head(repo)
     task = Task(repo, args.id)
+    check_plan(task, args.off_plan)
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
     task_text = task.file.read_text() if task.file else ""
@@ -1393,7 +1539,8 @@ def start(args):
     else:
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
-                  "verify": verify, "no_verify": args.no_verify or ""}
+                  "verify": verify, "no_verify": args.no_verify or "", "off_plan": args.off_plan or "",
+                  "milestone": frontmatter_value(task_text, "milestone")}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
         if args.refresh:
@@ -1409,6 +1556,8 @@ def start(args):
     if "Verification and tools" in task_text:
         section = re.search(r"(?ms)^#{1,6} Verification and tools\s*\n(.*?)(?=^#{1,6} |\Z)", task_text)
         print("\nVerification and tools:\n" + (section.group(1).strip() if section else ""))
+    if record.get("off_plan"):
+        print(f"off-plan exception: {record['off_plan']}")
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     refresh_context(task)
@@ -2298,7 +2447,8 @@ def merge(args):
             break
         else:
             raise Stop(f"{default} kept moving during three gate attempts; rerun `task merge`.")
-    atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit, "time": utc_now()})
+    atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit,
+                                        "time": datetime.now(timezone.utc).isoformat()})
     try:
         review = json.loads((archive / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -2769,6 +2919,8 @@ def status(args):
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
+        if (CORTEX / f"cortex-kb-{repo.name}").exists():
+            print("  " + plan_verdict(plan_info(repo)))
         attention = []
         state_root = HOME / ".local/state/task" / repo.name
         for path in sorted((repo / ".worktrees").glob("*")) if (repo / ".worktrees").is_dir() else []:
@@ -2860,6 +3012,11 @@ def status(args):
                                  f"(log: {path / '.work/run.log'})")
         if state_root.is_dir():
             for state in sorted(item for item in state_root.iterdir() if item.is_dir()):
+                pinned = state / "task.json"
+                if pinned.is_file():
+                    exception = json.loads(pinned.read_text()).get("off_plan")
+                    if exception:
+                        attention.append(f"{state.name}: off-plan exception: {exception}")
                 if (state / "exception.json").is_file() and not any(state.name in entry for entry in attention):
                     attention.append(f"{state.name}: exception")
         for request in open_setup_requests(setup_path, repo.name, setup_events):
@@ -3260,6 +3417,7 @@ def main(argv=None):
             sub.add_argument("--refresh", action="store_true")
             sub.add_argument("--seed", action="append", default=[], metavar="NAME")
             sub.add_argument("--no-verify", metavar="REASON")
+            sub.add_argument("--off-plan", metavar="REASON")
         if name == "lane":
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
             sub.add_argument("--builder", choices=("codex", "claude"))
@@ -3283,6 +3441,11 @@ def main(argv=None):
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
+    sub = commands.add_parser("plan")
+    sub.add_argument("repo")
+    sub.add_argument("--sign", action="store_true")
+    sub = commands.add_parser("realign")
+    sub.add_argument("repo")
     sub = commands.add_parser("runner-check", help="validate a runner file without launching it")
     sub.add_argument("repo")
     sub.add_argument("file")
@@ -3314,7 +3477,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair"}:
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign"} or args.command == "plan" and args.sign:
         try:
             require_pm(args)
         except Stop as stop:
@@ -3366,7 +3529,7 @@ def main(argv=None):
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "repair": repair,
-                      "wait": wait_task}[args.command](args) or 0
+                      "wait": wait_task, "plan": plan, "realign": realign}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"

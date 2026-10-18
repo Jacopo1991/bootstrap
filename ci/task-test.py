@@ -160,6 +160,88 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_plan_refusals_exceptions_and_resume(self):
+        plan = self.kb / 'PLAN.md'
+        original = plan.read_text()
+        task = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        for content, message in [(None, 'PLAN.md missing'),
+                                 ('---\ncurrent: m-1\n---\n', 'not signed'),
+                                 (original + 'changed\n', 'changed since sign-off')]:
+            if content is None:
+                plan.unlink()
+            else:
+                plan.write_text(content)
+            self.assertIn(message, self.task('start', 'proj', '5', code=1))
+        plan.write_text(original)
+        task.write_text(task.read_text().replace('milestone: m-1', 'milestone: m-2'))
+        self.assertIn('milestone', self.task('start', 'proj', '5', code=1))
+        self.assertIn('reason', self.task('start', 'proj', '5', '--off-plan', '', code=1))
+        self.assertIn('off-plan exception: founder ask', self.task('start', 'proj', '5', '--off-plan', 'founder ask'))
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], 'founder ask')
+        plan.unlink()
+        self.started()  # Existing record and worktree resume even with no plan.
+        self.assertIn('off-plan exception', self.task('status', 'proj'))
+        self.task('start', 'proj', 'direct-ask')
+
+    def test_plan_sign_counts_decisions_and_runner_warning(self):
+        plan = self.kb / 'PLAN.md'
+        plan.write_text(plan.read_text().replace('current: m-1', 'current: missing'))
+        self.assertIn('existing', self.task('plan', 'proj', '--sign', code=1))
+        plan.write_text('---\ncurrent: m-1\nrealign_every: 1\n---\nPass test\n')
+        self.assertIn('plan: ok', self.task('plan', 'proj', '--sign'))
+        signed = plan.read_text()
+        self.assertEqual(TASK_MODULE.plan_hash(signed), TASK_MODULE.frontmatter_value(signed, 'signed_hash'))
+        runner = self.home / 'runner.md'
+        runner.write_text('1. 5: builder codex, model gpt-6-luna\n2. direct: builder codex, model gpt-6-luna\n')
+        self.assertIn('stop at direct', self.task('runner-check', 'proj', str(runner)))
+        state = self.state('direct')
+        state.mkdir(parents=True)
+        (state / 'task.json').write_text(json.dumps({'id': 'direct', 'title': 'Direct ask'}))
+        (state / 'merge.json').write_text(json.dumps({'time': '2099-01-01T00:00:00+00:00'}))
+        self.assertIn('1/1', self.task('plan', 'proj'))
+        self.assertIn('realignment due', self.task('start', 'proj', '5', code=1))
+        from datetime import datetime, timezone
+        (state / 'merge.json').write_text(json.dumps({'time': datetime.now(timezone.utc).isoformat()}))
+        self.assertIn('0/1', self.task('plan', 'proj', '--sign'))
+        decisions = self.kb / 'backlog/decisions'
+        decisions.mkdir()
+        decision = decisions / 'd-1.md'
+        decision.write_text('New direction')
+        self.assertIn('decisions changed', self.task('start', 'proj', '5', code=1))
+        self.git(self.kb, 'add', str(decision))
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'decision'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertIn('d-1.md', self.task('plan', 'proj'))
+        self.assertIn('decisions changed', self.task('start', 'proj', '5', code=1))
+
+    def test_realign_read_only_prompt_and_output(self):
+        for name in ('INTENT.md', 'STATUS.md'):
+            (self.kb / name).write_text(name + ' contents')
+        (self.kb / 'backlog/decisions').mkdir()
+        (self.kb / 'backlog/decisions/d-1 - direction.md').write_text('Decision input')
+        state = self.state('direct')
+        state.mkdir(parents=True)
+        (state / 'task.json').write_text(json.dumps({'id': 'direct', 'title': 'Direct title', 'milestone': 'm-1'}))
+        (state / 'merge.json').write_text(json.dumps({'time': '2099-01-01T00:00:00+00:00'}))
+        stub = self.home / 'bin/codex'
+        stub.write_text('#!/usr/bin/env python3\nimport pathlib,sys\n'
+                        'pathlib.Path("prompt-copy").write_text(sys.stdin.read())\n'
+                        'pathlib.Path("args-copy").write_text(" ".join(sys.argv))\n'
+                        'print("Verdict: on plan")\n')
+        stub.chmod(0o755)
+        before = (self.kb / 'PLAN.md').read_bytes()
+        self.assertIn('Verdict: on plan', self.task('realign', 'proj'))
+        prompt = (self.kb / 'prompt-copy').read_text()
+        for value in ('PLAN.md', 'INTENT.md contents', 'STATUS.md contents', 'Decision input', 'pass test', 'founder', 'direct: Direct title; milestone: m-1'):
+            self.assertIn(value, prompt)
+        self.assertIn('--sandbox read-only', (self.kb / 'args-copy').read_text())
+        self.assertEqual((self.kb / 'PLAN.md').read_bytes(), before)
+        self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
+
+    def test_plan_without_knowledge_repo_is_exempt(self):
+        from types import SimpleNamespace
+        TASK_MODULE.check_plan(SimpleNamespace(kb=self.home / 'absent', number=5))
+
     def test_denials_filters_and_top_commands(self):
         import json
         from datetime import datetime, timezone, timedelta
@@ -529,9 +611,13 @@ store.write_text(json.dumps(prs))
         task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
         task_file.write_text(task_file.read_text() +
                              '\n[scope](../decisions/decision-1%20-%20scope.md)\n[[decision-2 - other]]\n')
+        self.git(self.kb, 'add', 'backlog/decisions')
+        self.git(self.kb, 'commit', '-qm', 'decisions')
+        self.task('plan', 'proj', '--sign')
         wt, out = self.started()
         self.assertIn("Context: .work/context/", out)
         context = wt / ".work/context"
+        self.assertEqual((context / 'PLAN.md').read_bytes(), (self.kb / 'PLAN.md').read_bytes())
         self.assertEqual((context / "INTENT.md").read_text(), "intent")
         self.assertEqual((context / "backlog/decisions" / decision.name).read_text(), "binding decision")
         self.assertEqual((context / 'backlog/decisions' / other.name).read_text(), 'other decision')
@@ -871,6 +957,7 @@ store.write_text(json.dumps(prs))
             id: T-5
             title: Add the b file
             status: To Do
+            milestone: m-1
             ---
             ## Acceptance Criteria
             - [ ] #1 b exists
@@ -878,6 +965,10 @@ store.write_text(json.dumps(prs))
             ## Verification and tools
             Verify: `true`
             """))
+        (self.kb / 'backlog/milestones').mkdir()
+        (self.kb / 'backlog/milestones/m-1 - Goal.md').write_text('---\ntitle: Goal\n---\n')
+        (self.kb / 'PLAN.md').write_text('---\ncurrent: m-1\n---\nPass test: ship the goal.\n')
+        self.raw_task('plan', 'proj', '--sign')
         self.git(self.kb, "add", "-A")
         self.git(self.kb, "commit", "-qm", "kb")
 
@@ -1579,7 +1670,7 @@ store.write_text(json.dumps(prs))
     def test_real_folded_backlog_title_reaches_dispatch_and_review_prompts(self):
         source = ROOT / "ci/fixtures/t48-folded-title.md"
         task_file = next((self.kb / "backlog/tasks").glob("t-5 - *.md"))
-        task_file.write_text(source.read_text())
+        task_file.write_text(source.read_text().replace('id:', 'milestone: m-1\nid:', 1))
         expected = ("Data layer phase 5 - household zone - location, module settings, "
                     "contracts, export and delete")
         out = self.raw_task("start", "proj", "5", "--builder", "codex", "--no-verify",
