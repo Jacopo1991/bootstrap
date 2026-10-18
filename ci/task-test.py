@@ -874,6 +874,95 @@ store.write_text(json.dumps(prs))
                 self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path), trusted)
                 self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path, advisory=True), advisory)
 
+    def test_gate_kernel_release_after_kill(self):
+        worker = self.home / 'hold.py'
+        worker.write_text(
+            'import fcntl, os, sys, time\n'
+            'fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)\n'
+            'fcntl.flock(fd, fcntl.LOCK_EX)\n'
+            'print("ready", flush=True)\n'
+            'time.sleep(30)\n')
+        lock = self.gate_dir / 'agent-task-gate.lock'
+        process = subprocess.Popen([sys.executable, str(worker), str(lock)], stdout=subprocess.PIPE,
+                                   text=True)
+        try:
+            self.assertEqual(process.stdout.readline().strip(), 'ready')
+            self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
+            (self.gate_dir / 'agent-task-gate.holder').write_text('{"pid": 99999999}')
+            process.kill()
+            process.wait(timeout=5)
+            self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
+            with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)):
+                with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, '5')):
+                    self.assertEqual(TASK_MODULE.gate_holder_pid(lock), os.getpid())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
+    def test_gate_drill_real_concurrency_isolation_and_cleanup(self):
+        repos = []
+        for name in ('clean', 'clash', 'always'):
+            repo = self.home / 'dev_workspace' / name
+            repo.mkdir()
+            self.git(repo, 'init', '-q', '-b', 'main')
+            (repo / 'justfile').write_text('check:\n    true\n')
+            (repo / 'kind').write_text(name)
+            self.git(repo, 'add', '.')
+            self.git(repo, 'commit', '-qm', 'stub gate')
+            repos.append(repo)
+        just = self.home / 'bin/just'
+        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+            import json, os, pathlib, sys, time
+            if sys.argv[1:] != ['check']:
+                sys.exit(1)
+            home = pathlib.Path(os.environ['HOME'])
+            kind = pathlib.Path('kind').read_text()
+            temporary = pathlib.Path(os.environ['TMPDIR'])
+            assert temporary.is_dir() and temporary.parent == pathlib.Path.cwd() / '.work/tmp'
+            slot = int(os.environ['TASK_GATE_SLOT'])
+            assert int(os.environ['TASK_GATE_PORT_BASE']) == 20000 + 200 * slot
+            with (home / (kind + '-env')).open('a') as out:
+                out.write(json.dumps([str(temporary), slot]) + '\\n')
+            if kind == 'clean':
+                (home / 'active').touch()
+                deadline = time.monotonic() + 8
+                while not (home / 'clashed').exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                assert (home / 'clashed').exists(), 'gates did not run concurrently'
+                (home / 'active').unlink()
+            elif kind == 'clash' and (home / 'active').exists():
+                (home / 'clashed').touch()
+                sys.exit(1)
+            elif kind == 'clash' and not (home / 'clashed').exists():
+                deadline = time.monotonic() + 8
+                while not (home / 'active').exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                (home / 'clashed').touch()
+                sys.exit(1)
+            elif kind == 'always':
+                sys.exit(1)
+            '''))
+        just.chmod(0o755)
+        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', code=1)
+        self.assertIn('clash', out)
+        evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
+        self.assertEqual(len(evidence), 1)
+        rows = json.loads(evidence[0].read_text())
+        self.assertEqual([row['verdict'] for row in rows], ['ok', 'clash', 'failing-alone'], out)
+        self.assertTrue(all(row['concurrent']['duration'] > 0 for row in rows))
+        for index, name in enumerate(('clean', 'clash', 'always')):
+            records = [json.loads(line) for line in (self.home / (name + '-env')).read_text().splitlines()]
+            self.assertEqual(len(records), 1 if name == 'clean' else 2)
+            for temporary, slot in records:
+                self.assertEqual(slot, index)
+                self.assertFalse(Path(temporary).exists())
+        self.assertEqual(list(self.gate_dir.iterdir()), [])
+        for repo in repos:
+            self.assertEqual(list((repo / '.worktrees').iterdir()), [])
+            self.assertEqual(len(self.git(repo, 'worktree', 'list').splitlines()), 1)
+
     def test_gate_slots_resources_exclusivity_and_status(self):
         config = self.home / '.config/task/gate.toml'
         config.parent.mkdir(parents=True, exist_ok=True)

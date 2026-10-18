@@ -34,6 +34,8 @@ it keeps the builders sandboxed, including when the runner itself uses bypass.
 import argparse
 import contextlib
 from contextlib import contextmanager
+from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -57,6 +59,7 @@ HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
 CHECK_TIMEOUT = int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
+GATE_SLOT = ContextVar("gate_slot", default=0)
 SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|error)|"
                      r"Tests?:? .*\b(passed|failed)|\d+ (passed|failed)|.*\b(PASS|FAIL)\b)")
 # Ignored paths a merged worktree may hold and still be removed: .work (preserved separately),
@@ -679,7 +682,14 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
                     raise Stop(message)
                 print(f"{message}; {notice}.", flush=True)
                 break
-        yield
+        token = GATE_SLOT.set(next((int(holder.stem.rsplit("-", 1)[1])
+                                    if holder.stem != "agent-task-gate" else 0
+                                    for _, holder in acquired
+                                    if holder.stem == "agent-task-gate" or "-slot-" in holder.stem), 0))
+        try:
+            yield
+        finally:
+            GATE_SLOT.reset(token)
     finally:
         release()
 
@@ -1584,6 +1594,20 @@ def start(args):
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False):
+    if advisory:
+        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True)
+    temporary_root = path / ".work/tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gate-", dir=temporary_root) as temporary:
+        slot = GATE_SLOT.get()
+        environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
+                       "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
+        return run_check_steps(path, base, record, state, evidence_name, display_log,
+                               gate_environment=environment)
+
+
+def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
+                    advisory=False, gate_environment=None):
     """Run the repository's gate in <path>; return True when it passes."""
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
@@ -1613,6 +1637,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             private_index_directory = None
             try:
                 child_env = check_step_environment(run_id)
+                child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
@@ -3423,11 +3448,73 @@ def wait_task(args):
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
+def gate_drill(args):
+    """Measure real cross-repository clashes without consuming gate slots."""
+    repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
+    archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
+    archive.mkdir(parents=True)
+    worktrees = []
+
+    def prepare(repo, index, phase):
+        parent = repo / ".worktrees"
+        parent.mkdir(exist_ok=True)
+        path = parent / f".task-drill-{archive.name}-{index}-{phase}"
+        base, _ = base_commit(repo, default_branch(repo))
+        git(repo, "worktree", "add", "-q", "--detach", str(path), base)
+        worktrees.append((repo, path))
+        prepare_environment(repo, path)
+        return path
+
+    def measure(path, index, phase):
+        token = GATE_SLOT.set(index)
+        started = time.monotonic()
+        try:
+            passed = run_check(path, "", state=archive / f"{index}-{phase}")
+            return {"result": "passed" if passed else "failed",
+                    "duration": round(time.monotonic() - started, 3)}
+        except (Stop, OSError) as error:
+            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
+                    "error": str(error)}
+        finally:
+            GATE_SLOT.reset(token)
+
+    rows = []
+    try:
+        paths = [prepare(repo, index, "concurrent") for index, repo in enumerate(repos)]
+        with ThreadPoolExecutor(max_workers=len(repos)) as pool:
+            futures = [pool.submit(measure, path, index, "concurrent")
+                       for index, path in enumerate(paths)]
+            concurrent = [future.result() for future in futures]
+        for index, (repo, result) in enumerate(zip(repos, concurrent)):
+            row = {"repo": repo.name, "concurrent": result, "solo": None, "verdict": "ok"}
+            if result["result"] != "passed":
+                row["solo"] = measure(prepare(repo, index, "solo"), index, "solo")
+                row["verdict"] = "clash" if row["solo"]["result"] == "passed" else "failing-alone"
+            rows.append(row)
+        table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
+        for row in rows:
+            def cell(result):
+                return f"{result['result']} ({result['duration']})" if result else "-"
+            table.append(f"{row['repo']} | {cell(row['concurrent'])} | {cell(row['solo'])} | {row['verdict']}")
+        atomic_json(archive / "results.json", rows)
+        (archive / "results.txt").write_text("\n".join(table) + "\n")
+        print("\n".join(table), flush=True)
+        print(f"Drill evidence: {archive}")
+        return int(any(row["verdict"] != "ok" for row in rows))
+    finally:
+        for repo, path in reversed(worktrees):
+            result = run_git(repo, "worktree", "remove", "--force", str(path))
+            if result.returncode:
+                raise Stop(f"Cannot remove drill worktree {path}: {result.stderr}")
+
+
 def main(argv=None):
     global ACTIVE_FOREGROUND_TASK
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    sub = commands.add_parser("gate-drill", help="PM-only concurrent full-gate clash drill")
+    sub.add_argument("repos", nargs="+")
     for name in ("start", "lane", "merge", "close", "review", "cancel", "wait"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
@@ -3496,7 +3583,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "runner-start"}:
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "runner-start", "gate-drill"}:
         try:
             require_pm(args)
         except Stop as stop:
@@ -3548,7 +3635,7 @@ def main(argv=None):
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                      "wait": wait_task}[args.command](args) or 0
+                      "wait": wait_task, "gate-drill": gate_drill}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"
