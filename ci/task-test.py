@@ -2141,7 +2141,10 @@ store.write_text(json.dumps(prs))
             self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
             self.assertIn("GIT_COMMITTER_EMAIL", call["env_names"])
             self.assertIn("lane: running", self.raw_task("status", "proj"))
-            self.assertIn("Lane already running", self.raw_task("lane", "proj", "5", code=1))
+            self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+            refused = self.raw_task("lane", "proj", "5", code=1)
+            self.assertIn("Lane already running", refused)
+            self.assertNotIn("boost:", refused)
         finally:
             release.touch()
             record = self.wait_for_lane(wt)
@@ -2942,6 +2945,8 @@ store.write_text(json.dumps(prs))
         self.assertEqual(self.git(self.kb, "status", "--porcelain"), "")
 
     def test_close_with_origin_uses_resumable_pr_and_merge_commit(self):
+        wt, _ = self.started()
+        self.commit_in(self.kb, "INTENT.md", "Original plan\n")
         origin = self.home / "knowledge-origin.git"
         self.git(self.home, "clone", "-q", "--bare", str(self.kb), str(origin))
         self.git(self.kb, "remote", "add", "origin", str(origin))
@@ -2973,10 +2978,13 @@ case "$1 $2" in
 esac
 """)
         (self.home / "bin/gh").chmod(0o755)
-        wt, _ = self.started()
         archive = self.state()
         (archive / "review.json").write_text('{"judgments":{"1":"pass","2":"pass"}}')
         (archive / "review.md").write_text("Verdict: PASS\\n#1 pass: reviewed\\n")
+        (self.kb / "INTENT.md").write_text("Uncommitted signed plan\n")
+        realign = self.kb / "history/realign/review.md"
+        realign.parent.mkdir(parents=True)
+        realign.write_text("Verdict: on plan\n")
         close_dirs = self.kb / ".worktrees"
         close_dirs_existed = close_dirs.exists()
         out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
@@ -2993,7 +3001,10 @@ esac
         parents = self.git(origin, "rev-list", "--parents", "-n", "1", merge).split()
         self.assertEqual(len(parents), 3, "the PR must use a two-parent merge commit")
         self.assertEqual(parents[2], close_head)
-        self.assertEqual(self.git(self.kb, "rev-parse", "main"), merge, "clean checkout fast-forwards")
+        self.assertEqual(self.git(self.kb, "rev-parse", "main"), merge,
+                         "checkout fast-forwards with dirty INTENT and untracked realignment")
+        self.assertEqual((self.kb / "INTENT.md").read_text(), "Uncommitted signed plan\n")
+        self.assertEqual(realign.read_text(), "Verdict: on plan\n")
         contents = sorted(path.name for path in close_dirs.iterdir()) if close_dirs.exists() else []
         close_paths = list(close_dirs.glob("task-close-*")) if close_dirs.exists() else []
         self.assertEqual(close_paths, [],
@@ -3008,6 +3019,18 @@ esac
         self.assertEqual(list(close_dirs.iterdir()), [], "the pre-existing folder stays empty")
         self.assertEqual(self.git(origin, "rev-list", "--count", "main"), before_count,
                          "rerunning close must not create a second commit")
+
+        incoming = self.home / "incoming-knowledge"
+        self.git(self.home, "clone", "-q", str(origin), str(incoming))
+        self.commit_in(incoming, "INTENT.md", "Incoming plan\n")
+        self.git(incoming, "push", "-q", "origin", "main")
+        out = self.raw_task("close", "proj", "5", "-m", "done", "--retro", "all routine")
+        self.assertIn("local main not updated", out)
+        self.assertIn("would be overwritten by merge", out)
+        self.assertIn("INTENT.md", out)
+        self.assertEqual(self.git(self.kb, "rev-parse", "main"), merge)
+        self.assertEqual((self.kb / "INTENT.md").read_text(), "Uncommitted signed plan\n")
+        self.assertEqual(realign.read_text(), "Verdict: on plan\n")
 
     def test_close_resumes_after_pr_creation_failure_without_duplicate_commit(self):
         origin = self.home / "knowledge-origin.git"

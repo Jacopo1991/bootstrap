@@ -1093,8 +1093,10 @@ def lane(args):
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
         upgraded = "gpt-6-astra" if builder == "codex" else "fable"
-        print(f"boost: {model} -> {upgraded} (until {until})")
+        boost_notice = f"boost: {model} -> {upgraded} (until {until})"
         model = cli_model = upgraded
+    else:
+        boost_notice = ""
     work = path / ".work"
     prompt = work / "prompt.md"
     if not prompt.is_file():
@@ -1125,6 +1127,8 @@ def lane(args):
                 previous = {}
             if previous.get("state") == "running" and pid_alive(previous.get("pid")):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
+            if boost_notice:
+                print(boost_notice)
             final.unlink(missing_ok=True)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--no-boost", "--_worker"]
@@ -1809,7 +1813,7 @@ def rebasing(gitdir: Path, branch: str) -> bool:
     return False
 
 
-def update_local_default(repo, default, commit):
+def update_local_default(repo, default, commit, *, allow_dirty=False):
     """Bring the local default branch to commit without touching anyone's work; report, never raise."""
     old = run_git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{default}").stdout.strip()
     if old == commit:
@@ -1831,7 +1835,7 @@ def update_local_default(repo, default, commit):
         result = run_git(repo, "update-ref", f"refs/heads/{default}", commit, old or "")
         return f"local {default} updated" if result.returncode == 0 else \
             f"local {default} not updated: {result.stderr.strip()}"
-    if git(holder, "status", "--porcelain"):
+    if not allow_dirty and git(holder, "status", "--porcelain"):
         return f"local {default} not updated in {holder}: it has uncommitted changes"
     result = run_git(holder, "merge", "-q", "--ff-only", commit)
     if result.returncode:
@@ -2710,9 +2714,13 @@ def delete_merged_close_branch(repo, branch):
 
 
 def update_closed_knowledge_checkout(repo, default):
-    if git(repo, "status", "--porcelain", "--untracked-files=all"):
+    tracked = git(repo, "status", "--porcelain", "--untracked-files=no",
+                  "--", ".", ":(top,exclude)INTENT.md")
+    untracked = git(repo, "ls-files", "--others", "--exclude-standard", "-z",
+                    "--", ".", ":(top,exclude)INTENT.md", ":(top,exclude)history/realign/**")
+    if tracked or untracked:
         return f"local {default} not updated in {repo}: checkout has uncommitted changes"
-    return update_local_default(repo, default, sha(repo, f"origin/{default}"))
+    return update_local_default(repo, default, sha(repo, f"origin/{default}"), allow_dirty=True)
 
 
 def close_with_pr(task, before, archive, args, criteria, status, summary):
