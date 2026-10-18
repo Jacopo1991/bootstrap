@@ -614,7 +614,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
     groups = [[f"resource-{name}"] for name in sorted(set(resources))]
     slots = [f"slot-{number}" for number in range(count)]
     groups.extend([[name] for name in slots] if exclusive else [slots])
-    allow_unavailable = silent_unavailable
+    allow_unavailable = silent_unavailable or not exclusive
     notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
     acquired = []
     metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id, "repo": task.repo.name}
@@ -3469,13 +3469,19 @@ def gate_drill(args):
         token = GATE_SLOT.set(index)
         started = time.monotonic()
         try:
-            passed = run_check(path, "", state=archive / f"{index}-{phase}")
+            passed = run_check(path, "", state=archive / f"{index}-{phase}",
+                               evidence_name="drill-check.json")
             return {"result": "passed" if passed else "failed",
                     "duration": round(time.monotonic() - started, 3)}
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": round(time.monotonic() - started, 3),
                     "error": str(error)}
         finally:
+            log = path / ".work/check.log"
+            if log.is_file():
+                destination = archive / f"{index}-{phase}"
+                destination.mkdir(exist_ok=True)
+                shutil.copy2(log, destination / "check.log")
             GATE_SLOT.reset(token)
 
     rows = []

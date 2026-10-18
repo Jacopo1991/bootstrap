@@ -950,7 +950,8 @@ store.write_text(json.dumps(prs))
         evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
         self.assertEqual(len(evidence), 1)
         rows = json.loads(evidence[0].read_text())
-        self.assertEqual([row['verdict'] for row in rows], ['ok', 'clash', 'failing-alone'], out)
+        logs = '\n'.join(log.read_text() for log in evidence[0].parent.glob('*/check.log'))
+        self.assertEqual([row['verdict'] for row in rows], ['ok', 'clash', 'failing-alone'], out + logs + repr(rows))
         self.assertTrue(all(row['concurrent']['duration'] > 0 for row in rows))
         for index, name in enumerate(('clean', 'clash', 'always')):
             records = [json.loads(line) for line in (self.home / (name + '-env')).read_text().splitlines()]
@@ -1041,24 +1042,38 @@ store.write_text(json.dumps(prs))
             self.assertIn('in new', lines[1])
             self.assertNotIn('in old', lines[1])
 
-    def test_gate_os_errors_fail_closed_for_trusted_checks(self):
+    def test_gate_os_errors_fall_back_only_without_explicit_opt_in(self):
         config_path = self.home / "gate-config"
         config_path.mkdir()
         task = TASK_MODULE.Task(self.repo, "5")
         for explicit in (False, True):
-            (config_path / ".task.toml").write_text("exclusive_gate = true\n" if explicit else "")
-            for operation in ("open", "flock"):
-                with self.subTest(explicit=explicit, operation=operation):
-                    target = TASK_MODULE.os if operation == "open" else TASK_MODULE.fcntl
-                    output = io.StringIO()
-                    ran = []
-                    with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
-                            mock.patch.object(target, operation, side_effect=PermissionError("permission denied")), \
-                            contextlib.redirect_stdout(output):
-                        with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
-                            with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
-                                ran.append(True)
-                    self.assertEqual(ran, [])
+            for resource in (False, True):
+                (config_path / ".task.toml").write_text(
+                    ("exclusive_gate = true\n" if explicit else "") +
+                    ('gate_resources = ["hermes"]\n' if resource else ''))
+                for operation in ("open", "flock"):
+                    self.check_gate_os_error(task, config_path, explicit, resource, operation)
+
+    def check_gate_os_error(self, task, config_path, explicit, resource, operation):
+        with self.subTest(explicit=explicit, resource=resource, operation=operation):
+            target = TASK_MODULE.os if operation == "open" else TASK_MODULE.fcntl
+            output = io.StringIO()
+            ran = []
+            with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                    mock.patch.object(target, operation, side_effect=PermissionError("permission denied")), \
+                    contextlib.redirect_stdout(output):
+                if explicit:
+                    with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
+                        with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
+                            ran.append(True)
+                else:
+                    with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
+                        ran.append(True)
+                self.assertEqual(TASK_MODULE.gate_holders(), [])
+            self.assertEqual(ran, [] if explicit else [True])
+            if not explicit:
+                self.assertIn("permission denied", output.getvalue())
+                self.assertIn("running trusted gate unlocked", output.getvalue())
 
     def test_skills_setup_repairs_verify_ui_before_updating_existing_install(self):
         stamp = self.home / ".local/state/bootstrap/skills-installed"
@@ -3280,12 +3295,13 @@ esac
         finally:
             os.close(fd)
 
-    def test_gate_unavailable_stops_trusted_but_allows_advisory_check(self):
+    def test_gate_unavailable_falls_back_unless_explicitly_exclusive(self):
         wt, _ = self.started()
         env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
-        out = self.raw_task("check", "proj", "5", env=env, code=1)
+        out = self.raw_task("check", "proj", "5", env=env)
         self.assertEqual(out.count("Cannot open shared gate lock"), 1)
-        self.assertNotIn("PASS", out)
+        self.assertIn("running trusted gate unlocked", out)
+        self.assertIn("PASS", out)
         (wt / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable exclusive gate")
