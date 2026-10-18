@@ -1513,7 +1513,7 @@ def start(args):
     repo = resolve_repo(args.repo)
     ensure_origin_head(repo)
     task = Task(repo, args.id)
-    if args.off_plan is not None and not args.refresh and real_worktree(repo, task.path) and (task_state(task) / "task.json").is_file():
+    if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
         raise Stop("--off-plan on a resumed task requires --refresh")
     check_plan(task, args.off_plan)
     if task.number is not None and task.file is None:

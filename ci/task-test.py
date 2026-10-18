@@ -242,6 +242,77 @@ class TaskTool(unittest.TestCase):
         self.assertIn('off-plan exception', self.task('status', 'proj'))
         self.task('start', 'proj', 'direct-ask')
 
+    def assert_start_exception(self, ident='5', reason='approved exception', refresh=False, state='t5'):
+        extra = ['--refresh'] if refresh else []
+        out = self.task('start', 'proj', ident, '--off-plan', reason, *extra)
+        self.assertIn(f'off-plan exception: {reason}', out)
+        self.assertEqual(json.loads((self.state(state) / 'task.json').read_text())['off_plan'], reason)
+        status = self.task('status', 'proj')
+        self.assertIn('Needs attention', status)
+        self.assertIn(f'{state}: off-plan exception: {reason}', status)
+
+    def test_start_plan_path_new_task(self):
+        (self.kb / 'INTENT.md').unlink()
+        self.assertIn('INTENT.md missing', self.task('start', 'proj', '5', code=1))
+        self.assertFalse((self.state() / 'task.json').exists())
+        self.assert_start_exception()
+
+    def test_start_plan_path_record_without_worktree(self):
+        wt, _ = self.started()
+        record = self.state() / 'task.json'
+        before = record.read_bytes()
+        self.git(self.repo, 'worktree', 'remove', '--force', str(wt))
+        (self.kb / 'INTENT.md').unlink()
+        self.assertIn('requires --refresh', self.task(
+            'start', 'proj', '5', '--off-plan', 'replacement', code=1))
+        self.assertFalse(wt.exists())
+        self.assertEqual(record.read_bytes(), before)
+        self.assertIn('INTENT.md missing', self.task('start', 'proj', '5', code=1))
+        self.assert_start_exception(reason='replacement', refresh=True)
+
+    def test_start_plan_path_worktree_without_record(self):
+        self.started()
+        (self.state() / 'task.json').unlink()
+        (self.kb / 'INTENT.md').unlink()
+        self.assertIn('INTENT.md missing', self.task('start', 'proj', '5', code=1))
+        self.assert_start_exception()
+
+    def test_start_plan_path_both_present(self):
+        self.started()
+        (self.kb / 'INTENT.md').unlink()
+        self.task('start', 'proj', '5')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], '')
+        self.assert_start_exception(refresh=True)
+        before = (self.state() / 'task.json').read_bytes()
+        self.assertIn('off-plan exception: approved exception', self.task('start', 'proj', '5'))
+        self.assertIn('requires --refresh', self.task(
+            'start', 'proj', '5', '--off-plan', 'replacement', code=1))
+        self.assertEqual((self.state() / 'task.json').read_bytes(), before)
+        self.assert_start_exception(refresh=True, reason='replacement')
+
+    def test_start_plan_path_refresh(self):
+        (self.kb / 'INTENT.md').unlink()
+        self.assertIn('INTENT.md missing', self.task('start', 'proj', '5', '--refresh', code=1))
+        self.assert_start_exception(refresh=True)
+        # A resumed task with both pieces remains exempt, including refresh.
+        self.task('start', 'proj', '5', '--refresh')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], '')
+        self.assert_start_exception(refresh=True, reason='renewed exception')
+
+    def test_start_plan_path_plain_name(self):
+        (self.kb / 'INTENT.md').unlink()
+        self.task('start', 'proj', 'direct-ask')
+        self.assert_start_exception('direct-ask', refresh=True, state='direct-ask')
+        self.assert_start_exception('direct-exception', state='direct-exception')
+
+    def test_start_plan_path_no_knowledge_repo(self):
+        self.kb.rename(self.home / 'unused-kb')
+        # Plan exemption does not waive the separate numbered-task existence check.
+        self.assertIn('No Backlog.md task', self.task('start', 'proj', '5', code=1))
+        self.task('start', 'proj', 'direct-ask')
+        self.assert_start_exception('direct-ask', refresh=True, state='direct-ask')
+        self.assert_start_exception('direct-exception', state='direct-exception')
+
     def test_plan_sign_counts_decisions_and_runner_warning(self):
         plan = self.kb / 'INTENT.md'
         plan.write_text(plan.read_text().replace('current: m-1', 'current: missing'))
