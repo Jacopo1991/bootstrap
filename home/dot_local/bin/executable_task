@@ -1297,7 +1297,7 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, codex = sys.argv[1:]
+source, done, log, codex, offset = sys.argv[1:]
 child = None
 def stop(signum, frame):
     if child is not None:
@@ -1312,8 +1312,9 @@ try:
         code = child.wait()
 finally:
     path = pathlib.Path(done)
-    text = path.read_text() if path.exists() else ''
-    lines = text.splitlines()
+    content = path.read_bytes() if path.exists() else b''
+    text = content.decode()
+    lines = content[int(offset):].decode().splitlines()
     last = lines[-1] if lines else ''
     if last != 'batch: finished' and not last.startswith('batch: stopped:'):
         with path.open('a') as stream:
@@ -1366,8 +1367,10 @@ def runner_start(args):
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
-    command = [sys.executable, str(wrapper), str(source), str(work / f'runner-{batch}.done'),
-               str(log), codex]
+    done = work / f'runner-{batch}.done'
+    done_offset = done.stat().st_size if done.exists() else 0
+    command = [sys.executable, str(wrapper), str(source), str(done),
+               str(log), codex, str(done_offset)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
@@ -1376,7 +1379,7 @@ def runner_start(args):
         result = subprocess.run(launch, capture_output=True, text=True)
     except FileNotFoundError:
         result = None
-    data = dict(unit=unit, started_at=utc_now(), backend='systemd')
+    data = dict(unit=unit, started_at=utc_now(), backend='systemd', done_offset=done_offset)
     if result is None or result.returncode:
         # A failed launch can race another caller; never duplicate an active service.
         if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
@@ -2872,7 +2875,8 @@ def status(args):
             active = (service.get('ActiveState') == 'active' if data['backend'] == 'systemd'
                       else pid_alive(data.get('pid')))
             done = record.with_suffix('.done')
-            lines = done.read_text().splitlines() if done.exists() else []
+            content = done.read_bytes() if done.exists() else b''
+            lines = content[data.get('done_offset', 0):].decode().splitlines()
             print(f"  {unit}: {'active' if active else 'inactive'} "
                   f"started={service.get('ExecMainStartTimestamp') or data['started_at']} "
                   f"last={lines[-1] if lines else '(no .done line)'}")

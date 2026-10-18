@@ -192,6 +192,9 @@ while (work / 'hold').exists():
     time.sleep(.02)
 print('runner stdout')
 print('runner stderr', file=sys.stderr)
+if os.environ.get('RUNNER_FINAL'):
+    with (work / 'runner-b1.done').open('a') as stream:
+        stream.write(os.environ['RUNNER_FINAL'] + '\\n')
 sys.exit(7)
 """}
         for name, body in scripts.items():
@@ -238,9 +241,25 @@ sys.exit(7)
         (self.home / 'active').unlink()
         self.assertIn('task-runner-proj-b1: inactive', self.raw_task('status', 'proj'))
         for final in ('batch: finished', 'batch: stopped: deliberate'):
-            runner.with_suffix('.done').write_text(final + '\n')
-            subprocess.run(command, cwd=self.repo, env=self.env, capture_output=True)
-            self.assertEqual(runner.with_suffix('.done').read_text(), final + '\n')
+            for own_final in ('', final):
+                with self.subTest(stale=final, own_final=own_final):
+                    done = runner.with_suffix('.done')
+                    stale = done.read_text() + final + '\n'
+                    done.write_text(stale)
+                    self.raw_task('runner-start', 'proj', str(runner))
+                    self.assertIn('last=(no .done line)', self.raw_task('status', 'proj'))
+                    args = json.loads((self.home / 'service-args').read_text())
+                    command = args[args.index(sys.executable):]
+                    subprocess.run(command, cwd=self.repo,
+                                   env=dict(self.env, RUNNER_FINAL=own_final), capture_output=True)
+                    current = done.read_text()[len(stale):]
+                    self.assertTrue(done.read_text().startswith(stale))
+                    if own_final:
+                        self.assertEqual(current, own_final + '\n')
+                    else:
+                        self.assertEqual(current, 'batch: stopped: runner exited (code 7) '
+                                         f'without a final line; see {runner.with_suffix(".log")}\n')
+                    self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
 
     def test_runner_fallback_survives_callers_group_and_cancel(self):
         runner = self.runner_fixture('setsid')
