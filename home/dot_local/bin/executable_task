@@ -1451,7 +1451,7 @@ def runner_check(args):
             try:
                 task = Task(repo, ident)
                 check_plan(task)
-                if not task.path.exists():
+                if not (task_state(task) / "merge.json").exists():
                     pending.append(task.id)
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")

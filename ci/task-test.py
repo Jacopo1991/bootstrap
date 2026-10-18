@@ -283,6 +283,23 @@ class TaskTool(unittest.TestCase):
         self.assertIn('d-1.md', self.task('plan', 'proj'))
         self.assertIn('decisions changed', self.task('start', 'proj', '5', code=1))
 
+    def test_runner_warning_counts_resumed_unmerged_tasks(self):
+        plan = self.kb / 'INTENT.md'
+        plan.write_text('---\ncurrent: m-1\nrealign_every: 1\n---\nPass test\n')
+        self.task('plan', 'proj', '--sign')
+        self.started()
+        self.assertTrue((self.state() / 'task.json').is_file())
+        self.assertFalse((self.state() / 'merge.json').exists())
+        runner = self.home / 'runner.md'
+        runner.write_text('1. 5: builder codex, model gpt-6-luna\n'
+                          '2. new: builder codex, model gpt-6-luna\n')
+        output = self.task('runner-check', 'proj', str(runner))
+        self.assertIn('warning: realignment stop at new (1 merged tasks)', output)
+        self.assertIn('runner file OK (2 tasks)', output)
+        # A merge record removes the resumed task from the projected count.
+        (self.state() / 'merge.json').write_text(json.dumps({'time': '2000-01-01T00:00:00+00:00'}))
+        self.assertNotIn('warning:', self.task('runner-check', 'proj', str(runner)))
+
     def test_plan_sign_preserves_intent_body_and_other_metadata(self):
         plan = self.kb / 'INTENT.md'
         body = '\n# Goal\n\n---\nsigned: body example\nsigned_hash: body hash\ncurrent: body example\nTail without newline'
