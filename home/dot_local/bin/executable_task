@@ -461,13 +461,13 @@ def plan_verdict(info):
     return "plan: stop: " + "; ".join(info["reasons"]) if info["reasons"] else "plan: ok"
 
 
-def check_plan(task, off_plan=None):
+def check_plan(task, off_plan=None, *, refresh=False):
     if off_plan is not None:
         if not off_plan.strip():
             raise Stop("--off-plan needs a reason")
         return
     if (not task.kb.exists() or task.number is None or
-            real_worktree(task.repo, task.path) and (task_state(task) / "task.json").is_file()):
+            not refresh and real_worktree(task.repo, task.path) and (task_state(task) / "task.json").is_file()):
         return
     if not task.file:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
@@ -1515,7 +1515,10 @@ def start(args):
     task = Task(repo, args.id)
     if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
         raise Stop("--off-plan on a resumed task requires --refresh")
-    check_plan(task, args.off_plan)
+    off_plan = args.off_plan
+    if args.refresh and off_plan is None:
+        off_plan = read_json_object(task_state(task) / "task.json").get("off_plan") or None
+    check_plan(task, off_plan, refresh=args.refresh)
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
     task_text = task.file.read_text() if task.file else ""
@@ -1610,7 +1613,7 @@ def start(args):
     else:
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
-                  "verify": verify, "no_verify": args.no_verify or "", "off_plan": args.off_plan or "",
+                  "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone")}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)

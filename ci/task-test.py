@@ -294,10 +294,31 @@ class TaskTool(unittest.TestCase):
         (self.kb / 'INTENT.md').unlink()
         self.assertIn('INTENT.md missing', self.task('start', 'proj', '5', '--refresh', code=1))
         self.assert_start_exception(refresh=True)
-        # A resumed task with both pieces remains exempt, including refresh.
-        self.task('start', 'proj', '5', '--refresh')
-        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], '')
+        # Refresh retains the recorded exception even when the plan still fails.
+        out = self.task('start', 'proj', '5', '--refresh')
+        self.assertIn('off-plan exception: approved exception', out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], 'approved exception')
+        self.assertIn('t5: off-plan exception: approved exception', self.task('status', 'proj'))
         self.assert_start_exception(refresh=True, reason='renewed exception')
+
+    def test_refresh_failing_plan_without_exception_refuses(self):
+        self.started()
+        record = self.state() / 'task.json'
+        before = record.read_bytes()
+        (self.kb / 'INTENT.md').unlink()
+        self.assertIn('INTENT.md missing', self.task('start', 'proj', '5', '--refresh', code=1))
+        self.assertEqual(record.read_bytes(), before)
+
+    def test_refresh_passing_plan_preserves_exception_and_status(self):
+        self.assert_start_exception()
+        self.assertIn('plan: ok', self.task('plan', 'proj'))
+        out = self.task('start', 'proj', '5', '--refresh')
+        self.assertIn('off-plan exception: approved exception', out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['off_plan'], 'approved exception')
+        status = self.task('status', 'proj')
+        self.assertIn('plan: ok', status)
+        self.assertIn('Needs attention', status)
+        self.assertIn('t5: off-plan exception: approved exception', status)
 
     def test_start_plan_path_plain_name(self):
         (self.kb / 'INTENT.md').unlink()
