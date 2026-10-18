@@ -304,6 +304,35 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(plan.read_bytes().split(b'---\r\n', 2)[2],
                          body.replace('\n', '\r\n').encode())
 
+    def test_plan_merge_boundary_full_precision(self):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        fixed = datetime(2026, 10, 18, 12, 0, 0, 500000, tzinfo=timezone.utc)
+        state = self.state('direct')
+        state.mkdir(parents=True)
+        (state / 'task.json').write_text(json.dumps({'id': 'direct'}))
+        # Signing must exclude an already recorded merge in the same second.
+        (state / 'merge.json').write_text(json.dumps({'time': fixed.replace(microsecond=499999).isoformat()}))
+        with mock.patch.object(TASK_MODULE, 'datetime') as clock, \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE, 'CORTEX', self.kb.parent), \
+                mock.patch.object(TASK_MODULE, 'resolve_repo', return_value=self.repo):
+            clock.now.return_value = fixed
+            clock.fromisoformat.side_effect = datetime.fromisoformat
+            self.assertEqual(TASK_MODULE.utc_now(), fixed.isoformat())
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                TASK_MODULE.plan(SimpleNamespace(repo='proj', sign=True))
+        self.assertIn('merged since sign-off: 0/15', output.getvalue())
+        for micros, count in [(499999, 0), (500000, 0), (500001, 1)]:
+            (state / 'merge.json').write_text(json.dumps({'time': fixed.replace(microsecond=micros).isoformat()}))
+            self.assertIn(f'merged since sign-off: {count}/15', self.task('plan', 'proj'))
+
+    def test_missing_task_precedes_plan_reasons(self):
+        (self.kb / 'INTENT.md').unlink()
+        output = self.task('start', 'proj', '999', code=1)
+        self.assertIn('No Backlog.md task', output)
+        self.assertNotIn('INTENT.md missing', output)
+
     def test_realign_read_only_prompt_and_output(self):
         (self.kb / 'STATUS.md').write_text('STATUS.md contents')
         (self.kb / 'backlog/decisions').mkdir()
@@ -328,8 +357,14 @@ class TaskTool(unittest.TestCase):
         self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
         self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
         stub.write_text('#!/usr/bin/env python3\nimport sys\nprint("partial reply")\nsys.exit(1)\n')
-        self.task('realign', 'proj', code=1)
-        self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
+        for report in (self.kb / 'history/realign').iterdir():
+            report.unlink()
+        (self.kb / 'history/realign').rmdir()
+        output = self.task('realign', 'proj', code=1)
+        failed_reply = Path(output.strip().split('Reply: ', 1)[1])
+        self.assertEqual(failed_reply.read_text(), 'partial reply\n')
+        self.assertTrue(failed_reply.is_relative_to(self.home / '.local/state/task/proj'))
+        self.assertFalse((self.kb / 'history/realign').exists())
         self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
 
     def test_plan_without_knowledge_repo_is_exempt(self):

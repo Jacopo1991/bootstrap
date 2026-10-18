@@ -334,7 +334,7 @@ class Task:
 
 
 def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def frontmatter_value(text, key):
@@ -429,6 +429,7 @@ def plan_info(repo):
     for evidence in sorted((HOME / ".local/state/task" / repo.name).glob("*/merge.json")):
         data = read_json_object(evidence)
         when = plan_time(data.get("time", ""))
+        # Preserve subsecond ordering; equal timestamps are not after sign-off.
         if since and when and when > since:
             record_path = evidence.parent / "task.json"
             record = read_json_object(record_path)
@@ -468,6 +469,8 @@ def check_plan(task, off_plan=None):
     if (not task.kb.exists() or task.number is None or
             real_worktree(task.repo, task.path) and (task_state(task) / "task.json").is_file()):
         return
+    if not task.file:
+        raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
     info = plan_info(task.repo)
     reasons = info["reasons"][:]
     if not task.file or frontmatter_value(task.file.read_text(), "milestone") != info["current"] or not info["current"]:
@@ -489,7 +492,7 @@ def plan(args):
         end = metadata.rfind("---")
         newline = "\r\n" if header[0].startswith("---\r\n") else "\n"
         unsigned = metadata + info["text"][header.end():]
-        text = (metadata[:end] + f"signed: {datetime.now(timezone.utc).isoformat()}{newline}"
+        text = (metadata[:end] + f"signed: {utc_now()}{newline}"
                 f"signed_hash: {plan_hash(unsigned)}{newline}" + metadata[end:]
                 + info["text"][header.end():])
         info["path"].write_bytes(text.encode())
@@ -514,14 +517,17 @@ def realign(args):
         prompt += f"\n## {name}\n" + (source.read_text() if source.is_file() else "(missing or deleted)")
     prompt += "\n## Tasks merged since sign-off\n" + "\n".join(info["merged"])
     directory = info["kb"] / "history/realign"
-    directory.mkdir(parents=True, exist_ok=True)
     reply = directory / ("realign-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".md")
-    with tempfile.TemporaryDirectory(dir=directory) as temporary:
+    state = HOME / ".local/state/task" / info["kb"].name.removeprefix("cortex-kb-") / "realign"
+    state.mkdir(parents=True, exist_ok=True)
+    failed_reply = state / reply.name
+    with tempfile.TemporaryDirectory(dir=state) as temporary:
         source = Path(temporary) / "prompt.md"
         source.write_text(prompt)
         run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -",
-                     info["kb"], source, Path(temporary) / "reply.md")
-        (Path(temporary) / "reply.md").replace(reply)
+                     info["kb"], source, failed_reply)
+        directory.mkdir(parents=True, exist_ok=True)
+        failed_reply.replace(reply)
     print(reply.read_text(), end="")
 
 
