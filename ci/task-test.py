@@ -746,6 +746,7 @@ store.write_text(json.dumps(prs))
     def test_reliability_lock_timeout_uses_kernel_holder(self):
         import json
         self.started()
+        (self.repo / '.task.toml').write_text('exclusive_gate = true\n')
         lock = self.gate_dir / "agent-task-gate.lock"
         with lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
@@ -873,7 +874,85 @@ store.write_text(json.dumps(prs))
                 self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path), trusted)
                 self.assertEqual(TASK_MODULE.exclusive_gate_enabled(path, advisory=True), advisory)
 
-    def test_gate_os_errors_fall_back_only_without_explicit_opt_in(self):
+    def test_gate_slots_resources_exclusivity_and_status(self):
+        config = self.home / '.config/task/gate.toml'
+        config.parent.mkdir(parents=True, exist_ok=True)
+        first = self.home / 'first-gate'
+        second = self.home / 'second-gate'
+        first.mkdir()
+        second.mkdir()
+        a = TASK_MODULE.Task(first, '1')
+        b = TASK_MODULE.Task(second, '2')
+        with mock.patch.dict(os.environ, HOME=str(self.home), TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE, 'GATE_LOCK_WAIT', 0):
+            self.assertEqual(TASK_MODULE.gate_slots(), 3)
+            config.write_text('slots = 2\n')
+            self.assertEqual(TASK_MODULE.gate_slots(), 2)
+            with TASK_MODULE.exclusive_gate_lock(a):
+                with TASK_MODULE.exclusive_gate_lock(b):
+                    holders = TASK_MODULE.gate_holders()
+                    self.assertEqual({row[0] for row in holders}, {'slot-0', 'slot-1'})
+                (second / '.task.toml').write_text('exclusive_gate = true\n')
+                with self.assertRaises(SystemExit) as stop:
+                    with TASK_MODULE.exclusive_gate_lock(b):
+                        self.fail('exclusive gate must wait for every slot')
+                self.assertEqual(stop.exception.code, 3)
+            with TASK_MODULE.exclusive_gate_lock(b):
+                self.assertEqual(len(TASK_MODULE.gate_holders()), 2)
+                with self.assertRaises(SystemExit):
+                    with TASK_MODULE.exclusive_gate_lock(a):
+                        self.fail('exclusive gate must block ordinary gates')
+                (first / '.task.toml').write_text('exclusive_gate = false\ngate_resources = ["hermes"]\n')
+                with TASK_MODULE.exclusive_gate_lock(a):
+                    self.assertEqual(len(TASK_MODULE.gate_holders()), 2)
+            for path in (first, second):
+                (path / '.task.toml').write_text('gate_resources = ["z", "hermes", "a"]\n')
+            with TASK_MODULE.exclusive_gate_lock(a):
+                self.assertEqual([row[0] for row in TASK_MODULE.gate_holders() if row[0].startswith('resource')],
+                                 ['resource-a', 'resource-hermes', 'resource-z'])
+                with self.assertRaises(SystemExit):
+                    with TASK_MODULE.exclusive_gate_lock(b):
+                        self.fail('shared resources must serialize')
+                (second / '.task.toml').write_text('gate_resources = ["other"]\n')
+                with TASK_MODULE.exclusive_gate_lock(b):
+                    output = io.StringIO()
+                    with mock.patch.object(TASK_MODULE, 'WORKSPACE', self.home / 'dev_workspace'), \
+                            contextlib.redirect_stdout(output):
+                        TASK_MODULE.status(type('Args', (), {'repo': None})())
+                    self.assertIn('Gate slots: 2', output.getvalue())
+                    self.assertIn('gate resource-hermes:', output.getvalue())
+                    self.assertIn('first-gate/T-1, since', output.getvalue())
+            lock, holder = TASK_MODULE.gate_paths('slot-0')
+            holder.write_text('{"pid": 99999999, "repo": "dead"}')
+            with TASK_MODULE.exclusive_gate_lock(a):
+                self.assertNotIn('dead', str(TASK_MODULE.gate_holders()))
+
+    def test_wait_message_refreshes_when_holder_changes(self):
+        (self.repo / '.task.toml').write_text('exclusive_gate = true\n')
+        lock, holder = self.gate_dir / 'agent-task-gate.lock', self.gate_dir / 'agent-task-gate.holder'
+        with lock.open('a') as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            holder.write_text(json.dumps({'repo': 'old', 'task': 'T-1', 'since': 'before'}))
+            calls = []
+            def change(_):
+                calls.append(True)
+                if len(calls) == 1:
+                    holder.write_text(json.dumps({'repo': 'new', 'task': 'T-2', 'since': 'after'}))
+                else:
+                    fcntl.flock(held, fcntl.LOCK_UN)
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                    mock.patch.object(TASK_MODULE.time, 'sleep', side_effect=change), \
+                    contextlib.redirect_stdout(output):
+                with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, '5')):
+                    pass
+            lines = output.getvalue().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn('in old', lines[0])
+            self.assertIn('in new', lines[1])
+            self.assertNotIn('in old', lines[1])
+
+    def test_gate_os_errors_fail_closed_for_trusted_checks(self):
         config_path = self.home / "gate-config"
         config_path.mkdir()
         task = TASK_MODULE.Task(self.repo, "5")
@@ -887,17 +966,10 @@ store.write_text(json.dumps(prs))
                     with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
                             mock.patch.object(target, operation, side_effect=PermissionError("permission denied")), \
                             contextlib.redirect_stdout(output):
-                        if explicit:
-                            with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
-                                with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
-                                    ran.append(True)
-                        else:
+                        with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
                             with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
                                 ran.append(True)
-                    self.assertEqual(ran, [] if explicit else [True])
-                    if not explicit:
-                        self.assertEqual(len(output.getvalue().splitlines()), 1)
-                        self.assertIn("running trusted gate unlocked", output.getvalue())
+                    self.assertEqual(ran, [])
 
     def test_skills_setup_repairs_verify_ui_before_updating_existing_install(self):
         stamp = self.home / ".local/state/bootstrap/skills-installed"
@@ -921,6 +993,7 @@ store.write_text(json.dumps(prs))
 
     def test_wait_message_uses_kernel_pid_instead_of_namespaced_record(self):
         import json
+        (self.repo / '.task.toml').write_text('exclusive_gate = true\n')
         lock = self.gate_dir / "agent-task-gate.lock"
         holder = self.gate_dir / "agent-task-gate.holder"
         with lock.open("a") as held:
@@ -3043,6 +3116,9 @@ esac
         self.assertEqual([path.read_text() for path in saved], ["before close reset and clean"])
 
     def test_exclusive_gate_serializes_checks_and_wait_does_not_use_timeout(self):
+        config = self.home / '.config/task/gate.toml'
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('slots = 1\n')
         lock_path = self.gate_dir / "agent-task-gate.lock"
         holder_path = self.gate_dir / "agent-task-gate.holder"
         self.addCleanup(lambda: holder_path.unlink(missing_ok=True))
@@ -3115,13 +3191,12 @@ esac
         finally:
             os.close(fd)
 
-    def test_exclusive_gate_unavailable_prints_notice_and_runs_check(self):
+    def test_gate_unavailable_stops_trusted_but_allows_advisory_check(self):
         wt, _ = self.started()
         env = dict(self.env, TASK_GATE_DIR=str(self.home / "missing" / "gate"))
-        out = self.raw_task("check", "proj", "5", env=env)
+        out = self.raw_task("check", "proj", "5", env=env, code=1)
         self.assertEqual(out.count("Cannot open shared gate lock"), 1)
-        self.assertIn("running trusted gate unlocked", out)
-        self.assertIn("PASS", out)
+        self.assertNotIn("PASS", out)
         (wt / ".task.toml").write_text("exclusive_gate = true\n")
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable exclusive gate")

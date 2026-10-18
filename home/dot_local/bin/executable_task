@@ -556,76 +556,132 @@ def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     return values.get("exclusive_gate", not advisory) is True
 
 
+def gate_slots():
+    config = Path.home() / ".config/task/gate.toml"
+    try:
+        count = tomllib.loads(config.read_text()).get("slots", 3) if config.exists() else 3
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Stop(f"Cannot read {config}: {error}")
+    if type(count) is not int or count < 1:
+        raise Stop(f"{config}: slots must be a positive integer")
+    return count
+
+
+def gate_paths(name):
+    root = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    stem = "agent-task-gate" if name == "slot-0" else f"agent-task-gate-{name}"
+    return root / (stem + ".lock"), root / (stem + ".holder")
+
+
+def gate_holders():
+    root = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    holders = []
+    for lock in sorted(root.glob("agent-task-gate*.lock")):
+        try:
+            pid = gate_holder_pid(lock)
+            if pid is None:
+                continue
+            try:
+                record = json.loads(lock.with_suffix(".holder").read_text())
+            except (OSError, ValueError):
+                record = {}
+            name = lock.stem.removeprefix("agent-task-gate-") if lock.stem != "agent-task-gate" else "slot-0"
+            holders.append((name, pid, record.get("repo", "?"), record.get("task", "?"), record.get("since", "?")))
+        except OSError:
+            continue
+    return holders
+
+
 @contextmanager
 def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=None):
-    """Serialize gates across the host and Codex sandboxes sharing /tmp."""
-    allow_unavailable = silent_unavailable or not exclusive_gate_enabled(
-        config_path if config_path is not None else task.repo, advisory=True)
-    unlocked_notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
-    gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
-    lock_path = gate_dir / "agent-task-gate.lock"
-    holder_path = gate_dir / "agent-task-gate.holder"
-    try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
-    except OSError as error:
-        if allow_unavailable:
-            print(f"Cannot open shared gate lock: {error}; {unlocked_notice}.", flush=True)
-            yield
-            return
-        raise Stop(f"Cannot open shared gate lock: {error}")
-    holder_record = None
-    try:
-        waiting = False
-        deadline = time.monotonic() + GATE_LOCK_WAIT * 60
-        while True:
+    """Hold sorted resources and either one slot or the whole machine."""
+    path = config_path if config_path is not None else task.repo
+    if not exclusive_gate_enabled(path):
+        yield
+        return
+    config = path / ".task.toml"
+    values = tomllib.loads(config.read_text()) if config.exists() else {}
+    resources = values.get("gate_resources", [])
+    if not isinstance(resources, list) or any(
+            not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
+            for name in resources):
+        raise Stop("gate_resources must be a list of resource names (letters, digits, _ or -)")
+    count = gate_slots()
+    exclusive = values.get("exclusive_gate") is True
+    groups = [[f"resource-{name}"] for name in sorted(set(resources))]
+    slots = [f"slot-{number}" for number in range(count)]
+    groups.extend([[name] for name in slots] if exclusive else [slots])
+    allow_unavailable = silent_unavailable
+    notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
+    acquired = []
+    metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id, "repo": task.repo.name}
+
+    def release():
+        while acquired:
+            descriptor, holder = acquired.pop()
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
+                holder.unlink(missing_ok=True)
+            except OSError:
+                pass
+            os.close(descriptor)
+
+    deadline = time.monotonic() + GATE_LOCK_WAIT * 60
+    previous = None
+    try:
+        while True:
+            stage = "open"
+            try:
+                blocked = False
+                for alternatives in groups:
+                    for name in alternatives:
+                        lock, holder = gate_paths(name)
+                        stage = "open"
+                        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
+                        try:
+                            stage = "acquire"
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            os.close(descriptor)
+                            continue
+                        except BaseException:
+                            os.close(descriptor)
+                            raise
+                        acquired.append((descriptor, holder))
+                        try:
+                            atomic_json(holder, metadata)
+                        except OSError:
+                            pass
+                        break
+                    else:
+                        blocked = True
+                        break
+                if not blocked:
+                    break
+                # Never wait with a partial allocation: exclusive gates cannot
+                # deadlock each other or gates acquiring named resources.
+                release()
+                holders = gate_holders()
                 if time.monotonic() >= deadline:
-                    try:
-                        holder = json.loads(holder_path.read_text()) if gate_holder_alive(lock_path) else {}
-                    except (OSError, ValueError):
-                        holder = {}
-                    print(f"gate busy: held by {holder.get('repo', '?')}/{holder.get('task', '?')} "
-                          f"since {holder.get('since', '?')}", file=sys.stderr, flush=True)
+                    detail = "; ".join(f"{repo}/{task_id} since {since}" for _, _, repo, task_id, since in holders)
+                    print(f"gate busy: held by {detail or 'another gate (holder details unavailable)'}",
+                          file=sys.stderr, flush=True)
                     raise SystemExit(3)
-                if not waiting:
-                    waiting = True
-                    try:
-                        holder_record = json.loads(holder_path.read_text())
-                        detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
-                                  f"pid {gate_holder_pid(lock_path)} since {holder_record['since']}")
-                    except (OSError, KeyError, json.JSONDecodeError, TypeError):
-                        detail = "another gate (holder details unavailable)"
-                    print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
+                if holders != previous:
+                    detail = "; ".join(f"task {task_id} in {repo}, pid {pid} since {since} ({name})"
+                                       for name, pid, repo, task_id, since in holders)
+                    print(f"Waiting for exclusive task gate held by {detail or 'another gate (holder details unavailable)'}.", flush=True)
+                    previous = holders
                 time.sleep(0.1)
             except OSError as error:
-                if allow_unavailable:
-                    print(f"Cannot acquire shared gate lock: {error}; {unlocked_notice}.", flush=True)
-                    os.close(descriptor)
-                    descriptor = None
-                    yield
-                    return
-                raise Stop(f"Cannot acquire shared gate lock: {error}")
-        metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
-                    "repo": task.repo.name}
-        try:
-            atomic_json(holder_path, metadata)
-            holder_record = metadata
-        except OSError:
-            holder_record = None
+                release()
+                message = f"Cannot {stage} shared gate lock: {error}"
+                if not allow_unavailable:
+                    raise Stop(message)
+                print(f"{message}; {notice}.", flush=True)
+                break
         yield
     finally:
-        if holder_record and holder_record.get("pid") == os.getpid():
-            try:
-                current = json.loads(holder_path.read_text())
-                if current.get("pid") == os.getpid():
-                    holder_path.unlink(missing_ok=True)
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-        if descriptor is not None:
-            os.close(descriptor)
+        release()
 
 
 def gate_holder_alive(lock_path):
@@ -1663,7 +1719,7 @@ def check(args):
     if advisory:
         with advisory_check_lock(path):
             if exclusive_gate_enabled(path, advisory=True):
-                with exclusive_gate_lock(task, silent_unavailable=True):
+                with exclusive_gate_lock(task, silent_unavailable=True, config_path=path):
                     passed = run_check(path, base, record, None, advisory=True)
             else:
                 passed = run_check(path, base, record, None, advisory=True)
@@ -2860,6 +2916,9 @@ def note(args):
 
 
 def status(args):
+    print(f"Gate slots: {gate_slots()}")
+    for name, pid, repo, task_id, since in gate_holders():
+        print(f"gate {name}: pid {pid}, {repo}/{task_id}, since {since}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
@@ -3137,9 +3196,8 @@ def prune_archive(repo, dry_run=False):
         if item != root:
             allocated[item.parent] = allocated.get(item.parent, 0) + allocated[item]
     # Temporary snapshots are handled whole, before finished-archive filtering.
-    lock_path = Path(os.environ.get('TASK_GATE_DIR', '/tmp')) / 'agent-task-gate.lock'
     try:
-        live_gate = gate_holder_alive(lock_path)
+        live_gate = bool(gate_holders())
     except FileNotFoundError:
         live_gate = False
     temporary, freed, finishing = set(), 0, {}
