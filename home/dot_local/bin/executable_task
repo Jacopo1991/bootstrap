@@ -355,14 +355,14 @@ def plan_time(value):
 
 def plan_info(repo):
     kb = CORTEX / f"cortex-kb-{repo.name}"
-    path = kb / "PLAN.md"
-    text = path.read_text() if path.is_file() else ""
+    path = kb / "INTENT.md"
+    text = path.read_bytes().decode() if path.is_file() else ""
     current = frontmatter_value(text, "current").split(" #", 1)[0].strip()
     signed = frontmatter_value(text, "signed")
     since = plan_time(signed)
     reasons = []
     if not path.is_file():
-        reasons.append("PLAN.md missing")
+        reasons.append("INTENT.md missing")
     if not since or not frontmatter_value(text, "signed_hash"):
         reasons.append("plan not signed")
     elif plan_hash(text) != frontmatter_value(text, "signed_hash"):
@@ -425,7 +425,7 @@ def check_plan(task, off_plan=None):
     if not task.file or frontmatter_value(task.file.read_text(), "milestone") != info["current"] or not info["current"]:
         reasons.append("task milestone must match current")
     if reasons:
-        raise Stop("; ".join(reasons) + "; update PLAN.md and run `task plan " + task.repo.name + " --sign`, or use --off-plan with a reason.")
+        raise Stop("; ".join(reasons) + "; update INTENT.md and run `task plan " + task.repo.name + " --sign`, or use --off-plan with a reason.")
 
 
 def plan(args):
@@ -434,12 +434,17 @@ def plan(args):
     if args.sign:
         if not info["current"] or not list((info["kb"] / "backlog/milestones").glob(f"{info['current']} - *.md")):
             raise Stop("current must name an existing Backlog milestone file")
-        text = re.sub(r"(?m)^(?:signed|signed_hash):[^\n]*(?:\n|$)", "", info["text"])
-        end = text.find("\n---", 3)
-        if end < 0:
-            raise Stop("PLAN.md needs YAML frontmatter")
-        text = text[:end] + f"\nsigned: {datetime.now(timezone.utc).isoformat()}\nsigned_hash: {plan_hash(text)}" + text[end:]
-        info["path"].write_text(text)
+        header = re.match(r"\A---\r?\n.*?\r?\n---(?:\r?\n|$)", info["text"], re.S)
+        if not header:
+            raise Stop("INTENT.md needs YAML frontmatter with current")
+        metadata = re.sub(r"(?m)^(?:signed|signed_hash):[^\n]*(?:\n|$)", "", header[0])
+        end = metadata.rfind("---")
+        newline = "\r\n" if header[0].startswith("---\r\n") else "\n"
+        unsigned = metadata + info["text"][header.end():]
+        text = (metadata[:end] + f"signed: {datetime.now(timezone.utc).isoformat()}{newline}"
+                f"signed_hash: {plan_hash(unsigned)}{newline}" + metadata[end:]
+                + info["text"][header.end():])
+        info["path"].write_bytes(text.encode())
         info = plan_info(repo)
     print(f"current: {info['current']} {info['title']}")
     print(f"signed: {info['signed'] or 'not signed'}")
@@ -451,12 +456,12 @@ def plan(args):
 def realign(args):
     info = plan_info(resolve_repo(args.repo))
     if not info["path"].is_file():
-        raise Stop("Create PLAN.md before realignment")
+        raise Stop("Create INTENT.md before realignment")
     prompt = ("Read-only drift review. Answer with Verdict: on plan | drifted | plan unclear, "
               "then evidence per merged task: does it serve current and its pass test; contradictions "
-              "between PLAN, INTENT, STATUS and decisions; and what the founder must decide. "
+              "between INTENT, STATUS and decisions; and what the founder must decide. "
               "Do not edit files or sign anything.\n")
-    for name in ["PLAN.md", "INTENT.md", "STATUS.md", *info["decisions"]]:
+    for name in ["INTENT.md", "STATUS.md", *info["decisions"]]:
         source = info["kb"] / name
         prompt += f"\n## {name}\n" + (source.read_text() if source.is_file() else "(missing or deleted)")
     prompt += "\n## Tasks merged since sign-off\n" + "\n".join(info["merged"])
@@ -991,7 +996,7 @@ def refresh_context(task):
     if destination.is_file():
         destination.unlink()
     destination.mkdir(parents=True, exist_ok=True)
-    sources = [task.kb / "INTENT.md", task.kb / "STATUS.md", task.kb / "PLAN.md"]
+    sources = [task.kb / "INTENT.md", task.kb / "STATUS.md"]
     if task.file:
         sources.append(task.file)
         text = task.file.read_text()

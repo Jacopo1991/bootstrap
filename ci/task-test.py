@@ -161,10 +161,12 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 class TaskTool(unittest.TestCase):
     def test_plan_refusals_exceptions_and_resume(self):
-        plan = self.kb / 'PLAN.md'
+        plan = self.kb / 'INTENT.md'
         original = plan.read_text()
         task = next((self.kb / 'backlog/tasks').glob('t-5 *'))
-        for content, message in [(None, 'PLAN.md missing'),
+        for content, message in [(None, 'INTENT.md missing'),
+                                 ('# Goal\ncurrent: m-1\n', 'current must name'),
+                                 ('---\ntitle: Goal\n---\nBody\n', 'current must name'),
                                  ('---\ncurrent: m-1\n---\n', 'not signed'),
                                  (original + 'changed\n', 'changed since sign-off')]:
             if content is None:
@@ -184,7 +186,7 @@ class TaskTool(unittest.TestCase):
         self.task('start', 'proj', 'direct-ask')
 
     def test_plan_sign_counts_decisions_and_runner_warning(self):
-        plan = self.kb / 'PLAN.md'
+        plan = self.kb / 'INTENT.md'
         plan.write_text(plan.read_text().replace('current: m-1', 'current: missing'))
         self.assertIn('existing', self.task('plan', 'proj', '--sign', code=1))
         plan.write_text('---\ncurrent: m-1\nrealign_every: 1\n---\nPass test\n')
@@ -214,9 +216,27 @@ class TaskTool(unittest.TestCase):
         self.assertIn('d-1.md', self.task('plan', 'proj'))
         self.assertIn('decisions changed', self.task('start', 'proj', '5', code=1))
 
+    def test_plan_sign_preserves_intent_body_and_other_metadata(self):
+        plan = self.kb / 'INTENT.md'
+        body = '\n# Goal\n\n---\nsigned: body example\nsigned_hash: body hash\ncurrent: body example\nTail without newline'
+        header = '---\n# Keep comment\ncurrent: m-1\nrealign_every: 7\ncustom: keep me\n'
+        plan.write_text(header + '---\n' + body)
+        for _ in range(2):
+            self.assertIn('plan: ok', self.task('plan', 'proj', '--sign'))
+            signed = plan.read_text()
+            self.assertTrue(signed.startswith(header))
+            self.assertEqual(signed.split('---\n', 2)[2], body)
+            self.assertEqual(TASK_MODULE.frontmatter_value(signed, 'signed_hash'),
+                             TASK_MODULE.plan_hash(signed))
+        plan.write_text(signed.replace('realign_every: 7', 'realign_every: 8'))
+        self.assertIn('changed since sign-off', self.task('plan', 'proj'))
+        plan.write_bytes((header + '---\n' + body).replace('\n', '\r\n').encode())
+        self.assertIn('plan: ok', self.task('plan', 'proj', '--sign'))
+        self.assertEqual(plan.read_bytes().split(b'---\r\n', 2)[2],
+                         body.replace('\n', '\r\n').encode())
+
     def test_realign_read_only_prompt_and_output(self):
-        for name in ('INTENT.md', 'STATUS.md'):
-            (self.kb / name).write_text(name + ' contents')
+        (self.kb / 'STATUS.md').write_text('STATUS.md contents')
         (self.kb / 'backlog/decisions').mkdir()
         (self.kb / 'backlog/decisions/d-1 - direction.md').write_text('Decision input')
         state = self.state('direct')
@@ -229,13 +249,14 @@ class TaskTool(unittest.TestCase):
                         'pathlib.Path("args-copy").write_text(" ".join(sys.argv))\n'
                         'print("Verdict: on plan")\n')
         stub.chmod(0o755)
-        before = (self.kb / 'PLAN.md').read_bytes()
+        before = (self.kb / 'INTENT.md').read_bytes()
         self.assertIn('Verdict: on plan', self.task('realign', 'proj'))
         prompt = (self.kb / 'prompt-copy').read_text()
-        for value in ('PLAN.md', 'INTENT.md contents', 'STATUS.md contents', 'Decision input', 'pass test', 'founder', 'direct: Direct title; milestone: m-1'):
+        self.assertEqual(prompt.count('## INTENT.md\n'), 1)
+        for value in ('INTENT.md', 'Pass test: ship the goal.', 'STATUS.md contents', 'Decision input', 'pass test', 'founder', 'direct: Direct title; milestone: m-1'):
             self.assertIn(value, prompt)
         self.assertIn('--sandbox read-only', (self.kb / 'args-copy').read_text())
-        self.assertEqual((self.kb / 'PLAN.md').read_bytes(), before)
+        self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
         self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
 
     def test_plan_without_knowledge_repo_is_exempt(self):
@@ -572,8 +593,8 @@ store.write_text(json.dumps(prs))
 
     def test_reliability_context_replaces_symlinks(self):
         from types import SimpleNamespace
-        (self.kb / 'INTENT.md').write_text('intent')
         wt, _ = self.started()
+        (self.kb / 'INTENT.md').write_text('intent')
         context = wt / '.work/context'
         outside = self.home / 'outside-context'
         outside.mkdir()
@@ -600,7 +621,6 @@ store.write_text(json.dumps(prs))
         self.assertEqual(list(outside.iterdir()), [victim])
 
     def test_reliability_context_and_review_range(self):
-        (self.kb / "INTENT.md").write_text("intent")
         (self.kb / "STATUS.md").write_text("status")
         decisions = self.kb / "backlog/decisions"
         decisions.mkdir(parents=True, exist_ok=True)
@@ -617,8 +637,7 @@ store.write_text(json.dumps(prs))
         wt, out = self.started()
         self.assertIn("Context: .work/context/", out)
         context = wt / ".work/context"
-        self.assertEqual((context / 'PLAN.md').read_bytes(), (self.kb / 'PLAN.md').read_bytes())
-        self.assertEqual((context / "INTENT.md").read_text(), "intent")
+        self.assertEqual((context / 'INTENT.md').read_bytes(), (self.kb / 'INTENT.md').read_bytes())
         self.assertEqual((context / "backlog/decisions" / decision.name).read_text(), "binding decision")
         self.assertEqual((context / 'backlog/decisions' / other.name).read_text(), 'other decision')
         self.assertEqual((context / "INTENT.md").stat().st_mode & 0o222, 0)
@@ -967,7 +986,7 @@ store.write_text(json.dumps(prs))
             """))
         (self.kb / 'backlog/milestones').mkdir()
         (self.kb / 'backlog/milestones/m-1 - Goal.md').write_text('---\ntitle: Goal\n---\n')
-        (self.kb / 'PLAN.md').write_text('---\ncurrent: m-1\n---\nPass test: ship the goal.\n')
+        (self.kb / 'INTENT.md').write_text('---\ncurrent: m-1\n---\nPass test: ship the goal.\n')
         self.raw_task('plan', 'proj', '--sign')
         self.git(self.kb, "add", "-A")
         self.git(self.kb, "commit", "-qm", "kb")
