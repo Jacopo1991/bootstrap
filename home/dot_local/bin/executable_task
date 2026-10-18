@@ -6,6 +6,7 @@ Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
+  task runner-start <repo> <runner-file>
   task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
@@ -1292,6 +1293,101 @@ def runner_check(args):
         print("\n".join(problems))
         return 1
     print(f"runner file OK ({task_lines} tasks)")
+    return 0
+
+
+RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
+source, done, log, codex = sys.argv[1:]
+child = None
+def stop(signum, frame):
+    if child is not None:
+        child.terminate()
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+code = 1
+try:
+    with open(source) as stream:
+        child = subprocess.Popen([codex, 'exec', '--dangerously-bypass-approvals-and-sandbox',
+                                  '-m', 'gpt-6-luna', '-'], stdin=stream)
+        code = child.wait()
+finally:
+    path = pathlib.Path(done)
+    text = path.read_text() if path.exists() else ''
+    lines = text.splitlines()
+    last = lines[-1] if lines else ''
+    if last != 'batch: finished' and not last.startswith('batch: stopped:'):
+        with path.open('a') as stream:
+            if text and not text.endswith('\\n'):
+                stream.write('\\n')
+            stream.write(f'batch: stopped: runner exited (code {code}) without a final line; see {log}\\n')
+sys.exit(code if code >= 0 else 128 - code)
+'''
+
+
+def runner_unit(repo, batch):
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', repo.name + batch):
+        raise Stop('Runner repo and batch names must contain only letters, digits, _ or -.')
+    return f'task-runner-{repo.name}-{batch}'
+
+
+def runner_service(unit):
+    try:
+        result = subprocess.run(['systemctl', '--user', 'show', unit,
+                                 '--property=ActiveState,ExecMainStartTimestamp'],
+                                capture_output=True, text=True)
+        return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+    except OSError:
+        return {}
+
+
+def runner_start(args):
+    repo = main_repo(resolve_repo(args.repo))
+    source = Path(args.file).resolve()
+    match = re.fullmatch(r'runner-([A-Za-z0-9_-]+)\.md', source.name)
+    if not match:
+        raise Stop('Runner file must be named runner-<batch>.md.')
+    if runner_check(args):
+        return 1
+    batch = match[1]
+    unit = runner_unit(repo, batch)
+    work = repo / '.work'
+    work.mkdir(exist_ok=True)
+    record = work / f'runner-{batch}.json'
+    service = runner_service(unit)
+    if service.get('ActiveState') in {'active', 'activating', 'deactivating', 'reloading'}:
+        raise Stop(f'{unit} is already active.')
+    if record.exists():
+        previous = json.loads(record.read_text())
+        if previous.get('backend') == 'setsid' and pid_alive(previous.get('pid')):
+            raise Stop(f'{unit} is already active (setsid).')
+    codex = shutil.which('codex')
+    if not codex:
+        raise Stop('codex is unavailable.')
+    wrapper = work / f'runner-{batch}-watch.py'
+    wrapper.write_text(RUNNER_WRAPPER)
+    log = work / f'runner-{batch}.log'
+    command = [sys.executable, str(wrapper), str(source), str(work / f'runner-{batch}.done'),
+               str(log), codex]
+    launch = ['systemd-run', '--user', '--unit', unit, '--collect',
+              '--working-directory', str(repo), '--property=StandardInput=null',
+              f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
+              '--setenv=PATH=' + os.environ.get('PATH', ''), *command]
+    try:
+        result = subprocess.run(launch, capture_output=True, text=True)
+    except FileNotFoundError:
+        result = None
+    data = dict(unit=unit, started_at=utc_now(), backend='systemd')
+    if result is None or result.returncode:
+        # A failed launch can race another caller; never duplicate an active service.
+        if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
+            raise Stop(f'{unit} is already active.')
+        with log.open('a') as output:
+            process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL,
+                                       stdout=output, stderr=output, start_new_session=True)
+        data.update(backend='setsid', pid=process.pid)
+        print('systemd-run --user unavailable; falling back to setsid (new session).')
+    atomic_json(record, data)
+    print(f'{unit}: log={log}')
     return 0
 
 
@@ -2769,6 +2865,17 @@ def status(args):
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
+        for record in sorted((repo / '.work').glob('runner-*.json')):
+            data = json.loads(record.read_text())
+            unit = data['unit']
+            service = runner_service(unit) if data['backend'] == 'systemd' else {}
+            active = (service.get('ActiveState') == 'active' if data['backend'] == 'systemd'
+                      else pid_alive(data.get('pid')))
+            done = record.with_suffix('.done')
+            lines = done.read_text().splitlines() if done.exists() else []
+            print(f"  {unit}: {'active' if active else 'inactive'} "
+                  f"started={service.get('ExecMainStartTimestamp') or data['started_at']} "
+                  f"last={lines[-1] if lines else '(no .done line)'}")
         attention = []
         state_root = HOME / ".local/state/task" / repo.name
         for path in sorted((repo / ".worktrees").glob("*")) if (repo / ".worktrees").is_dir() else []:
@@ -2920,6 +3027,16 @@ def denials(args):
 
 def cancel(args):
     repo = resolve_repo(args.repo)
+    if args.id.startswith('runner-'):
+        record = repo / '.work' / f'{args.id}.json'
+        if record.exists():
+            data = json.loads(record.read_text())
+            if data['backend'] == 'systemd':
+                subprocess.run(['systemctl', '--user', 'stop', data['unit']], check=True)
+            elif pid_alive(data.get('pid')):
+                os.killpg(data['pid'], signal.SIGTERM)
+            print(f"Cancelled {data['unit']}")
+            return 0
     prune_stale_gate_worktrees(repo)
     task = Task(repo, args.id)
     lane_path = task.path / ".work/lane.json"
@@ -3286,6 +3403,9 @@ def main(argv=None):
     sub = commands.add_parser("runner-check", help="validate a runner file without launching it")
     sub.add_argument("repo")
     sub.add_argument("file")
+    sub = commands.add_parser("runner-start", help="launch a validated, detached batch runner")
+    sub.add_argument("repo")
+    sub.add_argument("file")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
@@ -3314,7 +3434,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair"}:
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "runner-start"}:
         try:
             require_pm(args)
         except Stop as stop:
@@ -3365,7 +3485,7 @@ def main(argv=None):
         try:
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
-                      "denials": denials, "runner-check": runner_check, "repair": repair,
+                      "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
                       "wait": wait_task}[args.command](args) or 0
         finally:
             if lock:

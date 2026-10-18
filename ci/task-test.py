@@ -13,6 +13,8 @@ import importlib.util
 import io
 import json
 import os
+import signal
+import time
 import shutil
 import stat
 import subprocess
@@ -160,6 +162,121 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def runner_fixture(self, backend='systemd'):
+        work = self.repo / '.work'
+        work.mkdir(exist_ok=True)
+        runner = work / 'runner-b1.md'
+        runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
+        scripts = {
+            'systemctl': """#!/usr/bin/env python3
+import os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+if 'stop' in sys.argv:
+    (home / 'stopped').write_text(sys.argv[-1])
+else:
+    print('ActiveState=' + ('active' if (home / 'active').exists() else 'inactive'))
+    print('ExecMainStartTimestamp=test-start')
+""",
+            'systemd-run': """#!/usr/bin/env python3
+import json, os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+(home / 'service-args').write_text(json.dumps(sys.argv[1:]))
+sys.exit(int(os.environ.get('SERVICE_EXIT', '0')))
+""",
+            'codex': """#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+work = pathlib.Path.cwd() / '.work'
+(work / 'runner-call').write_text(json.dumps(dict(args=sys.argv[1:], prompt=sys.stdin.read(),
+    pid=os.getpid(), pgid=os.getpgrp(), sid=os.getsid(0))))
+while (work / 'hold').exists():
+    time.sleep(.02)
+print('runner stdout')
+print('runner stderr', file=sys.stderr)
+sys.exit(7)
+"""}
+        for name, body in scripts.items():
+            path = self.home / 'bin' / name
+            path.write_text(body)
+            path.chmod(0o755)
+        if backend == 'setsid':
+            self.env['SERVICE_EXIT'] = '1'
+        return runner
+
+    def wait_runner_file(self, path):
+        deadline = time.monotonic() + 10
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.assertTrue(path.exists(), str(path))
+        return path.read_text()
+
+    def test_runner_start_service_validation_status_cancel(self):
+        runner = self.runner_fixture()
+        runner.write_text('invalid\n')
+        self.raw_task('runner-start', 'proj', str(runner), code=1)
+        self.assertFalse((self.home / 'service-args').exists())
+        runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
+        out = self.raw_task('runner-start', 'proj', str(runner))
+        self.assertIn('task-runner-proj-b1', out)
+        args = json.loads((self.home / 'service-args').read_text())
+        self.assertEqual(args[:7], ['--user', '--unit', 'task-runner-proj-b1', '--collect',
+                                   '--working-directory', str(self.repo), '--property=StandardInput=null'])
+        self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
+        command = args[args.index(sys.executable):]
+        subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
+        call = json.loads((runner.parent / 'runner-call').read_text())
+        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
+                                        '-m', 'gpt-6-luna', '-'])
+        self.assertEqual(call['prompt'], runner.read_text())
+        self.assertIn('code 7', runner.with_suffix('.done').read_text())
+        (self.home / 'active').touch()
+        self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
+        status = self.raw_task('status', 'proj')
+        self.assertIn('task-runner-proj-b1: active started=test-start', status)
+        self.assertIn('last=batch: stopped: runner exited', status)
+        self.raw_task('cancel', 'proj', 'runner-b1')
+        self.assertEqual((self.home / 'stopped').read_text(), 'task-runner-proj-b1')
+        (self.home / 'active').unlink()
+        self.assertIn('task-runner-proj-b1: inactive', self.raw_task('status', 'proj'))
+        for final in ('batch: finished', 'batch: stopped: deliberate'):
+            runner.with_suffix('.done').write_text(final + '\n')
+            subprocess.run(command, cwd=self.repo, env=self.env, capture_output=True)
+            self.assertEqual(runner.with_suffix('.done').read_text(), final + '\n')
+
+    def test_runner_fallback_survives_callers_group_and_cancel(self):
+        runner = self.runner_fixture('setsid')
+        hold = runner.parent / 'hold'
+        hold.touch()
+        # The launcher stays in the caller's session until that entire group is killed.
+        caller = subprocess.Popen([sys.executable, '-c',
+            'import subprocess,sys,time; subprocess.run(sys.argv[1:], check=True); time.sleep(30)',
+            sys.executable, str(TOOL), 'runner-start', 'proj', str(runner)],
+            env=self.env, cwd=self.home, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            call = json.loads(self.wait_runner_file(runner.parent / 'runner-call'))
+            self.assertNotEqual(call['sid'], caller.pid)
+            self.assertNotEqual(call['pgid'], caller.pid)
+            os.killpg(caller.pid, signal.SIGKILL)
+            caller.wait()
+            os.kill(call['pid'], 0)
+            self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
+            self.assertIn('task-runner-proj-b1: active', self.raw_task('status', 'proj'))
+            self.raw_task('cancel', 'proj', 'runner-b1')
+            self.assertIn('without a final line', self.wait_runner_file(runner.with_suffix('.done')))
+        finally:
+            hold.unlink(missing_ok=True)
+            if caller.poll() is None:
+                os.killpg(caller.pid, signal.SIGKILL)
+                caller.wait()
+
+    def test_runner_fallback_exit_guard_and_logs(self):
+        runner = self.runner_fixture('setsid')
+        self.assertIn('falling back to setsid', self.raw_task('runner-start', 'proj', str(runner)))
+        self.assertIn('code 7', self.wait_runner_file(runner.with_suffix('.done')))
+        log = runner.with_suffix('.log').read_text()
+        self.assertIn('runner stdout', log)
+        self.assertIn('runner stderr', log)
+
     def test_denials_filters_and_top_commands(self):
         import json
         from datetime import datetime, timezone, timedelta
