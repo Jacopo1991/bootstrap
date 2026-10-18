@@ -445,12 +445,25 @@ def plan_info(repo):
     for line in run_git(kb, "status", "--porcelain", "-z", "--untracked-files=all", "--", "backlog/decisions").stdout.split("\0") if kb.exists() else []:
         if line:
             decisions.add(line[3:] if line[2:3] == " " else line)
-    if since:
-        for commit in run_git(kb, "log", "--format=%H", "--", "backlog/decisions").stdout.splitlines():
-            when = plan_time(git(kb, "show", "-s", "--format=%cI", commit))
+    if since and kb.exists():
+        # Walk the default branch when it resolves, else the checked-out branch; first-parent
+        # diffs catch decisions that arrive through merge commits.
+        try:
+            branch = default_branch(kb)
+        except Stop:
+            branch = ""
+        ref = branch if branch and ok(kb, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") else "HEAD"
+        for line in run_git(kb, "log", "--first-parent", "--format=%H %cI", ref).stdout.splitlines():
+            commit, _, stamp = line.partition(" ")
+            when = plan_time(stamp)
             if when and when > since:
-                decisions.update(filter(None, run_git(kb, "diff-tree", "--root", "--no-commit-id", "--name-only", "-z", "-r", commit,
-                                     "--", "backlog/decisions").stdout.split("\0")))
+                if ok(kb, "rev-parse", "--verify", "--quiet", f"{commit}^1"):
+                    changed = run_git(kb, "diff", "--name-only", "-z", f"{commit}^1", commit,
+                                      "--", "backlog/decisions")
+                else:
+                    changed = run_git(kb, "show", "--name-only", "-z", "--format=", commit,
+                                      "--", "backlog/decisions")
+                decisions.update(filter(None, changed.stdout.split("\0")))
     if decisions:
         reasons.append("decisions changed: " + ", ".join(sorted(decisions)))
     return dict(kb=kb, path=path, text=text, current=current, signed=signed, limit=limit,
@@ -3530,7 +3543,8 @@ def repair_published(task, base):
     merges = git(task.repo, 'rev-list', '--merges', '--ancestry-path', '--reverse',
                  f'{head}..{base}').splitlines()
     commit = merges[0] if merges else base
-    atomic_json(state / 'merge.json', {'head': head, 'commit': commit, 'time': utc_now()})
+    merged_at = read_json_object(state / 'merge.json').get('time') or git(task.repo, 'show', '-s', '--format=%cI', commit)
+    atomic_json(state / 'merge.json', {'head': head, 'commit': commit, 'time': merged_at})
     print(update_local_default(task.repo, default_branch(task.repo), base))
     if task.path.exists():
         for name in ('report.md', 'check.log'):

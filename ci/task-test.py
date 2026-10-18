@@ -401,6 +401,49 @@ class TaskTool(unittest.TestCase):
         self.assertIn('d-1.md', self.task('plan', 'proj'))
         self.assertIn('decisions changed', self.task('start', 'proj', '5', code=1))
 
+    def test_plan_detects_old_decision_merged_after_signoff(self):
+        self.git(self.kb, 'switch', '-q', '-c', 'decision')
+        decisions = self.kb / 'backlog/decisions'
+        decisions.mkdir()
+        (decisions / 'd-old.md').write_text('New direction')
+        self.git(self.kb, 'add', 'backlog/decisions')
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'old decision'],
+                       env=dict(self.env, GIT_AUTHOR_DATE='2000-01-01T00:00:00+00:00',
+                                GIT_COMMITTER_DATE='2000-01-01T00:00:00+00:00'), check=True)
+        self.git(self.kb, 'switch', '-q', 'main')
+        self.task('plan', 'proj', '--sign')
+        self.assertIn('plan: ok', self.task('plan', 'proj'))
+        subprocess.run(['git', '-C', str(self.kb), 'merge', '--no-ff', '-qm', 'Merge decision', 'decision'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertIn('decisions changed: backlog/decisions/d-old.md', self.task('plan', 'proj'))
+        # Scanning follows the default branch even when another branch is checked out.
+        self.git(self.kb, 'switch', '-q', 'decision')
+        self.assertIn('decisions changed: backlog/decisions/d-old.md', self.task('plan', 'proj'))
+
+    def test_plan_scans_head_without_default_branch(self):
+        self.task('plan', 'proj', '--sign')
+        # No remote and no main or master: the scan walks the checked-out branch.
+        self.git(self.kb, 'branch', '-m', 'main', 'trunk')
+        self.assertIn('plan: ok', self.task('plan', 'proj'))
+        decisions = self.kb / 'backlog/decisions'
+        decisions.mkdir()
+        (decisions / 'd-trunk.md').write_text('New direction')
+        self.git(self.kb, 'add', 'backlog/decisions')
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'decision'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertIn('decisions changed: backlog/decisions/d-trunk.md', self.task('plan', 'proj'))
+        # A root commit after sign-off is scanned too.
+        self.git(self.kb, 'checkout', '-q', '--orphan', 'fresh')
+        self.git(self.kb, 'rm', '-q', '--cached', 'backlog/decisions/d-trunk.md')
+        (decisions / 'd-trunk.md').unlink()
+        (decisions / 'd-root.md').write_text('Root direction')
+        self.git(self.kb, 'add', '.')
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'root decision'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        out = self.task('plan', 'proj')
+        self.assertIn('decisions changed: backlog/decisions/d-root.md', out)
+        self.assertNotIn('d-trunk.md', out)
+
     def test_runner_warning_counts_resumed_unmerged_tasks(self):
         plan = self.kb / 'INTENT.md'
         plan.write_text('---\ncurrent: m-1\nrealign_every: 1\n---\nPass test\n')
@@ -1563,16 +1606,26 @@ store.write_text(json.dumps(prs))
         self.git(self.repo, 'merge', '--no-ff', '-m', 'published', head)
         self.git(self.repo, 'push', '-q', 'origin', 'main')
         (wt / '.work/report.md').write_text('evidence')
+        merge_time = self.git(self.repo, 'show', '-s', '--format=%cI', 'HEAD')
+        self.task('plan', 'proj', '--sign')
+        self.assertIn('merged since sign-off: 0/15', self.task('plan', 'proj'))
         (self.state() / 'run.json').write_text(json.dumps({'command': 'merge', 'state': 'failed'}))
         out = self.raw_task('repair', 'proj')
         self.assertIn('Repaired published merge', out)
         self.assertFalse(wt.exists())
         self.assertEqual(json.loads((self.state() / 'merge.json').read_text())['head'], head)
+        self.assertEqual(json.loads((self.state() / 'merge.json').read_text())['time'], merge_time)
+        self.assertIn('merged since sign-off: 0/15', self.task('plan', 'proj'))
         self.assertEqual(json.loads((self.state() / 'run.json').read_text())['state'], 'passed')
         self.assertTrue(list(self.work_archives().glob('*/.work/report.md')))
         (self.state() / 'run.json').write_text(json.dumps({'command': 'merge', 'state': 'failed'}))
+        recorded_time = '2000-01-01T00:00:00.123456+00:00'
+        evidence = self.state() / 'merge.json'
+        evidence.write_text(json.dumps(dict(json.loads(evidence.read_text()), time=recorded_time)))
         self.raw_task('repair', 'proj')
         self.assertEqual(json.loads((self.state() / 'run.json').read_text())['state'], 'passed')
+        self.assertEqual(json.loads(evidence.read_text())['time'], recorded_time)
+        self.assertIn('merged since sign-off: 0/15', self.task('plan', 'proj'))
 
     def test_repair_skips_non_worktree_and_continues(self):
         wt, _ = self.started()
