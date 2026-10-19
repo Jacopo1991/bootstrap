@@ -818,24 +818,29 @@ def load_record(task: Task, required=True):
     return record
 
 
-def timeout_for(path: Path):
+def task_config(path: Path):
     config = path / ".task.toml"
-    if config.is_file():
-        match = re.search(r"(?m)^\s*check_timeout\s*=\s*(\d+)\s*(?:#.*)?$", config.read_text())
-        if match:
-            value = int(match.group(1))
-            if value < 1:
-                raise Stop(".task.toml check_timeout must be a positive number of seconds.")
-            return value
+    try:
+        return tomllib.loads(config.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        # ValueError includes UnicodeDecodeError and TOMLDecodeError. Do not echo
+        # parser details: they may include configuration values.
+        raise Stop(f"Cannot read {config}.") from None
+
+
+def timeout_for(path: Path):
+    value = task_config(path).get("check_timeout")
+    if value is not None:
+        if type(value) is not int or value < 1:
+            raise Stop(".task.toml check_timeout must be a positive number of seconds.")
+        return value
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
 def configured_environment(path, repo=None):
-    config = path / ".task.toml"
-    try:
-        values = tomllib.loads(config.read_text()).get("env", {}) if config.exists() else {}
-    except (OSError, tomllib.TOMLDecodeError):
-        raise Stop(f"Cannot read {config}.") from None
+    values = task_config(path).get("env", {})
     if not isinstance(values, dict):
         raise Stop(".task.toml [env] must be a table of plain strings.")
     for name, value in values.items():
@@ -853,13 +858,7 @@ def configured_environment(path, repo=None):
 
 
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
-    config = path / ".task.toml"
-    if not config.is_file():
-        return not advisory
-    try:
-        values = tomllib.loads(config.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise Stop(f"Cannot read {config}: {error}.")
+    values = task_config(path)
     return values.get("exclusive_gate", not advisory) is True
 
 
@@ -901,11 +900,12 @@ def gate_holders():
     return holders
 
 
-def holder_display(row):
+def holder_display(row, *, include_slot=True):
     name, pid, repo, task_id, since = row
     if repo == "holder details unavailable":
         return f"pid {pid} (holder details unavailable)"
-    return f"pid {pid}, {repo}/{task_id} since {since} ({name})"
+    suffix = f" ({name})" if include_slot else ""
+    return f"pid {pid}, {repo}/{task_id} since {since}{suffix}"
 
 
 @contextmanager
@@ -915,8 +915,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
     if not exclusive_gate_enabled(path):
         yield
         return
-    config = path / ".task.toml"
-    values = tomllib.loads(config.read_text()) if config.exists() else {}
+    values = task_config(path)
     resources = values.get("gate_resources", [])
     if not isinstance(resources, list) or any(
             not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
@@ -3372,7 +3371,7 @@ def status(args):
         print(active)
     print(f"Gate slots: {gate_slots()}")
     for row in gate_holders():
-        print(f"gate {row[0]}: {holder_display(row)}")
+        print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
@@ -3918,11 +3917,7 @@ def gate_drill(args):
         git(repo, "worktree", "add", "-q", "--detach", str(path), base)
         worktrees.append((repo, path))
         prepare_environment(repo, path)
-        config = path / ".task.toml"
-        try:
-            names = tomllib.loads(config.read_text()).get("drill_seeds", []) if config.exists() else []
-        except (OSError, tomllib.TOMLDecodeError):
-            raise Stop(f"Cannot read {config}.") from None
+        names = task_config(path).get("drill_seeds", [])
         if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
             raise Stop(".task.toml drill_seeds must be a list of seed names.")
         names = list(dict.fromkeys(names + cli_seeds[repo]))

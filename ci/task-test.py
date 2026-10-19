@@ -167,13 +167,15 @@ class TaskTool(unittest.TestCase):
         good.mkdir()
         self.git(good, 'init', '-q', '-b', 'main')
         (good / '.task.toml').write_text('[env]\nPRODUCT_DIR = "do-not-display"\n')
-        for config in ('[env', '[env]\nAPI_TOKEN = "do-not-display"\n'):
+        for config in (b'[env', b'[env]\nAPI_TOKEN = "do-not-display"\n', b'\xff'):
             with self.subTest(config=config):
-                (self.repo / '.task.toml').write_text(config)
+                (self.repo / '.task.toml').write_bytes(config)
                 output = self.raw_task('status')
                 self.assertIn('env keys: unavailable (', output)
                 self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
                 self.assertNotIn('do-not-display', output)
+                if config == b'\xff':
+                    self.assertIn(f'Cannot read {self.repo / ".task.toml"}', output)
 
     def test_configured_environment_rejects_reserved_names(self):
         names = TASK_MODULE.GIT_OVERRIDE_ENV | {'GIT_OVERRIDE_ENV', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
@@ -216,14 +218,28 @@ class TaskTool(unittest.TestCase):
         for config, reason in [('drill_seeds = ["absent"]', 'missing seed absent'),
                                ('drill_seeds = ["../escape"]', 'Invalid seed name'),
                                ('drill_seeds = "pinned"', 'list of seed names'),
-                               ('drill_seeds = [2]', 'list of seed names')]:
+                               ('drill_seeds = [2]', 'list of seed names'),
+                               (b'\xff', 'Cannot read')]:
             with self.subTest(config=config):
-                self.commit_in(bad, '.task.toml', config + '\n')
+                if isinstance(config, bytes):
+                    (bad / '.task.toml').write_bytes(config)
+                    self.git(bad, 'add', '.task.toml')
+                    self.git(bad, 'commit', '-qm', 'Non-UTF-8 config')
+                else:
+                    self.commit_in(bad, '.task.toml', config + '\n')
                 output = self.raw_task('gate-drill', 'bad', 'proj', '--seed', 'proj:extra',
                                        '--seed', 'proj:another', code=1)
                 self.assertIn(reason, output)
                 self.assertRegex(output, r'proj \| passed .* \| - \| ok')
                 self.assertEqual(len(self.git(bad, 'worktree', 'list').splitlines()), 1)
+                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
+                rows = json.loads(latest.read_text())
+                self.assertEqual(rows[0]['concurrent']['result'], 'failed')
+                self.assertEqual(rows[0]['solo']['result'], 'failed')
+                if isinstance(config, bytes):
+                    for phase in ('concurrent', 'solo'):
+                        self.assertIn('.task.toml', rows[0][phase]['error'])
+                self.assertEqual(rows[1]['verdict'], 'ok')
         output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:missing', code=1)
         self.assertIn('missing seed missing', output)
         (work / 'escape').symlink_to(self.home)

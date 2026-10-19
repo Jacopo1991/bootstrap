@@ -217,7 +217,8 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
     if blocker:
         report.append(f"{prefix} kept: {blocker}")
     elif not apply:
-        report.append(f"{prefix} is finished and clean; would be removed (would archive .work first)")
+        archive = " (would archive .work first)" if (path / ".work").exists() else ""
+        report.append(f"{prefix} is finished and clean; would be removed{archive}")
     else:
         if not archive_work(repo, path, report):
             return
@@ -265,7 +266,8 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
         if blocker:
             report.append(f"{repo.name}: finished worktree kept: {path} ({label}): {blocker}")
         elif not apply:
-            report.append(f"{repo.name}: finished worktree {path} ({label}) would archive .work and would be removed")
+            archive = "would archive .work and " if (path / ".work").exists() else ""
+            report.append(f"{repo.name}: finished worktree {path} ({label}) {archive}would be removed")
         else:
             if not archive_work(repo, path, report):
                 continue
