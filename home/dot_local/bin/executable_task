@@ -13,7 +13,7 @@ Write capability there determines trust; vendor environment markers do not.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
-  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--reviewer <vendor> <model>]
+  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach] [--lock-wait <minutes>]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
@@ -661,6 +661,46 @@ def report_is_filled(path: Path):
 def markdown_section(text: str, heading: str) -> str:
     match = re.search(rf"(?ms)^#{{1,6}} {re.escape(heading)}\s*\n(.*?)(?=^#{{1,6}} |\Z)", text)
     return match.group(1).strip() if match else ""
+
+
+def brief_field(text, heading):
+    section = markdown_section(text, heading) or markdown_section(text, heading + ":")
+    if section:
+        return section
+    match = re.search(rf"(?m)^{re.escape(heading)}:[ \t]*(.*(?:\n(?:[ \t]+|[-*] ).*)*)", text)
+    return match[1].strip() if match else ""
+
+
+def save_check_evidence(destination, name, evidence, log):
+    evidence = dict(evidence, summary_tail="\n".join(log.read_text(errors="replace").splitlines()[-20:]))
+    atomic_json(destination / name, evidence)
+    with (destination / "checks.jsonl").open("a") as stream:
+        stream.write(json.dumps(dict(evidence, kind=name)) + "\n")
+
+
+def review_check(task, path, head, record):
+    # Gate and prompt share this rule: a matching trusted check is authoritative,
+    # regardless of advisory timestamps. Otherwise use the newest advisory check
+    # (check.json is replaced on each check; checks.jsonl retains the history).
+    for directory in (task_state(task), path / ".work"):
+        evidence = read_json_object(directory / "check.json")
+        if evidence.get("sha") == head and evidence.get("record_revision") == record.get("revision"):
+            if "summary_tail" not in evidence:
+                log = directory / "check.log"
+                evidence["summary_tail"] = ("\n".join(log.read_text(errors="replace").splitlines()[-20:])
+                                            if log.is_file() else "(old check: no summary saved)")
+            return evidence
+    return {}
+
+
+def save_review_history(state, meta, text):
+    numbers = [int(p.stem.split("-")[1]) for p in state.glob("review-*.md")
+               if re.fullmatch(r"review-\d+", p.stem)]
+    number = max(numbers, default=0) + 1
+    # Exclusive creation protects earlier evidence even after refresh or a repeated record.
+    with (state / f"review-{number}.md").open("x") as stream:
+        stream.write(f"Verdict: {meta['verdict']}\nHead: {meta['commit']}\nTime: {meta['time']}\n\n" + text)
+    atomic_json(state / f"review-{number}.json", meta)
 
 
 def completed_step(task: Task, step: str):
@@ -1993,7 +2033,7 @@ def start(args):
         if not report.exists() or args.refresh and not report_is_filled(report):
             report.write_text("# Task report\n\n## What changed\n\n(fill in)\n\n## How I verified\n\n(fill in)\n\n## Criteria\n\n" +
                               "\n".join(f"#{item['number']} not met: (fill in)" for item in criteria) +
-                              "\n\n## Noticed, not done\n\n(none)\n")
+                              "\n\n## Check\n\n(fill in)\n\n## Noticed, not done\n\n(none)\n")
     if args.no_verify:
         print(f"exception: verification omitted: {args.no_verify}")
     if "Verification and tools" in task_text:
@@ -2008,8 +2048,13 @@ def start(args):
                 f"Work only in {task.path} on branch {branch}."]
     if task.file:
         dispatch.append(f"Task: {task.file}")
+    brief = task_text or ((work / "request.md").read_text() if (work / "request.md").is_file() else "")
+    for heading in ("Read first", "Test against"):
+        dispatch.append(f"{heading}:\n{brief_field(brief, heading) or '(PM: none given)'}")
     dispatch.append("Commit on the branch, then run `task check` from that folder for advisory feedback, "
-          "then fill `.work/report.md`; any later commit needs a new check. The PM's `task merge` "
+          "before reporting. Paste its final summary line (PASS/FAIL plus the log path) under `## Check` "
+          "in `.work/report.md`; a claim like 'tests pass' without that line is not evidence. "
+          "Check the final commit; any later commit needs a new check. The PM's `task merge` "
           "runs the trusted gate, unless a matching trusted check already passed. A PM may run "
           "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
           "`verified: ...`, and `not done: ...`, followed by `report written`. "
@@ -2158,6 +2203,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     if state:
                         set_child_group(state, None)
                     out.write(f"\nTIMEOUT after {timeout}s\n")
+                    out.flush()
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
                                     "timeout": True})
                     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
@@ -2165,13 +2211,14 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                                 "result": "failed", "steps": results, "time": utc_now(),
                                 "trusted": state is not None, "advisory": state is None}
                     if evidence_name == "check.json" and state is None:
-                        atomic_json(work / "check.json", evidence)
+                        save_check_evidence(work, "check.json", evidence, log)
                     if state:
-                        atomic_json(state / evidence_name, evidence)
+                        save_check_evidence(state, evidence_name, evidence, log)
                         if evidence_name == "check.json":
                             try: task_event(Task(main_repo(path), path.name), "check")
                             except OSError: pass
                     print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {display_log or log}")
+                    print(f"FAIL (log: {display_log or log})")
                     return False
             except subprocess.TimeoutExpired:
                 raise
@@ -2192,9 +2239,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 "result": "passed" if passed else "failed", "steps": results,
                 "time": utc_now(), "trusted": state is not None, "advisory": state is None}
     if evidence_name == "check.json" and state is None:
-        atomic_json(work / "check.json", evidence)
+        save_check_evidence(work, "check.json", evidence, log)
     if state:
-        atomic_json(state / evidence_name, evidence)
+        save_check_evidence(state, evidence_name, evidence, log)
         if evidence_name == "check.json":
             try: task_event(Task(main_repo(path), path.name), "check")
             except OSError: pass
@@ -2244,6 +2291,7 @@ def check(args):
     if record and record.get("no_verify"):
         print(f"exception: verification omitted: {record['no_verify']}")
     if advisory:
+        print("advisory lane check (not evidence for merge)")
         with advisory_check_lock(path):
             if exclusive_gate_enabled(path, advisory=True):
                 with exclusive_gate_lock(task, silent_unavailable=True, config_path=path, advisory=True):
@@ -2255,8 +2303,6 @@ def check(args):
             passed = run_check(path, base, record, task_state(task), advisory=False)
     else:
         passed = run_check(path, base, record, task_state(task), advisory=False)
-    if advisory:
-        print("advisory lane check (not evidence for merge)")
     return 0 if passed else 1
 
 
@@ -2570,6 +2616,15 @@ def review(args):
     path = task.worktree()
     record = load_record(task)
     head = sha(path, "HEAD")
+    state = task_state(task)
+    checked = review_check(task, path, head, record)
+    if args.no_check is not None and not args.no_check.strip():
+        raise Stop("--no-check needs a nonempty reason")
+    if args.run and checked.get("result") != "passed" and not args.no_check:
+        raise Stop("No passing check for the current head; run `task check` first, or use --no-check \"reason\".")
+    if args.no_check:
+        with (state / "review-overrides.jsonl").open("a") as stream:
+            stream.write(json.dumps(dict(head=head, time=utc_now(), reason=args.no_check)) + "\n")
     task_text = task.file.read_text() if task.file else ""
     request_text = ""
     request_label = "Original request:"
@@ -2595,6 +2650,37 @@ def review(args):
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
+        if checked:
+            prompt.extend(["Recorded check (trusted if present, otherwise advisory):",
+                           f"Verdict: {'PASS' if checked['result'] == 'passed' else 'FAIL'}; "
+                           f"head: {checked['sha']}; trusted: {checked.get('trusted', False)}",
+                           "Summary tail:", checked['summary_tail']])
+        else:
+            prompt.append("Recorded check: missing for the reviewed head.")
+        if args.no_check:
+            prompt.append(f"Check override: {args.no_check}")
+        previous = read_json_object(state / "review.json")
+        previous_file = state / "review.md"
+        if not previous.get("commit"):
+            history = sorted((p for p in state.glob("review-*.json")
+                              if re.fullmatch(r"review-\d+", p.stem)),
+                             key=lambda p: int(p.stem.split('-')[1]), reverse=True)
+            for file in history:
+                previous = read_json_object(file)
+                if previous.get("commit"):
+                    previous_file = file.with_suffix('.md')
+                    break
+        if previous.get("commit"):
+            previous_text = previous_file.read_text() if previous_file.is_file() else ""
+            blocking = re.search(r"(?ims)^(?:#{1,6}\s+)?(?:\*\*)?Blocking(?:\*\*)?:?\s*\n"
+                                 r"(.*?)(?=^(?:#{1,6}\s+)?(?:\*\*)?Notes\b|\Z)", previous_text)
+            prompt.extend(["Previous review Blocking list:", blocking[1].strip() if blocking else
+                           "(old review has no Blocking section)"])
+            delta = run_git(path, "diff", "--no-ext-diff", "--no-textconv", previous['commit'], head, "--")
+            prompt.extend([f"Diff since previously reviewed head {previous['commit']}:",
+                           delta.stdout if delta.returncode == 0 else "(previous head unavailable)",
+                           "In a re-review, new non-defect findings on code unchanged since the previous "
+                           "review are Notes only."])
         if request_text:
             prompt.extend([request_label, request_text.rstrip()])
         if latest_text and latest_text != request_text:
@@ -2634,7 +2720,8 @@ def review(args):
         prompt.append("```")
         prompt.append(
             "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
-            "Blocking finding must identify its criterion or the breakage. Put all other "
+            "Blocking finding must identify a named requested criterion or a concrete defect or regression, "
+            "with file:line. Put all other "
             "observations under Notes."
         )
         if args.append_prompt:
@@ -2735,6 +2822,9 @@ def review(args):
     meta = {"verdict": verdict, "commit": head, "reviewer": routed_reviewer[0].lower(),
             "model": routed_reviewer[1], "judgments": {str(k): v[0].lower() for k, v in judgments.items()},
             "record_revision": record["revision"], "time": utc_now()}
+    if args.no_check:
+        meta["no_check"] = args.no_check
+    save_review_history(state, meta, text)
     atomic_json(state / "review.json", meta)
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
@@ -3483,6 +3573,41 @@ def note(args):
     return 0
 
 
+def quality_summary(repo):
+    cutoff = datetime.now(timezone.utc).timestamp() - 14 * 86400
+    roots = [HOME / ".local/state/task" / repo.name,
+             HOME / ".local/state/task/archive" / repo.name]
+    tasks = {}
+    for root in roots:
+        for file in root.rglob("review*.json"):
+            if not re.fullmatch(r"review(?:-\d+)?\.json", file.name):
+                continue
+            meta = read_json_object(file)
+            when = plan_time(meta.get("time"))
+            if not when or meta.get("verdict") not in {"PASS", "FAIL"}:
+                continue
+            ident = file.relative_to(root).parts[0]
+            entry = tasks.setdefault(ident, {"reviews": {}, "merges": []})
+            # Latest pointer and archive copies do not count as additional reviews.
+            entry['reviews'][(meta.get('commit'), meta['time'])] = meta
+        for file in root.rglob("merge.json"):
+            when = plan_time(read_json_object(file).get("time"))
+            if when:
+                ident = file.relative_to(root).parts[0]
+                tasks.setdefault(ident, {"reviews": {}, "merges": []})['merges'].append(when.timestamp())
+    first, merged = [], []
+    for entry in tasks.values():
+        reviews = sorted(entry['reviews'].values(), key=lambda item: plan_time(item['time']))
+        if reviews and plan_time(reviews[0]['time']).timestamp() >= cutoff:
+            first.append(reviews[0]['verdict'] == 'PASS')
+        if reviews and any(when >= cutoff for when in entry['merges']):
+            merged.append(len(reviews))
+    passed, total = sum(first), len(first)
+    percent = round(100 * passed / total) if total else 0
+    average = sum(merged) / len(merged) if merged else 0
+    return f"quality: first-review pass {passed}/{total} ({percent}%), reviews per merged task {average:.1f} (last 14 days)"
+
+
 def status(args):
     active = boost_line()
     if active:
@@ -3505,6 +3630,7 @@ def status(args):
         except (OSError, ValueError):
             keys = f"unavailable (Cannot read environment for {repo}.)"
         print("  env keys: " + keys)
+        print("  " + quality_summary(repo))
         if (CORTEX / f"cortex-kb-{repo.name}").exists():
             print("  " + plan_verdict(plan_info(repo)))
         for record in sorted((repo / '.work').glob('runner-*.json')):
@@ -4218,6 +4344,7 @@ def main(argv=None):
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
+            sub.add_argument("--no-check", metavar="REASON", help="record an override of the passing-check prerequisite")
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
