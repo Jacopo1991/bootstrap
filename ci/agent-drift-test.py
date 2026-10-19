@@ -15,12 +15,13 @@ spec.loader.exec_module(drift)
 expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
             "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "verify-enable",
-            "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "job-ping",
+            "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
             "agentdev-shell-mcp"}
 assert drift.EXPECTED_BINARIES == expected
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
 for script in (ROOT / "home/dot_local/bin").iterdir():
-    assert script.name.removeprefix("executable_") in expected, script.name
+    if script.is_file():
+        assert script.name.removeprefix("executable_") in expected, script.name
 assert drift.compare_sets(expected, expected) == []
 pins = drift.read_pins(ROOT / "home/.chezmoitemplates/pins.env")
 assert pins["CLAUDE_VERSION"] == "2.1.296", "Claude Code alias routing requires the pinned 2.1.296 release"
