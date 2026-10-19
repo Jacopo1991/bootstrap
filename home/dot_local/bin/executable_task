@@ -413,6 +413,78 @@ def plan_time(value):
         return None
 
 
+def decision_content(text):
+    """Ignore only the frontmatter status field."""
+    lines = text.splitlines()
+    frontmatter = bool(lines and lines[0] == "---")
+    result = []
+    for index, line in enumerate(lines):
+        if index and line == "---":
+            frontmatter = False
+        if frontmatter and re.match(r"^status\s*:", line):
+            continue
+        result.append(line)
+    return result
+
+
+REPLACEMENT_MARKER = re.compile(
+    r"\*Replaced\b[^*]*\*|\(replaced\b[^)]*\)|Replaced by decision-\d+\b", re.I)
+
+
+def decision_line_status_only(old, new):
+    """Remove inserted markers, preserving all original text and spacing."""
+    if new == old:
+        return True
+    new = re.sub(r"~~(.+?)~~", r"\1", new)
+    # Keep existing markers intact. Each inserted fragment may include one
+    # separating space on either side; never normalize the surrounding prose.
+    positions = {(0, 0)}
+    seen = set()
+    while positions:
+        before, after = positions.pop()
+        if (before, after) in seen:
+            continue
+        seen.add((before, after))
+        if before == len(old) and after == len(new):
+            return True
+        if before < len(old) and after < len(new) and old[before] == new[after]:
+            positions.add((before + 1, after + 1))
+        for start in (after, after + 1) if new[after:after + 1] == " " else (after,):
+            marker = REPLACEMENT_MARKER.match(new, start)
+            if marker:
+                positions.add((before, marker.end()))
+                if start == after and new[marker.end():marker.end() + 1] == " ":
+                    positions.add((before, marker.end() + 1))
+    return False
+
+
+def decision_status_only(old, new):
+    remaining = iter(decision_content(old))
+    current = next(remaining, None)
+    for line in decision_content(new):
+        if current is not None and decision_line_status_only(current, line):
+            current = next(remaining, None)
+        elif not REPLACEMENT_MARKER.fullmatch(line.strip()):
+            return False
+    return current is None
+
+
+def decision_changed(kb, name, before="HEAD", after=None):
+    try:
+        old = run_git(kb, "show", f"{before}:{name}")
+        if after is None:
+            path = kb / name
+            new = path.read_text() if path.is_file() else None
+        else:
+            shown = run_git(kb, "show", f"{after}:{name}")
+            new = shown.stdout if shown.returncode == 0 else None
+    except (OSError, ValueError):
+        # Unreadable content cannot be proven to be a status-only edit.
+        # ValueError includes UnicodeDecodeError from either Git or the file.
+        return True
+    return old.returncode != 0 or new is None or not decision_status_only(old.stdout, new)
+
+
 def plan_info(repo):
     kb = CORTEX / f"cortex-kb-{repo.name}"
     path = kb / "INTENT.md"
@@ -455,7 +527,9 @@ def plan_info(repo):
     decisions = set()
     for line in run_git(kb, "status", "--porcelain", "-z", "--untracked-files=all", "--", "backlog/decisions").stdout.split("\0") if kb.exists() else []:
         if line:
-            decisions.add(line[3:] if line[2:3] == " " else line)
+            name = line[3:] if line[2:3] == " " else line
+            if decision_changed(kb, name):
+                decisions.add(name)
     if since and kb.exists():
         # Walk the default branch when it resolves, else the checked-out branch; first-parent
         # diffs catch decisions that arrive through merge commits.
@@ -474,7 +548,8 @@ def plan_info(repo):
                 else:
                     changed = run_git(kb, "show", "--name-only", "-z", "--format=", commit,
                                       "--", "backlog/decisions")
-                decisions.update(filter(None, changed.stdout.split("\0")))
+                decisions.update(name for name in changed.stdout.split("\0") if name and
+                                 decision_changed(kb, name, f"{commit}^1", commit))
     if decisions:
         reasons.append("decisions changed: " + ", ".join(sorted(decisions)))
     return dict(kb=kb, path=path, text=text, current=current, signed=signed, limit=limit,
@@ -663,12 +738,12 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
-def preserve_work(task: Task, path: Path, reuse_head=None):
+def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=False):
     """Preserve evidence; list runtime data and individual copy failures."""
     source = path / ".work"
     if not source.exists() and not source.is_symlink():
         return
-    archive = HOME / ".local/state/task/archive" / task.repo.name / task.name
+    archive = HOME / ".local/state/task/archive" / repo.name / name
     try:
         archive.mkdir(parents=True, exist_ok=True)
         if reuse_head:
@@ -731,6 +806,8 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
         atomic_json(pending / "manifest.json", {"skipped_special_files": special, "skipped": skipped,
                                                 "head": reuse_head or (head.stdout.strip()
                                                                        if not head.returncode else None)})
+        if strict and errors:
+            raise OSError("evidence could not be fully read or copied")
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except (OSError, shutil.Error) as error:
@@ -753,26 +830,47 @@ def load_record(task: Task, required=True):
     return record
 
 
-def timeout_for(path: Path):
+def task_config(path: Path):
     config = path / ".task.toml"
-    if config.is_file():
-        match = re.search(r"(?m)^\s*check_timeout\s*=\s*(\d+)\s*(?:#.*)?$", config.read_text())
-        if match:
-            value = int(match.group(1))
-            if value < 1:
-                raise Stop(".task.toml check_timeout must be a positive number of seconds.")
-            return value
+    try:
+        return tomllib.loads(config.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        # ValueError includes UnicodeDecodeError and TOMLDecodeError. Do not echo
+        # parser details: they may include configuration values.
+        raise Stop(f"Cannot read {config}.") from None
+
+
+def timeout_for(path: Path):
+    value = task_config(path).get("check_timeout")
+    if value is not None:
+        if type(value) is not int or value < 1:
+            raise Stop(".task.toml check_timeout must be a positive number of seconds.")
+        return value
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
+def configured_environment(path, repo=None):
+    values = task_config(path).get("env", {})
+    if not isinstance(values, dict):
+        raise Stop(".task.toml [env] must be a table of plain strings.")
+    for name, value in values.items():
+        if stripped_agent_variable(name) or name == "TMPDIR" or name.startswith("TASK_GATE_"):
+            raise Stop(f".task.toml env key {name} is reserved.")
+        if any(word in name.upper() for word in ("TOKEN", "KEY", "SECRET", "PASSWORD")):
+            raise Stop(f".task.toml env key {name} looks like a credential; use secretspec.")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not isinstance(value, str) or "\0" in value:
+            raise Stop(".task.toml [env] requires valid environment names and plain strings.")
+    if not values:
+        return {}
+    repo = repo or main_repo(path)
+    return {name: value.replace("{repo}", str(repo.resolve())).replace("{worktree}", str(path.resolve()))
+            for name, value in values.items()}
+
+
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
-    config = path / ".task.toml"
-    if not config.is_file():
-        return not advisory
-    try:
-        values = tomllib.loads(config.read_text())
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise Stop(f"Cannot read {config}: {error}.")
+    values = task_config(path)
     return values.get("exclusive_gate", not advisory) is True
 
 
@@ -805,11 +903,21 @@ def gate_holders():
                 record = json.loads(lock.with_suffix(".holder").read_text())
             except (OSError, ValueError):
                 record = {}
+            if not isinstance(record, dict) or record.get("pid") != pid:
+                record = {"repo": "holder details unavailable"}
             name = lock.stem.removeprefix("agent-task-gate-") if lock.stem != "agent-task-gate" else "slot-0"
             holders.append((name, pid, record.get("repo", "?"), record.get("task", "?"), record.get("since", "?")))
         except OSError:
             continue
     return holders
+
+
+def holder_display(row, *, include_slot=True):
+    name, pid, repo, task_id, since = row
+    if repo == "holder details unavailable":
+        return f"pid {pid} (holder details unavailable)"
+    suffix = f" ({name})" if include_slot else ""
+    return f"pid {pid}, {repo}/{task_id} since {since}{suffix}"
 
 
 @contextmanager
@@ -819,8 +927,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
     if not exclusive_gate_enabled(path):
         yield
         return
-    config = path / ".task.toml"
-    values = tomllib.loads(config.read_text()) if config.exists() else {}
+    values = task_config(path)
     resources = values.get("gate_resources", [])
     if not isinstance(resources, list) or any(
             not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
@@ -889,13 +996,12 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
                 release()
                 holders = [row for row in gate_holders() if not row[0].startswith("noslot-")]
                 if time.monotonic() >= deadline:
-                    detail = "; ".join(f"{repo}/{task_id} since {since}" for _, _, repo, task_id, since in holders)
+                    detail = "; ".join(holder_display(row) for row in holders)
                     print(f"gate busy: held by {detail or 'another gate (holder details unavailable)'}",
                           file=sys.stderr, flush=True)
                     raise SystemExit(3)
                 if holders != previous:
-                    detail = "; ".join(f"task {task_id} in {repo}, pid {pid} since {since} ({name})"
-                                       for name, pid, repo, task_id, since in holders)
+                    detail = "; ".join(holder_display(row) for row in holders)
                     print(f"Waiting for exclusive task gate held by {detail or 'another gate (holder details unavailable)'}.", flush=True)
                     previous = holders
                 time.sleep(0.1)
@@ -1147,16 +1253,20 @@ def require_pm(args):
             raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
 
 
+def stripped_agent_variable(name):
+    return name in GIT_OVERRIDE_ENV or name in {"GIT_OVERRIDE_ENV", "TASK_GATE_RUN_ID"} or name.startswith(("GIT_CONFIG", "TASK_RUN_"))
+
+
 def agent_environment():
     # The hook refuses Git control-plane overrides inherited by a nested CLI.
     # Never carry a runner's detached gate ownership into an agent.
     return {name: value for name, value in os.environ.items()
-            if name not in GIT_OVERRIDE_ENV and name != "TASK_GATE_RUN_ID"
-            and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
+            if not stripped_agent_variable(name)}
 
 
 def lane_environment(task):
     env = agent_environment()
+    env.update(configured_environment(task.path, task.repo))
     state = task.path / ".work/state"
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
@@ -1517,17 +1627,7 @@ def trusted_check_environment(path, run_id, gate_environment):
     allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SHELL"}
     environment = {key: value for key, value in os.environ.items()
                    if key in allowed or key.startswith("LC_")}
-    config = path / ".task.toml"
-    if config.is_file():
-        try:
-            extra = tomllib.loads(config.read_text()).get("env", {})
-        except (OSError, tomllib.TOMLDecodeError) as error:
-            raise Stop(f"Cannot read {config}: {error}.")
-        if not isinstance(extra, dict) or any(
-                not key or "=" in key or "\0" in key or not isinstance(value, str) or "\0" in value
-                for key, value in extra.items()):
-            raise Stop(".task.toml [env] must contain valid environment names and string values.")
-        environment.update(extra)
+    environment.update(configured_environment(path))
     environment.update(gate_environment)
     # Keep cancellation of descendants in new sessions without inheriting TASK_RUN_*.
     environment["TASK_GATE_RUN_ID"] = run_id
@@ -1989,6 +2089,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
     log = work / "check.log"
     passed = True
     timeout = timeout_for(path)
+    configured_env = configured_environment(path)
     run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
     with log.open("w") as out:
@@ -2008,6 +2109,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             try:
                 child_env = (check_step_environment(run_id) if advisory else
                              trusted_check_environment(path, run_id, gate_environment))
+                if advisory:
+                    child_env.update(configured_env)
+                    child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
@@ -2698,7 +2802,7 @@ def prune_stale_gate_worktrees(repo: Path):
 
 def remove_gate_worktree(task, gate):
     try:
-        preserve_work(task, gate)
+        preserve_work(task.repo, task.name, gate)
     except Stop as error:
         print(f"Gate archive warning: {error}", file=sys.stderr)
     finally:
@@ -2908,7 +3012,7 @@ def merge(args):
     if leftovers:
         print(f"Kept {path}: it holds files that are not in the merge:\n" + "\n".join(leftovers))
         return 0
-    preserve_work(task, path)
+    preserve_work(task.repo, task.name, path)
     git(repo, "worktree", "remove", "--force", str(path))
     completed_step(task, "cleaned")
     if is_ancestor(repo, lane_head, commit) and ok(repo, "branch", "-D", branch):
@@ -3056,7 +3160,7 @@ def remove_completed_close_worktree(repo, branch, remove_parent=False, *, task):
     else:
         # This deterministic path is owned by task close; after a verified merge, remove it
         # even if files were left behind in the temporary worktree.
-        preserve_work(task, path)
+        preserve_work(task.repo, task.name, path)
         removed = run_git(repo, "worktree", "remove", "--force", str(path))
         if removed.returncode:
             print(f"Close worktree kept at {path}: {removed.stderr.strip()}")
@@ -3132,7 +3236,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         if head != base:
             raise Stop(f"Close branch {branch} at {head[:7]} has an unexpected commit; preserved at {path}.")
         if git(path, "status", "--porcelain", "--untracked-files=all"):
-            preserve_work(task, path)
+            preserve_work(task.repo, task.name, path)
             git(path, "reset", "--hard", "HEAD")
             git(path, "clean", "-fd")
         changed = apply_close_update(path, task, before, archive, criteria, status, summary)
@@ -3356,8 +3460,8 @@ def status(args):
     if active:
         print(active)
     print(f"Gate slots: {gate_slots()}")
-    for name, pid, repo, task_id, since in gate_holders():
-        print(f"gate {name}: pid {pid}, {repo}/{task_id}, since {since}")
+    for row in gate_holders():
+        print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
@@ -3366,6 +3470,13 @@ def status(args):
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
+        try:
+            keys = ", ".join(sorted(configured_environment(repo))) or "(none)"
+        except Stop as error:
+            keys = f"unavailable ({error})"
+        except (OSError, ValueError):
+            keys = f"unavailable (Cannot read environment for {repo}.)"
+        print("  env keys: " + keys)
         if (CORTEX / f"cortex-kb-{repo.name}").exists():
             print("  " + plan_verdict(plan_info(repo)))
         for record in sorted((repo / '.work').glob('runner-*.json')):
@@ -3801,7 +3912,7 @@ def repair_published(task, base):
             if source.is_file():
                 shutil.copy2(source, state / name)
         if not (untracked(task.path) + ignored_leftovers(task.path)):
-            preserve_work(task, task.path, reuse_head=head)
+            preserve_work(task.repo, task.name, task.path, reuse_head=head)
             branch = git(task.path, 'branch', '--show-current')
             git(task.repo, 'worktree', 'remove', '--force', str(task.path))
             if branch:
@@ -3883,6 +3994,15 @@ def wait_task(args):
 def gate_drill(args):
     """Measure real cross-repository clashes without consuming gate slots."""
     repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
+    cli_seeds = {repo: [] for repo in repos}
+    for value in args.seed:
+        repo_name, separator, name = value.partition(":")
+        if not separator or not name:
+            raise Stop("gate-drill --seed requires <repo>:<name>.")
+        repo = resolve_repo(repo_name)
+        if repo not in cli_seeds:
+            raise Stop(f"Seed repository {repo_name} is not in this drill.")
+        cli_seeds[repo].append(name)
     archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
     archive.mkdir(parents=True)
     worktrees = []
@@ -3895,7 +4015,27 @@ def gate_drill(args):
         git(repo, "worktree", "add", "-q", "--detach", str(path), base)
         worktrees.append((repo, path))
         prepare_environment(repo, path)
+        names = task_config(path).get("drill_seeds", [])
+        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+            raise Stop(".task.toml drill_seeds must be a list of seed names.")
+        names = list(dict.fromkeys(names + cli_seeds[repo]))
+        for name in names:
+            try:
+                seed_source(repo, name)
+            except Stop as error:
+                if str(error).startswith("Seed does not exist:"):
+                    raise Stop(f"missing seed {name}") from None
+                raise
+        seed_worktree(repo, path, names)
         return path
+
+    def prepare_measure(repo, index, phase):
+        try:
+            return measure(prepare(repo, index, phase), index, phase)
+        except (Stop, OSError) as error:
+            return {"result": "failed", "duration": 0, "error": str(error)}
+        except ValueError:
+            return {"result": "failed", "duration": 0, "error": f"Cannot read drill inputs for {repo}."}
 
     def measure(path, index, phase):
         # Drill runs hold no slot; run_check reserves a free port index above the slots.
@@ -3911,6 +4051,9 @@ def gate_drill(args):
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": round(time.monotonic() - started, 3),
                     "error": str(error)}
+        except ValueError:
+            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
+                    "error": f"Cannot read drill inputs in {path}."}
         finally:
             log = path / ".work/check.log"
             if log.is_file():
@@ -3921,15 +4064,14 @@ def gate_drill(args):
 
     rows = []
     try:
-        paths = [prepare(repo, index, "concurrent") for index, repo in enumerate(repos)]
         with ThreadPoolExecutor(max_workers=len(repos)) as pool:
-            futures = [pool.submit(measure, path, index, "concurrent")
-                       for index, path in enumerate(paths)]
+            futures = [pool.submit(prepare_measure, repo, index, "concurrent")
+                       for index, repo in enumerate(repos)]
             concurrent = [future.result() for future in futures]
         for index, (repo, result) in enumerate(zip(repos, concurrent)):
             row = {"repo": repo.name, "concurrent": result, "solo": None, "verdict": "ok"}
             if result["result"] != "passed":
-                row["solo"] = measure(prepare(repo, index, "solo"), index, "solo")
+                row["solo"] = prepare_measure(repo, index, "solo")
                 row["verdict"] = "clash" if row["solo"]["result"] == "passed" else "failing-alone"
             rows.append(row)
         table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
@@ -3937,6 +4079,9 @@ def gate_drill(args):
             def cell(result):
                 return f"{result['result']} ({result['duration']})" if result else "-"
             table.append(f"{row['repo']} | {cell(row['concurrent'])} | {cell(row['solo'])} | {row['verdict']}")
+            for phase in ("concurrent", "solo"):
+                if row[phase] and row[phase].get("error"):
+                    table.append(f"  {phase}: {row[phase]['error']}")
         atomic_json(archive / "results.json", rows)
         (archive / "results.txt").write_text("\n".join(table) + "\n")
         print("\n".join(table), flush=True)
@@ -3956,6 +4101,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     sub = commands.add_parser("gate-drill", help="PM-only concurrent full-gate clash drill")
     sub.add_argument("repos", nargs="+")
+    sub.add_argument("--seed", action="append", default=[], metavar="REPO:NAME",
+                     help="copy main checkout .work/NAME into each drill worktree; adds to .task.toml drill_seeds")
     for name in ("start", "lane", "merge", "close", "review", "cancel", "wait"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")

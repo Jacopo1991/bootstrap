@@ -327,7 +327,7 @@ class BatchTest(unittest.TestCase):
         self.scenario({})
         self.assertTrue(self.run_batch().endswith('one: merged\nbatch: finished\n'))
         self.assertEqual(len(self.calls('start')), 1)
-        self.assertEqual(len(self.calls('lane')), 2)
+        self.assertEqual(len(self.calls('lane')), 1)
 
     def test_resumed_running_lane_limit_stops_without_new_lane(self):
         subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],

@@ -199,7 +199,7 @@ class Batch:
             self.require("wait", ident, "--max", box, retry=True)
             if not previous_limit:
                 self.lane_outcome(work)
-        run_lane = not resumed or bool(previous_limit) or not self.finished(path, record)
+        run_lane = not resumed or not self.finished(path, record)
         if resumed and run_lane:
             findings = (f"Previous lane ended by usage limit: {previous_limit}. Resume, finish and commit."
                         if previous_limit else blocking(read(state / "review.md")) or
