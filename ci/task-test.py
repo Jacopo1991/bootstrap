@@ -166,6 +166,61 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_gate_drill_signals_clean_children_worktrees_and_reservations(self):
+        just = self.home / 'bin/just'
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for phase in ('group', 'solo'):
+                with self.subTest(signal=sig, phase=phase):
+                    marker = self.home / 'sleeping-gate.json'
+                    marker.unlink(missing_ok=True)
+                    just.write_text(f'#!{sys.executable}\n' + textwrap.dedent(f'''\
+                        import json, os, pathlib, signal, subprocess, time
+                        if not pathlib.Path.cwd().name.endswith('-{phase}'):
+                            raise SystemExit(0)
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        child = subprocess.Popen(['sleep', '60'])
+                        pathlib.Path({str(marker)!r}).write_text(json.dumps(
+                            [os.getpid(), child.pid, os.environ['TMPDIR']]))
+                        time.sleep(60)
+                        '''))
+                    just.chmod(0o755)
+                    process = subprocess.Popen([sys.executable, str(TOOL), 'gate-drill', 'proj'],
+                                               env=self.env, cwd=self.home, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    pids = []
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        self.assertTrue(marker.exists(), 'sleeping gate never started')
+                        leader, child, temporary = json.loads(marker.read_text())
+                        pids = [leader, child]
+                        process.send_signal(sig)
+                        output, _ = process.communicate(timeout=10)
+                        self.assertNotEqual(process.returncode, 0, output)
+                        self.assertIn('Drill interrupted', output)
+                        for pid in pids:
+                            status = Path(f'/proc/{pid}/stat')
+                            self.assertTrue(not status.exists() or status.read_text().split()[2] == 'Z',
+                                            f'gate process {pid} survived')
+                        self.assertFalse(Path(temporary).exists())
+                        self.assertEqual(list((self.repo / '.worktrees').glob('.*drill-*')), [])
+                        self.assertNotIn('.drill-', self.git(self.repo, 'worktree', 'list'))
+                        locks = list(self.gate_dir.glob('*.lock'))
+                        self.assertTrue(locks, 'gate did not reserve a port index')
+                        for lock in locks:
+                            with lock.open('r') as stream:
+                                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                        process.communicate(timeout=5)
+                        for pid in pids:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+
     def test_status_bad_config_does_not_hide_other_repos(self):
         good = self.home / 'dev_workspace/z-good'
         good.mkdir()
