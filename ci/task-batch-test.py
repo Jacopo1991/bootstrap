@@ -313,6 +313,19 @@ class BatchTest(unittest.TestCase):
                                  {'code': 1, 'output': 'head fed4321 failed in 2.9s'}]})
         self.assertIn('parked: repeated failure', self.run_batch())
         self.assertEqual(len(self.calls('lane')), 2)
+        self.assertFalse(self.calls('review'))
+
+    def test_failed_check_fixes_before_spending_review(self):
+        self.scenario({'lane': [{'check_log': 'FAILED real fixture assertion'}, {}],
+                       'check': [{'code': 1}, {}]})
+        self.assertIn('merged after 1 fix rounds', self.run_batch())
+        commands = [call[0] for call in self.calls()]
+        self.assertEqual(commands.count('check'), 2)
+        self.assertEqual(commands.count('review'), 1)
+        self.assertGreater(commands.index('review'), max(i for i, cmd in enumerate(commands) if cmd == 'check'))
+        self.assertIn('FAILED real fixture assertion', self.prompts()[1]['prompt'])
+        for prompt in self.prompts():
+            self.assertIn('under `## Check`', prompt['prompt'])
 
     def test_usage_limit_in_lane_stops(self):
         self.scenario({'lane': [{'exit_code': 1, 'log': "ERROR: You've hit your usage limit. Try again later."}]})

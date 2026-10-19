@@ -166,6 +166,110 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_quality_dispatch_brief_and_evidence_instruction(self):
+        task = self.kb / "backlog/tasks/t-5 - Add-the-b-file.md"
+        task.write_text(task.read_text() + "\n## Read first\n\na.txt and justfile\n\n"
+                        "## Test against:\n\nci/fixtures/reviews/haiku-3-fenced.md\n")
+        wt, dispatch = self.started()
+        self.assertIn("Read first:\na.txt and justfile", dispatch)
+        self.assertIn("Test against:\nci/fixtures/reviews/haiku-3-fenced.md", dispatch)
+        self.assertIn("PASS/FAIL plus the log path", dispatch)
+        self.assertIn("under `## Check`", dispatch)
+        self.assertIn("## Check", (wt / '.work/report.md').read_text())
+        direct = self.raw_task('start', 'proj', 'direct', '--builder', 'codex')
+        self.assertIn('Read first:\n(PM: none given)', direct)
+        self.assertIn('Test against:\n(PM: none given)', direct)
+        request = self.repo / '.worktrees/direct/.work/request.md'
+        request.write_text('Read first: a.txt\n  justfile\nTest against: real fixture\n')
+        direct = self.raw_task('start', 'proj', 'direct', '--builder', 'codex')
+        self.assertIn('Read first:\na.txt\n  justfile', direct)
+        self.assertIn('Test against:\nreal fixture', direct)
+
+    def test_quality_review_check_guard_and_override(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.assertIn('run `task check` first', self.raw_task('review', 'proj', '5', '--run', code=1))
+        self.assertFalse((wt / '.work/reviewer-call.json').exists())
+        self.raw_task('check', 'proj', '5')
+        self.raw_task('start', 'proj', '5', '--refresh', '--builder', 'codex')
+        self.assertIn('run `task check` first', self.raw_task('review', 'proj', '5', '--run', code=1))
+        self.commit_in(wt, 'b.txt')
+        self.assertIn('run `task check` first', self.raw_task('review', 'proj', '5', '--run', code=1))
+        self.commit_in(wt, 'FAIL')
+        self.raw_task('check', 'proj', '5', code=1)
+        self.assertIn('run `task check` first', self.raw_task('review', 'proj', '5', '--run', code=1))
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: FAIL\nCommit: {head}\n#1 pass: b exists\n#2 fail: gate failed\n'
+        self.raw_task('review', 'proj', '5', '--run', '--no-check', 'Inspect failing gate',
+                      env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        meta = json.loads((self.state() / 'review.json').read_text())
+        self.assertEqual(meta['no_check'], 'Inspect failing gate')
+        self.assertEqual(json.loads((self.state() / 'review-overrides.jsonl').read_text())['head'], head)
+        prompt = json.loads((wt / '.work/reviewer-call.json').read_text())['prompt']
+        self.assertIn('Verdict: FAIL; head: ' + head, prompt)
+        self.assertIn('FAILED (failures=1)', prompt)
+        self.assertIn('file:line', prompt)
+        checks = [json.loads(line) for line in (self.state() / 'checks.jsonl').read_text().splitlines()]
+        self.assertEqual([item['result'] for item in checks], ['passed', 'failed'])
+
+    def test_quality_history_rereview_and_check_precedence(self):
+        wt, _ = self.started()
+        advisory = dict(self.env, CODEX_SANDBOX='1')
+        state_root = self.sandbox_state()
+        output = self.raw_task('check', cwd=wt, env=advisory)
+        state_root.chmod(0o755)
+        self.assertTrue(output.rstrip().splitlines()[-1].startswith('PASS (log: '))
+        self.assertIn('trusted: False', self.raw_task('review', 'proj', '5'))
+        self.raw_task('check', 'proj', '5')
+        self.assertIn('trusted: True', self.raw_task('review', 'proj', '5'))
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'review.md'
+        fixture = (REVIEW_FIXTURES / 'quality-rereview.md').read_text().replace('HEAD_PLACEHOLDER', head)
+        reply.write_text(fixture)
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'haiku')
+        first = (self.state() / 'review-1.md').read_bytes()
+        self.commit_in(wt, 'b.txt')
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertIn('Previous review Blocking list:\n- #1: b.txt:1', prompt)
+        self.assertIn('diff --git a/b.txt b/b.txt', prompt)
+        self.assertIn('new non-defect findings on code unchanged', prompt)
+        self.assertIn('Recorded check: missing', prompt)
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: b exists\n#2 pass: checked\n')
+        self.raw_task('check', 'proj', '5')
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'haiku')
+        self.assertEqual((self.state() / 'review-1.md').read_bytes(), first)
+        self.assertTrue((self.state() / 'review-2.md').exists())
+        self.raw_task('start', 'proj', '5', '--refresh', '--builder', 'codex')
+        self.assertIn('Diff since previously reviewed head', self.raw_task('review', 'proj', '5'))
+        self.assertEqual(len((self.state() / 'checks.jsonl').read_text().splitlines()), 2)
+        self.assertEqual(len((wt / '.work/checks.jsonl').read_text().splitlines()), 1)
+        (self.state() / 'merge.json').write_text(json.dumps(dict(time=TASK_MODULE.utc_now())))
+        self.assertIn('quality: first-review pass 0/1 (0%), reviews per merged task 2.0',
+                      self.raw_task('status', 'proj'))
+        archive = self.home / '.local/state/task/archive/proj/t5/snapshot/.work'
+        shutil.copytree(self.state(), archive)
+        self.assertIn('reviews per merged task 2.0', self.raw_task('status', 'proj'))
+        shutil.rmtree(self.state())
+        self.assertIn('quality: first-review pass 0/1 (0%), reviews per merged task 2.0',
+                      self.raw_task('status', 'proj'))
+
+    def test_quality_metric_tolerates_missing_old_and_malformed_history(self):
+        self.started()
+        (self.state() / 'review.json').write_text('{broken')
+        self.assertIn('quality: first-review pass 0/0 (0%), reviews per merged task 0.0',
+                      self.raw_task('status', 'proj'))
+        (self.state() / 'review-1.json').write_text(json.dumps(dict(
+            time='2000-01-01T00:00:00+00:00', verdict='PASS', commit='old')))
+        self.assertIn('first-review pass 0/0 (0%)', self.raw_task('status', 'proj'))
+        recent = self.state('another')
+        recent.mkdir()
+        (recent / 'review.json').write_text(json.dumps(dict(
+            time=TASK_MODULE.utc_now(), verdict='PASS', commit='new')))
+        (recent / 'merge.json').write_text(json.dumps(dict(time=TASK_MODULE.utc_now())))
+        self.assertIn('first-review pass 1/1 (100%), reviews per merged task 1.0',
+                      self.raw_task('status', 'proj'))
+
     def test_gate_drill_signals_clean_children_worktrees_and_reservations(self):
         just = self.home / 'bin/just'
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -593,6 +697,7 @@ class TaskTool(unittest.TestCase):
         reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
         for builder, vendor, model in [('codex', 'claude', 'opus'), ('claude', 'codex', 'gpt-6.1-sol')]:
             self.task('start', 'proj', '5', '--refresh', '--builder', builder)
+            self.raw_task("check", "proj", '5')
             self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
             metadata = json.loads((self.state() / 'review.json').read_text())
             self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
@@ -604,6 +709,7 @@ class TaskTool(unittest.TestCase):
         self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
         head = self.git(wt, 'rev-parse', 'HEAD')
         reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', env=dict(self.env,
                             REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit · resets 5pm (UTC)\n\n",
                             REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
@@ -625,6 +731,7 @@ class TaskTool(unittest.TestCase):
                 (wt / '.work/reviewer-calls.jsonl').unlink(missing_ok=True)
                 if boosted:
                     self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+                self.raw_task("check", "proj", '5')
                 out = self.raw_task('review', 'proj', '5', '--run', code=1,
                                     env=dict(self.env, REVIEW_STUB_REPLY="You've hit your weekly limit",
                                              REVIEW_STUB_EXIT='2'))
@@ -637,6 +744,7 @@ class TaskTool(unittest.TestCase):
         self.stub_reviewers()
         wt, _ = self.started()
         self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', code=1,
                             env=dict(self.env, REVIEW_STUB_REPLY="You've hit your Opus limit\nOther failure",
                                      REVIEW_STUB_EXIT='1'))
@@ -648,6 +756,7 @@ class TaskTool(unittest.TestCase):
         self.stub_reviewers()
         wt, _ = self.started()
         self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', code=1,
                             env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit",
                                      REVIEW_STUB_FIRST_EXIT='1', REVIEW_STUB_REPLY='No verdict'))
@@ -660,6 +769,7 @@ class TaskTool(unittest.TestCase):
         self.raw_task('start', 'proj', '5', '--builder', 'claude')
         wt = self.repo / '.worktrees/t5'
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', code=1,
                             env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
                                      REVIEW_STUB_EXIT='1'))
@@ -2962,7 +3072,7 @@ store.write_text(json.dumps(prs))
         self.assertIn("t-5 - Add-the-b-file.md", out)
         commit_at = out.index("Commit on the branch")
         check_at = out.index("then run `task check`", commit_at)
-        report_at = out.index("then fill `.work/report.md`", check_at)
+        report_at = out.index("in `.work/report.md`", check_at)
         later_commit_at = out.index("any later commit needs a new check", report_at)
         self.assertLess(commit_at, check_at)
         self.assertLess(check_at, report_at)
@@ -3518,6 +3628,7 @@ store.write_text(json.dumps(prs))
         self.stub_reviewers()
         head = self.git(wt, "rev-parse", "HEAD")
         reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n```\n"
+        self.raw_task("check", "proj", "5")
         self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
         self.assertEqual(json.loads((self.state() / "review-routing.json").read_text())["vendor"], "codex")
 
@@ -3552,6 +3663,7 @@ store.write_text(json.dumps(prs))
         reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: source\n#2 pass: evidence\n```\n"
         for first in ("I am the builder", reply.replace(head, "a" * 40)):
             (wt / ".work/reviewer-count").unlink(missing_ok=True)
+            self.raw_task("check", "proj", "5")
             out = self.raw_task("review", "proj", "5", "--run",
                                 env=dict(self.env, REVIEW_STUB_FIRST_REPLY=first, REVIEW_STUB_REPLY=reply))
             self.assertEqual((wt / ".work/reviewer-count").read_text(), "2")
@@ -3563,6 +3675,7 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         head = self.git(wt, "rev-parse", "HEAD")
         reply = f"Verdict: PASS\nCommit: {head[:12]}\n#1 pass: source\n#2 pass: evidence\n"
+        self.raw_task("check", "proj", "5")
         out = self.raw_task("review", "proj", "5", "--run",
                             env=dict(self.env, REVIEW_STUB_REPLY=reply))
         self.assertEqual((wt / ".work/reviewer-count").read_text(), "1")
@@ -3576,6 +3689,7 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         head = self.git(wt, "rev-parse", "HEAD")
         reply = f"Commit: {head}\n#1 pass: source\n#2 pass: evidence\n"
+        self.raw_task("check", "proj", "5")
         out = self.raw_task("review", "proj", "5", "--run", code=1,
                             env=dict(self.env, REVIEW_STUB_REPLY=reply))
         self.assertEqual((wt / ".work/reviewer-count").read_text(), "2")
@@ -3944,7 +4058,8 @@ store.write_text(json.dumps(prs))
             "#1 pass|fail|unclear: <one line of evidence>\n"
             "#2 pass|fail|unclear: <one line of evidence>\n```\n"
             "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
-            "Blocking finding must identify its criterion or the breakage. Put all other "
+            "Blocking finding must identify a named requested criterion or a concrete defect or regression, "
+            "with file:line. Put all other "
             "observations under Notes.\n"))
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
@@ -3959,6 +4074,7 @@ store.write_text(json.dumps(prs))
         self.raw_task("start", "proj", "5", "--builder", builder)
         wt = self.repo / ".worktrees/t5"
         head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
         prepared = self.raw_task("review", "proj", "5")
         self.assertFalse((wt / ".work/reviewer-call.json").exists())
         prompt = (self.state() / "review-prompt.md").read_text()
@@ -4010,6 +4126,7 @@ store.write_text(json.dumps(prs))
         self.stub_reviewers()
         self.raw_task('start', 'proj', '5', '--builder', 'claude')
         diagnostic = "ERROR: You've hit your usage limit. Try again later.\n"
+        self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', code=1,
                             env=dict(self.env, REVIEW_STUB_STDERR=diagnostic, REVIEW_STUB_EXIT='1'))
         self.assertIn(diagnostic, out)
@@ -4034,6 +4151,7 @@ store.write_text(json.dumps(prs))
                            GIT_OPTIONAL_LOCKS="1", TASK_RUN_ID="runner",
                            REVIEW_STUB_POLICY=str(ROOT / "system/agent-policy/pre_tool_use.py"),
                            REVIEW_STUB_REPLY=reply)
+                self.raw_task("check", "proj", name)
                 self.raw_task("review", "proj", name, "--run", env=env)
                 call = json.loads((wt / ".work/reviewer-call.json").read_text())
                 self.assertFalse(any(key in TASK_MODULE.GIT_OVERRIDE_ENV or
@@ -4054,6 +4172,7 @@ store.write_text(json.dumps(prs))
         request = self.home / "request with spaces.md"
         request.write_text("Preserve user files.")
         reply = f"```review\nVerdict: PASS\nCommit: {self.git(wt, 'rev-parse', 'HEAD')}\n```\n"
+        self.raw_task("check", "proj", "direct-request")
         self.raw_task("review", "proj", "direct-request", "--run", "--request", str(request),
                       env=dict(self.env, REVIEW_STUB_REPLY=reply))
         call = json.loads((wt / ".work/reviewer-call.json").read_text())
@@ -4064,6 +4183,7 @@ store.write_text(json.dumps(prs))
     def test_review_run_errors_do_not_record_or_replace_previous_review(self):
         self.stub_reviewers()
         wt, _ = self.started()
+        self.raw_task("check", "proj", "5")
         head = self.git(wt, "rev-parse", "HEAD")
         valid_reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: b\n#2 pass: checked\n```\n"
         cases = (({"REVIEW_STUB_REPLY": " \n\t"}, "review produced no verdict; rerun `task review`"),
