@@ -454,6 +454,30 @@ Plain `task review <repo> <id>` still prints the prompt and headless command for
 manual use; `--record <file>` still records a supplied reply. `--run` and `--record`
 are mutually exclusive, and all review modes refuse in a sandboxed session.
 
+Before reporting, builders run advisory `task check` from the worktree on the final
+commit and paste its final PASS/FAIL line, including the log path, under `## Check`
+in `.work/report.md`. `review --run` requires a passing check for that head and
+pinned task revision; `--no-check "reason"` records an exception. Both the review
+gate and prompt use the trusted check for that head and revision when present:
+it is authoritative over any advisory check, whatever their order. Without a
+matching trusted check, the newest advisory check counts. Review prompts also
+include the previous Blocking list and incremental diff on re-review. Blocking findings
+must name a requested criterion or concrete defect/regression and a file:line;
+other observations belong in Notes. New non-defect findings on unchanged code
+are Notes on re-review.
+
+Task briefs may include `## Read first` (files/docs to read before editing) and
+`## Test against` (real data, fixtures or examples), or inline `Read first:` and
+`Test against:` fields with indented or bullet continuations. Dispatch prints
+both fields; omitted fields show `(PM: none given)`.
+
+Task state retains numbered `review-<n>.md` replies with verdict, head and time
+and JSON metadata, plus append-only `checks.jsonl` (advisory history stays in
+the worktree's archived `.work`). `task status` reports first-review pass rate
+for tasks first reviewed in the last 14 days, and mean total reviews for tasks
+merged in that period with available review history. Legacy records are used
+when available; missing history is excluded. Archive copies are deduplicated.
+
 Always launch build lanes through `task lane`, including from a batch runner:
 
 ```sh

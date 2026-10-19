@@ -190,6 +190,9 @@ class Batch:
             dispatch = (f"Read the pinned context in .work/context/. Work only in {path} "
                         f"on branch {record['branch']}. Commit, run task check, then fill "
                         ".work/report.md (What changed, How I verified, Criteria, Noticed, not done).")
+        dispatch += ("\nBefore reporting, run `task check` (advisory, from the worktree) on the final commit "
+                     "and paste its final summary line (PASS/FAIL plus the log path) under `## Check` "
+                     "in `.work/report.md`. A claim like 'tests pass' without that line is not evidence.\n")
         started = time.monotonic()
         builder, model = task["builder"], task["model"]
         rounds, previous, findings, check_tail = 0, None, "", ""
