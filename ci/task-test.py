@@ -277,6 +277,10 @@ class TaskTool(unittest.TestCase):
         evidence = self.home / '.local/state/task/gate-drill'
         rows = json.loads(next(evidence.glob('*/results.json')).read_text())
         self.assertEqual(rows[0]['verdict'], 'ok')
+        # Evidence identity must not depend on filesystem timestamp ordering.
+        initial_result = next(evidence.glob('*/results.json'))
+        future = time.time() + 3600
+        os.utime(initial_result, (future, future))
         bad = self.home / 'dev_workspace/bad'
         bad.mkdir()
         self.git(bad, 'init', '-q', '-b', 'main')
@@ -304,8 +308,10 @@ class TaskTool(unittest.TestCase):
                 self.assertIn(reason, output)
                 self.assertRegex(output, r'proj \| passed .* \| passed .* \| ok')
                 self.assertEqual(len(self.git(bad, 'worktree', 'list').splitlines()), 1)
-                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
-                rows = json.loads(latest.read_text())
+                archive = Path(next(line.removeprefix('Drill evidence: ') for line in output.splitlines()
+                                    if line.startswith('Drill evidence: ')))
+                rows = json.loads((archive / 'results.json').read_text())
+                self.assertEqual([row['repo'] for row in rows], ['bad', 'proj'])
                 self.assertEqual(rows[0]['concurrent']['result'], 'failed')
                 self.assertEqual(rows[0]['solo']['result'], 'failed')
                 if isinstance(config, bytes) or config is None:
@@ -344,9 +350,10 @@ class TaskTool(unittest.TestCase):
                         contextlib.redirect_stdout(output):
                     self.assertEqual(TASK_MODULE.gate_drill(mock.Mock(repos=['bad', 'proj'], seed=[])), 1)
                 self.assertRegex(output.getvalue(), r'proj \| passed .* \| passed .* \| ok')
-                evidence = self.home / '.local/state/task/gate-drill'
-                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
-                rows = json.loads(latest.read_text())
+                archive = Path(next(line.removeprefix('Drill evidence: ') for line in output.getvalue().splitlines()
+                                    if line.startswith('Drill evidence: ')))
+                rows = json.loads((archive / 'results.json').read_text())
+                self.assertEqual([row['repo'] for row in rows], ['bad', 'proj'])
                 for phase in ('concurrent', 'solo'):
                     self.assertEqual(rows[0][phase]['result'], 'failed')
                     self.assertIn('error', rows[0][phase])
