@@ -4426,11 +4426,17 @@ def main(argv=None):
                     task = Task(repo, args.id)
                     path = task.worktree()
                 return detached(args, task, path)
-        lock = foreground_lock(args)
-        if lock:
-            signal.signal(signal.SIGHUP, handle_interruption)
-            signal.signal(signal.SIGTERM, handle_interruption)
-        elif os.environ.get("TASK_RUN_RECORD") and args.command in {"check", "merge"}:
+        # A visible lock can prompt cancellation before run.json and the
+        # handlers exist. Defer termination until startup is fully recorded.
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGHUP, signal.SIGTERM})
+        try:
+            lock = foreground_lock(args)
+            if lock:
+                signal.signal(signal.SIGHUP, handle_interruption)
+                signal.signal(signal.SIGTERM, handle_interruption)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        if not lock and os.environ.get("TASK_RUN_RECORD") and args.command in {"check", "merge"}:
             if args.command == "merge":
                 ACTIVE_FOREGROUND_TASK = Task(resolve_repo(args.repo), args.id)
             elif args.id is not None:

@@ -5568,6 +5568,30 @@ Reviewer: claude strict-model
         stdout, _ = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, stdout)
 
+    def test_sighup_at_foreground_lock_creation_records_interruption(self):
+        self.started()
+        # Deliver the signal exactly when the lock first becomes visible,
+        # before foreground_lock has written run.json or returned to main.
+        code = textwrap.dedent('''\
+            import os, runpy, signal, sys
+            module = runpy.run_path(sys.argv[1])
+            original_open = os.open
+            def interrupt_on_lock(path, flags, *args, **kwargs):
+                fd = original_open(path, flags, *args, **kwargs)
+                if str(path).endswith('/run.lock'):
+                    os.kill(os.getpid(), signal.SIGHUP)
+                return fd
+            os.open = interrupt_on_lock
+            sys.exit(module['main'](['check', 'proj', '5']))
+        ''')
+        result = subprocess.run([sys.executable, '-c', code, str(TOOL)],
+                                cwd=self.home, env=self.env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        run = json.loads((self.state() / 'run.json').read_text())
+        self.assertEqual(run['state'], 'interrupted')
+        self.assertFalse((self.state() / 'run.lock').exists())
+
     def test_round3_sighup_marks_foreground_run_interrupted_and_cancel_clears_lock(self):
         self.started()
         (self.home / "bin/just").write_text("#!/bin/sh\nsleep 30\n")
