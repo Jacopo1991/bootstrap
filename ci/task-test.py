@@ -254,6 +254,50 @@ class TaskTool(unittest.TestCase):
         self.assertIn('quality: first-review pass 0/1 (0%), reviews per merged task 2.0',
                       self.raw_task('status', 'proj'))
 
+    def test_quality_review_gate_and_prompt_check_precedence(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.raw_task('check', 'proj', '5')
+        trusted_file = self.state() / 'check.json'
+        base = json.loads(trusted_file.read_text())
+        head = base['sha']
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: fixture\n#2 pass: fixture\n'
+        for trusted, older, newest, allowed in (
+                ('passed', None, 'failed', True),
+                ('failed', None, 'passed', False),
+                (None, 'passed', 'failed', False),
+                (None, 'failed', 'passed', True)):
+            with self.subTest(trusted=trusted, older=older, newest=newest):
+                trusted_file.unlink(missing_ok=True)
+                if trusted:
+                    trusted_file.write_text(json.dumps(dict(
+                        base, result=trusted, time='2026-10-19T10:00:00+00:00',
+                        summary_tail='trusted evidence')))
+                advisory_history = []
+                for hour, result in ((11, older), (12, newest)):
+                    if result:
+                        evidence = dict(base, result=result, trusted=False, advisory=True,
+                                        time=f'2026-10-19T{hour}:00:00+00:00',
+                                        summary_tail=f'advisory {result} evidence')
+                        advisory_history.append(json.dumps(evidence))
+                        (wt / '.work/check.json').write_text(json.dumps(evidence))
+                (wt / '.work/checks.jsonl').write_text('\n'.join(advisory_history) + '\n')
+                prompt = self.raw_task('review', 'proj', '5')
+                verdict = 'PASS' if allowed else 'FAIL'
+                self.assertIn(f'Verdict: {verdict}; head: {head}; trusted: {bool(trusted)}', prompt)
+                self.assertIn('trusted evidence' if trusted else f'advisory {newest} evidence', prompt)
+                call = wt / '.work/reviewer-call.json'
+                call.unlink(missing_ok=True)
+                output = self.raw_task('review', 'proj', '5', '--run',
+                                       code=0 if allowed else 1,
+                                       env=dict(self.env, REVIEW_STUB_REPLY=reply))
+                self.assertEqual(call.exists(), allowed)
+                if allowed:
+                    run_prompt = json.loads(call.read_text())['prompt']
+                    self.assertIn(f'Verdict: PASS; head: {head}; trusted: {bool(trusted)}', run_prompt)
+                else:
+                    self.assertIn('run `task check` first', output)
+
     def test_quality_metric_tolerates_missing_old_and_malformed_history(self):
         self.started()
         (self.state() / 'review.json').write_text('{broken')

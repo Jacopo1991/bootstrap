@@ -679,6 +679,9 @@ def save_check_evidence(destination, name, evidence, log):
 
 
 def review_check(task, path, head, record):
+    # Gate and prompt share this rule: a matching trusted check is authoritative,
+    # regardless of advisory timestamps. Otherwise use the newest advisory check
+    # (check.json is replaced on each check; checks.jsonl retains the history).
     for directory in (task_state(task), path / ".work"):
         evidence = read_json_object(directory / "check.json")
         if evidence.get("sha") == head and evidence.get("record_revision") == record.get("revision"):

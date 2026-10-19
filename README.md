@@ -457,9 +457,11 @@ are mutually exclusive, and all review modes refuse in a sandboxed session.
 Before reporting, builders run advisory `task check` from the worktree on the final
 commit and paste its final PASS/FAIL line, including the log path, under `## Check`
 in `.work/report.md`. `review --run` requires a passing check for that head and
-pinned task revision; `--no-check "reason"` records an exception. Review prompts
-include trusted check evidence when available, otherwise advisory evidence, and
-the previous Blocking list and incremental diff on re-review. Blocking findings
+pinned task revision; `--no-check "reason"` records an exception. Both the review
+gate and prompt use the trusted check for that head and revision when present:
+it is authoritative over any advisory check, whatever their order. Without a
+matching trusted check, the newest advisory check counts. Review prompts also
+include the previous Blocking list and incremental diff on re-review. Blocking findings
 must name a requested criterion or concrete defect/regression and a file:line;
 other observations belong in Notes. New non-defect findings on unchanged code
 are Notes on re-review.
