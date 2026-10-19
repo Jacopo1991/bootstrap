@@ -156,6 +156,7 @@ reply = os.environ.get('REVIEW_STUB_REPLY', '')
 if count == 1:
     reply = os.environ.get('REVIEW_STUB_FIRST_REPLY', reply)
 print(reply, end='', flush=True)
+print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
 time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
 sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 """
@@ -3329,6 +3330,9 @@ store.write_text(json.dumps(prs))
         if builder == "claude":
             self.assertEqual(call["git_optional_locks"], "0")
         self.assertEqual((self.state() / "review-response.md").read_text(), reply)
+        self.assertEqual(json.loads((self.state() / "review-run.json").read_text()),
+                         dict(builder='claude' if builder == 'codex' else 'codex',
+                              state='finished', exit_code=0))
         self.assertEqual((self.state() / "review.md").read_text(), reply)
         metadata = json.loads((self.state() / "review.json").read_text())
         self.assertEqual((metadata["reviewer"], metadata["model"]),
@@ -3350,6 +3354,18 @@ store.write_text(json.dumps(prs))
 
     def test_review_run_codex_records_fail_like_manual_record(self):
         self.assert_review_run("claude", "FAIL")
+
+    def test_review_run_records_cli_exit_and_separate_stderr(self):
+        import json
+        self.stub_reviewers()
+        self.raw_task('start', 'proj', '5', '--builder', 'claude')
+        diagnostic = "ERROR: You've hit your usage limit. Try again later.\n"
+        out = self.raw_task('review', 'proj', '5', '--run', code=1,
+                            env=dict(self.env, REVIEW_STUB_STDERR=diagnostic, REVIEW_STUB_EXIT='1'))
+        self.assertIn(diagnostic, out)
+        self.assertEqual((self.state() / 'review-stderr.log').read_text(), diagnostic)
+        self.assertEqual(json.loads((self.state() / 'review-run.json').read_text()),
+                         dict(builder='codex', state='finished', exit_code=1))
 
     def test_review_run_cleans_inherited_environment_before_hook_and_diff(self):
         import json

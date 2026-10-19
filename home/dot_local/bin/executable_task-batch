@@ -12,11 +12,29 @@ from pathlib import Path
 TASK_LINE = re.compile(
     r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
     r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?(?:\b.*)?$")
-LIMIT = re.compile(r"(?i)(?:usage limit|rate[ _-]?limit|quota exceeded|insufficient_quota|"
-                   r"too many requests|you(?:'ve| have) hit your limit)")
-BLOCK = re.compile(r"(?i)(?:blocked by.*(?:hook|policy|sandbox)|(?:hook|sandbox).*"
-                   r"(?:blocked|denied)|operation not permitted|permission denied|"
-                   r"private task state is not writable)")
+# Terminal CLI diagnostics, not words to search for in agent-authored content.
+# Formats checked against installed Codex 0.159.2 / Claude Code 2.1.296.
+CLI_LIMIT = {
+    "codex": re.compile(r"ERROR: (?:You've hit your usage limit(?:\..*| for .+)|quota exceeded|"
+                        r"(?:unexpected status |exceeded retry limit, last status: )"
+                        r"429 Too Many Requests(?:.*))"),
+    "claude": re.compile(r"(?:You've hit your (?:limit|fast limit|monthly spend limit)"
+                         r"(?:[. ·].*)?|API Error: 429(?: .*)?)"),
+}
+HOOK_DENIAL = "Command blocked by PreToolUse hook: "
+
+
+def cli_limit(record, output):
+    """Only a failed, completed CLI run's terminal diagnostic can be a limit."""
+    if record.get("state") != "finished" or record.get("exit_code") != 1:
+        return ""
+    pattern = CLI_LIMIT.get(record.get("builder"))
+    lines = output.rstrip().splitlines()
+    # codex exec emits this after an error when --output-last-message is set.
+    if lines and lines[-1].startswith("Warning: no last agent message; wrote empty content to "):
+        lines.pop()
+    last = lines[-1] if lines else ""
+    return last if pattern and pattern.fullmatch(last) else ""
 
 
 class Stop(Exception):
@@ -114,10 +132,6 @@ class Batch:
             print("+ " + shlex.join(argv), flush=True)
             result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             print(result.stdout, end="", flush=True)
-            # A review's prose can mention a lane's denied command. Only errors from
-            # this command are runner blocks; lane logs are checked for limits only.
-            if LIMIT.search(result.stdout) or (result.returncode and BLOCK.search(result.stdout)):
-                raise Stop(f"{shlex.join(argv)}: {result.stdout.strip()}")
             if not (retry and result.returncode == 3):
                 return result
 
@@ -142,11 +156,28 @@ class Batch:
             (match := re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", report))
             and match[1].strip() for heading in headings))
 
-    def limits(self, *paths):
-        for path in paths:
-            for line in read(path).splitlines():
-                if LIMIT.search(line):
-                    raise Stop(f"{path}: {line}")
+    def lane_outcome(self, work):
+        record = data(work / "lane.json")
+        limit = cli_limit(record, read(work / "lane.log"))
+        if limit:
+            raise Stop(f"lane CLI: {limit}")
+        # Tool denials in the transcript can be recovered from. Only an explicit
+        # terminal outcome (or the exact denial in the final reply) stops us.
+        if record.get("state") in {"hook_blocked", "sandbox_blocked"}:
+            raise Stop(f"lane: {record['state']}")
+        if record.get("state") == "finished":
+            for line in read(work / "final.md").splitlines():
+                if line.startswith(HOOK_DENIAL):
+                    raise Stop(f"lane: {line}")
+
+    def reviewer_outcome(self, state):
+        record = data(state / "review-run.json")
+        # Claude -p writes its terminal error to stdout; Codex uses stderr.
+        output = state / ("review-response.md" if record.get("builder") == "claude"
+                          else "review-stderr.log")
+        limit = cli_limit(record, read(output))
+        if limit:
+            raise Stop(f"reviewer CLI: {limit}")
 
     def task(self, task):
         ident, box = task["id"], task["box"]
@@ -176,7 +207,7 @@ class Batch:
         # Never launch a duplicate lane or overwrite the prompt of a running lane.
         if resumed:
             self.require("wait", ident, "--max", box, retry=True)
-            self.limits(work / "lane.log", work / "final.md")
+            self.lane_outcome(work)
         run_lane = not resumed or not self.finished(path, record)
         if resumed and run_lane:
             findings = blocking(read(state / "review.md")) or "Unfinished work: finish and commit."
@@ -192,7 +223,7 @@ class Batch:
                 (work / "prompt.md").write_text(prompt + "\n")
                 self.require("lane", ident, "--builder", builder, "--model", model, "--timeout", box)
                 self.require("wait", ident, "--max", box, retry=True)
-                self.limits(work / "lane.log", work / "final.md")
+                self.lane_outcome(work)
             if time.monotonic() - started >= 3 * box * 60:
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             record = data(state / "task.json")
@@ -209,7 +240,7 @@ class Batch:
                     review = {}
                     for _ in range(2):
                         result = self.call("review", ident, "--run")
-                        self.limits(state / "review-response.md")
+                        self.reviewer_outcome(state)
                         candidate = data(state / "review.json")
                         if (result.returncode == 0 and candidate.get("commit") == git(path, "rev-parse", "HEAD")
                                 and candidate.get("record_revision") == record.get("revision")

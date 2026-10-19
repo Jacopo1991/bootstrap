@@ -71,8 +71,11 @@ elif cmd == 'lane':
     record = json.loads((state / 'task.json').read_text())
     record['builder'] = options[options.index('--builder') + 1]
     save(state / 'task.json', record)
-    save(work / 'lane.json', dict(state=entry.get('state', 'succeeded')))
+    save(work / 'lane.json', dict(state=entry.get('state', 'finished'),
+         builder=record['builder'], exit_code=entry.get('exit_code', 0)))
     (work / 'lane.log').write_text(entry.get('log', ''))
+    (work / 'final.md').write_text(entry.get('final', ''))
+    (work / 'check.log').write_text(entry.get('check_log', ''))
     if not entry.get('unfinished'):
         (wt / 'result').write_text(str(index))
         git(wt, 'add', 'result')
@@ -83,6 +86,9 @@ elif cmd == 'lane':
 elif cmd == 'wait':
     print('interrupted')
 elif cmd == 'review':
+    save(state / 'review-run.json', dict(state='finished', builder=entry.get('builder', 'claude'),
+         exit_code=entry.get('exit_code', 0)))
+    (state / 'review-stderr.log').write_text(entry.get('stderr', ''))
     if entry.get('corrupt'):
         (state / 'review.json').write_text('{invalid')
     elif not entry.get('missing'):
@@ -268,21 +274,77 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(len(self.calls('lane')), 2)
 
     def test_usage_limit_in_lane_stops(self):
-        self.scenario({'lane': [{'log': 'You have hit your usage limit'}]})
+        self.scenario({'lane': [{'exit_code': 1, 'log': "ERROR: You've hit your usage limit. Try again later."}]})
         self.assertIn('batch: stopped:', self.run_batch(1))
         self.assertFalse(self.calls('check'))
 
     def test_review_limit_stops(self):
-        self.scenario({'review': [{'reply': 'rate_limit_exceeded'}]})
+        self.scenario({'review': [{'exit_code': 1, 'reply': "You've hit your limit · resets 5pm (UTC)"}]})
         self.assertIn('batch: stopped:', self.run_batch(1))
+
+    def test_codex_reviewer_limit_stops(self):
+        self.scenario({'review': [{'exit_code': 1, 'builder': 'codex',
+                                  'stderr': "ERROR: You've hit your usage limit. Try again later."}]})
+        self.assertIn('batch: stopped: reviewer CLI:', self.run_batch(1))
+
+    def test_claude_lane_limit_stops(self):
+        self.source.write_text(self.source.read_text().replace('codex', 'claude').replace('gpt-6-luna', 'sonnet'))
+        self.scenario({'lane': [{'exit_code': 1, 'log': "You've hit your limit · resets 5pm (UTC)"}]})
+        self.assertIn('batch: stopped: lane CLI:', self.run_batch(1))
+
+    def test_limit_mentions_in_transcripts_review_and_commands_do_not_stop(self):
+        mention = 'Discuss rate limit and usage limit handling'
+        self.scenario({'lane': [{'log': mention, 'final': mention}],
+                       'review': [{'reply': mention, 'output': mention}],
+                       'check': [{'output': mention}], 'merge': [{'output': mention}]})
+        self.assertIn('batch: finished', self.run_batch())
+
+    def test_failed_cli_transcript_is_not_a_terminal_limit(self):
+        self.scenario({'lane': [{'exit_code': 1,
+                                'log': "ERROR: You've hit your usage limit.\nOther terminal failure"}],
+                       'review': [{'exit_code': 1, 'reply': 'Review mentions rate limit'}]})
+        self.assertIn('batch: finished', self.run_batch())
+
+    def test_successful_cli_quoting_exact_limit_error_does_not_stop(self):
+        self.scenario({'lane': [{'log': "ERROR: You've hit your usage limit."}],
+                       'review': [{'reply': "You've hit your limit · resets 5pm (UTC)"}]})
+        self.assertIn('batch: finished', self.run_batch())
 
     def test_lane_hook_feedback_does_not_stop_batch(self):
         self.scenario({'lane': [{'log': 'blocked by policy hook'}]})
         self.assertIn('batch: finished', self.run_batch())
 
-    def test_required_command_block_records_exact_command(self):
-        self.scenario({'check': [{'code': 1, 'output': 'blocked by policy hook'}]})
-        self.assertIn(f'task check {self.repo} one: blocked by policy hook', self.run_batch(1))
+    def test_check_permission_denied_enters_fix_round(self):
+        self.scenario({'lane': [{'check_log': 'Permission denied: test fixture'}, {}],
+                       'check': [{'code': 1, 'output': 'check failed; see check.log'}, {}]})
+        self.assertIn('merged after 1 fix rounds', self.run_batch())
+        self.assertIn('Permission denied', self.prompts()[1]['prompt'])
+
+    def test_merge_hook_and_limit_text_enters_fix_round(self):
+        self.scenario({'merge': [{'code': 1, 'output': 'blocked by policy hook; rate limit test failed'}, {}]})
+        self.assertIn('merged after 1 fix rounds', self.run_batch())
+
+    def test_exact_final_hook_denial_stops(self):
+        self.scenario({'lane': [{'final': 'Command blocked by PreToolUse hook: required git command'}]})
+        self.assertIn('batch: stopped: lane: Command blocked by PreToolUse hook:', self.run_batch(1))
+        self.assertFalse(self.calls('check'))
+
+    def test_structured_sandbox_block_stops(self):
+        self.scenario({'lane': [{'state': 'sandbox_blocked'}]})
+        self.assertIn('batch: stopped: lane: sandbox_blocked', self.run_batch(1))
+
+    def test_terminal_cli_diagnostics(self):
+        record = dict(builder='codex', state='finished', exit_code=1)
+        diagnostic = "ERROR: You've hit your usage limit. Try again later."
+        self.assertEqual(batch_module.cli_limit(record, diagnostic + '\nWarning: no last agent message; wrote empty content to /tmp/final.md\n'), diagnostic)
+        self.assertFalse(batch_module.cli_limit(dict(record, state='timed_out'), diagnostic))
+        self.assertFalse(batch_module.cli_limit(dict(record, exit_code=0), diagnostic))
+        self.assertTrue(batch_module.cli_limit(record,
+                                              'ERROR: exceeded retry limit, last status: 429 Too Many Requests'))
+        self.assertFalse(batch_module.cli_limit(record,
+                                               'ERROR: exceeded retry limit, last status: 500 Internal Server Error'))
+        self.assertTrue(batch_module.cli_limit(dict(record, builder='claude'),
+                                              'API Error: 429 {"error":{"type":"rate_limit_error"}}'))
 
     def test_unexpected_exception_writes_final_line(self):
         self.scenario({'review': [{'corrupt': True}]})

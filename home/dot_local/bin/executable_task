@@ -2332,21 +2332,32 @@ def run_reviewer(command, path, prompt_file, reply_file):
     if argv[0] == "GIT_OPTIONAL_LOCKS=0":
         env["GIT_OPTIONAL_LOCKS"] = "0"
         argv.pop(0)
+    run_file = reply_file.with_name("review-run.json")
+    stderr_file = reply_file.with_name("review-stderr.log")
+    run = {"builder": argv[0], "state": "running", "exit_code": None}
+    atomic_json(run_file, run)
     try:
-        with prompt_file.open() as prompt, reply_file.open("w") as reply:
+        with prompt_file.open() as prompt, reply_file.open("w") as reply, stderr_file.open("w") as errors:
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
-                                       start_new_session=True)
+                                       stderr=errors, start_new_session=True)
             try:
                 code = process.wait(timeout=timeout)
+                run.update(state="finished", exit_code=code)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 process.wait()
+                run.update(state="timed_out")
                 raise Stop(f"Reviewer timed out after {timeout}s; no review recorded. Reply: {reply_file}")
     except OSError as error:
+        run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
+    finally:
+        atomic_json(run_file, run)
+        if stderr_file.is_file():
+            print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
         raise Stop(f"Reviewer exited with status {code}; no review recorded. Reply: {reply_file}")
 
