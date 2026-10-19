@@ -36,6 +36,8 @@ it keeps the builders sandboxed, including when the runner itself uses bypass.
 import argparse
 import contextlib
 from contextlib import contextmanager
+from contextvars import ContextVar
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -59,6 +61,8 @@ HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
 CHECK_TIMEOUT = int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
+GATE_SLOT = ContextVar("gate_slot", default=None)
+GATE_PORT_INDEXES = 227  # 20000 + 200 * 226 + 199 stays below 65536
 SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|error)|"
                      r"Tests?:? .*\b(passed|failed)|\d+ (passed|failed)|.*\b(PASS|FAIL)\b)")
 # Ignored paths a merged worktree may hold and still be removed: .work (preserved separately),
@@ -765,76 +769,195 @@ def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     return values.get("exclusive_gate", not advisory) is True
 
 
+def gate_slots():
+    config = Path.home() / ".config/task/gate.toml"
+    try:
+        count = tomllib.loads(config.read_text()).get("slots", 3) if config.exists() else 3
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Stop(f"Cannot read {config}: {error}")
+    if type(count) is not int or count < 1:
+        raise Stop(f"{config}: slots must be a positive integer")
+    return count
+
+
+def gate_paths(name):
+    root = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    stem = "agent-task-gate" if name == "slot-0" else f"agent-task-gate-{name}"
+    return root / (stem + ".lock"), root / (stem + ".holder")
+
+
+def gate_holders():
+    root = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    holders = []
+    for lock in sorted(root.glob("agent-task-gate*.lock")):
+        try:
+            pid = gate_holder_pid(lock)
+            if pid is None:
+                continue
+            try:
+                record = json.loads(lock.with_suffix(".holder").read_text())
+            except (OSError, ValueError):
+                record = {}
+            name = lock.stem.removeprefix("agent-task-gate-") if lock.stem != "agent-task-gate" else "slot-0"
+            holders.append((name, pid, record.get("repo", "?"), record.get("task", "?"), record.get("since", "?")))
+        except OSError:
+            continue
+    return holders
+
+
 @contextmanager
 def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=None):
-    """Serialize gates across the host and Codex sandboxes sharing /tmp."""
-    allow_unavailable = silent_unavailable or not exclusive_gate_enabled(
-        config_path if config_path is not None else task.repo, advisory=True)
-    unlocked_notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
-    gate_dir = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
-    lock_path = gate_dir / "agent-task-gate.lock"
-    holder_path = gate_dir / "agent-task-gate.holder"
-    try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
-    except OSError as error:
-        if allow_unavailable:
-            print(f"Cannot open shared gate lock: {error}; {unlocked_notice}.", flush=True)
-            yield
-            return
-        raise Stop(f"Cannot open shared gate lock: {error}")
-    holder_record = None
-    try:
-        waiting = False
-        deadline = time.monotonic() + GATE_LOCK_WAIT * 60
-        while True:
+    """Hold sorted resources and either one slot or the whole machine."""
+    path = config_path if config_path is not None else task.repo
+    if not exclusive_gate_enabled(path):
+        yield
+        return
+    config = path / ".task.toml"
+    values = tomllib.loads(config.read_text()) if config.exists() else {}
+    resources = values.get("gate_resources", [])
+    if not isinstance(resources, list) or any(
+            not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
+            for name in resources):
+        raise Stop("gate_resources must be a list of resource names (letters, digits, _ or -)")
+    count = gate_slots()
+    exclusive = values.get("exclusive_gate") is True
+    groups = [[f"resource-{name}"] for name in sorted(set(resources))]
+    slots = [f"slot-{number}" for number in range(count)]
+    groups.extend([[name] for name in slots] if exclusive else [slots])
+    # A gate whose isolation is required (whole machine, or named resources) must not run
+    # unlocked; only a plain one-slot gate may degrade to an unlocked run with a notice.
+    allow_unavailable = silent_unavailable or not (exclusive or resources)
+    notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
+    acquired = []
+    held_slot = None
+    metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id, "repo": task.repo.name}
+
+    def release():
+        nonlocal held_slot
+        held_slot = None
+        while acquired:
+            descriptor, holder = acquired.pop()
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
+                holder.unlink(missing_ok=True)
+            except OSError:
+                pass
+            os.close(descriptor)
+
+    deadline = time.monotonic() + GATE_LOCK_WAIT * 60
+    previous = None
+    try:
+        while True:
+            stage = "open"
+            try:
+                blocked = False
+                for alternatives in groups:
+                    for name in alternatives:
+                        lock, holder = gate_paths(name)
+                        stage = "open"
+                        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
+                        try:
+                            stage = "acquire"
+                            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            os.close(descriptor)
+                            continue
+                        except BaseException:
+                            os.close(descriptor)
+                            raise
+                        acquired.append((descriptor, holder))
+                        if held_slot is None and name in slots:
+                            held_slot = slots.index(name)
+                        try:
+                            atomic_json(holder, metadata)
+                        except OSError:
+                            pass
+                        break
+                    else:
+                        blocked = True
+                        break
+                if not blocked:
+                    break
+                # Never wait with a partial allocation: exclusive gates cannot
+                # deadlock each other or gates acquiring named resources.
+                release()
+                holders = [row for row in gate_holders() if not row[0].startswith("noslot-")]
                 if time.monotonic() >= deadline:
-                    try:
-                        holder = json.loads(holder_path.read_text()) if gate_holder_alive(lock_path) else {}
-                    except (OSError, ValueError):
-                        holder = {}
-                    print(f"gate busy: held by {holder.get('repo', '?')}/{holder.get('task', '?')} "
-                          f"since {holder.get('since', '?')}", file=sys.stderr, flush=True)
+                    detail = "; ".join(f"{repo}/{task_id} since {since}" for _, _, repo, task_id, since in holders)
+                    print(f"gate busy: held by {detail or 'another gate (holder details unavailable)'}",
+                          file=sys.stderr, flush=True)
                     raise SystemExit(3)
-                if not waiting:
-                    waiting = True
-                    try:
-                        holder_record = json.loads(holder_path.read_text())
-                        detail = (f"task {holder_record['task']} in {holder_record['repo']}, "
-                                  f"pid {gate_holder_pid(lock_path)} since {holder_record['since']}")
-                    except (OSError, KeyError, json.JSONDecodeError, TypeError):
-                        detail = "another gate (holder details unavailable)"
-                    print(f"Waiting for exclusive task gate held by {detail}.", flush=True)
+                if holders != previous:
+                    detail = "; ".join(f"task {task_id} in {repo}, pid {pid} since {since} ({name})"
+                                       for name, pid, repo, task_id, since in holders)
+                    print(f"Waiting for exclusive task gate held by {detail or 'another gate (holder details unavailable)'}.", flush=True)
+                    previous = holders
                 time.sleep(0.1)
             except OSError as error:
-                if allow_unavailable:
-                    print(f"Cannot acquire shared gate lock: {error}; {unlocked_notice}.", flush=True)
-                    os.close(descriptor)
-                    descriptor = None
-                    yield
-                    return
-                raise Stop(f"Cannot acquire shared gate lock: {error}")
-        metadata = {"pid": os.getpid(), "since": utc_now(), "task": task.id,
-                    "repo": task.repo.name}
+                release()
+                message = f"Cannot {stage} shared gate lock: {error}"
+                if not allow_unavailable:
+                    raise Stop(message)
+                print(f"{message}; {notice}.", flush=True)
+                break
+        # Only a slot lock actually held sets the slot; resource names never do.
+        token = GATE_SLOT.set(held_slot)
         try:
-            atomic_json(holder_path, metadata)
-            holder_record = metadata
-        except OSError:
-            holder_record = None
-        yield
+            yield
+        finally:
+            GATE_SLOT.reset(token)
     finally:
-        if holder_record and holder_record.get("pid") == os.getpid():
+        release()
+
+
+@contextmanager
+def gate_port_index(path: Path):
+    """Yield the held slot, or reserve an index above the slots for a run that holds none."""
+    slot = GATE_SLOT.get()
+    if slot is not None:
+        yield slot
+        return
+    count = gate_slots()
+    try:
+        repo = main_repo(path).name
+    except Stop:
+        repo = path.name
+    metadata = {"pid": os.getpid(), "since": utc_now(), "task": path.name, "repo": repo}
+    try:
+        for index in range(count, GATE_PORT_INDEXES):
+            lock, holder = gate_paths(f"noslot-{index - count}")
+            descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
             try:
-                current = json.loads(holder_path.read_text())
-                if current.get("pid") == os.getpid():
-                    holder_path.unlink(missing_ok=True)
-            except (OSError, json.JSONDecodeError, AttributeError):
-                pass
-        if descriptor is not None:
-            os.close(descriptor)
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(descriptor)
+                continue
+            except BaseException:
+                os.close(descriptor)
+                raise
+            break
+        else:
+            raise Stop(f"No free gate port range: indexes {count}-{GATE_PORT_INDEXES - 1} are all in use.")
+    except OSError as error:
+        # Without a usable gate directory, two runs cannot share a reserved index, so each
+        # derives its own index above the slots from its process id.
+        span = max(1, GATE_PORT_INDEXES - count - 1)
+        index = count + 1 + os.getpid() % span
+        print(f"Cannot reserve a gate port range: {error}; using unreserved index {index} "
+              f"derived from process id {os.getpid()}.", flush=True)
+        yield index
+        return
+    try:
+        try:
+            atomic_json(holder, metadata)
+        except OSError:
+            pass
+        yield index
+    finally:
+        try:
+            holder.unlink(missing_ok=True)
+        except OSError:
+            pass
+        os.close(descriptor)
 
 
 def gate_holder_alive(lock_path):
@@ -1767,8 +1890,26 @@ def start(args):
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-              advisory=False):
-    """Run the repository's gate in <path>; return True when it passes."""
+              advisory=False, pre_commit_all_files=False):
+    if advisory:
+        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True)
+    temporary_root = path / ".work/tmp"
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="gate-", dir=temporary_root) as temporary, \
+            gate_port_index(path) as slot:
+        environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
+                       "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
+        return run_check_steps(path, base, record, state, evidence_name, display_log,
+                               gate_environment=environment, pre_commit_all_files=pre_commit_all_files)
+
+
+def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
+                    advisory=False, gate_environment=None, pre_commit_all_files=False):
+    """Run the repository's gate in <path>; return True when it passes.
+
+    pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
+    has no base) it checks every file instead of being skipped.
+    """
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
@@ -1788,8 +1929,11 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         steps = [["just", "check"]]
         if record:
             steps.extend([["bash", "-c", command] for command in record.get("verify", [])])
-        if (path / ".pre-commit-config.yaml").exists() and base:
-            steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
+        if (path / ".pre-commit-config.yaml").exists():
+            if pre_commit_all_files:
+                steps.append(["pre-commit", "run", "--all-files"])
+            elif base:
+                steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
         for step in steps:
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
@@ -1797,6 +1941,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             private_index_directory = None
             try:
                 child_env = check_step_environment(run_id)
+                child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
@@ -1903,7 +2048,7 @@ def check(args):
     if advisory:
         with advisory_check_lock(path):
             if exclusive_gate_enabled(path, advisory=True):
-                with exclusive_gate_lock(task, silent_unavailable=True):
+                with exclusive_gate_lock(task, silent_unavailable=True, config_path=path):
                     passed = run_check(path, base, record, None, advisory=True)
             else:
                 passed = run_check(path, base, record, None, advisory=True)
@@ -3115,6 +3260,9 @@ def status(args):
     active = boost_line()
     if active:
         print(active)
+    print(f"Gate slots: {gate_slots()}")
+    for name, pid, repo, task_id, since in gate_holders():
+        print(f"gate {name}: pid {pid}, {repo}/{task_id}, since {since}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
@@ -3403,9 +3551,8 @@ def prune_archive(repo, dry_run=False):
         if item != root:
             allocated[item.parent] = allocated.get(item.parent, 0) + allocated[item]
     # Temporary snapshots are handled whole, before finished-archive filtering.
-    lock_path = Path(os.environ.get('TASK_GATE_DIR', '/tmp')) / 'agent-task-gate.lock'
     try:
-        live_gate = gate_holder_alive(lock_path)
+        live_gate = bool(gate_holders())
     except FileNotFoundError:
         live_gate = False
     temporary, freed, finishing = set(), 0, {}
@@ -3632,11 +3779,82 @@ def wait_task(args):
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
+def gate_drill(args):
+    """Measure real cross-repository clashes without consuming gate slots."""
+    repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
+    archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
+    archive.mkdir(parents=True)
+    worktrees = []
+
+    def prepare(repo, index, phase):
+        parent = repo / ".worktrees"
+        parent.mkdir(exist_ok=True)
+        path = parent / f".task-drill-{archive.name}-{index}-{phase}"
+        base, _ = base_commit(repo, default_branch(repo))
+        git(repo, "worktree", "add", "-q", "--detach", str(path), base)
+        worktrees.append((repo, path))
+        prepare_environment(repo, path)
+        return path
+
+    def measure(path, index, phase):
+        # Drill runs hold no slot; run_check reserves a free port index above the slots.
+        # The full default gate runs: `just check`, then pre-commit over all files when the
+        # repository has a pre-commit config (a drill has no base range to check).
+        token = GATE_SLOT.set(None)
+        started = time.monotonic()
+        try:
+            passed = run_check(path, "", state=archive / f"{index}-{phase}",
+                               evidence_name="drill-check.json", pre_commit_all_files=True)
+            return {"result": "passed" if passed else "failed",
+                    "duration": round(time.monotonic() - started, 3)}
+        except (Stop, OSError) as error:
+            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
+                    "error": str(error)}
+        finally:
+            log = path / ".work/check.log"
+            if log.is_file():
+                destination = archive / f"{index}-{phase}"
+                destination.mkdir(exist_ok=True)
+                shutil.copy2(log, destination / "check.log")
+            GATE_SLOT.reset(token)
+
+    rows = []
+    try:
+        paths = [prepare(repo, index, "concurrent") for index, repo in enumerate(repos)]
+        with ThreadPoolExecutor(max_workers=len(repos)) as pool:
+            futures = [pool.submit(measure, path, index, "concurrent")
+                       for index, path in enumerate(paths)]
+            concurrent = [future.result() for future in futures]
+        for index, (repo, result) in enumerate(zip(repos, concurrent)):
+            row = {"repo": repo.name, "concurrent": result, "solo": None, "verdict": "ok"}
+            if result["result"] != "passed":
+                row["solo"] = measure(prepare(repo, index, "solo"), index, "solo")
+                row["verdict"] = "clash" if row["solo"]["result"] == "passed" else "failing-alone"
+            rows.append(row)
+        table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
+        for row in rows:
+            def cell(result):
+                return f"{result['result']} ({result['duration']})" if result else "-"
+            table.append(f"{row['repo']} | {cell(row['concurrent'])} | {cell(row['solo'])} | {row['verdict']}")
+        atomic_json(archive / "results.json", rows)
+        (archive / "results.txt").write_text("\n".join(table) + "\n")
+        print("\n".join(table), flush=True)
+        print(f"Drill evidence: {archive}")
+        return int(any(row["verdict"] != "ok" for row in rows))
+    finally:
+        for repo, path in reversed(worktrees):
+            result = run_git(repo, "worktree", "remove", "--force", str(path))
+            if result.returncode:
+                raise Stop(f"Cannot remove drill worktree {path}: {result.stderr}")
+
+
 def main(argv=None):
     global ACTIVE_FOREGROUND_TASK
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    sub = commands.add_parser("gate-drill", help="PM-only concurrent full-gate clash drill")
+    sub.add_argument("repos", nargs="+")
     for name in ("start", "lane", "merge", "close", "review", "cancel", "wait"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
@@ -3719,7 +3937,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign", "runner-start"} or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign", "runner-start", "gate-drill"} or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -3771,7 +3989,8 @@ def main(argv=None):
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost}[args.command](args) or 0
+                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost,
+                      "gate-drill": gate_drill}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"
