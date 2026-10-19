@@ -24,6 +24,14 @@ CLI_LIMIT = {
 }
 HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
                "Execution stopped by PreToolUse hook")
+BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end your final reply "
+                     "with a line starting `BLOCKED:` and the denied command.")
+
+
+def terminal_block(output):
+    lines = [line for line in output.splitlines() if line.strip()]
+    last = lines[-1] if lines else ""
+    return last if last.startswith(("BLOCKED:", *HOOK_DENIAL)) else ""
 
 
 def cli_limit(record, output):
@@ -167,14 +175,9 @@ class Batch:
         limit = cli_limit(record, read(work / "lane.log"))
         if limit:
             raise Stop(f"lane CLI: {limit}")
-        # Tool denials in the transcript can be recovered from. Only an explicit
-        # terminal outcome (or the exact denial in the final reply) stops us.
-        if record.get("state") in {"hook_blocked", "sandbox_blocked"}:
-            raise Stop(f"lane: {record['state']}")
-        if record.get("state") == "finished":
-            for line in read(work / "final.md").splitlines():
-                if line.startswith(HOOK_DENIAL):
-                    raise Stop(f"lane: {line}")
+        denied = terminal_block(read(work / "final.md"))
+        if denied:
+            raise Stop(f"lane: {denied}")
 
     def reviewer_outcome(self, state):
         record = data(state / "review-run.json")
@@ -184,6 +187,9 @@ class Batch:
         limit = cli_limit(record, read(output))
         if limit:
             raise Stop(f"reviewer CLI: {limit}")
+        denied = terminal_block(read(state / "review-response.md"))
+        if denied:
+            raise Stop(f"reviewer: {denied}")
 
     def task(self, task):
         ident, box = task["id"], task["box"]
@@ -226,7 +232,7 @@ class Batch:
                 if rounds or findings:
                     prompt += ("\n\nFix round: re-measure, run the tests, finish and commit.\n"
                                f"Blocking findings:\n{findings}\nFailing check output tail:\n{check_tail}\n")
-                (work / "prompt.md").write_text(prompt + "\n")
+                (work / "prompt.md").write_text(prompt + "\n\n" + BLOCK_INSTRUCTION + "\n")
                 self.require("lane", ident, "--builder", builder, "--model", model, "--timeout", box)
                 self.require("wait", ident, "--max", box, retry=True)
                 self.lane_outcome(work)
@@ -236,6 +242,9 @@ class Batch:
             if not self.finished(path, record):
                 findings, signature = "Unfinished work: re-measure, test, finish and commit.", None
             else:
+                # PM decision (round 5, .work/request.md): trusted task command
+                # output is never a block signal; check/merge failures get fixes.
+                # Only lane final.md and the reviewer's own reply are inspected.
                 checked = self.call("check", ident, retry=True)
                 if checked.returncode:
                     check_tail = "\n".join((read(work / "check.log") or checked.stdout).splitlines()[-80:])
@@ -245,7 +254,7 @@ class Batch:
                     check_tail = ""
                     review = {}
                     for _ in range(2):
-                        result = self.call("review", ident, "--run")
+                        result = self.call("review", ident, "--run", "--append-prompt", BLOCK_INSTRUCTION)
                         self.reviewer_outcome(state)
                         candidate = data(state / "review.json")
                         if (result.returncode == 0 and candidate.get("commit") == git(path, "rev-parse", "HEAD")

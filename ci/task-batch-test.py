@@ -139,10 +139,16 @@ class BatchTest(unittest.TestCase):
         (self.home / 'scenario.json').write_text(json.dumps(value))
 
     def run_batch(self, code=0):
+        prior_prompts = len(self.prompts()) if (self.home / 'prompts.jsonl').exists() else 0
         result = subprocess.run([sys.executable, str(TOOL), 'proj', str(self.source)],
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         self.assertFalse((self.home / 'overlap').exists())
+        prompts = self.prompts() if (self.home / 'prompts.jsonl').exists() else []
+        for prompt in prompts[prior_prompts:]:
+            self.assertTrue(prompt['prompt'].endswith(batch_module.BLOCK_INSTRUCTION + '\n'))
+        for call in self.calls('review'):
+            self.assertEqual(call[-2:], ['--append-prompt', batch_module.BLOCK_INSTRUCTION])
         return (self.repo / '.work/runner-test.done').read_text()
 
     def calls(self, command=None):
@@ -336,9 +342,32 @@ class BatchTest(unittest.TestCase):
         self.assertIn('batch: stopped: lane: Command blocked by PreToolUse hook:', self.run_batch(1))
         self.assertFalse(self.calls('check'))
 
-    def test_structured_sandbox_block_stops(self):
-        self.scenario({'lane': [{'state': 'sandbox_blocked'}]})
-        self.assertIn('batch: stopped: lane: sandbox_blocked', self.run_batch(1))
+    def test_lane_final_blocked_stops(self):
+        self.scenario({'lane': [{'final': 'Could not finish.\nBLOCKED: git commit\n\n  \n'}]})
+        self.assertIn('batch: stopped: lane: BLOCKED: git commit', self.run_batch(1))
+        self.assertFalse(self.calls('check'))
+
+    def test_reviewer_final_blocked_stops(self):
+        self.scenario({'review': [{'reply': 'Could not review.\nBLOCKED: git show\n\n  \n'}]})
+        self.assertIn('batch: stopped: reviewer: BLOCKED: git show', self.run_batch(1))
+        self.assertFalse(self.calls('merge'))
+        self.assertEqual(len(self.calls('review')), 1)
+
+    def test_reviewer_final_hook_denial_stops(self):
+        self.scenario({'review': [{'reply': 'Review failed.\nExecution stopped by PreToolUse hook\n'}]})
+        self.assertIn('batch: stopped: reviewer: Execution stopped by PreToolUse hook', self.run_batch(1))
+        self.assertFalse(self.calls('merge'))
+
+    def test_block_signal_mid_text_does_not_stop(self):
+        reply = 'BLOCKED: git show\nBlocked by PreToolUse hook\nRecovered and finished.\n'
+        self.scenario({'lane': [{'final': reply}], 'review': [{'reply': reply}]})
+        self.assertIn('one: merged', self.run_batch())
+
+    def test_trusted_command_block_marker_enters_fix_round(self):
+        self.scenario({'check': [{'code': 1, 'output': 'BLOCKED: test fixture'}, {}],
+                       'merge': [{'code': 1, 'output': 'Command blocked by PreToolUse hook: fixture'}, {}],
+                       'review': [{'output': 'BLOCKED: wrapper output is not reviewer output'}]})
+        self.assertIn('merged after 2 fix rounds', self.run_batch())
 
     def test_claude_final_hook_denials(self):
         work = self.home / 'hook-outcome'

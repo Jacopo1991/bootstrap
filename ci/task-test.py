@@ -3306,6 +3306,14 @@ store.write_text(json.dumps(prs))
         self.assertIn("`just` is not installed", out)
         self.assertNotIn("no `just sync` recipe", out)
 
+    def test_review_appends_instruction_to_generated_prompt(self):
+        self.started()
+        instruction = "If a hook or sandbox denial stops a required step, end your final reply with a line starting `BLOCKED:` and the denied command."
+        self.raw_task("review", "proj", "5", "--append-prompt", instruction)
+        prompt = (self.state() / "review-prompt.md").read_text()
+        self.assertTrue(prompt.endswith(instruction + "\n"))
+        self.assertIn("Verdict: PASS|FAIL", prompt)
+
     def test_review_prints_claude_headless_command_and_persisted_prompt(self):
         wt, _ = self.started()
         out = self.raw_task("review", "proj", "5")

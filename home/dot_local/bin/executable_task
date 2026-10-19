@@ -13,7 +13,7 @@ Write capability there determines trust; vendor environment markers do not.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
-  task review <repo> <id> [--request <file>] [--run | --record <file>] [--reviewer <vendor> <model>]
+  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--reviewer <vendor> <model>]
   task merge <repo> <id> [--keep] [--override <reason>] [--detach] [--lock-wait <minutes>]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
@@ -2440,6 +2440,8 @@ def review(args):
             "Blocking finding must identify its criterion or the breakage. Put all other "
             "observations under Notes."
         )
+        if args.append_prompt:
+            prompt.append(args.append_prompt)
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)
@@ -3905,6 +3907,7 @@ def main(argv=None):
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
+            sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
     sub = commands.add_parser("boost")
