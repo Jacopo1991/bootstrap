@@ -212,6 +212,55 @@ class TaskTool(unittest.TestCase):
         (self.kb / 'backlog/decisions/new.md').write_text('Replaced by decision-2\n')
         self.assertIn('decisions changed:', self.task('plan', 'proj'))
 
+    def test_decision_inline_replacement_hsh_history(self):
+        # Copied before/after lines from HSH d65ee46, decision-22.
+        old = (
+            '- **v1 category:** electricity only. Phone, internet, subscriptions, weather as a product and device advice wait until the pilot has passed. Existing phone code stays as it is, with no new work.\n'
+            "- **Pilot:** first the founder's own household for 2 weeks as acceptance, then 3 invited households for 4 weeks.\n"
+        )
+        new = (
+            '- **v1 category:** electricity only. *Replaced 2026-10-18 by decision-24: electricity first, then phone, then internet.* Phone, internet, subscriptions, weather as a product and device advice wait until the pilot has passed. Existing phone code stays as it is, with no new work.\n'
+            "- **Pilot:** first the founder's own household for 2 weeks as acceptance, then 3 invited households for 4 weeks. *Replaced 2026-10-18 by decision-24: founder household (with his wife) only until three categories pass.*\n"
+        )
+        name = 'backlog/decisions/decision-22.md'
+        (self.kb / 'backlog/decisions').mkdir()
+        self.commit_in(self.kb, name, old)
+        self.task('plan', 'proj', '--sign')
+        (self.kb / name).write_text(new)
+        self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
+        self.git(self.kb, 'add', name)
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'replacement'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
+        for changed in (new.replace('electricity only.', 'electricity first.'),
+                        new.replace('Phone, internet,', 'Phone,  internet,'),
+                        new.replace('Existing phone code stays as it is, with no new work.', '')):
+            with self.subTest(changed=changed):
+                self.assertFalse(TASK_MODULE.decision_status_only(old, changed))
+
+    def test_decision_marker_fragments_preserve_exact_content(self):
+        old = 'Keep the data.'
+        for marker in ('*Replaced 2026-10-18 by decision-24: new scope.*',
+                       '(replaced by decision-24)', 'Replaced by decision-24',
+                       '*rEpLaCeD by decision-24*'):
+            for new in (f'{marker} {old}', f'Keep {marker} the data.',
+                        f'{old} {marker}', f'~~Keep~~ {marker} the ~~data.~~',
+                        f'{old}\n{marker}\n', f'{marker} {old} {marker}'):
+                with self.subTest(new=new):
+                    self.assertTrue(TASK_MODULE.decision_status_only(old, new))
+            self.assertFalse(TASK_MODULE.decision_status_only(old, marker))
+        for added in ('Replaced by decision-24 and delete the data.',
+                      '*Replaced by decision-24* new policy',
+                      '(replaced by decision-24) new policy',
+                      'Replaced arbitrary prose', '~~new policy~~', ''):
+            with self.subTest(added=added):
+                self.assertFalse(TASK_MODULE.decision_status_only(old, old + '\n' + added + '\n'))
+        existing = old + ' *Replaced by decision-2*'
+        self.assertTrue(TASK_MODULE.decision_status_only(existing, existing + ' (replaced by decision-3)'))
+        self.assertFalse(TASK_MODULE.decision_status_only(existing, old))
+        self.assertFalse(TASK_MODULE.decision_status_only(
+            old, 'Keep  *Replaced by decision-2* the data.'))
+
     def test_gate_handoff_failed_metadata_write(self):
         task = TASK_MODULE.Task(self.repo, '5')
         with mock.patch.dict(os.environ, self.env):

@@ -420,14 +420,44 @@ def decision_content(text):
     return result
 
 
+REPLACEMENT_MARKER = re.compile(
+    r"\*Replaced\b[^*]*\*|\(replaced\b[^)]*\)|Replaced by decision-\d+\b", re.I)
+
+
+def decision_line_status_only(old, new):
+    """Remove inserted markers, preserving all original text and spacing."""
+    if new == old:
+        return True
+    new = re.sub(r"~~(.+?)~~", r"\1", new)
+    # Keep existing markers intact. Each inserted fragment may include one
+    # separating space on either side; never normalize the surrounding prose.
+    positions = {(0, 0)}
+    seen = set()
+    while positions:
+        before, after = positions.pop()
+        if (before, after) in seen:
+            continue
+        seen.add((before, after))
+        if before == len(old) and after == len(new):
+            return True
+        if before < len(old) and after < len(new) and old[before] == new[after]:
+            positions.add((before + 1, after + 1))
+        for start in (after, after + 1) if new[after:after + 1] == " " else (after,):
+            marker = REPLACEMENT_MARKER.match(new, start)
+            if marker:
+                positions.add((before, marker.end()))
+                if start == after and new[marker.end():marker.end() + 1] == " ":
+                    positions.add((before, marker.end() + 1))
+    return False
+
+
 def decision_status_only(old, new):
     remaining = iter(decision_content(old))
     current = next(remaining, None)
     for line in decision_content(new):
-        if current is not None and (line == current or
-                                    re.sub(r"~~(.+?)~~", r"\1", line) == current):
+        if current is not None and decision_line_status_only(current, line):
             current = next(remaining, None)
-        elif not re.fullmatch(r"\s*\*?Replaced\b.*", line, re.I):
+        elif not REPLACEMENT_MARKER.fullmatch(line.strip()):
             return False
     return current is None
 
