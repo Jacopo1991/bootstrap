@@ -156,6 +156,7 @@ reply = os.environ.get('REVIEW_STUB_REPLY', '')
 if count == 1:
     reply = os.environ.get('REVIEW_STUB_FIRST_REPLY', reply)
 print(reply, end='', flush=True)
+print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
 time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
 sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 """
@@ -785,6 +786,7 @@ if os.environ.get('RUNNER_FINAL'):
         stream.write(os.environ['RUNNER_FINAL'] + '\\n')
 sys.exit(7)
 """}
+        scripts['task-batch'] = scripts['codex']
         for name, body in scripts.items():
             path = self.home / 'bin' / name
             path.write_text(body)
@@ -815,9 +817,8 @@ sys.exit(7)
         command = args[args.index(sys.executable):]
         subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
         call = json.loads((runner.parent / 'runner-call').read_text())
-        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
-                                        '-m', 'gpt-6-luna', '-'])
-        self.assertEqual(call['prompt'], runner.read_text())
+        self.assertEqual(call['args'], [str(self.repo), str(runner)])
+        self.assertEqual(call['prompt'], '')
         self.assertIn('code 7', runner.with_suffix('.done').read_text())
         (self.home / 'active').touch()
         self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
@@ -848,6 +849,17 @@ sys.exit(7)
                         self.assertEqual(current, 'batch: stopped: runner exited (code 7) '
                                          f'without a final line; see {runner.with_suffix(".log")}\n')
                     self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
+
+    def test_runner_llm_opt_in(self):
+        runner = self.runner_fixture()
+        self.raw_task('runner-start', 'proj', str(runner), '--llm')
+        args = json.loads((self.home / 'service-args').read_text())
+        subprocess.run(args[args.index(sys.executable):], cwd=self.repo, env=self.env,
+                       check=False, capture_output=True)
+        call = json.loads((runner.parent / 'runner-call').read_text())
+        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
+                                        '-m', 'gpt-6-luna', '-'])
+        self.assertEqual(call['prompt'], runner.read_text())
 
     def test_runner_fallback_survives_callers_group_and_cancel(self):
         runner = self.runner_fixture('setsid')
@@ -3511,6 +3523,14 @@ store.write_text(json.dumps(prs))
         self.assertIn("`just` is not installed", out)
         self.assertNotIn("no `just sync` recipe", out)
 
+    def test_review_appends_instruction_to_generated_prompt(self):
+        self.started()
+        instruction = "If a hook or sandbox denial stops a required step, end your final reply with a line starting `BLOCKED:` and the denied command."
+        self.raw_task("review", "proj", "5", "--append-prompt", instruction)
+        prompt = (self.state() / "review-prompt.md").read_text()
+        self.assertTrue(prompt.endswith(instruction + "\n"))
+        self.assertIn("Verdict: PASS|FAIL", prompt)
+
     def test_review_prints_claude_headless_command_and_persisted_prompt(self):
         wt, _ = self.started()
         out = self.raw_task("review", "proj", "5")
@@ -3569,6 +3589,9 @@ store.write_text(json.dumps(prs))
         if builder == "claude":
             self.assertEqual(call["git_optional_locks"], "0")
         self.assertEqual((self.state() / "review-response.md").read_text(), reply)
+        self.assertEqual(json.loads((self.state() / "review-run.json").read_text()),
+                         dict(builder='claude' if builder == 'codex' else 'codex',
+                              state='finished', exit_code=0))
         self.assertEqual((self.state() / "review.md").read_text(), reply)
         metadata = json.loads((self.state() / "review.json").read_text())
         self.assertEqual((metadata["reviewer"], metadata["model"]),
@@ -3590,6 +3613,18 @@ store.write_text(json.dumps(prs))
 
     def test_review_run_codex_records_fail_like_manual_record(self):
         self.assert_review_run("claude", "FAIL")
+
+    def test_review_run_records_cli_exit_and_separate_stderr(self):
+        import json
+        self.stub_reviewers()
+        self.raw_task('start', 'proj', '5', '--builder', 'claude')
+        diagnostic = "ERROR: You've hit your usage limit. Try again later.\n"
+        out = self.raw_task('review', 'proj', '5', '--run', code=1,
+                            env=dict(self.env, REVIEW_STUB_STDERR=diagnostic, REVIEW_STUB_EXIT='1'))
+        self.assertIn(diagnostic, out)
+        self.assertEqual((self.state() / 'review-stderr.log').read_text(), diagnostic)
+        self.assertEqual(json.loads((self.state() / 'review-run.json').read_text()),
+                         dict(builder='codex', state='finished', exit_code=1))
 
     def test_review_run_cleans_inherited_environment_before_hook_and_diff(self):
         import json
@@ -4571,7 +4606,9 @@ exit 1
     def test_round2_private_state_and_tracked_work_refusal(self):
         wt, _ = self.started()
         self.assertTrue((self.state() / "task.json").is_file())
-        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()), ["context", "report.md"])
+        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()),
+                         ["context", "dispatch.md", "report.md"])
+        self.assertIn(f"Work only in {wt}", (wt / ".work/dispatch.md").read_text())
         self.assertFalse((wt / ".work/task.json").exists())
         (wt / ".work/leak.json").write_text("{}")
         self.git(wt, "add", "-f", ".work/leak.json")
