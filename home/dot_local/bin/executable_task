@@ -1984,8 +1984,13 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
               advisory=False, pre_commit_all_files=False):
     if advisory:
         return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True)
-    temporary_root = path / ".work/tmp"
-    temporary_root.mkdir(parents=True, exist_ok=True)
+    # Do not inherit TMPDIR: callers may point it inside a checkout.
+    temporary_root = Path("/tmp") / f"task-gate-{os.getuid()}"
+    temporary_root.mkdir(mode=0o700, exist_ok=True)
+    info = temporary_root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise Stop(f"Gate temporary parent must be an owned directory with mode 0700: {temporary_root}")
     with tempfile.TemporaryDirectory(prefix="gate-", dir=temporary_root) as temporary, \
             gate_port_index(path) as slot:
         environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
