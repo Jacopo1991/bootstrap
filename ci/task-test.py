@@ -163,6 +163,298 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_status_bad_config_does_not_hide_other_repos(self):
+        good = self.home / 'dev_workspace/z-good'
+        good.mkdir()
+        self.git(good, 'init', '-q', '-b', 'main')
+        (good / '.task.toml').write_text('[env]\nPRODUCT_DIR = "do-not-display"\n')
+        for config in (b'[env', b'[env]\nAPI_TOKEN = "do-not-display"\n', b'\xff'):
+            with self.subTest(config=config):
+                (self.repo / '.task.toml').write_bytes(config)
+                output = self.raw_task('status')
+                self.assertIn('env keys: unavailable (', output)
+                self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
+                self.assertNotIn('do-not-display', output)
+                if config == b'\xff':
+                    self.assertIn(f'Cannot read {self.repo / ".task.toml"}', output)
+        config = self.repo / '.task.toml'
+        config.unlink()
+        config.mkdir()  # A real OSError from the newly added configuration read.
+        output = self.raw_task('status')
+        self.assertIn(f'env keys: unavailable (Cannot read {config}.)', output)
+        self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
+
+    def test_configured_environment_rejects_reserved_names(self):
+        names = TASK_MODULE.GIT_OVERRIDE_ENV | {'GIT_OVERRIDE_ENV', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
+                                              'TASK_RUN_ID', 'TASK_RUN_ANY', 'TMPDIR', 'TASK_GATE_SLOT',
+                                              'TASK_GATE_ANY'}
+        for name in names:
+            with self.subTest(name=name):
+                (self.repo / '.task.toml').write_text(f'[env]\n{name} = "never-print-this"\n')
+                with self.assertRaisesRegex(TASK_MODULE.Stop, 'reserved'):
+                    TASK_MODULE.configured_environment(self.repo)
+
+    def test_gate_drill_seeds_and_per_repo_failures(self):
+        self.commit_in(self.repo, '.task.toml', 'drill_seeds = ["pinned"]\n[env]\nPRODUCT_DIR = "{repo}/data"\n')
+        self.git(self.repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        work = self.repo / '.work'
+        work.mkdir(exist_ok=True)
+        (work / 'pinned').mkdir()
+        (work / 'pinned/source').write_text('source bytes')
+        (work / 'extra').write_text('extra bytes')
+        (work / 'another').write_text('another bytes')
+        just = self.home / 'bin/just'
+        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+            import os, pathlib, sys
+            if sys.argv[1:] != ['check']:
+                sys.exit(1)
+            assert pathlib.Path('.work/pinned/source').read_text() == 'source bytes'
+            assert pathlib.Path('.work/extra').read_text() == 'extra bytes'
+            assert pathlib.Path('.work/another').read_text() == 'another bytes'
+            assert os.environ['PRODUCT_DIR'] == str(pathlib.Path(os.environ['HOME']) / 'dev_workspace/proj/data')
+            print('OK')
+            '''))
+        just.chmod(0o755)
+        self.raw_task('gate-drill', 'proj', '--seed', 'proj:extra', '--seed', 'proj:another')
+        evidence = self.home / '.local/state/task/gate-drill'
+        rows = json.loads(next(evidence.glob('*/results.json')).read_text())
+        self.assertEqual(rows[0]['verdict'], 'ok')
+        bad = self.home / 'dev_workspace/bad'
+        bad.mkdir()
+        self.git(bad, 'init', '-q', '-b', 'main')
+        for config, reason in [('drill_seeds = ["absent"]', 'missing seed absent'),
+                               ('drill_seeds = ["../escape"]', 'Invalid seed name'),
+                               ('drill_seeds = "pinned"', 'list of seed names'),
+                               ('drill_seeds = [2]', 'list of seed names'),
+                               (b'\xff', 'Cannot read'),
+                               (None, 'Cannot read')]:
+            with self.subTest(config=config):
+                if config is None:
+                    (bad / '.task.toml').unlink()
+                    (bad / '.task.toml').mkdir()
+                    (bad / '.task.toml/entry').write_text('directory instead of config')
+                    self.git(bad, 'add', '-A', '.task.toml')
+                    self.git(bad, 'commit', '-qm', 'Unreadable config')
+                elif isinstance(config, bytes):
+                    (bad / '.task.toml').write_bytes(config)
+                    self.git(bad, 'add', '.task.toml')
+                    self.git(bad, 'commit', '-qm', 'Non-UTF-8 config')
+                else:
+                    self.commit_in(bad, '.task.toml', config + '\n')
+                output = self.raw_task('gate-drill', 'bad', 'proj', '--seed', 'proj:extra',
+                                       '--seed', 'proj:another', code=1)
+                self.assertIn(reason, output)
+                self.assertRegex(output, r'proj \| passed .* \| - \| ok')
+                self.assertEqual(len(self.git(bad, 'worktree', 'list').splitlines()), 1)
+                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
+                rows = json.loads(latest.read_text())
+                self.assertEqual(rows[0]['concurrent']['result'], 'failed')
+                self.assertEqual(rows[0]['solo']['result'], 'failed')
+                if isinstance(config, bytes) or config is None:
+                    for phase in ('concurrent', 'solo'):
+                        self.assertIn('.task.toml', rows[0][phase]['error'])
+                self.assertEqual(rows[1]['verdict'], 'ok')
+        output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:missing', code=1)
+        self.assertIn('missing seed missing', output)
+        (work / 'escape').symlink_to(self.home)
+        output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:escape', code=1)
+        self.assertIn('Seed symlink escapes .work', output)
+        self.assertEqual(len(self.git(self.repo, 'worktree', 'list').splitlines()), 1)
+
+    def test_gate_drill_seed_read_errors_do_not_hide_other_repos(self):
+        bad = self.home / 'dev_workspace/bad'
+        bad.mkdir()
+        self.git(bad, 'init', '-q', '-b', 'main')
+        self.commit_in(bad, '.task.toml', 'drill_seeds = ["pinned"]\n')
+        (bad / '.work').mkdir()
+        seed = bad / '.work/pinned'
+        seed.write_text('seed contents')
+        copy = shutil.copy2
+        for error in (OSError('seed read failed'), ValueError('seed read failed'),
+                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
+            with self.subTest(error=type(error).__name__):
+                def copy_seed(source, destination, *args, **kwargs):
+                    if Path(source) == seed:
+                        raise error
+                    return copy(source, destination, *args, **kwargs)
+
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.env), \
+                        mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                        mock.patch.object(TASK_MODULE, 'WORKSPACE', self.repo.parent), \
+                        mock.patch.object(shutil, 'copy2', side_effect=copy_seed), \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(TASK_MODULE.gate_drill(mock.Mock(repos=['bad', 'proj'], seed=[])), 1)
+                self.assertRegex(output.getvalue(), r'proj \| passed .* \| - \| ok')
+                evidence = self.home / '.local/state/task/gate-drill'
+                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
+                rows = json.loads(latest.read_text())
+                for phase in ('concurrent', 'solo'):
+                    self.assertEqual(rows[0][phase]['result'], 'failed')
+                    self.assertIn('error', rows[0][phase])
+                self.assertEqual(rows[1]['verdict'], 'ok')
+                for repo in (bad, self.repo):
+                    self.assertEqual(len(self.git(repo, 'worktree', 'list').splitlines()), 1)
+
+    def test_configured_gate_environment(self):
+        config = '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n'
+        self.commit_in(self.repo, '.task.toml', config)
+        wt, _ = self.started()
+        (wt / '.task.toml').write_text(config)
+        script = self.home / 'during-check.sh'
+        script.write_text('#!/bin/sh\nprintf "PRODUCT_DIR=%s\\nWORK_DIR=%s\\n" "$PRODUCT_DIR" "$WORK_DIR" > "$PWD/.work/observed-env"\n')
+        script.chmod(0o755)
+        for advisory in (False, True):
+            with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                self.assertTrue(TASK_MODULE.run_check(wt, '', advisory=advisory))
+            observed = (wt / '.work/observed-env').read_text()
+            self.assertIn(f'PRODUCT_DIR={self.repo}/data', observed)
+            self.assertIn(f'WORK_DIR={wt}/output', observed)
+        lane = TASK_MODULE.lane_environment(TASK_MODULE.Task(self.repo, '5'))
+        self.assertEqual(lane['WORK_DIR'], f'{wt}/output')
+        status = self.task('status', 'proj')
+        self.assertIn('env keys: PRODUCT_DIR, WORK_DIR', status)
+        self.assertNotIn(str(self.repo / 'data'), status)
+        for bad in ('TOKEN', 'api_key', 'SECRET', 'PASSWORD'):
+            (wt / '.task.toml').write_text(f'[env]\n{bad} = "never-print-this"\n')
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'secretspec'):
+                TASK_MODULE.configured_environment(wt)
+        (wt / '.task.toml').write_text('[env]\nCOUNT = 2\n')
+        with self.assertRaisesRegex(TASK_MODULE.Stop, 'plain strings'):
+            TASK_MODULE.configured_environment(wt)
+
+    def test_decision_status_only_changes(self):
+        name = 'backlog/decisions/d-status.md'
+        (self.kb / 'backlog/decisions').mkdir()
+        original = '---\nstatus: accepted\n---\n## Decision\nKeep the data.\n'
+        self.commit_in(self.kb, name, original)
+        self.task('plan', 'proj', '--sign')
+        for revised, counted in (
+                (original.replace('accepted', 'replaced'), False),
+                (original + '*Replaced by decision-2*\n', False),
+                (original.replace('Keep the data.', '~~Keep the data.~~'), False),
+                (original.replace('## Decision', '## Other'), True),
+                (original.replace('Keep the data.', 'Replaced by decision-2'), True),
+                (original.replace('Keep the data.', 'Delete the data.'), True)):
+            (self.kb / name).write_text(revised)
+            self.assertEqual('decisions changed:' in self.task('plan', 'proj'), counted)
+        (self.kb / name).write_text(original.replace('accepted', 'replaced'))
+        self.git(self.kb, 'add', name)
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'status'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
+        (self.kb / 'backlog/decisions/new.md').write_text('Replaced by decision-2\n')
+        self.assertIn('decisions changed:', self.task('plan', 'proj'))
+
+    def test_status_unreadable_decision_next_to_status_edit_lists_every_repo(self):
+        good = self.home / 'dev_workspace/z-good'
+        good.mkdir()
+        self.git(good, 'init', '-q', '-b', 'main')
+        (self.kb / 'backlog/decisions').mkdir()
+        status_name = 'backlog/decisions/d-status.md'
+        binary_name = 'backlog/decisions/d-bytes.md'
+        original = '---\nstatus: accepted\n---\nKeep the data.\n'
+        self.commit_in(self.kb, status_name, original)
+        self.commit_in(self.kb, binary_name, original)
+        self.task('plan', 'proj', '--sign')
+        (self.kb / status_name).write_text(original.replace('accepted', 'replaced'))
+        (self.kb / binary_name).write_bytes(b'\xff')
+        for phase in ('working tree', 'committed', 'unreadable before'):
+            with self.subTest(phase=phase):
+                if phase == 'committed':
+                    self.git(self.kb, 'add', status_name, binary_name)
+                    subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'decisions'],
+                                   env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'),
+                                   check=True, capture_output=True)
+                elif phase == 'unreadable before':
+                    (self.kb / binary_name).write_text(original)
+                output = self.raw_task('status')
+                self.assertIn('proj:', output)
+                self.assertIn('z-good:', output)
+                self.assertIn(f'decisions changed: {binary_name}', output)
+                self.assertNotIn(status_name, output)
+
+    def test_decision_read_errors_conservatively_count_as_changed(self):
+        name = 'decision.md'
+        (self.kb / name).write_text('Keep the data.\n')
+        shown = subprocess.CompletedProcess([], 0, stdout='Keep the data.\n')
+        for error in (OSError('read failed'), ValueError('read failed'),
+                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
+            for source in ('before', 'after', 'working tree'):
+                with self.subTest(error=type(error).__name__, source=source):
+                    git_reads = [error] if source == 'before' else [shown, error]
+                    with mock.patch.object(TASK_MODULE, 'run_git', side_effect=git_reads), \
+                            mock.patch.object(Path, 'read_text', side_effect=error):
+                        after = None if source == 'working tree' else 'HEAD'
+                        self.assertTrue(TASK_MODULE.decision_changed(self.kb, name, after=after))
+
+    def test_decision_inline_replacement_hsh_history(self):
+        # Copied before/after lines from HSH d65ee46, decision-22.
+        old = (
+            '- **v1 category:** electricity only. Phone, internet, subscriptions, weather as a product and device advice wait until the pilot has passed. Existing phone code stays as it is, with no new work.\n'
+            "- **Pilot:** first the founder's own household for 2 weeks as acceptance, then 3 invited households for 4 weeks.\n"
+        )
+        new = (
+            '- **v1 category:** electricity only. *Replaced 2026-10-18 by decision-24: electricity first, then phone, then internet.* Phone, internet, subscriptions, weather as a product and device advice wait until the pilot has passed. Existing phone code stays as it is, with no new work.\n'
+            "- **Pilot:** first the founder's own household for 2 weeks as acceptance, then 3 invited households for 4 weeks. *Replaced 2026-10-18 by decision-24: founder household (with his wife) only until three categories pass.*\n"
+        )
+        name = 'backlog/decisions/decision-22.md'
+        (self.kb / 'backlog/decisions').mkdir()
+        self.commit_in(self.kb, name, old)
+        self.task('plan', 'proj', '--sign')
+        (self.kb / name).write_text(new)
+        self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
+        self.git(self.kb, 'add', name)
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'replacement'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
+        for changed in (new.replace('electricity only.', 'electricity first.'),
+                        new.replace('Phone, internet,', 'Phone,  internet,'),
+                        new.replace('Existing phone code stays as it is, with no new work.', '')):
+            with self.subTest(changed=changed):
+                self.assertFalse(TASK_MODULE.decision_status_only(old, changed))
+
+    def test_decision_marker_fragments_preserve_exact_content(self):
+        old = 'Keep the data.'
+        for marker in ('*Replaced 2026-10-18 by decision-24: new scope.*',
+                       '(replaced by decision-24)', 'Replaced by decision-24',
+                       '*rEpLaCeD by decision-24*'):
+            for new in (f'{marker} {old}', f'Keep {marker} the data.',
+                        f'{old} {marker}', f'~~Keep~~ {marker} the ~~data.~~',
+                        f'{old}\n{marker}\n', f'{marker} {old} {marker}'):
+                with self.subTest(new=new):
+                    self.assertTrue(TASK_MODULE.decision_status_only(old, new))
+            self.assertFalse(TASK_MODULE.decision_status_only(old, marker))
+        for added in ('Replaced by decision-24 and delete the data.',
+                      '*Replaced by decision-24* new policy',
+                      '(replaced by decision-24) new policy',
+                      'Replaced arbitrary prose', '~~new policy~~', ''):
+            with self.subTest(added=added):
+                self.assertFalse(TASK_MODULE.decision_status_only(old, old + '\n' + added + '\n'))
+        existing = old + ' *Replaced by decision-2*'
+        self.assertTrue(TASK_MODULE.decision_status_only(existing, existing + ' (replaced by decision-3)'))
+        self.assertFalse(TASK_MODULE.decision_status_only(existing, old))
+        self.assertFalse(TASK_MODULE.decision_status_only(
+            old, 'Keep  *Replaced by decision-2* the data.'))
+
+    def test_gate_handoff_failed_metadata_write(self):
+        task = TASK_MODULE.Task(self.repo, '5')
+        with mock.patch.dict(os.environ, self.env):
+            lock, holder = TASK_MODULE.gate_paths('slot-0')
+            holder.write_text(json.dumps({'pid': 99999999, 'repo': 'previous-holder'}))
+            with mock.patch.object(TASK_MODULE, 'atomic_json', side_effect=OSError('write failed')):
+                with TASK_MODULE.exclusive_gate_lock(task):
+                    holders = TASK_MODULE.gate_holders()
+                    self.assertEqual(holders[0][1], os.getpid())
+                    self.assertIn('holder details unavailable', str(holders))
+                    self.assertNotIn('previous-holder', str(holders))
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                        TASK_MODULE.status(type('Args', (), {'repo': str(self.repo)})())
+                    self.assertIn(f'pid {os.getpid()} (holder details unavailable)', output.getvalue())
+                    self.assertNotIn('/? since ?', output.getvalue())
+                    self.assertNotIn('previous-holder', output.getvalue())
+
     def test_close_update_checks_default_branch_holder_dirt(self):
         holder = self.home / 'knowledge-holder'
         self.git(self.kb, 'worktree', 'add', '-q', '-b', 'holder-main', str(holder))
@@ -916,7 +1208,9 @@ store.write_text(json.dumps(prs))
                     time.sleep(0.02)
                 self.assertEqual(run['state'], 'failed')
                 self.assertFalse((self.state() / 'run.lock').exists())
-                self.assertIn('gate busy: held by proj/T-9 since today', (wt / '.work/run.log').read_text())
+                log = (wt / '.work/run.log').read_text()
+                self.assertIn(f'gate busy: held by pid {os.getpid()} (holder details unavailable)', log)
+                self.assertNotIn('proj/T-9', log)
                 self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
                 self.assertEqual(json.loads(holder.read_text())['pid'], 99999999)
 
@@ -1163,7 +1457,8 @@ store.write_text(json.dumps(prs))
                         self.fail("must never enter unlocked")
                 self.assertEqual(stop.exception.code, 3)
                 self.assertEqual(stdout.getvalue(), '')
-                self.assertIn("gate busy: held by proj/T-9 since 2026-01-01", output.getvalue())
+                self.assertIn(f"gate busy: held by pid {os.getpid()} (holder details unavailable)", output.getvalue())
+                self.assertNotIn('proj/T-9', output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_start_clears_stale_run_locks(self):
@@ -1333,9 +1628,13 @@ store.write_text(json.dumps(prs))
             self.git(repo, 'init', '-q', '-b', 'main')
             (repo / 'justfile').write_text('check:\n    true\n')
             (repo / 'kind').write_text(name)
+            (repo / '.task.toml').write_text('drill_seeds = ["pinned"]\n[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
             (repo / '.pre-commit-config.yaml').write_text('repos: []\n')
             self.git(repo, 'add', '.')
             self.git(repo, 'commit', '-qm', 'stub gate')
+            (repo / '.work').mkdir()
+            (repo / '.work/pinned').write_text(name)
+            (repo / '.work/extra').write_text(name)
             repos.append(repo)
         # The drill runs the full default gate: pre-commit over all files follows `just check`.
         # The `always` repo passes `just check` and fails only in pre-commit, so a skipped
@@ -1358,6 +1657,10 @@ store.write_text(json.dumps(prs))
             home = pathlib.Path(os.environ['HOME'])
             kind = pathlib.Path('kind').read_text()
             temporary = pathlib.Path(os.environ['TMPDIR'])
+            assert pathlib.Path('.work/pinned').read_text() == kind
+            assert pathlib.Path('.work/extra').read_text() == kind
+            assert os.environ['PRODUCT_DIR'] == str(home / 'dev_workspace' / kind / 'data')
+            assert os.environ['WORK_DIR'] == str(pathlib.Path.cwd() / 'output')
             slot = int(os.environ['TASK_GATE_SLOT'])
             port = int(os.environ['TASK_GATE_PORT_BASE'])
             # Record first so a failed assertion below still leaves evidence for the test.
@@ -1389,7 +1692,8 @@ store.write_text(json.dumps(prs))
                 sys.exit(1)
             '''))
         just.chmod(0o755)
-        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', code=1)
+        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', '--seed', 'clean:extra',
+                            '--seed', 'clash:extra', '--seed', 'always:extra', code=1)
         self.assertIn('clash', out)
         evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
         self.assertEqual(len(evidence), 1)
@@ -1482,7 +1786,7 @@ store.write_text(json.dumps(prs))
                         TASK_MODULE.status(type('Args', (), {'repo': None})())
                     self.assertIn('Gate slots: 2', output.getvalue())
                     self.assertIn('gate resource-hermes:', output.getvalue())
-                    self.assertIn('first-gate/T-1, since', output.getvalue())
+                    self.assertIn('first-gate/T-1 since', output.getvalue())
             lock, holder = TASK_MODULE.gate_paths('slot-0')
             holder.write_text('{"pid": 99999999, "repo": "dead"}')
             with TASK_MODULE.exclusive_gate_lock(a):
@@ -1559,12 +1863,12 @@ store.write_text(json.dumps(prs))
         lock, holder = self.gate_dir / 'agent-task-gate.lock', self.gate_dir / 'agent-task-gate.holder'
         with lock.open('a') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            holder.write_text(json.dumps({'repo': 'old', 'task': 'T-1', 'since': 'before'}))
+            holder.write_text(json.dumps({'pid': os.getpid(), 'repo': 'old', 'task': 'T-1', 'since': 'before'}))
             calls = []
             def change(_):
                 calls.append(True)
                 if len(calls) == 1:
-                    holder.write_text(json.dumps({'repo': 'new', 'task': 'T-2', 'since': 'after'}))
+                    holder.write_text(json.dumps({'pid': os.getpid(), 'repo': 'new', 'task': 'T-2', 'since': 'after'}))
                 else:
                     fcntl.flock(held, fcntl.LOCK_UN)
             output = io.StringIO()
@@ -1575,9 +1879,9 @@ store.write_text(json.dumps(prs))
                     pass
             lines = output.getvalue().splitlines()
             self.assertEqual(len(lines), 2)
-            self.assertIn('in old', lines[0])
-            self.assertIn('in new', lines[1])
-            self.assertNotIn('in old', lines[1])
+            self.assertIn('old/T-1', lines[0])
+            self.assertIn('new/T-2', lines[1])
+            self.assertNotIn('old/T-1', lines[1])
 
     def test_gate_os_errors_fall_back_only_without_exclusive_or_resources(self):
         # Only a plain one-slot gate may run unlocked after a lock error. A gate that is
@@ -1644,7 +1948,7 @@ store.write_text(json.dumps(prs))
         holder = self.gate_dir / "agent-task-gate.holder"
         with lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            holder.write_text(json.dumps({"repo": "proj", "task": "T-9", "pid": 2, "since": "today"}))
+            holder.write_text(json.dumps({"repo": "proj", "task": "T-9", "pid": 99999999, "since": "today"}))
             self.assertEqual(TASK_MODULE.gate_holder_pid(lock), os.getpid())
             output = io.StringIO()
             def release(_):
@@ -1655,7 +1959,10 @@ store.write_text(json.dumps(prs))
                     contextlib.redirect_stdout(output):
                 with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, "5")):
                     pass
-            self.assertIn(f"pid {os.getpid()} since today", output.getvalue())
+            self.assertIn(f"pid {os.getpid()} (holder details unavailable)", output.getvalue())
+            self.assertNotIn('/? since ?', output.getvalue())
+            self.assertIn('holder details unavailable', output.getvalue())
+            self.assertNotIn('T-9', output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_noticed_import_lists_only_and_deduplicates(self):
@@ -1890,7 +2197,7 @@ store.write_text(json.dumps(prs))
                      'review.json', 'merge.json', 'manifest.json'):
             (work / 'big' / name).write_text('keep')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         manifest = next(self.work_archives().glob('*/manifest.json'))
         record = json.loads(manifest.read_text())
         skipped = {entry['path']: entry for entry in record['skipped']}
@@ -1925,7 +2232,7 @@ store.write_text(json.dumps(prs))
 
         with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
                 mock.patch.object(TASK_MODULE.shutil, 'copy2', side_effect=copy):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         manifest = next(self.work_archives().glob('*/manifest.json'))
         self.assertIn('disappearing', [entry['path'] for entry in json.loads(manifest.read_text())['skipped']])
         self.assertFalse(list(self.work_archives().glob('.pending-*')))
@@ -1982,7 +2289,7 @@ store.write_text(json.dumps(prs))
         self.git(self.repo, 'merge', '--no-ff', '-m', 'published', head)
         self.git(self.repo, 'push', '-q', 'origin', 'main')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         original = list(self.work_archives().glob('*/manifest.json'))
         (wt / 'leftover.txt').write_text('keep worktree')
         for _ in range(2):
@@ -2117,7 +2424,7 @@ store.write_text(json.dumps(prs))
                 stream.truncate(201 * 1024 ** 2)
             (directory / 'report.md').write_text('report')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         archived = next(self.work_archives().glob('*/.work'))
         self.assertFalse((archived / 't8venv/lib').exists())
         self.assertFalse((archived / 't8venv/pyvenv.cfg').exists())
@@ -2220,7 +2527,7 @@ store.write_text(json.dumps(prs))
             (directory / 'empty').mkdir()
         (finished / 'manifest.json').write_text('{}')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         archived = next(path.parent.parent for path in self.work_archives().glob('*/.work/big')
                         if path.parent.parent != finished)
         self.raw_task('repair', '--prune-archive', 'proj')
@@ -3870,7 +4177,7 @@ esac
         self.assertEqual(first.returncode, 0, out1)
         self.assertEqual(second.returncode, 0, out2)
         self.assertGreater(elapsed, 2, "the second check waited longer than its one-second check timeout")
-        self.assertIn("Waiting for exclusive task gate held by task T-5 in proj, pid", out2)
+        self.assertRegex(out2, r"Waiting for exclusive task gate held by pid \d+, proj/T-5")
         self.assertIn("since ", out2)
         self.assertFalse((self.home / "gate-overlap").exists(), "checks never overlapped")
 
@@ -4116,9 +4423,12 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         (self.repo / "node_modules").mkdir()
         (self.home / "bin/just").write_text(
             "#!/bin/sh\n[ -d .venv ] && [ -d node_modules ] || exit 9\n"
+            '[ "$WORK_DIR" = "$PWD/output" ] || exit 10\n'
+            '[ "$PRODUCT_DIR" = "$HOME/dev_workspace/proj/data" ] || exit 11\n'
             "echo 'Ran 1 test'; echo OK\n")
         (self.home / "bin/just").chmod(0o755)
         wt, _ = self.started()
+        self.commit_in(wt, '.task.toml', '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
         self.commit_in(wt, "b.txt")
         self.assertIn("PASS", self.raw_task("check", "proj", "5"))
         out = self.task("merge", "proj", "5")

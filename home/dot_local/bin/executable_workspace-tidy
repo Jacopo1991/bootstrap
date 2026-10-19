@@ -4,7 +4,8 @@
 Removes only what is provably finished and nothing else:
 - hand-made worktrees inside a repository (<repo>/.worktrees/<name>, <repo>/.claude/worktrees/<name>)
   that are clean, unlocked, not in use, idle for a day, hold no ignored files beyond rebuildable
-  caches, and whose every commit (HEAD and its reflog) is already in the default branch;
+  caches and .work evidence (archived first), and whose every commit (HEAD and its reflog) is
+  already in the default branch;
 - local branches whose commits, including their reflog, are all in the default branch.
 - Codex app worktrees under `$CODEX_HOME/worktrees` that are clean and whose branch is merged
   or whose detached commit is reachable from a default branch.
@@ -19,6 +20,7 @@ The report is also written to ~/.local/state/workspace-tidy/report.txt.
 import argparse
 import json
 import os
+import runpy
 import subprocess
 import sys
 import time
@@ -130,23 +132,6 @@ def paths_in_use() -> list[Path]:
     return found
 
 
-def work_archived(path: Path) -> bool:
-    """task merge snapshots .work under archive/<repo>/<task>/<snapshot>/.work."""
-    common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
-    if path.parent != common.parent / ".worktrees":
-        return False
-    archive = HOME / ".local/state/task/archive" / common.parent.name / path.name
-    return archive.is_dir() and any(p.is_dir() for p in archive.glob("*/.work"))
-
-
-def only_caches(path: Path) -> bool:
-    if path.is_symlink():
-        return False
-    if path.is_dir():
-        return all(child.name in REBUILDABLE or only_caches(child) for child in path.iterdir())
-    return False
-
-
 def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
     """Why this worktree must not be removed, or None when removing it loses nothing."""
     if any(inside(cwd, path) for cwd in in_use):
@@ -166,7 +151,7 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
             continue  # session-local settings and transcripts are disposable
         if not item.startswith("!! "):
             return "uncommitted or untracked changes"
-        if parts and parts[0] == ".work" and (work_archived(path) or only_caches(path / ".work")):
+        if parts and parts[0] == ".work":
             continue
         if not any(part in REBUILDABLE for part in parts):
             return f"ignored file that is not a rebuildable cache: {item[3:]}"
@@ -175,6 +160,20 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
     if any(line[:1].islower() or (line[:1] == "S" and not sparse) for line in flags):
         return "files marked assume-unchanged or skip-worktree"
     return None
+
+
+def archive_work(repo, path, report):
+    """Use task merge's archive implementation before discarding ignored evidence."""
+    tool = Path(__file__).with_name("task")
+    if not tool.is_file():
+        tool = Path(__file__).with_name("executable_task")
+    try:
+        task = runpy.run_path(str(tool), run_name="workspace_tidy_archive")
+        task["preserve_work"](repo, path.name, path, strict=True)
+    except Exception as error:
+        report.append(f"{repo.name}: kept {path}: cannot archive .work: {error}")
+        return False
+    return True
 
 
 def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], apply: bool,
@@ -218,8 +217,12 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
     if blocker:
         report.append(f"{prefix} kept: {blocker}")
     elif not apply:
-        report.append(f"{prefix} is finished and clean; would be removed")
+        archive = " (would archive .work first)" if (path / ".work").exists() else ""
+        report.append(f"{prefix} is finished and clean; would be removed{archive}")
     else:
+        source = path / ".work"
+        if (source.exists() or source.is_symlink()) and not archive_work(repo, path, report):
+            return
         # The blocker checked all changes; --force also discards disposable session files.
         result = git(repo, "worktree", "remove", "--force", str(path))
         if result.returncode == 0:
@@ -264,8 +267,12 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
         if blocker:
             report.append(f"{repo.name}: finished worktree kept: {path} ({label}): {blocker}")
         elif not apply:
-            report.append(f"{repo.name}: finished worktree {path} ({label}) would be removed")
+            archive = "would archive .work and " if (path / ".work").exists() else ""
+            report.append(f"{repo.name}: finished worktree {path} ({label}) {archive}would be removed")
         else:
+            source = path / ".work"
+            if (source.exists() or source.is_symlink()) and not archive_work(repo, path, report):
+                continue
             # The blocker checked all changes; --force also discards disposable session files.
             result = git(repo, "worktree", "remove", "--force", str(path))
             if result.returncode == 0:
