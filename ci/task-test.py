@@ -1297,9 +1297,23 @@ store.write_text(json.dumps(prs))
             self.git(repo, 'init', '-q', '-b', 'main')
             (repo / 'justfile').write_text('check:\n    true\n')
             (repo / 'kind').write_text(name)
+            (repo / '.pre-commit-config.yaml').write_text('repos: []\n')
             self.git(repo, 'add', '.')
             self.git(repo, 'commit', '-qm', 'stub gate')
             repos.append(repo)
+        # The drill runs the full default gate: pre-commit over all files follows `just check`.
+        # The `always` repo passes `just check` and fails only in pre-commit, so a skipped
+        # pre-commit stage would wrongly report it as ok.
+        pre_commit = self.home / 'bin/pre-commit'
+        pre_commit.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+            import json, os, pathlib, sys
+            home = pathlib.Path(os.environ['HOME'])
+            kind = pathlib.Path('kind').read_text()
+            with (home / (kind + '-pre-commit')).open('a') as out:
+                out.write(json.dumps([sys.argv[1:], os.environ['TMPDIR'], int(os.environ['TASK_GATE_SLOT'])]) + '\\n')
+            sys.exit(1 if kind == 'always' else 0)
+            '''))
+        pre_commit.chmod(0o755)
         just = self.home / 'bin/just'
         just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
             import json, os, pathlib, sys, time
@@ -1332,8 +1346,6 @@ store.write_text(json.dumps(prs))
                     time.sleep(.01)
                 (home / 'clashed').touch()
                 sys.exit(1)
-            elif kind == 'always':
-                sys.exit(1)
             '''))
         just.chmod(0o755)
         out = self.raw_task('gate-drill', 'clean', 'clash', 'always', code=1)
@@ -1354,7 +1366,22 @@ store.write_text(json.dumps(prs))
                 self.assertGreaterEqual(slot, 3)
                 self.assertEqual(port, 20000 + 200 * slot)
                 self.assertFalse(Path(temporary).exists())
+            # pre-commit ran over all files after every passing `just check` (for `clash`
+            # only the solo run), in the same isolated environment as that run.
+            pre_commit_log = self.home / (name + '-pre-commit')
+            pre_commit_records = [json.loads(line) for line in pre_commit_log.read_text().splitlines()]
+            self.assertEqual([(temporary, slot) for _, temporary, slot in pre_commit_records],
+                             [(temporary, slot) for temporary, slot, _ in
+                              (records[1:] if name == 'clash' else records)], logs)
+            self.assertEqual({tuple(arguments) for arguments, _, _ in pre_commit_records},
+                             {('run', '--all-files')}, logs)
         self.assertEqual(sorted(concurrent_slots), [3, 4, 5])
+        self.assertIn('$ pre-commit run --all-files', logs)
+        self.assertNotIn('--from-ref', logs)
+        always_steps = [json.loads(path.read_text())['steps']
+                        for path in sorted(evidence[0].parent.glob('2-*/drill-check.json'))]
+        self.assertEqual([[(step['command'], step['exit']) for step in steps] for steps in always_steps],
+                         [[(['just', 'check'], 0), (['pre-commit', 'run', '--all-files'], 1)]] * 2, always_steps)
         self.assertEqual([path for path in self.gate_dir.iterdir() if path.suffix != '.lock'], [])
         with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)):
             self.assertEqual(TASK_MODULE.gate_holders(), [])
@@ -1441,13 +1468,45 @@ store.write_text(json.dumps(prs))
                                      ['noslot-0', 'noslot-1', 'slot-0'])
                 with TASK_MODULE.gate_port_index(self.repo) as again:
                     self.assertEqual(again, 3)
-            missing = self.home / 'missing-gate-dir'
-            with mock.patch.object(TASK_MODULE, 'gate_paths',
-                                   return_value=(missing / 'x.lock', missing / 'x.holder')), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
-                with TASK_MODULE.gate_port_index(self.repo) as unreserved:
-                    self.assertEqual(unreserved, 3)
-            self.assertIn('using index 3 unreserved', output.getvalue())
+        # Without a usable gate directory nothing can be reserved, so each process derives
+        # its own index above the slots from its pid: two such runs never share a range.
+        span = TASK_MODULE.GATE_PORT_INDEXES - 3 - 1
+        missing = self.home / 'missing-gate-dir'
+        with mock.patch.dict(os.environ, HOME=str(self.home), TASK_GATE_DIR=str(missing)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            with TASK_MODULE.gate_port_index(self.repo) as unreserved:
+                self.assertEqual(unreserved, 3 + 1 + os.getpid() % span)
+        self.assertIn(f'using unreserved index {unreserved} derived from process id {os.getpid()}',
+                      output.getvalue())
+        probe = self.home / 'port-index-probe.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import importlib.machinery, importlib.util, os, pathlib, sys
+            loader = importlib.machinery.SourceFileLoader('task_probe', {str(TOOL)!r})
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader('task_probe', loader))
+            loader.exec_module(module)
+            with module.gate_port_index(pathlib.Path({str(self.repo)!r})) as index:
+                print(os.getpid(), index)
+            '''))
+        runs = []
+        env = dict(self.env, TASK_GATE_DIR=str(missing), PYTHONDONTWRITEBYTECODE='1')
+        # Two processes get different ranges whenever their pids differ modulo the span of
+        # free indexes; retry the second probe in the rare case the kernel hands out such a pid.
+        for _attempt in range(6):
+            if len(runs) == 2:
+                break
+            result = subprocess.run([sys.executable, '-I', str(probe)], env=env, cwd=self.home,
+                                    capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            pid, index = (int(word) for word in result.stdout.split()[-2:])
+            self.assertEqual(index, 3 + 1 + pid % span, result.stdout)
+            self.assertIn(f'derived from process id {pid}', result.stdout)
+            if runs and runs[0][0] % span == pid % span:
+                continue
+            runs.append((pid, index))
+        self.assertEqual(len(runs), 2, runs)
+        self.assertNotEqual(runs[0][0], runs[1][0], runs)
+        self.assertNotEqual(runs[0][1], runs[1][1], runs)
+        self.assertFalse(missing.exists())
 
     def test_wait_message_refreshes_when_holder_changes(self):
         (self.repo / '.task.toml').write_text('exclusive_gate = true\n')
@@ -1474,7 +1533,9 @@ store.write_text(json.dumps(prs))
             self.assertIn('in new', lines[1])
             self.assertNotIn('in old', lines[1])
 
-    def test_gate_os_errors_fall_back_only_without_explicit_opt_in(self):
+    def test_gate_os_errors_fall_back_only_without_exclusive_or_resources(self):
+        # Only a plain one-slot gate may run unlocked after a lock error. A gate that is
+        # exclusive or declares resources needs its isolation and stops instead.
         config_path = self.home / "gate-config"
         config_path.mkdir()
         task = TASK_MODULE.Task(self.repo, "5")
@@ -1488,13 +1549,14 @@ store.write_text(json.dumps(prs))
 
     def check_gate_os_error(self, task, config_path, explicit, resource, operation):
         with self.subTest(explicit=explicit, resource=resource, operation=operation):
+            stops = explicit or resource
             target = TASK_MODULE.os if operation == "open" else TASK_MODULE.fcntl
             output = io.StringIO()
             ran = []
             with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
                     mock.patch.object(target, operation, side_effect=PermissionError("permission denied")), \
                     contextlib.redirect_stdout(output):
-                if explicit:
+                if stops:
                     with self.assertRaisesRegex(TASK_MODULE.Stop, "permission denied"):
                         with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
                             ran.append(True)
@@ -1502,8 +1564,10 @@ store.write_text(json.dumps(prs))
                     with TASK_MODULE.exclusive_gate_lock(task, config_path=config_path):
                         ran.append(True)
                 self.assertEqual(TASK_MODULE.gate_holders(), [])
-            self.assertEqual(ran, [] if explicit else [True])
-            if not explicit:
+            self.assertEqual(ran, [] if stops else [True])
+            if stops:
+                self.assertNotIn("unlocked", output.getvalue())
+            else:
                 self.assertIn("permission denied", output.getvalue())
                 self.assertIn("running trusted gate unlocked", output.getvalue())
 

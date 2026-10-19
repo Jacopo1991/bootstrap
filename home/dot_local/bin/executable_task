@@ -824,7 +824,9 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
     groups = [[f"resource-{name}"] for name in sorted(set(resources))]
     slots = [f"slot-{number}" for number in range(count)]
     groups.extend([[name] for name in slots] if exclusive else [slots])
-    allow_unavailable = silent_unavailable or not exclusive
+    # A gate whose isolation is required (whole machine, or named resources) must not run
+    # unlocked; only a plain one-slot gate may degrade to an unlocked run with a notice.
+    allow_unavailable = silent_unavailable or not (exclusive or resources)
     notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
     acquired = []
     held_slot = None
@@ -936,8 +938,13 @@ def gate_port_index(path: Path):
         else:
             raise Stop(f"No free gate port range: indexes {count}-{GATE_PORT_INDEXES - 1} are all in use.")
     except OSError as error:
-        print(f"Cannot reserve a gate port range: {error}; using index {count} unreserved.", flush=True)
-        yield count
+        # Without a usable gate directory, two runs cannot share a reserved index, so each
+        # derives its own index above the slots from its process id.
+        span = max(1, GATE_PORT_INDEXES - count - 1)
+        index = count + 1 + os.getpid() % span
+        print(f"Cannot reserve a gate port range: {error}; using unreserved index {index} "
+              f"derived from process id {os.getpid()}.", flush=True)
+        yield index
         return
     try:
         try:
@@ -1879,7 +1886,7 @@ def start(args):
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-              advisory=False):
+              advisory=False, pre_commit_all_files=False):
     if advisory:
         return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True)
     temporary_root = path / ".work/tmp"
@@ -1889,12 +1896,16 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
                        "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
         return run_check_steps(path, base, record, state, evidence_name, display_log,
-                               gate_environment=environment)
+                               gate_environment=environment, pre_commit_all_files=pre_commit_all_files)
 
 
 def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-                    advisory=False, gate_environment=None):
-    """Run the repository's gate in <path>; return True when it passes."""
+                    advisory=False, gate_environment=None, pre_commit_all_files=False):
+    """Run the repository's gate in <path>; return True when it passes.
+
+    pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
+    has no base) it checks every file instead of being skipped.
+    """
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
@@ -1914,8 +1925,11 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         steps = [["just", "check"]]
         if record:
             steps.extend([["bash", "-c", command] for command in record.get("verify", [])])
-        if (path / ".pre-commit-config.yaml").exists() and base:
-            steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
+        if (path / ".pre-commit-config.yaml").exists():
+            if pre_commit_all_files:
+                steps.append(["pre-commit", "run", "--all-files"])
+            elif base:
+                steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
         for step in steps:
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
@@ -3780,11 +3794,13 @@ def gate_drill(args):
 
     def measure(path, index, phase):
         # Drill runs hold no slot; run_check reserves a free port index above the slots.
+        # The full default gate runs: `just check`, then pre-commit over all files when the
+        # repository has a pre-commit config (a drill has no base range to check).
         token = GATE_SLOT.set(None)
         started = time.monotonic()
         try:
             passed = run_check(path, "", state=archive / f"{index}-{phase}",
-                               evidence_name="drill-check.json")
+                               evidence_name="drill-check.json", pre_commit_all_files=True)
             return {"result": "passed" if passed else "failed",
                     "duration": round(time.monotonic() - started, 3)}
         except (Stop, OSError) as error:
