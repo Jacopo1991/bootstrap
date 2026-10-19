@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Sequence an approved batch using the installed task command, without a model."""
+import argparse
+import json
+import re
+import shlex
+import subprocess
+import time
+from pathlib import Path
+
+
+TASK_LINE = re.compile(
+    r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
+    r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?(?:\b.*)?$")
+LIMIT = re.compile(r"(?i)(?:usage limit|rate[ _-]?limit|quota exceeded|insufficient_quota|"
+                   r"too many requests|you(?:'ve| have) hit your limit)")
+BLOCK = re.compile(r"(?i)(?:blocked by.*(?:hook|policy|sandbox)|(?:hook|sandbox).*"
+                   r"(?:blocked|denied)|operation not permitted|permission denied|"
+                   r"private task state is not writable)")
+
+
+class Stop(Exception):
+    pass
+
+
+def read(path):
+    return path.read_text() if path.is_file() else ""
+
+
+def data(path):
+    return json.loads(read(path) or "{}")
+
+
+def name(ident):
+    match = re.fullmatch(r"(?i)t?-?(\d+)", ident)
+    return f"t{int(match[1])}" if match else ident.replace("/", "-")
+
+
+def parse(source):
+    tasks, current, in_rules = [], None, False
+    for line in source.read_text().splitlines():
+        if re.match(r"\s*```text\s*$", line, re.I):
+            current, in_rules = None, True
+            continue
+        if in_rules:
+            if re.fullmatch(r"\s*```\s*", line):
+                in_rules = False
+            continue
+        if line.strip().startswith("Do not explore the environment;"):
+            current = None
+            break
+        match = TASK_LINE.match(line)
+        if match:
+            ident, builder, model, seed, after = match.groups()
+            current = dict(id=ident, builder=builder.lower(), model=model,
+                           seed=seed, after=after, lines=[line])
+            tasks.append(current)
+        elif current is not None:
+            current["lines"].append(line)
+    if not tasks:
+        raise Stop("No task lines found")
+    for task in tasks:
+        task["block"] = "\n".join(task.pop("lines")).strip()
+        box = re.search(r"(?im)^\s*Time box:\s*(\d+(?:\.\d+)?)\s*min\b", task["block"])
+        task["box"] = float(box[1]) if box else 90
+        if task["box"] <= 0:
+            raise Stop(f"{task['id']}: time box must be positive")
+    return tasks
+
+
+def git(repo, *args):
+    command = ["git", "-C", str(repo), *args]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise Stop(f"{shlex.join(command)}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def blocking(text):
+    """Keep recorded blocking evidence, excluding commit hashes and optional notes."""
+    section = re.search(r"(?ims)^\s*(?:#{1,6}\s*)?(?:\*\*)?Blocking(?:\*\*)?\s*:?\s*\n"
+                        r"(.*?)(?=^\s*(?:#{1,6}\s*)?(?:\*\*)?Notes\b|\Z)", text)
+    if section and section[1].strip():
+        return section[1].strip()
+    judgments = re.findall(r"(?im)^#\d+\s+(?:fail|unclear):.*$", text)
+    if judgments:
+        return "\n".join(judgments)
+    return re.sub(r"(?im)^Commit:.*$", "", text).strip()
+
+
+def failure_key(text):
+    """Ignore Git heads and timing noise when comparing consecutive failures."""
+    text = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", text)
+    text = re.sub(r"\b\d+(?:\.\d+)?\s*(?:seconds?|secs?|ms|s)\b", "<duration>", text)
+    return " ".join(text.split())
+
+
+class Batch:
+    def __init__(self, repo, source):
+        self.repo = repo
+        self.source = source
+        self.done = repo / ".work" / source.with_suffix(".done").name
+        self.current = None
+
+    def append(self, line):
+        self.done.parent.mkdir(parents=True, exist_ok=True)
+        with self.done.open("a") as stream:
+            stream.write(" ".join(line.split()) + "\n")
+        print(line, flush=True)
+
+    def call(self, command, *args, retry=False):
+        argv = ["task", command, str(self.repo), *map(str, args)]
+        while True:
+            print("+ " + shlex.join(argv), flush=True)
+            result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            print(result.stdout, end="", flush=True)
+            # A review's prose can mention a lane's denied command. Only errors from
+            # this command are runner blocks; lane logs are checked for limits only.
+            if LIMIT.search(result.stdout) or (result.returncode and BLOCK.search(result.stdout)):
+                raise Stop(f"{shlex.join(argv)}: {result.stdout.strip()}")
+            if not (retry and result.returncode == 3):
+                return result
+
+    def require(self, command, *args, retry=False):
+        result = self.call(command, *args, retry=retry)
+        if result.returncode:
+            raise Stop(f"task {command}: {result.stdout.strip()}")
+        return result.stdout
+
+    def finished(self, path, record):
+        if git(path, "status", "--porcelain"):
+            return False
+        if git(path, "rev-parse", "HEAD") == record["base_sha"]:
+            return False
+        if re.match(r"(?i)WIP\b", git(path, "log", "-1", "--format=%s")):
+            return False
+        report = read(path / ".work/report.md")
+        headings = ["What changed", "How I verified"]
+        if record.get("criteria"):
+            headings += ["Criteria", "Noticed, not done"]
+        return bool(report and "(fill in)" not in report.lower() and all(
+            (match := re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", report))
+            and match[1].strip() for heading in headings))
+
+    def limits(self, *paths):
+        for path in paths:
+            for line in read(path).splitlines():
+                if LIMIT.search(line):
+                    raise Stop(f"{path}: {line}")
+
+    def task(self, task):
+        ident, box = task["id"], task["box"]
+        path = self.repo / ".worktrees" / name(ident)
+        work = path / ".work"
+        state = Path.home() / ".local/state/task" / self.repo.name / name(ident)
+        if (state / "merge.json").is_file():
+            self.require("merge", ident, retry=True)
+            return "merged"
+        resumed = path.is_dir() and (state / "task.json").is_file()
+        dispatch = ""
+        if not resumed:
+            options = ["--builder", task["builder"]]
+            if task["seed"]:
+                options += ["--seed", task["seed"]]
+            dispatch = self.require("start", ident, *options)
+        record = data(state / "task.json")
+        # New task versions persist their dispatch instructions for resumed batches.
+        dispatch = read(work / "dispatch.md") or dispatch
+        if not dispatch:
+            dispatch = (f"Read the pinned context in .work/context/. Work only in {path} "
+                        f"on branch {record['branch']}. Commit, run task check, then fill "
+                        ".work/report.md (What changed, How I verified, Criteria, Noticed, not done).")
+        started = time.monotonic()
+        builder, model = task["builder"], task["model"]
+        rounds, previous, findings, check_tail = 0, None, "", ""
+        # Never launch a duplicate lane or overwrite the prompt of a running lane.
+        if resumed:
+            self.require("wait", ident, "--max", box, retry=True)
+            self.limits(work / "lane.log", work / "final.md")
+        run_lane = not resumed or not self.finished(path, record)
+        if resumed and run_lane:
+            findings = blocking(read(state / "review.md")) or "Unfinished work: finish and commit."
+            check_tail = "\n".join(read(work / "check.log").splitlines()[-80:])
+        while True:
+            if time.monotonic() - started >= 3 * box * 60:
+                return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
+            if run_lane:
+                prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch
+                if rounds or findings:
+                    prompt += ("\n\nFix round: re-measure, run the tests, finish and commit.\n"
+                               f"Blocking findings:\n{findings}\nFailing check output tail:\n{check_tail}\n")
+                (work / "prompt.md").write_text(prompt + "\n")
+                self.require("lane", ident, "--builder", builder, "--model", model, "--timeout", box)
+                self.require("wait", ident, "--max", box, retry=True)
+                self.limits(work / "lane.log", work / "final.md")
+            if time.monotonic() - started >= 3 * box * 60:
+                return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
+            record = data(state / "task.json")
+            if not self.finished(path, record):
+                findings, signature = "Unfinished work: re-measure, test, finish and commit.", None
+            else:
+                checked = self.call("check", ident, retry=True)
+                if checked.returncode:
+                    check_tail = "\n".join((read(work / "check.log") or checked.stdout).splitlines()[-80:])
+                    findings = "Failed task check"
+                    signature = ("check", failure_key(check_tail))
+                else:
+                    check_tail = ""
+                    review = {}
+                    for _ in range(2):
+                        result = self.call("review", ident, "--run")
+                        self.limits(state / "review-response.md")
+                        candidate = data(state / "review.json")
+                        if (result.returncode == 0 and candidate.get("commit") == git(path, "rev-parse", "HEAD")
+                                and candidate.get("record_revision") == record.get("revision")
+                                and candidate.get("verdict") in {"PASS", "FAIL"}):
+                            review = candidate
+                            break
+                    if time.monotonic() - started >= 3 * box * 60:
+                        return f"parked: total time cap; last blocking findings: {findings or 'time cap'}"
+                    if (review.get("verdict") == "PASS"
+                            and all(v == "pass" for v in review.get("judgments", {}).values())):
+                        merged = self.call("merge", ident, retry=True)
+                        if merged.returncode == 0:
+                            return f"merged after {rounds} fix rounds" if rounds else "merged"
+                        findings = merged.stdout.strip()
+                        signature = ("merge", findings)
+                    else:
+                        findings = blocking(read(state / "review.md")) if review else "Review produced no verdict twice"
+                        signature = ("review", failure_key(findings))
+            if signature is not None and signature == previous:
+                return f"parked: repeated failure; last blocking findings: {findings}; {check_tail}"
+            if rounds == 3:
+                return f"parked: fix rounds exhausted; last blocking findings: {findings}; {check_tail}"
+            previous = signature
+            rounds += 1
+            if rounds == 2:
+                stronger = "gpt-6.1-sol" if builder == "codex" else "opus"
+                if model in {"gpt-6.1-sol", "gpt-6-astra", "opus", "claude-opus-5-5", "fable", "claude-fable-5-1"}:
+                    rounds = 3
+                else:
+                    model = stronger
+            if rounds == 3:
+                builder = "claude" if builder == "codex" else "codex"
+                model = "opus" if builder == "claude" else "gpt-6.1-sol"
+            run_lane = True
+
+    def run(self):
+        try:
+            self.require("runner-check", self.source)
+            parked, consecutive = set(), 0
+            for task in parse(self.source):
+                self.current = task["id"]
+                if task["after"] and name(task["after"]) in parked:
+                    self.append(f"{self.current}: not started: after {task['after']}")
+                    parked.add(name(self.current))
+                    continue
+                outcome = self.task(task)
+                self.append(f"{self.current}: {outcome}")
+                self.current = None
+                if outcome.startswith("parked:"):
+                    parked.add(name(task["id"]))
+                    consecutive += 1
+                    if consecutive == 2:
+                        raise Stop("two tasks parked in a row")
+                else:
+                    consecutive = 0
+            self.append("batch: finished")
+            return 0
+        except (Exception, KeyboardInterrupt) as error:
+            if self.current:
+                self.append(f"{self.current}: stopped: {error}")
+            self.append(f"batch: stopped: {error}")
+            return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("repo")
+    parser.add_argument("runner_file", type=Path)
+    args = parser.parse_args()
+    repo = Path(args.repo).expanduser()
+    if not repo.is_absolute():
+        repo = Path.home() / "dev_workspace" / repo
+    batch = Batch(repo.resolve(), args.runner_file.resolve())
+    try:
+        batch.repo = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
+        batch.done = batch.repo / ".work" / batch.source.with_suffix(".done").name
+    except Exception as error:
+        batch.append(f"batch: stopped: {error}")
+        return 1
+    return batch.run()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

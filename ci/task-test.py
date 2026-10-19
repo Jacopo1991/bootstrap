@@ -583,6 +583,7 @@ if os.environ.get('RUNNER_FINAL'):
         stream.write(os.environ['RUNNER_FINAL'] + '\\n')
 sys.exit(7)
 """}
+        scripts['task-batch'] = scripts['codex']
         for name, body in scripts.items():
             path = self.home / 'bin' / name
             path.write_text(body)
@@ -613,9 +614,8 @@ sys.exit(7)
         command = args[args.index(sys.executable):]
         subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
         call = json.loads((runner.parent / 'runner-call').read_text())
-        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
-                                        '-m', 'gpt-6-luna', '-'])
-        self.assertEqual(call['prompt'], runner.read_text())
+        self.assertEqual(call['args'], [str(self.repo), str(runner)])
+        self.assertEqual(call['prompt'], '')
         self.assertIn('code 7', runner.with_suffix('.done').read_text())
         (self.home / 'active').touch()
         self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
@@ -646,6 +646,17 @@ sys.exit(7)
                         self.assertEqual(current, 'batch: stopped: runner exited (code 7) '
                                          f'without a final line; see {runner.with_suffix(".log")}\n')
                     self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
+
+    def test_runner_llm_opt_in(self):
+        runner = self.runner_fixture()
+        self.raw_task('runner-start', 'proj', str(runner), '--llm')
+        args = json.loads((self.home / 'service-args').read_text())
+        subprocess.run(args[args.index(sys.executable):], cwd=self.repo, env=self.env,
+                       check=False, capture_output=True)
+        call = json.loads((runner.parent / 'runner-call').read_text())
+        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
+                                        '-m', 'gpt-6-luna', '-'])
+        self.assertEqual(call['prompt'], runner.read_text())
 
     def test_runner_fallback_survives_callers_group_and_cancel(self):
         runner = self.runner_fixture('setsid')
@@ -4027,7 +4038,9 @@ exit 1
     def test_round2_private_state_and_tracked_work_refusal(self):
         wt, _ = self.started()
         self.assertTrue((self.state() / "task.json").is_file())
-        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()), ["context", "report.md"])
+        self.assertEqual(sorted(p.name for p in (wt / ".work").iterdir()),
+                         ["context", "dispatch.md", "report.md"])
+        self.assertIn(f"Work only in {wt}", (wt / ".work/dispatch.md").read_text())
         self.assertFalse((wt / ".work/task.json").exists())
         (wt / ".work/leak.json").write_text("{}")
         self.git(wt, "add", "-f", ".work/leak.json")

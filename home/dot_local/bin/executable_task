@@ -6,7 +6,7 @@ Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
-  task runner-start <repo> <runner-file>
+  task runner-start <repo> <runner-file> [--llm]
   task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
@@ -1524,7 +1524,7 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, codex, offset = sys.argv[1:]
+source, done, log, executable, offset, mode, repo = sys.argv[1:]
 child = None
 def stop(signum, frame):
     if child is not None:
@@ -1534,8 +1534,9 @@ signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
     with open(source) as stream:
-        child = subprocess.Popen([codex, 'exec', '--dangerously-bypass-approvals-and-sandbox',
-                                  '-m', 'gpt-6-luna', '-'], stdin=stream)
+        command = ([executable, 'exec', '--dangerously-bypass-approvals-and-sandbox',
+                    '-m', 'gpt-6-luna', '-'] if mode == 'llm' else [executable, repo, source])
+        child = subprocess.Popen(command, stdin=stream if mode == 'llm' else subprocess.DEVNULL)
         code = child.wait()
 finally:
     path = pathlib.Path(done)
@@ -1588,16 +1589,17 @@ def runner_start(args):
         previous = json.loads(record.read_text())
         if previous.get('backend') == 'setsid' and pid_alive(previous.get('pid')):
             raise Stop(f'{unit} is already active (setsid).')
-    codex = shutil.which('codex')
-    if not codex:
-        raise Stop('codex is unavailable.')
+    binary = 'codex' if args.llm else 'task-batch'
+    executable = shutil.which(binary)
+    if not executable:
+        raise Stop(f'{binary} is unavailable.')
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
     command = [sys.executable, str(wrapper), str(source), str(done),
-               str(log), codex, str(done_offset)]
+               str(log), executable, str(done_offset), 'llm' if args.llm else 'batch', str(repo)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
@@ -1747,19 +1749,21 @@ def start(args):
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     refresh_context(task)
-    print("Context: .work/context/")
-    print(f"{task.id}{title}")
-    print(f"Work only in {task.path} on branch {branch}.")
+    dispatch = ["Context: .work/context/", f"{task.id}{title}",
+                f"Work only in {task.path} on branch {branch}."]
     if task.file:
-        print(f"Task: {task.file}")
-    print("Commit on the branch, then run `task check` from that folder for advisory feedback, "
+        dispatch.append(f"Task: {task.file}")
+    dispatch.append("Commit on the branch, then run `task check` from that folder for advisory feedback, "
           "then fill `.work/report.md`; any later commit needs a new check. The PM's `task merge` "
           "runs the trusted gate, unless a matching trusted check already passed. A PM may run "
           "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
           "`verified: ...`, and `not done: ...`, followed by `report written`. "
           "For long gates, the PM can use `task merge --detach`.")
-    print(f"The PM writes the approved prompt to {work / 'prompt.md'} and launches the builder with "
+    dispatch.append(f"The PM writes the approved prompt to {work / 'prompt.md'} and launches the builder with "
           f"`task lane {args.repo} {task.id}`. Always use `task lane` so builders stay sandboxed.")
+    dispatch_text = "\n".join(dispatch) + "\n"
+    (work / 'dispatch.md').write_text(dispatch_text)
+    print(dispatch_text, end="")
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
@@ -3686,6 +3690,7 @@ def main(argv=None):
     sub = commands.add_parser("runner-start", help="launch a validated, detached batch runner")
     sub.add_argument("repo")
     sub.add_argument("file")
+    sub.add_argument("--llm", action="store_true", help="use the legacy Codex runner for this release")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
