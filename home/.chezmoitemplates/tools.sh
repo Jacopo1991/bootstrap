@@ -10,6 +10,11 @@ download() {
   printf '%s  %s\n' "$2" "$3" | sha256sum --check --status
 }
 mkdir -p "$HOME/.local/bin"
+download "$SHELLCHECK_URL" "$SHELLCHECK_SHA256" "$tmp/shellcheck.tar.xz"
+tar -xJf "$tmp/shellcheck.tar.xz" -C "$tmp"
+shellcheck_version=${SHELLCHECK_URL##*/download/}
+shellcheck_version=${shellcheck_version%%/*}
+install -m 0755 "$tmp/shellcheck-$shellcheck_version/shellcheck" "$HOME/.local/bin/shellcheck"
 # Tool caches writable to sandboxed checks must exist before their sandboxes bind them.
 mkdir -p "$HOME/.cache/uv" "$HOME/.cache/pre-commit" "$HOME/.cache/pip" "$HOME/.npm"
 download "$GITLEAKS_URL" "$GITLEAKS_SHA256" "$tmp/gitleaks.tar.gz"

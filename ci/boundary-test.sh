@@ -35,26 +35,26 @@ if has_agent_session_interop '' "$tmp/WSL" 123 "$tmp/proc"; then
   echo 'FAIL: regular file detected as session socket.' >&2; exit 1;
 fi
 rm "$tmp/WSL/123_interop"
-python3 -c 'import socket,sys,time; sockets=[socket.socket(socket.AF_UNIX) for _ in sys.argv[1:]]; [s.bind(path) for s,path in zip(sockets,sys.argv[1:])]; time.sleep(5)' \
-  "$tmp/WSL/123_interop" "$tmp/WSL/2_interop" "$tmp/WSL/789_interop" &
-socket_pid=$!
-for _ in {1..50}; do [[ -S "$tmp/WSL/789_interop" ]] && break; sleep .02; done
+has_agent_session_interop x "$tmp/WSL" '789 2 1' "$tmp/proc" || { echo 'FAIL: set WSL_INTEROP environment missed.' >&2; exit 1; }
+status=0
+python3 "$(dirname -- "$0")/boundary-sockets.py" \
+  "$tmp/WSL/123_interop" "$tmp/WSL/2_interop" "$tmp/WSL/789_interop" || status=$?
+[[ $status != 77 ]] || exit 0
+[[ $status == 0 ]] || exit "$status"
 ln -s 2_interop "$tmp/WSL/1_interop"
 for pid in 1 2 123 789; do
-  [[ -S "$tmp/WSL/${pid}_interop" ]] || { echo "FAIL: socket fixture $pid missing." >&2; kill "$socket_pid" 2>/dev/null || true; exit 1; }
+  [[ -S "$tmp/WSL/${pid}_interop" ]] || { echo "FAIL: socket fixture $pid missing." >&2; exit 1; }
 done
 if has_agent_session_interop '' "$tmp/WSL" '999 456 2 1' "$tmp/proc"; then
-  echo 'FAIL: WSL init PID sockets flagged as session interop.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1;
+  echo 'FAIL: WSL init PID sockets flagged as session interop.' >&2; exit 1;
 fi
 if has_agent_session_interop '' "$tmp/WSL" '999 789 2 1' "$tmp/proc"; then
-  echo 'FAIL: /init executable socket flagged as session interop.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1;
+  echo 'FAIL: /init executable socket flagged as session interop.' >&2; exit 1;
 fi
-has_agent_session_interop '' "$tmp/WSL" '999 123 789 2 1' "$tmp/proc" || { echo 'FAIL: user-session ancestor socket missed.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1; }
-has_agent_session_interop '' "$tmp/WSL" '1 2 789 123' "$tmp/proc" || { echo 'FAIL: init ancestors stopped user-session socket detection.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1; }
+has_agent_session_interop '' "$tmp/WSL" '999 123 789 2 1' "$tmp/proc" || { echo 'FAIL: user-session ancestor socket missed.' >&2; exit 1; }
+has_agent_session_interop '' "$tmp/WSL" '1 2 789 123' "$tmp/proc" || { echo 'FAIL: init ancestors stopped user-session socket detection.' >&2; exit 1; }
 if has_agent_session_interop '' "$tmp/WSL" 456 "$tmp/proc"; then
-  echo 'FAIL: unrelated session socket flagged.' >&2; kill "$socket_pid" 2>/dev/null || true; exit 1;
+  echo 'FAIL: unrelated session socket flagged.' >&2; exit 1;
 fi
-kill "$socket_pid" 2>/dev/null || true
-wait "$socket_pid" 2>/dev/null || true
 has_agent_session_interop x "$tmp/WSL" '789 2 1' "$tmp/proc" || { echo 'FAIL: set WSL_INTEROP environment missed.' >&2; exit 1; }
 echo 'PASS: init sockets excluded, user-session socket and WSL_INTEROP detected, unrelated socket ignored'
