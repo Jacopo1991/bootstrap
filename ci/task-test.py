@@ -245,13 +245,14 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(len((self.state() / 'checks.jsonl').read_text().splitlines()), 2)
         self.assertEqual(len((wt / '.work/checks.jsonl').read_text().splitlines()), 1)
         (self.state() / 'merge.json').write_text(json.dumps(dict(time=TASK_MODULE.utc_now())))
-        self.assertIn('quality: first-review pass 0/1 (0%), reviews per merged task 2.0',
+        self.assertIn('quality: collecting (1 tasks with review history since ',
                       self.raw_task('status', 'proj'))
         archive = self.home / '.local/state/task/archive/proj/t5/snapshot/.work'
         shutil.copytree(self.state(), archive)
-        self.assertIn('reviews per merged task 2.0', self.raw_task('status', 'proj'))
+        self.assertIn('quality: collecting (1 tasks with review history since ',
+                      self.raw_task('status', 'proj'))
         shutil.rmtree(self.state())
-        self.assertIn('quality: first-review pass 0/1 (0%), reviews per merged task 2.0',
+        self.assertIn('quality: collecting (1 tasks with review history since ',
                       self.raw_task('status', 'proj'))
 
     def test_quality_review_gate_and_prompt_check_precedence(self):
@@ -298,21 +299,89 @@ class TaskTool(unittest.TestCase):
                 else:
                     self.assertIn('run `task check` first', output)
 
-    def test_quality_metric_tolerates_missing_old_and_malformed_history(self):
-        self.started()
-        (self.state() / 'review.json').write_text('{broken')
-        self.assertIn('quality: first-review pass 0/0 (0%), reviews per merged task 0.0',
-                      self.raw_task('status', 'proj'))
-        (self.state() / 'review-1.json').write_text(json.dumps(dict(
-            time='2000-01-01T00:00:00+00:00', verdict='PASS', commit='old')))
-        self.assertIn('first-review pass 0/0 (0%)', self.raw_task('status', 'proj'))
-        recent = self.state('another')
-        recent.mkdir()
-        (recent / 'review.json').write_text(json.dumps(dict(
-            time=TASK_MODULE.utc_now(), verdict='PASS', commit='new')))
-        (recent / 'merge.json').write_text(json.dumps(dict(time=TASK_MODULE.utc_now())))
-        self.assertIn('first-review pass 1/1 (100%), reviews per merged task 1.0',
-                      self.raw_task('status', 'proj'))
+    def quality_fixture(self, name, verdicts=(), merge='events'):
+        # Mirror the supplied real layout: Markdown reviews survive without JSON
+        # sidecars; events.json survives even where merge.json is absent.
+        state = self.state(name)
+        state.mkdir(parents=True, exist_ok=True)
+        (state / 'task.json').write_text('{}')
+        latest = '```review\nVerdict: PASS\nCommit: fixture-head\n```\n\n**Blocking**\n\nNone.\n'
+        for filename in ('review.md', 'review-response.md', 'review-prompt.md'):
+            (state / filename).write_text(latest)
+        (state / 'events.json').write_text(json.dumps({
+            'check': '2026-10-19T11:34:19.319446+00:00',
+            'review': '2026-10-19T14:44:45.870047+00:00',
+            **({'merge': '2026-10-19T15:19:59.010637+00:00'} if merge == 'events' else {})}))
+        if merge == 'record':
+            (state / 'merge.json').write_text(json.dumps({
+                'commit': 'merged-head', 'head': 'fixture-head',
+                'time': '2026-10-19T16:07:27.918904+00:00'}))
+        for number, verdict in enumerate(verdicts, 1):
+            (state / f'review-{number}.md').write_text(
+                f'Verdict: {verdict}\nHead: fixture-head\n'
+                f'Time: 2026-09-01T12:00:{number:02d}+00:00\n\n{latest}')
+        if verdicts:
+            (state / 'checks.jsonl').write_text('{"result":"passed"}\n' * 3)
+        return state
+
+    def quality_output(self):
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            return TASK_MODULE.quality_summary(Path('proj'))
+
+    def test_quality_metric_legacy_only_tasks_are_excluded(self):
+        for number in range(6):
+            state = self.quality_fixture(f'legacy-{number}')
+            (state / 'review.json').write_text(json.dumps(dict(
+                time=TASK_MODULE.utc_now(), verdict='PASS', commit='latest')))
+        self.assertEqual(self.quality_output(),
+                         'quality: collecting (0 tasks with review history since unknown)')
+
+    def test_quality_metric_collecting_state(self):
+        for number in range(4):
+            self.quality_fixture(f'numbered-{number}', ['FAIL', 'PASS'])
+            self.assertEqual(self.quality_output(),
+                             f'quality: collecting ({number + 1} tasks with review history since 2026-09-01)')
+        state = self.quality_fixture('malformed')
+        (state / 'review-1.md').write_text('Verdict: PASS\nTime: invalid\n')
+        (state / 'review-1.json').write_text('{broken')
+        self.assertIn('collecting (4 tasks', self.quality_output())
+
+    def test_quality_metric_correct_rounds_count(self):
+        for name, verdicts, merge in (
+                ('events', ['FAIL', 'PASS'], 'events'),
+                ('record', ['FAIL', 'FAIL', 'PASS'], 'record'),
+                ('single', ['PASS'], 'events'),
+                ('open', ['PASS'], None),
+                ('before-window', ['PASS'], 'record')):
+            state = self.quality_fixture(name, verdicts, merge)
+        (state / 'merge.json').write_text('{"time":"2026-08-01T00:00:00+00:00"}')
+        # Both merge sources and repeated snapshots must still count each task once.
+        (self.state('record') / 'events.json').write_text(
+            '{"merge":"2026-10-19T15:19:59+00:00"}')
+        expected = ('quality (since 2026-09-01): first-review pass 3/5 (60%), '
+                    'reviews per merged task 2.0')
+        self.assertEqual(self.quality_output(), expected)
+        for name in ('events', 'record', 'single', 'open', 'before-window'):
+            for snapshot in ('snapshot-1', 'snapshot-2'):
+                archive = self.home / '.local/state/task/archive/proj' / name / snapshot / '.work'
+                shutil.copytree(self.state(name), archive)
+        self.assertEqual(self.quality_output(), expected)
+        for name in ('events', 'record', 'single', 'open', 'before-window'):
+            shutil.rmtree(self.state(name))
+        self.assertEqual(self.quality_output(), expected)
+
+    def test_quality_metric_mixed_legacy_and_numbered_history(self):
+        for number in range(8):
+            self.quality_fixture(f'legacy-{number}')
+        for number in range(5):
+            state = self.quality_fixture(f'numbered-{number}',
+                                         ['FAIL', 'PASS'] if number < 3 else ['PASS'], None)
+            # A latest JSON pointer must not alter the numbered history.
+            (state / 'review.json').write_text(json.dumps(dict(
+                time='2026-08-01T00:00:00+00:00', verdict='PASS', commit='latest')))
+        self.assertEqual(self.quality_output(),
+                         'quality (since 2026-09-01): first-review pass 2/5 (40%), '
+                         'reviews per merged task n/a')
 
     def test_gate_drill_signals_clean_children_worktrees_and_reservations(self):
         just = self.home / 'bin/just'

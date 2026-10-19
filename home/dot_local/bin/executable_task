@@ -3574,38 +3574,51 @@ def note(args):
 
 
 def quality_summary(repo):
-    cutoff = datetime.now(timezone.utc).timestamp() - 14 * 86400
     roots = [HOME / ".local/state/task" / repo.name,
              HOME / ".local/state/task/archive" / repo.name]
     tasks = {}
     for root in roots:
-        for file in root.rglob("review*.json"):
-            if not re.fullmatch(r"review(?:-\d+)?\.json", file.name):
+        for file in root.rglob("review-*.md"):
+            if not re.fullmatch(r"review-\d+\.md", file.name):
                 continue
-            meta = read_json_object(file)
+            # Numbered Markdown is the durable history; legacy review.md/json
+            # only holds the latest verdict and cannot establish a first pass.
+            header = file.read_text(errors="replace").split("\n\n", 1)[0]
+            meta = {key.lower(): value for key, value in
+                    re.findall(r"(?m)^(Verdict|Head|Time): (.+)$", header)}
             when = plan_time(meta.get("time"))
             if not when or meta.get("verdict") not in {"PASS", "FAIL"}:
                 continue
             ident = file.relative_to(root).parts[0]
             entry = tasks.setdefault(ident, {"reviews": {}, "merges": []})
             # Latest pointer and archive copies do not count as additional reviews.
-            entry['reviews'][(meta.get('commit'), meta['time'])] = meta
-        for file in root.rglob("merge.json"):
-            when = plan_time(read_json_object(file).get("time"))
+            entry['reviews'][(file.name, meta.get('head'), meta['time'])] = meta
+        for file in root.rglob("*.json"):
+            if file.name not in {"merge.json", "events.json"}:
+                continue
+            key = "time" if file.name == "merge.json" else "merge"
+            when = plan_time(read_json_object(file).get(key))
             if when:
                 ident = file.relative_to(root).parts[0]
                 tasks.setdefault(ident, {"reviews": {}, "merges": []})['merges'].append(when.timestamp())
+    dates = [plan_time(meta['time']) for entry in tasks.values()
+             for meta in entry['reviews'].values()]
+    since = min(dates) if dates else None
+    date = since.date().isoformat() if since else "unknown"
     first, merged = [], []
     for entry in tasks.values():
         reviews = sorted(entry['reviews'].values(), key=lambda item: plan_time(item['time']))
-        if reviews and plan_time(reviews[0]['time']).timestamp() >= cutoff:
+        if reviews:
             first.append(reviews[0]['verdict'] == 'PASS')
-        if reviews and any(when >= cutoff for when in entry['merges']):
+        if reviews and any(when >= since.timestamp() for when in entry['merges']):
             merged.append(len(reviews))
     passed, total = sum(first), len(first)
+    if total < 5:
+        return f"quality: collecting ({total} tasks with review history since {date})"
     percent = round(100 * passed / total) if total else 0
-    average = sum(merged) / len(merged) if merged else 0
-    return f"quality: first-review pass {passed}/{total} ({percent}%), reviews per merged task {average:.1f} (last 14 days)"
+    average = f"{sum(merged) / len(merged):.1f}" if merged else "n/a"
+    return (f"quality (since {date}): first-review pass {passed}/{total} ({percent}%), "
+            f"reviews per merged task {average}")
 
 
 def status(args):
