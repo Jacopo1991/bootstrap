@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
-# Offline preflight shared by lint and its regression test.
+# Prefer installed tools; optionally fetch missing tools into a disposable gate dir.
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=../home/.chezmoitemplates/pins.env
 source "$ROOT/home/.chezmoitemplates/pins.env"
 failed=0
+fallback=${1:-}
 check_tool() {
   local tool=$1 expected=$2 output
   shift 2
+  if ! command -v "$tool" >/dev/null && [[ -n $fallback ]]; then
+    echo "WARN: missing $tool; trying checksum-pinned download for this gate; apply install.sh outside the lane sandbox for offline use" >&2
+    if ! bash "$ROOT/ci/lint-install.sh" "$fallback" "$tool"; then
+      echo "FAIL: missing $tool; pinned download unavailable or invalid; apply bootstrap with install.sh outside the lane sandbox" >&2
+      failed=1
+      return
+    fi
+  fi
   if ! command -v "$tool" >/dev/null; then
     echo "FAIL: missing $tool; apply bootstrap with install.sh outside the lane sandbox" >&2
     failed=1

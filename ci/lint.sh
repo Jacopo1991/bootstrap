@@ -4,11 +4,9 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cd "$ROOT"
-# Keep the existing hosted fresh-runner setup separate from offline local gates.
-if [[ ${GITHUB_ACTIONS:-} == true ]] && ! bash ci/gate-tools.sh; then
-  # shellcheck source=lint-install.sh
-  source "$ROOT/ci/lint-install.sh"
-fi
+# Missing tools use the same checksum-pinned fallback on hosts and fresh CI.
+export PATH="$tmp/gate-bin:$PATH"
+bash ci/gate-tools.sh "$tmp"
 failed=0
 run() {
   echo "RUN: $*" >&2

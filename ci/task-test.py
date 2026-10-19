@@ -2418,7 +2418,10 @@ store.write_text(json.dumps(prs))
             "![alt](/home/agent/x.png)"), "alt")
 
     def setUp(self):
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Includes AF_UNIX fixtures: nested gate TMPDIR paths exceed 108 bytes.
+        socket_test = self._testMethodName == 'test_reliability_special_files_archive_manifest_and_publication'
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory(
+            dir='/tmp' if socket_test else None, prefix='s')))
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
         for name, body in STUBS.items():

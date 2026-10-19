@@ -1,14 +1,17 @@
 """Offline lookup and fail-closed socket policy regression checks."""
 import contextlib
 import errno
+import hashlib
 import io
 import os
 from pathlib import Path
 import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +19,48 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GateToolsTest(unittest.TestCase):
+    def test_pinned_download_and_failures(self):
+        # Exercise real checksum verification and extraction with local transport.
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / 'repo'
+            for name in ('ci/lint-install.sh', 'system/common.sh',
+                         'home/.chezmoitemplates/pins.env'):
+                target = repo / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, target)
+            binary = base / 'shellcheck'
+            binary.write_text('#!/bin/sh\necho "version: 0.11.0"\n')
+            binary.chmod(0o755)
+            archive = base / 'archive.tar.xz'
+            with tarfile.open(archive, 'w:xz') as bundle:
+                bundle.add(binary, arcname='shellcheck-v0.11.0/shellcheck')
+            pins = repo / 'home/.chezmoitemplates/pins.env'
+            pins.write_text(pins.read_text() + '\nSHELLCHECK_SHA256=' +
+                            hashlib.sha256(archive.read_bytes()).hexdigest() + '\n')
+            transport = base / 'bin'
+            transport.mkdir()
+            curl = transport / 'curl'
+            curl.write_text('#!/bin/bash\ncp ' + shlex.quote(str(archive)) + ' "${@: -1}"\n')
+            curl.chmod(0o755)
+            env = dict(os.environ, PATH=str(transport) + ':' + os.environ['PATH'])
+
+            def install(label):
+                return subprocess.run(['bash', str(repo / 'ci/lint-install.sh'),
+                                       str(base / label), 'shellcheck'],
+                                      env=env, text=True, capture_output=True)
+
+            result = install('good')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('0.11.0', subprocess.check_output(
+                [str(base / 'good/gate-bin/shellcheck'), '--version'], text=True))
+            archive.write_bytes(b'corrupted download')
+            self.assertNotEqual(install('corrupt').returncode, 0)
+            self.assertFalse((base / 'corrupt/gate-bin/shellcheck').exists())
+            curl.write_text('#!/bin/sh\nexit 6\n')
+            self.assertNotEqual(install('offline').returncode, 0)
+            self.assertFalse((base / 'offline/gate-bin/shellcheck').exists())
+
     def test_offline_lookup(self):
         pins = dict(line.split("=", 1) for line in
                     (ROOT / "home/.chezmoitemplates/pins.env").read_text().splitlines())
