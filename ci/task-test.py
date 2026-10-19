@@ -166,6 +166,61 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_gate_drill_signals_clean_children_worktrees_and_reservations(self):
+        just = self.home / 'bin/just'
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            for phase in ('group', 'solo'):
+                with self.subTest(signal=sig, phase=phase):
+                    marker = self.home / 'sleeping-gate.json'
+                    marker.unlink(missing_ok=True)
+                    just.write_text(f'#!{sys.executable}\n' + textwrap.dedent(f'''\
+                        import json, os, pathlib, signal, subprocess, time
+                        if not pathlib.Path.cwd().name.endswith('-{phase}'):
+                            raise SystemExit(0)
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                        child = subprocess.Popen(['sleep', '60'])
+                        pathlib.Path({str(marker)!r}).write_text(json.dumps(
+                            [os.getpid(), child.pid, os.environ['TMPDIR']]))
+                        time.sleep(60)
+                        '''))
+                    just.chmod(0o755)
+                    process = subprocess.Popen([sys.executable, str(TOOL), 'gate-drill', 'proj'],
+                                               env=self.env, cwd=self.home, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    pids = []
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        self.assertTrue(marker.exists(), 'sleeping gate never started')
+                        leader, child, temporary = json.loads(marker.read_text())
+                        pids = [leader, child]
+                        process.send_signal(sig)
+                        output, _ = process.communicate(timeout=10)
+                        self.assertNotEqual(process.returncode, 0, output)
+                        self.assertIn('Drill interrupted', output)
+                        for pid in pids:
+                            status = Path(f'/proc/{pid}/stat')
+                            self.assertTrue(not status.exists() or status.read_text().split()[2] == 'Z',
+                                            f'gate process {pid} survived')
+                        self.assertFalse(Path(temporary).exists())
+                        self.assertEqual(list((self.repo / '.worktrees').glob('.*drill-*')), [])
+                        self.assertNotIn('.drill-', self.git(self.repo, 'worktree', 'list'))
+                        locks = list(self.gate_dir.glob('*.lock'))
+                        self.assertTrue(locks, 'gate did not reserve a port index')
+                        for lock in locks:
+                            with lock.open('r') as stream:
+                                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                        process.communicate(timeout=5)
+                        for pid in pids:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+
     def test_status_bad_config_does_not_hide_other_repos(self):
         good = self.home / 'dev_workspace/z-good'
         good.mkdir()
@@ -222,6 +277,10 @@ class TaskTool(unittest.TestCase):
         evidence = self.home / '.local/state/task/gate-drill'
         rows = json.loads(next(evidence.glob('*/results.json')).read_text())
         self.assertEqual(rows[0]['verdict'], 'ok')
+        # Evidence identity must not depend on filesystem timestamp ordering.
+        initial_result = next(evidence.glob('*/results.json'))
+        future = time.time() + 3600
+        os.utime(initial_result, (future, future))
         bad = self.home / 'dev_workspace/bad'
         bad.mkdir()
         self.git(bad, 'init', '-q', '-b', 'main')
@@ -247,10 +306,12 @@ class TaskTool(unittest.TestCase):
                 output = self.raw_task('gate-drill', 'bad', 'proj', '--seed', 'proj:extra',
                                        '--seed', 'proj:another', code=1)
                 self.assertIn(reason, output)
-                self.assertRegex(output, r'proj \| passed .* \| - \| ok')
+                self.assertRegex(output, r'proj \| passed .* \| passed .* \| ok')
                 self.assertEqual(len(self.git(bad, 'worktree', 'list').splitlines()), 1)
-                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
-                rows = json.loads(latest.read_text())
+                archive = Path(next(line.removeprefix('Drill evidence: ') for line in output.splitlines()
+                                    if line.startswith('Drill evidence: ')))
+                rows = json.loads((archive / 'results.json').read_text())
+                self.assertEqual([row['repo'] for row in rows], ['bad', 'proj'])
                 self.assertEqual(rows[0]['concurrent']['result'], 'failed')
                 self.assertEqual(rows[0]['solo']['result'], 'failed')
                 if isinstance(config, bytes) or config is None:
@@ -288,10 +349,11 @@ class TaskTool(unittest.TestCase):
                         mock.patch.object(shutil, 'copy2', side_effect=copy_seed), \
                         contextlib.redirect_stdout(output):
                     self.assertEqual(TASK_MODULE.gate_drill(mock.Mock(repos=['bad', 'proj'], seed=[])), 1)
-                self.assertRegex(output.getvalue(), r'proj \| passed .* \| - \| ok')
-                evidence = self.home / '.local/state/task/gate-drill'
-                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
-                rows = json.loads(latest.read_text())
+                self.assertRegex(output.getvalue(), r'proj \| passed .* \| passed .* \| ok')
+                archive = Path(next(line.removeprefix('Drill evidence: ') for line in output.getvalue().splitlines()
+                                    if line.startswith('Drill evidence: ')))
+                rows = json.loads((archive / 'results.json').read_text())
+                self.assertEqual([row['repo'] for row in rows], ['bad', 'proj'])
                 for phase in ('concurrent', 'solo'):
                     self.assertEqual(rows[0][phase]['result'], 'failed')
                     self.assertIn('error', rows[0][phase])
@@ -1651,8 +1713,8 @@ store.write_text(json.dumps(prs))
     def test_gate_defaults_and_advisory_compatibility(self):
         path = self.home / "gate-config"
         path.mkdir()
-        for config, trusted, advisory in ((None, True, False), ("", True, False),
-                ("exclusive_gate = false\n", False, False),
+        for config, trusted, advisory in ((None, True, True), ("", True, True),
+                ("exclusive_gate = false\n", False, True),
                 ("exclusive_gate = true\n", True, True)):
             with self.subTest(config=config):
                 file = path / ".task.toml"
@@ -1841,12 +1903,16 @@ store.write_text(json.dumps(prs))
         pre_commit.chmod(0o755)
         just = self.home / 'bin/just'
         just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
-            import json, os, pathlib, sys, time
+            import json, os, pathlib, re, sys, time
             assert not any(key in os.environ for key in ('PYTHONPATH', 'VIRTUAL_ENV', 'FOO', 'TASK_GATE_FAKE'))
             if sys.argv[1:] != ['check']:
                 sys.exit(1)
             home = pathlib.Path(os.environ['HOME'])
             kind = pathlib.Path('kind').read_text()
+            name = pathlib.Path.cwd().name
+            assert re.fullmatch(r'\\.drill-[0-9a-f]{6}-\\d+-(group|solo)', name), name
+            assert len(name) < 24, name
+            assert not re.search(r'sk-[A-Za-z0-9_-]{20,}|\\d{10,}', name), name
             temporary = pathlib.Path(os.environ['TMPDIR'])
             assert pathlib.Path('.work/pinned').read_text() == kind
             assert pathlib.Path('.work/extra').read_text() == kind
@@ -1889,6 +1955,9 @@ store.write_text(json.dumps(prs))
                             env=dict(self.env, TMPDIR=str(self.repo), PYTHONPATH='/odd-python',
                                      VIRTUAL_ENV='/odd-venv', FOO='caller', TASK_GATE_FAKE='caller'))
         self.assertIn('clash', out)
+        self.assertIn('clean: solo: PASS, together: PASS, verdict: ok', out)
+        self.assertIn('clash: solo: PASS, together: FAIL, verdict: clash', out)
+        self.assertIn('always: solo: FAIL, together: FAIL, verdict: failing-alone (pre-existing failure, not a concurrency clash)', out)
         evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
         self.assertEqual(len(evidence), 1)
         rows = json.loads(evidence[0].read_text())
@@ -1899,7 +1968,7 @@ store.write_text(json.dumps(prs))
         temporary_paths = []
         for name in ('clean', 'clash', 'always'):
             records = [json.loads(line) for line in (self.home / (name + '-env')).read_text().splitlines()]
-            self.assertEqual(len(records), 1 if name == 'clean' else 2)
+            self.assertEqual(len(records), 2)
             concurrent_slots.append(records[0][1])
             for temporary, slot, port in records:
                 temporary_paths.append(temporary)
@@ -3134,19 +3203,56 @@ store.write_text(json.dumps(prs))
                          ["run", "--from-ref", self.git(self.repo, "rev-parse", "origin/main"),
                           "--to-ref", "HEAD"])
 
-    def test_advisory_check_holds_exclusive_gate_lock_during_run(self):
+    def test_advisory_check_holds_one_slot_and_resources_during_run(self):
         wt, _ = self.started()
-        (wt / ".task.toml").write_text("exclusive_gate = true\n")
+        (wt / ".task.toml").write_text('exclusive_gate = true\ngate_resources = ["shared"]\n')
         self.git(wt, "add", ".task.toml")
         self.git(wt, "commit", "-qm", "enable shared check gate")
         (self.home / "during-check.sh").write_text(
-            'test -s "$TASK_GATE_DIR/agent-task-gate.holder" || exit 7\n')
+            'test -s "$TASK_GATE_DIR/agent-task-gate.holder" || exit 7\n'
+            'test -s "$TASK_GATE_DIR/agent-task-gate-resource-shared.holder" || exit 8\n'
+            'test ! -e "$TASK_GATE_DIR/agent-task-gate-slot-1.holder" || exit 9\n'
+            'test ! -e "$TASK_GATE_DIR/agent-task-gate-slot-2.holder" || exit 10\n')
         (self.home / "during-check.sh").chmod(0o755)
         self.sandbox_state()
         out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
         self.assertIn("PASS", out)
         self.assertFalse((self.gate_dir / "agent-task-gate.holder").exists(),
                          "the shared gate holder should be released after the advisory run")
+
+    def test_advisory_resources_exclude_other_gates_but_not_other_slots(self):
+        self.commit_in(self.repo, '.task.toml', 'exclusive_gate = true\ngate_resources = ["shared"]\n')
+        other = self.home / 'other'
+        other.mkdir()
+        task = TASK_MODULE.Task(self.repo, '5')
+        second = TASK_MODULE.Task(other, '6')
+        with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE, 'GATE_LOCK_WAIT', 0):
+            with TASK_MODULE.exclusive_gate_lock(task, advisory=True):
+                with TASK_MODULE.exclusive_gate_lock(second):
+                    self.assertEqual(TASK_MODULE.GATE_SLOT.get(), 1)
+                (other / '.task.toml').write_text('gate_resources = ["shared"]\n')
+                with self.assertRaises(SystemExit) as caught:
+                    with TASK_MODULE.exclusive_gate_lock(second):
+                        self.fail('shared resource was not locked')
+                self.assertEqual(caught.exception.code, 3)
+
+    def test_drill_cleanup_old_and_new_names_preserves_live_and_unrelated(self):
+        parent = self.repo / '.worktrees'
+        parent.mkdir(exist_ok=True)
+        stale = ['.task-drill-1792000000000000000-99999999-0-concurrent',
+                 '.drill-abcdef-0-group', '.drill-abcdef-0-solo']
+        kept = [f'.task-drill-1792000000000000000-{os.getpid()}-0-solo',
+                '.drill-fedcba-0-group', '.drill-unrelated']
+        for name in stale + kept:
+            path = parent / name
+            self.git(self.repo, 'worktree', 'add', '-q', '--detach', str(path), 'HEAD')
+            if name == '.drill-fedcba-0-group':
+                (path / '.work').mkdir(exist_ok=True)
+                (path / '.work/drill.pid').write_text(str(os.getpid()))
+        with mock.patch.dict(os.environ, self.env):
+            TASK_MODULE.prune_drill_worktrees(self.repo)
+        self.assertEqual(sorted(path.name for path in parent.iterdir()), sorted(kept))
 
     def test_bare_just_check_does_not_expand_unset_proxy_bypass_vars(self):
         justfile = (ROOT / "justfile").read_text()

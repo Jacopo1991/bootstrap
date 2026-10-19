@@ -871,6 +871,8 @@ def configured_environment(path, repo=None):
 
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     values = task_config(path)
+    if advisory:
+        return True
     return values.get("exclusive_gate", not advisory) is True
 
 
@@ -921,10 +923,10 @@ def holder_display(row, *, include_slot=True):
 
 
 @contextmanager
-def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=None):
+def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=None, advisory=False):
     """Hold sorted resources and either one slot or the whole machine."""
     path = config_path if config_path is not None else task.repo
-    if not exclusive_gate_enabled(path):
+    if not exclusive_gate_enabled(path, advisory=advisory):
         yield
         return
     values = task_config(path)
@@ -934,13 +936,13 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
             for name in resources):
         raise Stop("gate_resources must be a list of resource names (letters, digits, _ or -)")
     count = gate_slots()
-    exclusive = values.get("exclusive_gate") is True
+    exclusive = not advisory and values.get("exclusive_gate") is True
     groups = [[f"resource-{name}"] for name in sorted(set(resources))]
     slots = [f"slot-{number}" for number in range(count)]
     groups.extend([[name] for name in slots] if exclusive else [slots])
     # A gate whose isolation is required (whole machine, or named resources) must not run
     # unlocked; only a plain one-slot gate may degrade to an unlocked run with a notice.
-    allow_unavailable = silent_unavailable or not (exclusive or resources)
+    allow_unavailable = not resources and (silent_unavailable or not exclusive)
     notice = "running advisory check unlocked" if silent_unavailable else "running trusted gate unlocked"
     acquired = []
     held_slot = None
@@ -2046,9 +2048,10 @@ def sweep_gate_temporary(root):
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-              advisory=False, pre_commit_all_files=False):
+              advisory=False, pre_commit_all_files=False, cancelled=None):
     if advisory:
-        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True)
+        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
+                               cancelled=cancelled)
     # Do not inherit TMPDIR: callers may point it inside a checkout.
     temporary_root = Path("/tmp") / f"task-gate-{os.getuid()}"
     temporary_root.mkdir(mode=0o700, exist_ok=True)
@@ -2063,11 +2066,12 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
                            "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
             return run_check_steps(path, base, record, state, evidence_name, display_log,
-                                   gate_environment=environment, pre_commit_all_files=pre_commit_all_files)
+                                   gate_environment=environment, pre_commit_all_files=pre_commit_all_files,
+                                   cancelled=cancelled)
 
 
 def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-                    advisory=False, gate_environment=None, pre_commit_all_files=False):
+                    advisory=False, gate_environment=None, pre_commit_all_files=False, cancelled=None):
     """Run the repository's gate in <path>; return True when it passes.
 
     pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
@@ -2075,7 +2079,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
     """
     if not advisory and gate_environment is None:
         return run_check(path, base, record, state, evidence_name, display_log,
-                         pre_commit_all_files=pre_commit_all_files)
+                         pre_commit_all_files=pre_commit_all_files, cancelled=cancelled)
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
@@ -2102,6 +2106,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             elif base:
                 steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
         for step in steps:
+            if cancelled and cancelled():
+                raise Stop("Drill interrupted.")
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
             started = time.monotonic()
@@ -2120,7 +2126,29 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 if state:
                     set_child_group(state, process.pid)
                 try:
-                    code = process.wait(timeout=timeout)
+                    if cancelled is None:
+                        code = process.wait(timeout=timeout)
+                    else:
+                        deadline = time.monotonic() + timeout
+                        while True:
+                            if cancelled():
+                                try:
+                                    os.killpg(process.pid, signal.SIGTERM)
+                                    time.sleep(0.2)
+                                    # Descendants may survive even if the leader exits.
+                                    os.killpg(process.pid, signal.SIGKILL)
+                                except ProcessLookupError:
+                                    pass
+                                process.wait()
+                                if state:
+                                    set_child_group(state, None)
+                                raise Stop("Drill interrupted.")
+                            try:
+                                code = process.wait(timeout=min(0.1, max(0, deadline - time.monotonic())))
+                                break
+                            except subprocess.TimeoutExpired:
+                                if time.monotonic() >= deadline:
+                                    raise
                 except subprocess.TimeoutExpired:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
@@ -2218,7 +2246,7 @@ def check(args):
     if advisory:
         with advisory_check_lock(path):
             if exclusive_gate_enabled(path, advisory=True):
-                with exclusive_gate_lock(task, silent_unavailable=True, config_path=path):
+                with exclusive_gate_lock(task, silent_unavailable=True, config_path=path, advisory=True):
                     passed = run_check(path, base, record, None, advisory=True)
             else:
                 passed = run_check(path, base, record, None, advisory=True)
@@ -3991,9 +4019,26 @@ def wait_task(args):
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
+def prune_drill_worktrees(repo):
+    for path in (repo / ".worktrees").glob(".*drill-*"):
+        old = re.fullmatch(r"\.task-drill-\d{19}-(\d+)-\d+-(concurrent|solo)", path.name)
+        new = re.fullmatch(r"\.drill-[0-9a-f]{6}-\d+-(group|solo)", path.name)
+        if not old and not new:
+            continue
+        owner = path / ".work/drill.pid"
+        pid = old.group(1) if old else owner.read_text().strip() if owner.is_file() else ""
+        if pid.isdigit() and pid_alive(pid):
+            continue
+        result = run_git(repo, "worktree", "remove", "--force", str(path))
+        if result.returncode:
+            raise Stop(f"Cannot remove drill worktree {path}: {result.stderr}")
+
+
 def gate_drill(args):
     """Measure real cross-repository clashes without consuming gate slots."""
     repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
+    for repo in repos:
+        prune_drill_worktrees(repo)
     cli_seeds = {repo: [] for repo in repos}
     for value in args.seed:
         repo_name, separator, name = value.partition(":")
@@ -4005,15 +4050,27 @@ def gate_drill(args):
         cli_seeds[repo].append(name)
     archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
     archive.mkdir(parents=True)
+    run_name = secrets.token_hex(3)
     worktrees = []
+    interrupted = False
+
+    def interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+
+    previous_handlers = {sig: signal.signal(sig, interrupt)
+                         for sig in (signal.SIGTERM, signal.SIGINT)}
 
     def prepare(repo, index, phase):
         parent = repo / ".worktrees"
         parent.mkdir(exist_ok=True)
-        path = parent / f".task-drill-{archive.name}-{index}-{phase}"
+        mode = "solo" if phase == "solo" else "group"
+        path = parent / f".drill-{run_name}-{index}-{mode}"
         base, _ = base_commit(repo, default_branch(repo))
         git(repo, "worktree", "add", "-q", "--detach", str(path), base)
         worktrees.append((repo, path))
+        (path / ".work").mkdir(exist_ok=True)
+        (path / ".work/drill.pid").write_text(str(os.getpid()))
         prepare_environment(repo, path)
         names = task_config(path).get("drill_seeds", [])
         if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
@@ -4031,6 +4088,8 @@ def gate_drill(args):
 
     def prepare_measure(repo, index, phase):
         try:
+            if interrupted:
+                raise Stop("Drill interrupted.")
             return measure(prepare(repo, index, phase), index, phase)
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": 0, "error": str(error)}
@@ -4045,7 +4104,8 @@ def gate_drill(args):
         started = time.monotonic()
         try:
             passed = run_check(path, "", state=archive / f"{index}-{phase}",
-                               evidence_name="drill-check.json", pre_commit_all_files=True)
+                               evidence_name="drill-check.json", pre_commit_all_files=True,
+                               cancelled=lambda: interrupted)
             return {"result": "passed" if passed else "failed",
                     "duration": round(time.monotonic() - started, 3)}
         except (Stop, OSError) as error:
@@ -4068,12 +4128,18 @@ def gate_drill(args):
             futures = [pool.submit(prepare_measure, repo, index, "concurrent")
                        for index, repo in enumerate(repos)]
             concurrent = [future.result() for future in futures]
+        if interrupted:
+            raise Stop("Drill interrupted.")
         for index, (repo, result) in enumerate(zip(repos, concurrent)):
-            row = {"repo": repo.name, "concurrent": result, "solo": None, "verdict": "ok"}
-            if result["result"] != "passed":
-                row["solo"] = prepare_measure(repo, index, "solo")
-                row["verdict"] = "clash" if row["solo"]["result"] == "passed" else "failing-alone"
+            row = {"repo": repo.name, "concurrent": result,
+                   "solo": prepare_measure(repo, index, "solo"), "verdict": "ok"}
+            if row["solo"]["result"] != "passed":
+                row["verdict"] = "failing-alone"
+            elif result["result"] != "passed":
+                row["verdict"] = "clash"
             rows.append(row)
+            if interrupted:
+                raise Stop("Drill interrupted.")
         table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
         for row in rows:
             def cell(result):
@@ -4082,16 +4148,31 @@ def gate_drill(args):
             for phase in ("concurrent", "solo"):
                 if row[phase] and row[phase].get("error"):
                     table.append(f"  {phase}: {row[phase]['error']}")
+        table.append("Summary:")
+        for row in rows:
+            solo = "PASS" if row["solo"]["result"] == "passed" else "FAIL"
+            together = "PASS" if row["concurrent"]["result"] == "passed" else "FAIL"
+            note = " (pre-existing failure, not a concurrency clash)" if row["verdict"] == "failing-alone" else ""
+            table.append(f"{row['repo']}: solo: {solo}, together: {together}, verdict: {row['verdict']}{note}")
         atomic_json(archive / "results.json", rows)
         (archive / "results.txt").write_text("\n".join(table) + "\n")
         print("\n".join(table), flush=True)
         print(f"Drill evidence: {archive}")
         return int(any(row["verdict"] != "ok" for row in rows))
     finally:
-        for repo, path in reversed(worktrees):
-            result = run_git(repo, "worktree", "remove", "--force", str(path))
-            if result.returncode:
-                raise Stop(f"Cannot remove drill worktree {path}: {result.stderr}")
+        try:
+            errors = []
+            for repo, path in reversed(worktrees):
+                result = run_git(repo, "worktree", "remove", "--force", str(path))
+                if result.returncode:
+                    errors.append(f"Cannot remove drill worktree {path}: {result.stderr}")
+            if errors:
+                raise Stop("\n".join(errors))
+            if interrupted:
+                raise Stop("Drill interrupted.")
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
 
 
 def main(argv=None):
