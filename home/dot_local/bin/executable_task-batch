@@ -18,23 +18,32 @@ CLI_LIMIT = {
     "codex": re.compile(r"ERROR: (?:You've hit your usage limit(?:\..*| for .+)|quota exceeded|"
                         r"(?:unexpected status |exceeded retry limit, last status: )"
                         r"429 Too Many Requests(?:.*))"),
-    "claude": re.compile(r"(?:You've hit your (?:limit|fast limit|monthly spend limit)"
-                         r"(?:[. ·].*)?|API Error: 429(?: .*)?)"),
+    "claude": re.compile(r"(?:You've hit your (?:session limit|weekly limit|Opus limit|"
+                         r"Sonnet limit|Fable limit|usage credit limit|limit|fast limit|"
+                         r"monthly spend limit)|API Error: 429)"),
 }
-HOOK_DENIAL = "Command blocked by PreToolUse hook: "
+HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
+               "Execution stopped by PreToolUse hook")
 
 
 def cli_limit(record, output):
     """Only a failed, completed CLI run's terminal diagnostic can be a limit."""
-    if record.get("state") != "finished" or record.get("exit_code") != 1:
+    builder, code = record.get("builder"), record.get("exit_code")
+    # Claude's limit-stop exit status is not confirmed; require a recorded
+    # nonzero exit and its exact terminal diagnostic prefix instead.
+    failed = isinstance(code, int) and code != 0 if builder == "claude" else code == 1
+    if record.get("state") != "finished" or not failed:
         return ""
     pattern = CLI_LIMIT.get(record.get("builder"))
     lines = output.rstrip().splitlines()
     # codex exec emits this after an error when --output-last-message is set.
-    if lines and lines[-1].startswith("Warning: no last agent message; wrote empty content to "):
+    if builder == "codex" and lines and lines[-1].startswith("Warning: no last agent message; wrote empty content to "):
         lines.pop()
     last = lines[-1] if lines else ""
-    return last if pattern and pattern.fullmatch(last) else ""
+    if not pattern:
+        return ""
+    match = pattern.match(last) if builder == "claude" else pattern.fullmatch(last)
+    return last if match else ""
 
 
 class Stop(Exception):
@@ -64,9 +73,6 @@ def parse(source):
             if re.fullmatch(r"\s*```\s*", line):
                 in_rules = False
             continue
-        if line.strip().startswith("Do not explore the environment;"):
-            current = None
-            break
         match = TASK_LINE.match(line)
         if match:
             ident, builder, model, seed, after = match.groups()

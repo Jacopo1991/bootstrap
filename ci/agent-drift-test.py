@@ -19,8 +19,9 @@ expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "agentdev-shell-mcp"}
 assert drift.EXPECTED_BINARIES == expected
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
-for script in (ROOT / "home/dot_local/bin").glob("executable_*"):
-    assert script.name.removeprefix("executable_") in expected, script.name
+for script in (ROOT / "home/dot_local/bin").iterdir():
+    if script.is_file():
+        assert script.name.removeprefix("executable_") in expected, script.name
 assert drift.compare_sets(expected, expected) == []
 pins = drift.read_pins(ROOT / "home/.chezmoitemplates/pins.env")
 assert pins["CLAUDE_VERSION"] == "2.1.296", "Claude Code alias routing requires the pinned 2.1.296 release"

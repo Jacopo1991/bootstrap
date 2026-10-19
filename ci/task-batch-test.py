@@ -175,6 +175,13 @@ class BatchTest(unittest.TestCase):
         self.assertEqual([c[0] for c in self.calls()[before:]],
                          ['runner-check', 'wait', 'check', 'review', 'merge'])
 
+    def test_tasks_after_environment_instruction_still_run(self):
+        self.source.write_text(self.source.read_text() +
+                               'Do not explore the environment; start with step 1.\n'
+                               '2. two: builder codex, model gpt-6-luna\nRequest: implement two\n')
+        self.assertEqual(self.run_batch(), 'one: merged\ntwo: merged\nbatch: finished\n')
+        self.assertEqual([call[2] for call in self.calls('start')], ['one', 'two'])
+
     def test_resume_unfinished_rewrites_stale_prompt(self):
         subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
                        env=self.env, check=True, capture_output=True)
@@ -279,7 +286,7 @@ class BatchTest(unittest.TestCase):
         self.assertFalse(self.calls('check'))
 
     def test_review_limit_stops(self):
-        self.scenario({'review': [{'exit_code': 1, 'reply': "You've hit your limit · resets 5pm (UTC)"}]})
+        self.scenario({'review': [{'exit_code': 2, 'reply': "You've hit your weekly limit · resets 5pm (UTC)"}]})
         self.assertIn('batch: stopped:', self.run_batch(1))
 
     def test_codex_reviewer_limit_stops(self):
@@ -289,7 +296,7 @@ class BatchTest(unittest.TestCase):
 
     def test_claude_lane_limit_stops(self):
         self.source.write_text(self.source.read_text().replace('codex', 'claude').replace('gpt-6-luna', 'sonnet'))
-        self.scenario({'lane': [{'exit_code': 1, 'log': "You've hit your limit · resets 5pm (UTC)"}]})
+        self.scenario({'lane': [{'exit_code': 2, 'log': "You've hit your session limit · resets 3pm (Europe/Copenhagen)"}]})
         self.assertIn('batch: stopped: lane CLI:', self.run_batch(1))
 
     def test_limit_mentions_in_transcripts_review_and_commands_do_not_stop(self):
@@ -332,6 +339,39 @@ class BatchTest(unittest.TestCase):
     def test_structured_sandbox_block_stops(self):
         self.scenario({'lane': [{'state': 'sandbox_blocked'}]})
         self.assertIn('batch: stopped: lane: sandbox_blocked', self.run_batch(1))
+
+    def test_claude_final_hook_denials(self):
+        work = self.home / 'hook-outcome'
+        work.mkdir()
+        (work / 'lane.json').write_text(json.dumps(dict(state='finished', builder='claude', exit_code=1)))
+        runner = batch_module.Batch(self.repo, self.source)
+        for prefix in ('Blocked by PreToolUse hook', 'Execution stopped by PreToolUse hook'):
+            for suffix in ('', ': required git command'):
+                with self.subTest(prefix=prefix, suffix=suffix):
+                    (work / 'final.md').write_text(prefix + suffix)
+                    with self.assertRaises(batch_module.Stop):
+                        runner.lane_outcome(work)
+                    (work / 'final.md').write_text('Review mentions ' + prefix + suffix)
+                    (work / 'lane.log').write_text(prefix + suffix)
+                    runner.lane_outcome(work)
+
+    def test_exact_claude_limit_prefixes_on_final_line(self):
+        diagnostics = ["You've hit your " + name for name in (
+            'session limit', 'weekly limit', 'Opus limit', 'Sonnet limit',
+            'Fable limit', 'usage credit limit', 'limit', 'fast limit', 'monthly spend limit')]
+        diagnostics += ['API Error: 429']
+        for diagnostic in diagnostics:
+            for suffix in ('', ' · resets 3pm (Europe/Copenhagen)', ': details'):
+                for code in (1, 2, -15):
+                    with self.subTest(diagnostic=diagnostic, suffix=suffix, code=code):
+                        record = dict(builder='claude', state='finished', exit_code=code)
+                        final = diagnostic + suffix
+                        self.assertEqual(batch_module.cli_limit(record, 'Earlier output\n' + final + '\n'), final)
+                        self.assertFalse(batch_module.cli_limit(record, final + '\nOther failure'))
+                        self.assertFalse(batch_module.cli_limit(record, 'Quoted: ' + final))
+                        for nonfailure in (0, None):
+                            self.assertFalse(batch_module.cli_limit(dict(record, exit_code=nonfailure), final))
+                        self.assertFalse(batch_module.cli_limit(dict(record, state='timed_out'), final))
 
     def test_terminal_cli_diagnostics(self):
         record = dict(builder='codex', state='finished', exit_code=1)
