@@ -463,13 +463,18 @@ def decision_status_only(old, new):
 
 
 def decision_changed(kb, name, before="HEAD", after=None):
-    old = run_git(kb, "show", f"{before}:{name}")
-    if after is None:
-        path = kb / name
-        new = path.read_text() if path.is_file() else None
-    else:
-        shown = run_git(kb, "show", f"{after}:{name}")
-        new = shown.stdout if shown.returncode == 0 else None
+    try:
+        old = run_git(kb, "show", f"{before}:{name}")
+        if after is None:
+            path = kb / name
+            new = path.read_text() if path.is_file() else None
+        else:
+            shown = run_git(kb, "show", f"{after}:{name}")
+            new = shown.stdout if shown.returncode == 0 else None
+    except (OSError, ValueError):
+        # Unreadable content cannot be proven to be a status-only edit.
+        # ValueError includes UnicodeDecodeError from either Git or the file.
+        return True
     return old.returncode != 0 or new is None or not decision_status_only(old.stdout, new)
 
 
@@ -726,12 +731,12 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
-def preserve_work(task: Task, path: Path, reuse_head=None, *, strict=False):
+def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=False):
     """Preserve evidence; list runtime data and individual copy failures."""
     source = path / ".work"
     if not source.exists() and not source.is_symlink():
         return
-    archive = HOME / ".local/state/task/archive" / task.repo.name / task.name
+    archive = HOME / ".local/state/task/archive" / repo.name / name
     try:
         archive.mkdir(parents=True, exist_ok=True)
         if reuse_head:
@@ -2729,7 +2734,7 @@ def prune_stale_gate_worktrees(repo: Path):
 
 def remove_gate_worktree(task, gate):
     try:
-        preserve_work(task, gate)
+        preserve_work(task.repo, task.name, gate)
     except Stop as error:
         print(f"Gate archive warning: {error}", file=sys.stderr)
     finally:
@@ -2939,7 +2944,7 @@ def merge(args):
     if leftovers:
         print(f"Kept {path}: it holds files that are not in the merge:\n" + "\n".join(leftovers))
         return 0
-    preserve_work(task, path)
+    preserve_work(task.repo, task.name, path)
     git(repo, "worktree", "remove", "--force", str(path))
     completed_step(task, "cleaned")
     if is_ancestor(repo, lane_head, commit) and ok(repo, "branch", "-D", branch):
@@ -3087,7 +3092,7 @@ def remove_completed_close_worktree(repo, branch, remove_parent=False, *, task):
     else:
         # This deterministic path is owned by task close; after a verified merge, remove it
         # even if files were left behind in the temporary worktree.
-        preserve_work(task, path)
+        preserve_work(task.repo, task.name, path)
         removed = run_git(repo, "worktree", "remove", "--force", str(path))
         if removed.returncode:
             print(f"Close worktree kept at {path}: {removed.stderr.strip()}")
@@ -3163,7 +3168,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         if head != base:
             raise Stop(f"Close branch {branch} at {head[:7]} has an unexpected commit; preserved at {path}.")
         if git(path, "status", "--porcelain", "--untracked-files=all"):
-            preserve_work(task, path)
+            preserve_work(task.repo, task.name, path)
             git(path, "reset", "--hard", "HEAD")
             git(path, "clean", "-fd")
         changed = apply_close_update(path, task, before, archive, criteria, status, summary)
@@ -3401,6 +3406,8 @@ def status(args):
             keys = ", ".join(sorted(configured_environment(repo))) or "(none)"
         except Stop as error:
             keys = f"unavailable ({error})"
+        except (OSError, ValueError):
+            keys = f"unavailable (Cannot read environment for {repo}.)"
         print("  env keys: " + keys)
         if (CORTEX / f"cortex-kb-{repo.name}").exists():
             print("  " + plan_verdict(plan_info(repo)))
@@ -3834,7 +3841,7 @@ def repair_published(task, base):
             if source.is_file():
                 shutil.copy2(source, state / name)
         if not (untracked(task.path) + ignored_leftovers(task.path)):
-            preserve_work(task, task.path, reuse_head=head)
+            preserve_work(task.repo, task.name, task.path, reuse_head=head)
             branch = git(task.path, 'branch', '--show-current')
             git(task.repo, 'worktree', 'remove', '--force', str(task.path))
             if branch:
@@ -3953,6 +3960,8 @@ def gate_drill(args):
             return measure(prepare(repo, index, phase), index, phase)
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": 0, "error": str(error)}
+        except ValueError:
+            return {"result": "failed", "duration": 0, "error": f"Cannot read drill inputs for {repo}."}
 
     def measure(path, index, phase):
         # Drill runs hold no slot; run_check reserves a free port index above the slots.
@@ -3968,6 +3977,9 @@ def gate_drill(args):
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": round(time.monotonic() - started, 3),
                     "error": str(error)}
+        except ValueError:
+            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
+                    "error": f"Cannot read drill inputs in {path}."}
         finally:
             log = path / ".work/check.log"
             if log.is_file():

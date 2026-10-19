@@ -239,6 +239,29 @@ class Safety(unittest.TestCase):
         self.assertEqual((flagged / "a.txt").read_text(), "edited", out)
         self.assertTrue(merging.exists(), out)
 
+    def test_uppercase_worktree_without_evidence_is_removed(self):
+        path = self.worktree('Feature-X', '-b', 'Feature-X')
+        age(path)
+        out = self.tidy()
+        self.assertFalse(path.exists(), out)
+        self.assertNotIn('cannot archive', out)
+        self.assertFalse((self.home / '.local/state/task/archive').exists())
+
+    def test_evidence_keeps_uppercase_and_numeric_worktree_names(self):
+        paths = [self.worktree(name, '-b', name) for name in ('Feature-X', '28')]
+        for path in paths:
+            (path / '.work').mkdir()
+            (path / '.work/report.md').write_text(f'evidence for {path.name}')
+            age(path)
+        out = self.tidy()
+        archive = self.home / '.local/state/task/archive/proj'
+        self.assertEqual({path.name for path in archive.iterdir()}, {'Feature-X', '28'})
+        for path in paths:
+            self.assertFalse(path.exists(), out)
+            reports = list((archive / path.name).glob('*/.work/report.md'))
+            self.assertEqual(len(reports), 1, out)
+            self.assertEqual(reports[0].read_text(), f'evidence for {path.name}')
+
     def test_merged_session_files_archived_databases_and_work_caches_removed(self):
         run(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD", old=True)
         paths = []

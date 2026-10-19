@@ -169,7 +169,7 @@ def archive_work(repo, path, report):
         tool = Path(__file__).with_name("executable_task")
     try:
         task = runpy.run_path(str(tool), run_name="workspace_tidy_archive")
-        task["preserve_work"](task["Task"](repo, path.name), path, strict=True)
+        task["preserve_work"](repo, path.name, path, strict=True)
     except Exception as error:
         report.append(f"{repo.name}: kept {path}: cannot archive .work: {error}")
         return False
@@ -220,7 +220,8 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
         archive = " (would archive .work first)" if (path / ".work").exists() else ""
         report.append(f"{prefix} is finished and clean; would be removed{archive}")
     else:
-        if not archive_work(repo, path, report):
+        source = path / ".work"
+        if (source.exists() or source.is_symlink()) and not archive_work(repo, path, report):
             return
         # The blocker checked all changes; --force also discards disposable session files.
         result = git(repo, "worktree", "remove", "--force", str(path))
@@ -269,7 +270,8 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
             archive = "would archive .work and " if (path / ".work").exists() else ""
             report.append(f"{repo.name}: finished worktree {path} ({label}) {archive}would be removed")
         else:
-            if not archive_work(repo, path, report):
+            source = path / ".work"
+            if (source.exists() or source.is_symlink()) and not archive_work(repo, path, report):
                 continue
             # The blocker checked all changes; --force also discards disposable session files.
             result = git(repo, "worktree", "remove", "--force", str(path))

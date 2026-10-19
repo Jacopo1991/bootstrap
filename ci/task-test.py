@@ -177,6 +177,12 @@ class TaskTool(unittest.TestCase):
                 self.assertNotIn('do-not-display', output)
                 if config == b'\xff':
                     self.assertIn(f'Cannot read {self.repo / ".task.toml"}', output)
+        config = self.repo / '.task.toml'
+        config.unlink()
+        config.mkdir()  # A real OSError from the newly added configuration read.
+        output = self.raw_task('status')
+        self.assertIn(f'env keys: unavailable (Cannot read {config}.)', output)
+        self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
 
     def test_configured_environment_rejects_reserved_names(self):
         names = TASK_MODULE.GIT_OVERRIDE_ENV | {'GIT_OVERRIDE_ENV', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
@@ -220,9 +226,16 @@ class TaskTool(unittest.TestCase):
                                ('drill_seeds = ["../escape"]', 'Invalid seed name'),
                                ('drill_seeds = "pinned"', 'list of seed names'),
                                ('drill_seeds = [2]', 'list of seed names'),
-                               (b'\xff', 'Cannot read')]:
+                               (b'\xff', 'Cannot read'),
+                               (None, 'Cannot read')]:
             with self.subTest(config=config):
-                if isinstance(config, bytes):
+                if config is None:
+                    (bad / '.task.toml').unlink()
+                    (bad / '.task.toml').mkdir()
+                    (bad / '.task.toml/entry').write_text('directory instead of config')
+                    self.git(bad, 'add', '-A', '.task.toml')
+                    self.git(bad, 'commit', '-qm', 'Unreadable config')
+                elif isinstance(config, bytes):
                     (bad / '.task.toml').write_bytes(config)
                     self.git(bad, 'add', '.task.toml')
                     self.git(bad, 'commit', '-qm', 'Non-UTF-8 config')
@@ -237,7 +250,7 @@ class TaskTool(unittest.TestCase):
                 rows = json.loads(latest.read_text())
                 self.assertEqual(rows[0]['concurrent']['result'], 'failed')
                 self.assertEqual(rows[0]['solo']['result'], 'failed')
-                if isinstance(config, bytes):
+                if isinstance(config, bytes) or config is None:
                     for phase in ('concurrent', 'solo'):
                         self.assertIn('.task.toml', rows[0][phase]['error'])
                 self.assertEqual(rows[1]['verdict'], 'ok')
@@ -247,6 +260,41 @@ class TaskTool(unittest.TestCase):
         output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:escape', code=1)
         self.assertIn('Seed symlink escapes .work', output)
         self.assertEqual(len(self.git(self.repo, 'worktree', 'list').splitlines()), 1)
+
+    def test_gate_drill_seed_read_errors_do_not_hide_other_repos(self):
+        bad = self.home / 'dev_workspace/bad'
+        bad.mkdir()
+        self.git(bad, 'init', '-q', '-b', 'main')
+        self.commit_in(bad, '.task.toml', 'drill_seeds = ["pinned"]\n')
+        (bad / '.work').mkdir()
+        seed = bad / '.work/pinned'
+        seed.write_text('seed contents')
+        copy = shutil.copy2
+        for error in (OSError('seed read failed'), ValueError('seed read failed'),
+                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
+            with self.subTest(error=type(error).__name__):
+                def copy_seed(source, destination, *args, **kwargs):
+                    if Path(source) == seed:
+                        raise error
+                    return copy(source, destination, *args, **kwargs)
+
+                output = io.StringIO()
+                with mock.patch.dict(os.environ, self.env), \
+                        mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                        mock.patch.object(TASK_MODULE, 'WORKSPACE', self.repo.parent), \
+                        mock.patch.object(shutil, 'copy2', side_effect=copy_seed), \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(TASK_MODULE.gate_drill(mock.Mock(repos=['bad', 'proj'], seed=[])), 1)
+                self.assertRegex(output.getvalue(), r'proj \| passed .* \| - \| ok')
+                evidence = self.home / '.local/state/task/gate-drill'
+                latest = max(evidence.glob('*/results.json'), key=lambda path: path.stat().st_mtime_ns)
+                rows = json.loads(latest.read_text())
+                for phase in ('concurrent', 'solo'):
+                    self.assertEqual(rows[0][phase]['result'], 'failed')
+                    self.assertIn('error', rows[0][phase])
+                self.assertEqual(rows[1]['verdict'], 'ok')
+                for repo in (bad, self.repo):
+                    self.assertEqual(len(self.git(repo, 'worktree', 'list').splitlines()), 1)
 
     def test_configured_gate_environment(self):
         config = '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n'
@@ -297,6 +345,48 @@ class TaskTool(unittest.TestCase):
         self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
         (self.kb / 'backlog/decisions/new.md').write_text('Replaced by decision-2\n')
         self.assertIn('decisions changed:', self.task('plan', 'proj'))
+
+    def test_status_unreadable_decision_next_to_status_edit_lists_every_repo(self):
+        good = self.home / 'dev_workspace/z-good'
+        good.mkdir()
+        self.git(good, 'init', '-q', '-b', 'main')
+        (self.kb / 'backlog/decisions').mkdir()
+        status_name = 'backlog/decisions/d-status.md'
+        binary_name = 'backlog/decisions/d-bytes.md'
+        original = '---\nstatus: accepted\n---\nKeep the data.\n'
+        self.commit_in(self.kb, status_name, original)
+        self.commit_in(self.kb, binary_name, original)
+        self.task('plan', 'proj', '--sign')
+        (self.kb / status_name).write_text(original.replace('accepted', 'replaced'))
+        (self.kb / binary_name).write_bytes(b'\xff')
+        for phase in ('working tree', 'committed', 'unreadable before'):
+            with self.subTest(phase=phase):
+                if phase == 'committed':
+                    self.git(self.kb, 'add', status_name, binary_name)
+                    subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'decisions'],
+                                   env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'),
+                                   check=True, capture_output=True)
+                elif phase == 'unreadable before':
+                    (self.kb / binary_name).write_text(original)
+                output = self.raw_task('status')
+                self.assertIn('proj:', output)
+                self.assertIn('z-good:', output)
+                self.assertIn(f'decisions changed: {binary_name}', output)
+                self.assertNotIn(status_name, output)
+
+    def test_decision_read_errors_conservatively_count_as_changed(self):
+        name = 'decision.md'
+        (self.kb / name).write_text('Keep the data.\n')
+        shown = subprocess.CompletedProcess([], 0, stdout='Keep the data.\n')
+        for error in (OSError('read failed'), ValueError('read failed'),
+                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
+            for source in ('before', 'after', 'working tree'):
+                with self.subTest(error=type(error).__name__, source=source):
+                    git_reads = [error] if source == 'before' else [shown, error]
+                    with mock.patch.object(TASK_MODULE, 'run_git', side_effect=git_reads), \
+                            mock.patch.object(Path, 'read_text', side_effect=error):
+                        after = None if source == 'working tree' else 'HEAD'
+                        self.assertTrue(TASK_MODULE.decision_changed(self.kb, name, after=after))
 
     def test_decision_inline_replacement_hsh_history(self):
         # Copied before/after lines from HSH d65ee46, decision-22.
@@ -2107,7 +2197,7 @@ store.write_text(json.dumps(prs))
                      'review.json', 'merge.json', 'manifest.json'):
             (work / 'big' / name).write_text('keep')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         manifest = next(self.work_archives().glob('*/manifest.json'))
         record = json.loads(manifest.read_text())
         skipped = {entry['path']: entry for entry in record['skipped']}
@@ -2142,7 +2232,7 @@ store.write_text(json.dumps(prs))
 
         with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
                 mock.patch.object(TASK_MODULE.shutil, 'copy2', side_effect=copy):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         manifest = next(self.work_archives().glob('*/manifest.json'))
         self.assertIn('disappearing', [entry['path'] for entry in json.loads(manifest.read_text())['skipped']])
         self.assertFalse(list(self.work_archives().glob('.pending-*')))
@@ -2199,7 +2289,7 @@ store.write_text(json.dumps(prs))
         self.git(self.repo, 'merge', '--no-ff', '-m', 'published', head)
         self.git(self.repo, 'push', '-q', 'origin', 'main')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         original = list(self.work_archives().glob('*/manifest.json'))
         (wt / 'leftover.txt').write_text('keep worktree')
         for _ in range(2):
@@ -2334,7 +2424,7 @@ store.write_text(json.dumps(prs))
                 stream.truncate(201 * 1024 ** 2)
             (directory / 'report.md').write_text('report')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         archived = next(self.work_archives().glob('*/.work'))
         self.assertFalse((archived / 't8venv/lib').exists())
         self.assertFalse((archived / 't8venv/pyvenv.cfg').exists())
@@ -2437,7 +2527,7 @@ store.write_text(json.dumps(prs))
             (directory / 'empty').mkdir()
         (finished / 'manifest.json').write_text('{}')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-            TASK_MODULE.preserve_work(TASK_MODULE.Task(self.repo, '5'), wt)
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
         archived = next(path.parent.parent for path in self.work_archives().glob('*/.work/big')
                         if path.parent.parent != finished)
         self.raw_task('repair', '--prune-archive', 'proj')
