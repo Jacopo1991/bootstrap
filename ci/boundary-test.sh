@@ -40,7 +40,6 @@ has_agent_session_interop x "$tmp/WSL" '789 2 1' "$tmp/proc" || { echo 'FAIL: se
 status=0
 python3 "$(dirname -- "$0")/boundary-sockets.py" \
   "$tmp/WSL/123_interop" "$tmp/WSL/2_interop" "$tmp/WSL/789_interop" || status=$?
-[[ $status != 77 ]] || exit 0
 [[ $status == 0 ]] || exit "$status"
 ln -s 2_interop "$tmp/WSL/1_interop"
 for pid in 1 2 123 789; do

@@ -1,7 +1,8 @@
 # Gate tools
 
-Installed by bootstrap before lanes start; local checks never download tools. Release
-versions and SHA-256 hashes live in `home/.chezmoitemplates/pins.env`.
+Installed tools are used with no download. Missing tools get a checksum-pinned
+download into the gate's temporary directory on any host. Release versions and
+SHA-256 hashes live in `home/.chezmoitemplates/pins.env`.
 
 | Tool | Job | Installation | Review |
 | --- | --- | --- | --- |
@@ -12,11 +13,6 @@ versions and SHA-256 hashes live in `home/.chezmoitemplates/pins.env`.
 | pre-commit | Local hook runner; version and dependencies in the hashed requirements lock | chezmoi tools script | Monthly pin refresh |
 | chezmoi 2.73.0 | Template rendering | `install.sh`, `/usr/local/bin/chezmoi` | Monthly pin refresh |
 
-These are existing gate dependencies. No replacement tool is introduced. Missing
-or mismatched tools fail the gate with an installer diagnostic; a lane must not
+These are existing gate dependencies. No replacement tool is introduced. Failed
+downloads or mismatched tools fail the gate with installer guidance; a lane must not
 install them into the shared home. The PM/admin applies bootstrap before retrying.
-
-The existing GitHub Actions fresh-runner lint job retains its disposable setup
-in `ci/lint-install.sh`, only when `GITHUB_ACTIONS=true` and preflight fails.
-When tools are already present, it also makes no downloads. `just check` strips
-that variable, and the trusted local gate's environment allowlist excludes it.

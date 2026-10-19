@@ -8,11 +8,15 @@ cd "$ROOT"
 export PATH="$tmp/gate-bin:$PATH"
 bash ci/gate-tools.sh "$tmp"
 failed=0
+skipped=0
 run() {
   echo "RUN: $*" >&2
   local status=0
   "$@" || status=$?
-  if (( status )); then
+  if (( status == 77 )); then
+    echo "SKIP: suite $*" >&2
+    skipped=$((skipped + 1))
+  elif (( status )); then
     echo "FAIL: $* (exit $status)" >&2
     failed=1
   else
@@ -68,5 +72,5 @@ run python3 ci/qmd-test.py "$(command -v chezmoi || true)"
 run gitleaks git --redact --no-banner .
 run bash ci/gitleaks-working-tree.sh gitleaks "$ROOT" "$tmp/working-tree-scan"
 
-echo "Gate suites finished (failed=$failed)"
+echo "Gate suites finished (failed=$failed, skipped=$skipped)"
 exit "$failed"
