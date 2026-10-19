@@ -135,6 +135,8 @@ work = pathlib.Path.cwd() / '.work'
     'git_optional_locks': os.environ.get('GIT_OPTIONAL_LOCKS'),
     'env_names': sorted(os.environ),
 }))
+with (work / 'reviewer-calls.jsonl').open('a') as calls:
+    calls.write(json.dumps(sys.argv[1:]) + '\\n')
 if os.environ.get('REVIEW_STUB_POLICY'):
     import importlib.util, subprocess
     spec = importlib.util.spec_from_file_location('review_policy', os.environ['REVIEW_STUB_POLICY'])
@@ -158,7 +160,8 @@ if count == 1:
 print(reply, end='', flush=True)
 print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
 time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
-sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
+code = os.environ.get('REVIEW_STUB_EXIT', '0')
+sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else code))
 """
 
 
@@ -240,6 +243,75 @@ class TaskTool(unittest.TestCase):
             metadata = json.loads((self.state() / 'review.json').read_text())
             self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
             self.assertIn(model, json.loads((wt / '.work/reviewer-call.json').read_text())['args'])
+
+    def test_boosted_claude_limit_falls_back_once_and_records_actual_reviewer(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        out = self.raw_task('review', 'proj', '5', '--run', env=dict(self.env,
+                            REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit · resets 5pm (UTC)\n\n",
+                            REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
+        calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
+        self.assertEqual([call[call.index('--model') + 1] for call in calls], ['opus', 'haiku'])
+        self.assertIn('retrying once', out)
+        route = json.loads((self.state() / 'review-routing.json').read_text())
+        self.assertEqual(route, dict(vendor='claude', model='haiku', fallback_from='opus'))
+        review = json.loads((self.state() / 'review.json').read_text())
+        self.assertEqual((review['reviewer'], review['model'], review['verdict']), ('claude', 'haiku', 'PASS'))
+        self.assertEqual((self.state() / 'review.md').read_text(), reply)
+
+    def test_review_limit_without_boost_or_after_fallback_is_not_retried(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        for boosted, expected in ((False, ['haiku']), (True, ['opus', 'haiku'])):
+            with self.subTest(boosted=boosted):
+                (wt / '.work/reviewer-count').unlink(missing_ok=True)
+                (wt / '.work/reviewer-calls.jsonl').unlink(missing_ok=True)
+                if boosted:
+                    self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+                out = self.raw_task('review', 'proj', '5', '--run', code=1,
+                                    env=dict(self.env, REVIEW_STUB_REPLY="You've hit your weekly limit",
+                                             REVIEW_STUB_EXIT='2'))
+                self.assertIn('ended by usage limit', out)
+                calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
+                self.assertEqual([call[call.index('--model') + 1] for call in calls], expected)
+                self.assertFalse((self.state() / 'review.json').exists())
+
+    def test_boosted_reviewer_other_errors_do_not_fall_back(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        out = self.raw_task('review', 'proj', '5', '--run', code=1,
+                            env=dict(self.env, REVIEW_STUB_REPLY="You've hit your Opus limit\nOther failure",
+                                     REVIEW_STUB_EXIT='1'))
+        self.assertIn('exited with status 1', out)
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'opus')
+
+    def test_boosted_claude_fallback_without_verdict_stops_after_one_try(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        out = self.raw_task('review', 'proj', '5', '--run', code=1,
+                            env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit",
+                                     REVIEW_STUB_FIRST_EXIT='1', REVIEW_STUB_REPLY='No verdict'))
+        self.assertIn('review produced no verdict', out)
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
+        self.assertFalse((self.state() / 'review.json').exists())
+
+    def test_boosted_codex_limit_is_reported_without_fallback(self):
+        self.stub_reviewers()
+        self.raw_task('start', 'proj', '5', '--builder', 'claude')
+        wt = self.repo / '.worktrees/t5'
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        out = self.raw_task('review', 'proj', '5', '--run', code=1,
+                            env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
+                                     REVIEW_STUB_EXIT='1'))
+        self.assertIn('ended by usage limit', out)
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertFalse((self.state() / 'review.json').exists())
 
     def test_plan_refusals_exceptions_and_resume(self):
         plan = self.kb / 'INTENT.md'
@@ -612,6 +684,7 @@ sys.exit(7)
         self.assertEqual(args[:7], ['--user', '--unit', 'task-runner-proj-b1', '--collect',
                                    '--working-directory', str(self.repo), '--property=StandardInput=null'])
         self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
+        self.assertIn('--property=KillMode=process', args)
         command = args[args.index(sys.executable):]
         subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
         call = json.loads((runner.parent / 'runner-call').read_text())
@@ -1006,6 +1079,27 @@ store.write_text(json.dumps(prs))
         run.write_text(json.dumps({"state": "passed"}))
         self.assertIn("passed", self.raw_task("wait", "proj", "5"))
 
+    def test_status_and_wait_identify_terminal_lane_limits(self):
+        wt, _ = self.started()
+        work = wt / '.work'
+        for builder, diagnostic in [('codex', "ERROR: You've hit your usage limit. Try again later."),
+                                    ('claude', "You've hit your weekly limit · resets 5pm (UTC)")]:
+            for source in ('final.md', 'lane.log'):
+                for code, state, suffix, limited in [(2, 'finished', '\n\n  \n', True),
+                                                     (0, 'finished', '\n', False),
+                                                     (1, 'finished', '\nOther failure', False),
+                                                     (1, 'timed_out', '\n', False)]:
+                    with self.subTest(builder=builder, source=source, code=code, state=state, suffix=suffix):
+                        for name in ('final.md', 'lane.log'):
+                            (work / name).write_text(diagnostic + suffix if name == source else '')
+                        (work / 'lane.json').write_text(json.dumps(dict(builder=builder, state=state, exit_code=code)))
+                        for command in [('status', 'proj'), ('wait', 'proj', '5', '--max', '0')]:
+                            out = self.raw_task(*command)
+                            if limited:
+                                self.assertIn(f'lane: ended by usage limit ({diagnostic})', out)
+                            else:
+                                self.assertNotIn('ended by usage limit', out)
+
     def test_reliability_status_does_not_write_and_repair_does(self):
         import json
         self.started()
@@ -1313,7 +1407,8 @@ store.write_text(json.dumps(prs))
             self.assertFalse(temporary.is_relative_to(self.repo.resolve()))
             self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(temporary.parent.stat().st_mode), 0o700)
-            self.assertEqual(list(temporary.iterdir()), [])
+            self.assertEqual([entry.name for entry in temporary.iterdir()], ['holder.pid'])
+            self.assertEqual(int((temporary / 'holder.pid').read_text()), os.getpid())
             (temporary / 'leftover').write_text('gate data')
             raise RuntimeError('gate interrupted')
 
@@ -1324,6 +1419,98 @@ store.write_text(json.dumps(prs))
                     TASK_MODULE.run_check(wt, '')
                 self.assertFalse(seen[-1].exists())
         self.assertEqual(len(set(seen)), 2)
+
+    def test_trusted_gate_allowlist_applies_to_all_steps_and_branch_env(self):
+        wt, _ = self.started()
+        (wt / '.pre-commit-config.yaml').write_text('repos: []\n')
+        (wt / '.task.toml').write_text('[env]\nPROJECT_MODE = "from-branch"\n'
+                                      'TMPDIR = "ignored-config-tmp"\nTASK_GATE_SLOT = "ignored-slot"\n')
+        self.git(wt, 'add', '.pre-commit-config.yaml', '.task.toml')
+        self.git(wt, 'commit', '-qm', 'configure gate')
+        (self.home / 'during-check.sh').write_text('env > "$HOME/just-env"\n')
+        (self.home / 'during-check.sh').chmod(0o755)
+        record_file = self.state() / 'task.json'
+        record = json.loads(record_file.read_text())
+        record['verify'] = ['env > "$HOME/verify-env"']
+        record['revision'] = TASK_MODULE.record_revision(record)
+        record_file.write_text(json.dumps(record))
+        caller = dict(self.env, TMPDIR=str(wt / 'odd-tmp'), PYTHONPATH='/odd-python',
+                      VIRTUAL_ENV='/odd-venv', FOO='caller-value', TASK_GATE_FAKE='caller-gate',
+                      TASK_GATE_SLOT='999', HTTP_PROXY='http://caller.invalid',
+                      LC_MESSAGES='C', LANG='C', TERM='dumb', SHELL='/bin/bash',
+                      PROJECT_MODE='caller-mode')
+        self.assertIn('PASS', self.raw_task('check', 'proj', '5', env=caller))
+        environments = []
+        for name in ('just', 'verify', 'pre-commit'):
+            captured = dict(line.split('=', 1) for line in
+                            (self.home / f'{name}-env').read_text().splitlines() if '=' in line)
+            environments.append(captured)
+            for key in ('PYTHONPATH', 'VIRTUAL_ENV', 'FOO', 'HTTP_PROXY', 'TASK_GATE_FAKE',
+                        'TASK_GATE_DIR', 'TASK_RUN_ID', 'GIT_CONFIG_GLOBAL', 'GIT_AUTHOR_NAME'):
+                self.assertNotIn(key, captured)
+            for key in ('PATH', 'HOME', 'LC_MESSAGES', 'LANG', 'TERM', 'SHELL'):
+                self.assertEqual(captured[key], caller[key])
+            self.assertEqual(captured['PROJECT_MODE'], 'from-branch')
+            self.assertEqual(Path(captured['TMPDIR']).parent, Path('/tmp') / f'task-gate-{os.getuid()}')
+            self.assertTrue(Path(captured['TMPDIR']).name.startswith('gate-'))
+            self.assertNotEqual(captured['TASK_GATE_SLOT'], '999')
+            self.assertEqual(int(captured['TASK_GATE_PORT_BASE']), 20000 + 200 * int(captured['TASK_GATE_SLOT']))
+            self.assertTrue(captured['TASK_GATE_RUN_ID'])
+            self.assertFalse(Path(captured['TMPDIR']).exists())
+        self.assertEqual(len({e['TMPDIR'] for e in environments}), 1)
+
+    def test_trusted_check_steps_direct_call_uses_isolation_and_rejects_bad_env(self):
+        wt, _ = self.started()
+        (self.home / 'during-check.sh').write_text('env > "$HOME/just-env"\n')
+        (self.home / 'during-check.sh').chmod(0o755)
+        with mock.patch.dict(os.environ, dict(self.env, FOO='caller', TMPDIR=str(wt))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(TASK_MODULE.run_check_steps(wt, '', state=self.state()))
+        captured = dict(line.split('=', 1) for line in (self.home / 'just-env').read_text().splitlines())
+        self.assertNotIn('FOO', captured)
+        self.assertNotEqual(captured['TMPDIR'], str(wt))
+        self.assertFalse(Path(captured['TMPDIR']).exists())
+        for config in ('[env]\nFOO = 1\n', '[env]\n"BAD=KEY" = "x"\n', 'env = "invalid"\n'):
+            (wt / '.task.toml').write_text(config)
+            with self.assertRaisesRegex(TASK_MODULE.Stop, '\\[env\\]'):
+                TASK_MODULE.trusted_check_environment(wt, 'run', {})
+
+    def test_gate_temp_sweeper_only_removes_old_dead_owned_gate_directories(self):
+        root = self.home / 'gate-temp'
+        root.mkdir()
+        old = time.time() - 25 * 60 * 60
+        for name, pid in [('gate-dead', '99999999'), ('gate-recent', '99999999'),
+                          ('gate-live', str(os.getpid())), ('gate-denied', '77777777'),
+                          ('gate-invalid', 'unknown'), ('gate-negative', '-1'),
+                          ('gate-no-holder', None), ('unrelated', '99999999')]:
+            directory = root / name
+            directory.mkdir()
+            (directory / 'keep').write_text('data')
+            if pid is not None:
+                (directory / 'holder.pid').write_text(pid)
+            if name != 'gate-recent':
+                os.utime(directory, (old, old))
+        (root / 'gate-file').write_text('untouched')
+        (root / 'gate-link').symlink_to(root / 'unrelated', target_is_directory=True)
+        linked_holder = root / 'gate-linked-holder'
+        linked_holder.mkdir()
+        (linked_holder / 'holder.pid').symlink_to(root / 'unrelated/holder.pid')
+        os.utime(linked_holder, (old, old))
+
+        def probe(pid, signum):
+            self.assertEqual(signum, 0)
+            if pid == 99999999:
+                raise ProcessLookupError
+            if pid == 77777777:
+                raise PermissionError
+            self.assertEqual(pid, os.getpid())
+
+        before = set(root.iterdir())
+        with mock.patch.object(TASK_MODULE.os, 'kill', side_effect=probe):
+            TASK_MODULE.sweep_gate_temporary(root)
+        self.assertEqual(set(root.iterdir()), before - {root / 'gate-dead'})
+        self.assertEqual((root / 'unrelated/keep').read_text(), 'data')
+        self.assertTrue((root / 'gate-link').is_symlink())
 
     def test_gate_drill_real_concurrency_isolation_and_cleanup(self):
         repos = []
@@ -1343,6 +1530,7 @@ store.write_text(json.dumps(prs))
         pre_commit = self.home / 'bin/pre-commit'
         pre_commit.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
             import json, os, pathlib, sys
+            assert not any(key in os.environ for key in ('PYTHONPATH', 'VIRTUAL_ENV', 'FOO', 'TASK_GATE_FAKE'))
             home = pathlib.Path(os.environ['HOME'])
             kind = pathlib.Path('kind').read_text()
             with (home / (kind + '-pre-commit')).open('a') as out:
@@ -1353,6 +1541,7 @@ store.write_text(json.dumps(prs))
         just = self.home / 'bin/just'
         just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
             import json, os, pathlib, sys, time
+            assert not any(key in os.environ for key in ('PYTHONPATH', 'VIRTUAL_ENV', 'FOO', 'TASK_GATE_FAKE'))
             if sys.argv[1:] != ['check']:
                 sys.exit(1)
             home = pathlib.Path(os.environ['HOME'])
@@ -1368,7 +1557,8 @@ store.write_text(json.dumps(prs))
             assert not temporary.resolve().is_relative_to((home / 'dev_workspace').resolve()), temporary
             assert temporary.stat().st_mode & 0o777 == 0o700, temporary
             assert temporary.parent.stat().st_mode & 0o777 == 0o700, temporary.parent
-            assert not list(temporary.iterdir()), temporary
+            assert [entry.name for entry in temporary.iterdir()] == ['holder.pid'], temporary
+            os.kill(int((temporary / 'holder.pid').read_text()), 0)
             (temporary / 'leftover').write_text(kind)
             assert port == 20000 + 200 * slot, (slot, port)
             if kind == 'clean':
@@ -1389,7 +1579,9 @@ store.write_text(json.dumps(prs))
                 sys.exit(1)
             '''))
         just.chmod(0o755)
-        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', code=1)
+        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', code=1,
+                            env=dict(self.env, TMPDIR=str(self.repo), PYTHONPATH='/odd-python',
+                                     VIRTUAL_ENV='/odd-venv', FOO='caller', TASK_GATE_FAKE='caller'))
         self.assertIn('clash', out)
         evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
         self.assertEqual(len(evidence), 1)
@@ -3046,7 +3238,8 @@ store.write_text(json.dumps(prs))
     def test_agent_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
         blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}
         blocked.update(GIT_CONFIG="blocked", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="override",
-                       GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner")
+                       GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner",
+                       TASK_GATE_RUN_ID="gate")
         kept = {"GIT_AUTHOR_NAME": "builder", "GIT_AUTHOR_EMAIL": "builder@example.invalid",
                 "GIT_COMMITTER_NAME": "builder", "GIT_COMMITTER_EMAIL": "builder@example.invalid",
                 "GIT_OPTIONAL_LOCKS": "0", "GIT_FUTURE_VARIABLE": "value",
@@ -3831,14 +4024,14 @@ esac
         lock_path = self.gate_dir / "agent-task-gate.lock"
         holder_path = self.gate_dir / "agent-task-gate.holder"
         self.addCleanup(lambda: holder_path.unlink(missing_ok=True))
-        (self.repo / ".task.toml").write_text("check_timeout = 3\n")
+        (self.repo / ".task.toml").write_text('check_timeout = 3\n[env]\nTASK_CHECK_SLEEP = "2.2"\n')
         self.git(self.repo, "add", ".task.toml")
         self.git(self.repo, "commit", "-qm", "enable exclusive gate")
         self.git(self.repo, "push", "-q", "origin", "main")
         self.started()
         other = self.repo / ".worktrees/other"
         self.git(self.repo, "worktree", "add", "-q", "--no-track", "-b", "other", str(other), "main")
-        (other / ".task.toml").write_text("check_timeout = 1\n")
+        (other / ".task.toml").write_text('check_timeout = 1\n[env]\nTASK_CHECK_SLEEP = "0.05"\n')
         self.git(other, "add", ".task.toml")
         self.git(other, "commit", "-qm", "short check timeout")
         (self.home / "during-check.sh").write_text(
@@ -3848,10 +4041,8 @@ esac
             "sleep \"${TASK_CHECK_SLEEP:-0.05}\"\n"
             "rm -f \"$HOME/gate-active\"\n")
         (self.home / "during-check.sh").chmod(0o755)
-        env1 = dict(self.env, TASK_CHECK_SLEEP="2.2")
-        env2 = dict(self.env, TASK_CHECK_SLEEP="0.05")
         first = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "5"],
-                                 cwd=self.home, env=env1, stdout=subprocess.PIPE,
+                                 cwd=self.home, env=self.env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True)
         deadline = __import__("time").monotonic() + 5
         while __import__("time").monotonic() < deadline and not (self.home / "gate-active").exists():
@@ -3862,7 +4053,7 @@ esac
         self.assertEqual(holder["task"], "T-5")
         started = __import__("time").monotonic()
         second = subprocess.Popen([sys.executable, str(TOOL), "check", "proj", "other"],
-                                  cwd=self.home, env=env2, stdout=subprocess.PIPE,
+                                  cwd=self.home, env=self.env, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, text=True)
         out1, _ = first.communicate(timeout=8)
         out2, _ = second.communicate(timeout=8)
@@ -3988,6 +4179,8 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         self.commit_in(wt, "b.txt")
         other = self.home / "other"
         self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.git(other, 'config', 'user.name', 't')
+        self.git(other, 'config', 'user.email', 't@example.invalid')
         self.during_check(f"cd {other} && echo c > c.txt && git add c.txt && git commit -qm c "
                           f"&& git push -q origin main && git -C {self.repo} fetch -q origin\n")
         out = self.task("merge", "proj", "5")
@@ -4000,6 +4193,8 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
 
     def test_lane_commit_during_gate_is_not_published(self):
         wt, _ = self.started()
+        self.git(wt, 'config', 'user.name', 't')
+        self.git(wt, 'config', 'user.email', 't@example.invalid')
         self.commit_in(wt, "b.txt")
         before = self.git(self.origin, "rev-parse", "main")
         reviewed_head = self.git(wt, "rev-parse", "HEAD")
@@ -4353,7 +4548,7 @@ exit 1
         child_pid = int(child_pid_file.read_text())
         run = __import__("json").loads((self.state() / "run.json").read_text())
         environment = Path(f"/proc/{child_pid}/environ").read_bytes().split(b"\0")
-        self.assertIn(f"TASK_RUN_ID={run['task_run_id']}".encode(), environment)
+        self.assertIn(f"TASK_GATE_RUN_ID={run['task_run_id']}".encode(), environment)
         self.assertIn("Cancelled", self.raw_task("cancel", "proj", "5"))
         deadline = __import__("time").monotonic() + 5
         while __import__("time").monotonic() < deadline:
