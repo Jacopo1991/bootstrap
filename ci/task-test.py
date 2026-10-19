@@ -162,6 +162,75 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_status_bad_config_does_not_hide_other_repos(self):
+        good = self.home / 'dev_workspace/z-good'
+        good.mkdir()
+        self.git(good, 'init', '-q', '-b', 'main')
+        (good / '.task.toml').write_text('[env]\nPRODUCT_DIR = "do-not-display"\n')
+        for config in ('[env', '[env]\nAPI_TOKEN = "do-not-display"\n'):
+            with self.subTest(config=config):
+                (self.repo / '.task.toml').write_text(config)
+                output = self.raw_task('status')
+                self.assertIn('env keys: unavailable (', output)
+                self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
+                self.assertNotIn('do-not-display', output)
+
+    def test_configured_environment_rejects_reserved_names(self):
+        names = TASK_MODULE.GIT_OVERRIDE_ENV | {'GIT_OVERRIDE_ENV', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
+                                              'TASK_RUN_ID', 'TASK_RUN_ANY', 'TMPDIR', 'TASK_GATE_SLOT',
+                                              'TASK_GATE_ANY'}
+        for name in names:
+            with self.subTest(name=name):
+                (self.repo / '.task.toml').write_text(f'[env]\n{name} = "never-print-this"\n')
+                with self.assertRaisesRegex(TASK_MODULE.Stop, 'reserved'):
+                    TASK_MODULE.configured_environment(self.repo)
+
+    def test_gate_drill_seeds_and_per_repo_failures(self):
+        self.commit_in(self.repo, '.task.toml', 'drill_seeds = ["pinned"]\n[env]\nPRODUCT_DIR = "{repo}/data"\n')
+        self.git(self.repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+        work = self.repo / '.work'
+        work.mkdir(exist_ok=True)
+        (work / 'pinned').mkdir()
+        (work / 'pinned/source').write_text('source bytes')
+        (work / 'extra').write_text('extra bytes')
+        (work / 'another').write_text('another bytes')
+        just = self.home / 'bin/just'
+        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+            import os, pathlib, sys
+            if sys.argv[1:] != ['check']:
+                sys.exit(1)
+            assert pathlib.Path('.work/pinned/source').read_text() == 'source bytes'
+            assert pathlib.Path('.work/extra').read_text() == 'extra bytes'
+            assert pathlib.Path('.work/another').read_text() == 'another bytes'
+            assert os.environ['PRODUCT_DIR'] == str(pathlib.Path(os.environ['HOME']) / 'dev_workspace/proj/data')
+            print('OK')
+            '''))
+        just.chmod(0o755)
+        self.raw_task('gate-drill', 'proj', '--seed', 'proj:extra', '--seed', 'proj:another')
+        evidence = self.home / '.local/state/task/gate-drill'
+        rows = json.loads(next(evidence.glob('*/results.json')).read_text())
+        self.assertEqual(rows[0]['verdict'], 'ok')
+        bad = self.home / 'dev_workspace/bad'
+        bad.mkdir()
+        self.git(bad, 'init', '-q', '-b', 'main')
+        for config, reason in [('drill_seeds = ["absent"]', 'missing seed absent'),
+                               ('drill_seeds = ["../escape"]', 'Invalid seed name'),
+                               ('drill_seeds = "pinned"', 'list of seed names'),
+                               ('drill_seeds = [2]', 'list of seed names')]:
+            with self.subTest(config=config):
+                self.commit_in(bad, '.task.toml', config + '\n')
+                output = self.raw_task('gate-drill', 'bad', 'proj', '--seed', 'proj:extra',
+                                       '--seed', 'proj:another', code=1)
+                self.assertIn(reason, output)
+                self.assertRegex(output, r'proj \| passed .* \| - \| ok')
+                self.assertEqual(len(self.git(bad, 'worktree', 'list').splitlines()), 1)
+        output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:missing', code=1)
+        self.assertIn('missing seed missing', output)
+        (work / 'escape').symlink_to(self.home)
+        output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:escape', code=1)
+        self.assertIn('Seed symlink escapes .work', output)
+        self.assertEqual(len(self.git(self.repo, 'worktree', 'list').splitlines()), 1)
+
     def test_configured_gate_environment(self):
         config = '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n'
         self.commit_in(self.repo, '.task.toml', config)
@@ -275,7 +344,8 @@ class TaskTool(unittest.TestCase):
                     output = io.StringIO()
                     with contextlib.redirect_stdout(output), mock.patch.object(TASK_MODULE, 'HOME', self.home):
                         TASK_MODULE.status(type('Args', (), {'repo': str(self.repo)})())
-                    self.assertIn(f'pid {os.getpid()}, holder details unavailable', output.getvalue())
+                    self.assertIn(f'pid {os.getpid()} (holder details unavailable)', output.getvalue())
+                    self.assertNotIn('/? since ?', output.getvalue())
                     self.assertNotIn('previous-holder', output.getvalue())
 
     def test_close_update_checks_default_branch_holder_dirt(self):
@@ -1021,7 +1091,7 @@ store.write_text(json.dumps(prs))
                 self.assertEqual(run['state'], 'failed')
                 self.assertFalse((self.state() / 'run.lock').exists())
                 log = (wt / '.work/run.log').read_text()
-                self.assertIn(f'gate busy: held by pid {os.getpid()}, holder details unavailable', log)
+                self.assertIn(f'gate busy: held by pid {os.getpid()} (holder details unavailable)', log)
                 self.assertNotIn('proj/T-9', log)
                 self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
                 self.assertEqual(json.loads(holder.read_text())['pid'], 99999999)
@@ -1269,7 +1339,7 @@ store.write_text(json.dumps(prs))
                         self.fail("must never enter unlocked")
                 self.assertEqual(stop.exception.code, 3)
                 self.assertEqual(stdout.getvalue(), '')
-                self.assertIn(f"gate busy: held by pid {os.getpid()}, holder details unavailable", output.getvalue())
+                self.assertIn(f"gate busy: held by pid {os.getpid()} (holder details unavailable)", output.getvalue())
                 self.assertNotIn('proj/T-9', output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
@@ -1440,10 +1510,13 @@ store.write_text(json.dumps(prs))
             self.git(repo, 'init', '-q', '-b', 'main')
             (repo / 'justfile').write_text('check:\n    true\n')
             (repo / 'kind').write_text(name)
-            (repo / '.task.toml').write_text('[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
+            (repo / '.task.toml').write_text('drill_seeds = ["pinned"]\n[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
             (repo / '.pre-commit-config.yaml').write_text('repos: []\n')
             self.git(repo, 'add', '.')
             self.git(repo, 'commit', '-qm', 'stub gate')
+            (repo / '.work').mkdir()
+            (repo / '.work/pinned').write_text(name)
+            (repo / '.work/extra').write_text(name)
             repos.append(repo)
         # The drill runs the full default gate: pre-commit over all files follows `just check`.
         # The `always` repo passes `just check` and fails only in pre-commit, so a skipped
@@ -1466,6 +1539,8 @@ store.write_text(json.dumps(prs))
             home = pathlib.Path(os.environ['HOME'])
             kind = pathlib.Path('kind').read_text()
             temporary = pathlib.Path(os.environ['TMPDIR'])
+            assert pathlib.Path('.work/pinned').read_text() == kind
+            assert pathlib.Path('.work/extra').read_text() == kind
             assert os.environ['PRODUCT_DIR'] == str(home / 'dev_workspace' / kind / 'data')
             assert os.environ['WORK_DIR'] == str(pathlib.Path.cwd() / 'output')
             slot = int(os.environ['TASK_GATE_SLOT'])
@@ -1499,7 +1574,8 @@ store.write_text(json.dumps(prs))
                 sys.exit(1)
             '''))
         just.chmod(0o755)
-        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', code=1)
+        out = self.raw_task('gate-drill', 'clean', 'clash', 'always', '--seed', 'clean:extra',
+                            '--seed', 'clash:extra', '--seed', 'always:extra', code=1)
         self.assertIn('clash', out)
         evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
         self.assertEqual(len(evidence), 1)
@@ -1592,7 +1668,7 @@ store.write_text(json.dumps(prs))
                         TASK_MODULE.status(type('Args', (), {'repo': None})())
                     self.assertIn('Gate slots: 2', output.getvalue())
                     self.assertIn('gate resource-hermes:', output.getvalue())
-                    self.assertIn('first-gate/T-1, since', output.getvalue())
+                    self.assertIn('first-gate/T-1 since', output.getvalue())
             lock, holder = TASK_MODULE.gate_paths('slot-0')
             holder.write_text('{"pid": 99999999, "repo": "dead"}')
             with TASK_MODULE.exclusive_gate_lock(a):
@@ -1685,9 +1761,9 @@ store.write_text(json.dumps(prs))
                     pass
             lines = output.getvalue().splitlines()
             self.assertEqual(len(lines), 2)
-            self.assertIn('in old', lines[0])
-            self.assertIn('in new', lines[1])
-            self.assertNotIn('in old', lines[1])
+            self.assertIn('old/T-1', lines[0])
+            self.assertIn('new/T-2', lines[1])
+            self.assertNotIn('old/T-1', lines[1])
 
     def test_gate_os_errors_fall_back_only_without_exclusive_or_resources(self):
         # Only a plain one-slot gate may run unlocked after a lock error. A gate that is
@@ -1765,7 +1841,8 @@ store.write_text(json.dumps(prs))
                     contextlib.redirect_stdout(output):
                 with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, "5")):
                     pass
-            self.assertIn(f"pid {os.getpid()} since ?", output.getvalue())
+            self.assertIn(f"pid {os.getpid()} (holder details unavailable)", output.getvalue())
+            self.assertNotIn('/? since ?', output.getvalue())
             self.assertIn('holder details unavailable', output.getvalue())
             self.assertNotIn('T-9', output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
@@ -3959,7 +4036,7 @@ esac
         self.assertEqual(first.returncode, 0, out1)
         self.assertEqual(second.returncode, 0, out2)
         self.assertGreater(elapsed, 2, "the second check waited longer than its one-second check timeout")
-        self.assertIn("Waiting for exclusive task gate held by task T-5 in proj, pid", out2)
+        self.assertRegex(out2, r"Waiting for exclusive task gate held by pid \d+, proj/T-5")
         self.assertIn("since ", out2)
         self.assertFalse((self.home / "gate-overlap").exists(), "checks never overlapped")
 

@@ -839,6 +839,8 @@ def configured_environment(path, repo=None):
     if not isinstance(values, dict):
         raise Stop(".task.toml [env] must be a table of plain strings.")
     for name, value in values.items():
+        if stripped_agent_variable(name) or name == "TMPDIR" or name.startswith("TASK_GATE_"):
+            raise Stop(f".task.toml env key {name} is reserved.")
         if any(word in name.upper() for word in ("TOKEN", "KEY", "SECRET", "PASSWORD")):
             raise Stop(f".task.toml env key {name} looks like a credential; use secretspec.")
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not isinstance(value, str) or "\0" in value:
@@ -897,6 +899,13 @@ def gate_holders():
         except OSError:
             continue
     return holders
+
+
+def holder_display(row):
+    name, pid, repo, task_id, since = row
+    if repo == "holder details unavailable":
+        return f"pid {pid} (holder details unavailable)"
+    return f"pid {pid}, {repo}/{task_id} since {since} ({name})"
 
 
 @contextmanager
@@ -976,13 +985,12 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
                 release()
                 holders = [row for row in gate_holders() if not row[0].startswith("noslot-")]
                 if time.monotonic() >= deadline:
-                    detail = "; ".join(f"pid {pid}, {repo}/{task_id} since {since}" for _, pid, repo, task_id, since in holders)
+                    detail = "; ".join(holder_display(row) for row in holders)
                     print(f"gate busy: held by {detail or 'another gate (holder details unavailable)'}",
                           file=sys.stderr, flush=True)
                     raise SystemExit(3)
                 if holders != previous:
-                    detail = "; ".join(f"task {task_id} in {repo}, pid {pid} since {since} ({name})"
-                                       for name, pid, repo, task_id, since in holders)
+                    detail = "; ".join(holder_display(row) for row in holders)
                     print(f"Waiting for exclusive task gate held by {detail or 'another gate (holder details unavailable)'}.", flush=True)
                     previous = holders
                 time.sleep(0.1)
@@ -1234,11 +1242,15 @@ def require_pm(args):
             raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
 
 
+def stripped_agent_variable(name):
+    return name in GIT_OVERRIDE_ENV or name == "GIT_OVERRIDE_ENV" or name.startswith(("GIT_CONFIG", "TASK_RUN_"))
+
+
 def agent_environment():
     # The hook refuses Git control-plane overrides inherited by a nested CLI.
     # Never carry a runner's detached gate ownership into an agent.
     return {name: value for name, value in os.environ.items()
-            if name not in GIT_OVERRIDE_ENV and not name.startswith(("GIT_CONFIG", "TASK_RUN_"))}
+            if not stripped_agent_variable(name)}
 
 
 def lane_environment(task):
@@ -3359,8 +3371,8 @@ def status(args):
     if active:
         print(active)
     print(f"Gate slots: {gate_slots()}")
-    for name, pid, repo, task_id, since in gate_holders():
-        print(f"gate {name}: pid {pid}, {repo}/{task_id}, since {since}")
+    for row in gate_holders():
+        print(f"gate {row[0]}: {holder_display(row)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
@@ -3369,7 +3381,11 @@ def status(args):
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
-        print("  env keys: " + (", ".join(sorted(configured_environment(repo))) or "(none)"))
+        try:
+            keys = ", ".join(sorted(configured_environment(repo))) or "(none)"
+        except Stop as error:
+            keys = f"unavailable ({error})"
+        print("  env keys: " + keys)
         if (CORTEX / f"cortex-kb-{repo.name}").exists():
             print("  " + plan_verdict(plan_info(repo)))
         for record in sorted((repo / '.work').glob('runner-*.json')):
@@ -3881,6 +3897,15 @@ def wait_task(args):
 def gate_drill(args):
     """Measure real cross-repository clashes without consuming gate slots."""
     repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
+    cli_seeds = {repo: [] for repo in repos}
+    for value in args.seed:
+        repo_name, separator, name = value.partition(":")
+        if not separator or not name:
+            raise Stop("gate-drill --seed requires <repo>:<name>.")
+        repo = resolve_repo(repo_name)
+        if repo not in cli_seeds:
+            raise Stop(f"Seed repository {repo_name} is not in this drill.")
+        cli_seeds[repo].append(name)
     archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
     archive.mkdir(parents=True)
     worktrees = []
@@ -3893,7 +3918,29 @@ def gate_drill(args):
         git(repo, "worktree", "add", "-q", "--detach", str(path), base)
         worktrees.append((repo, path))
         prepare_environment(repo, path)
+        config = path / ".task.toml"
+        try:
+            names = tomllib.loads(config.read_text()).get("drill_seeds", []) if config.exists() else []
+        except (OSError, tomllib.TOMLDecodeError):
+            raise Stop(f"Cannot read {config}.") from None
+        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+            raise Stop(".task.toml drill_seeds must be a list of seed names.")
+        names = list(dict.fromkeys(names + cli_seeds[repo]))
+        for name in names:
+            try:
+                seed_source(repo, name)
+            except Stop as error:
+                if str(error).startswith("Seed does not exist:"):
+                    raise Stop(f"missing seed {name}") from None
+                raise
+        seed_worktree(repo, path, names)
         return path
+
+    def prepare_measure(repo, index, phase):
+        try:
+            return measure(prepare(repo, index, phase), index, phase)
+        except (Stop, OSError) as error:
+            return {"result": "failed", "duration": 0, "error": str(error)}
 
     def measure(path, index, phase):
         # Drill runs hold no slot; run_check reserves a free port index above the slots.
@@ -3919,15 +3966,14 @@ def gate_drill(args):
 
     rows = []
     try:
-        paths = [prepare(repo, index, "concurrent") for index, repo in enumerate(repos)]
         with ThreadPoolExecutor(max_workers=len(repos)) as pool:
-            futures = [pool.submit(measure, path, index, "concurrent")
-                       for index, path in enumerate(paths)]
+            futures = [pool.submit(prepare_measure, repo, index, "concurrent")
+                       for index, repo in enumerate(repos)]
             concurrent = [future.result() for future in futures]
         for index, (repo, result) in enumerate(zip(repos, concurrent)):
             row = {"repo": repo.name, "concurrent": result, "solo": None, "verdict": "ok"}
             if result["result"] != "passed":
-                row["solo"] = measure(prepare(repo, index, "solo"), index, "solo")
+                row["solo"] = prepare_measure(repo, index, "solo")
                 row["verdict"] = "clash" if row["solo"]["result"] == "passed" else "failing-alone"
             rows.append(row)
         table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
@@ -3935,6 +3981,9 @@ def gate_drill(args):
             def cell(result):
                 return f"{result['result']} ({result['duration']})" if result else "-"
             table.append(f"{row['repo']} | {cell(row['concurrent'])} | {cell(row['solo'])} | {row['verdict']}")
+            for phase in ("concurrent", "solo"):
+                if row[phase] and row[phase].get("error"):
+                    table.append(f"  {phase}: {row[phase]['error']}")
         atomic_json(archive / "results.json", rows)
         (archive / "results.txt").write_text("\n".join(table) + "\n")
         print("\n".join(table), flush=True)
@@ -3954,6 +4003,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     sub = commands.add_parser("gate-drill", help="PM-only concurrent full-gate clash drill")
     sub.add_argument("repos", nargs="+")
+    sub.add_argument("--seed", action="append", default=[], metavar="REPO:NAME",
+                     help="copy main checkout .work/NAME into each drill worktree; adds to .task.toml drill_seeds")
     for name in ("start", "lane", "merge", "close", "review", "cancel", "wait"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
