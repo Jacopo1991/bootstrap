@@ -162,6 +162,73 @@ sys.exit(int(os.environ.get('REVIEW_STUB_EXIT', '0')))
 
 
 class TaskTool(unittest.TestCase):
+    def test_configured_gate_environment(self):
+        config = '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n'
+        self.commit_in(self.repo, '.task.toml', config)
+        wt, _ = self.started()
+        (wt / '.task.toml').write_text(config)
+        script = self.home / 'during-check.sh'
+        script.write_text('#!/bin/sh\nprintf "PRODUCT_DIR=%s\\nWORK_DIR=%s\\n" "$PRODUCT_DIR" "$WORK_DIR" > "$PWD/.work/observed-env"\n')
+        script.chmod(0o755)
+        for advisory in (False, True):
+            with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                self.assertTrue(TASK_MODULE.run_check(wt, '', advisory=advisory))
+            observed = (wt / '.work/observed-env').read_text()
+            self.assertIn(f'PRODUCT_DIR={self.repo}/data', observed)
+            self.assertIn(f'WORK_DIR={wt}/output', observed)
+        lane = TASK_MODULE.lane_environment(TASK_MODULE.Task(self.repo, '5'))
+        self.assertEqual(lane['WORK_DIR'], f'{wt}/output')
+        status = self.task('status', 'proj')
+        self.assertIn('env keys: PRODUCT_DIR, WORK_DIR', status)
+        self.assertNotIn(str(self.repo / 'data'), status)
+        for bad in ('TOKEN', 'api_key', 'SECRET', 'PASSWORD'):
+            (wt / '.task.toml').write_text(f'[env]\n{bad} = "never-print-this"\n')
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'secretspec'):
+                TASK_MODULE.configured_environment(wt)
+        (wt / '.task.toml').write_text('[env]\nCOUNT = 2\n')
+        with self.assertRaisesRegex(TASK_MODULE.Stop, 'plain strings'):
+            TASK_MODULE.configured_environment(wt)
+
+    def test_decision_status_only_changes(self):
+        name = 'backlog/decisions/d-status.md'
+        (self.kb / 'backlog/decisions').mkdir()
+        original = '---\nstatus: accepted\n---\n## Decision\nKeep the data.\n'
+        self.commit_in(self.kb, name, original)
+        self.task('plan', 'proj', '--sign')
+        for revised, counted in (
+                (original.replace('accepted', 'replaced'), False),
+                (original + '*Replaced by decision-2*\n', False),
+                (original.replace('Keep the data.', '~~Keep the data.~~'), False),
+                (original.replace('## Decision', '## Other'), True),
+                (original.replace('Keep the data.', 'Replaced by decision-2'), True),
+                (original.replace('Keep the data.', 'Delete the data.'), True)):
+            (self.kb / name).write_text(revised)
+            self.assertEqual('decisions changed:' in self.task('plan', 'proj'), counted)
+        (self.kb / name).write_text(original.replace('accepted', 'replaced'))
+        self.git(self.kb, 'add', name)
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'status'],
+                       env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
+        self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
+        (self.kb / 'backlog/decisions/new.md').write_text('Replaced by decision-2\n')
+        self.assertIn('decisions changed:', self.task('plan', 'proj'))
+
+    def test_gate_handoff_failed_metadata_write(self):
+        task = TASK_MODULE.Task(self.repo, '5')
+        with mock.patch.dict(os.environ, self.env):
+            lock, holder = TASK_MODULE.gate_paths('slot-0')
+            holder.write_text(json.dumps({'pid': 99999999, 'repo': 'previous-holder'}))
+            with mock.patch.object(TASK_MODULE, 'atomic_json', side_effect=OSError('write failed')):
+                with TASK_MODULE.exclusive_gate_lock(task):
+                    holders = TASK_MODULE.gate_holders()
+                    self.assertEqual(holders[0][1], os.getpid())
+                    self.assertIn('holder details unavailable', str(holders))
+                    self.assertNotIn('previous-holder', str(holders))
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                        TASK_MODULE.status(type('Args', (), {'repo': str(self.repo)})())
+                    self.assertIn(f'pid {os.getpid()}, holder details unavailable', output.getvalue())
+                    self.assertNotIn('previous-holder', output.getvalue())
+
     def test_close_update_checks_default_branch_holder_dirt(self):
         holder = self.home / 'knowledge-holder'
         self.git(self.kb, 'worktree', 'add', '-q', '-b', 'holder-main', str(holder))
@@ -904,7 +971,9 @@ store.write_text(json.dumps(prs))
                     time.sleep(0.02)
                 self.assertEqual(run['state'], 'failed')
                 self.assertFalse((self.state() / 'run.lock').exists())
-                self.assertIn('gate busy: held by proj/T-9 since today', (wt / '.work/run.log').read_text())
+                log = (wt / '.work/run.log').read_text()
+                self.assertIn(f'gate busy: held by pid {os.getpid()}, holder details unavailable', log)
+                self.assertNotIn('proj/T-9', log)
                 self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
                 self.assertEqual(json.loads(holder.read_text())['pid'], 99999999)
 
@@ -1151,7 +1220,8 @@ store.write_text(json.dumps(prs))
                         self.fail("must never enter unlocked")
                 self.assertEqual(stop.exception.code, 3)
                 self.assertEqual(stdout.getvalue(), '')
-                self.assertIn("gate busy: held by proj/T-9 since 2026-01-01", output.getvalue())
+                self.assertIn(f"gate busy: held by pid {os.getpid()}, holder details unavailable", output.getvalue())
+                self.assertNotIn('proj/T-9', output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_start_clears_stale_run_locks(self):
@@ -1297,6 +1367,7 @@ store.write_text(json.dumps(prs))
             self.git(repo, 'init', '-q', '-b', 'main')
             (repo / 'justfile').write_text('check:\n    true\n')
             (repo / 'kind').write_text(name)
+            (repo / '.task.toml').write_text('[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
             (repo / '.pre-commit-config.yaml').write_text('repos: []\n')
             self.git(repo, 'add', '.')
             self.git(repo, 'commit', '-qm', 'stub gate')
@@ -1322,6 +1393,8 @@ store.write_text(json.dumps(prs))
             home = pathlib.Path(os.environ['HOME'])
             kind = pathlib.Path('kind').read_text()
             temporary = pathlib.Path(os.environ['TMPDIR'])
+            assert os.environ['PRODUCT_DIR'] == str(home / 'dev_workspace' / kind / 'data')
+            assert os.environ['WORK_DIR'] == str(pathlib.Path.cwd() / 'output')
             slot = int(os.environ['TASK_GATE_SLOT'])
             port = int(os.environ['TASK_GATE_PORT_BASE'])
             # Record first so a failed assertion below still leaves evidence for the test.
@@ -1513,12 +1586,12 @@ store.write_text(json.dumps(prs))
         lock, holder = self.gate_dir / 'agent-task-gate.lock', self.gate_dir / 'agent-task-gate.holder'
         with lock.open('a') as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            holder.write_text(json.dumps({'repo': 'old', 'task': 'T-1', 'since': 'before'}))
+            holder.write_text(json.dumps({'pid': os.getpid(), 'repo': 'old', 'task': 'T-1', 'since': 'before'}))
             calls = []
             def change(_):
                 calls.append(True)
                 if len(calls) == 1:
-                    holder.write_text(json.dumps({'repo': 'new', 'task': 'T-2', 'since': 'after'}))
+                    holder.write_text(json.dumps({'pid': os.getpid(), 'repo': 'new', 'task': 'T-2', 'since': 'after'}))
                 else:
                     fcntl.flock(held, fcntl.LOCK_UN)
             output = io.StringIO()
@@ -1598,7 +1671,7 @@ store.write_text(json.dumps(prs))
         holder = self.gate_dir / "agent-task-gate.holder"
         with lock.open("a") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            holder.write_text(json.dumps({"repo": "proj", "task": "T-9", "pid": 2, "since": "today"}))
+            holder.write_text(json.dumps({"repo": "proj", "task": "T-9", "pid": 99999999, "since": "today"}))
             self.assertEqual(TASK_MODULE.gate_holder_pid(lock), os.getpid())
             output = io.StringIO()
             def release(_):
@@ -1609,7 +1682,9 @@ store.write_text(json.dumps(prs))
                     contextlib.redirect_stdout(output):
                 with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, "5")):
                     pass
-            self.assertIn(f"pid {os.getpid()} since today", output.getvalue())
+            self.assertIn(f"pid {os.getpid()} since ?", output.getvalue())
+            self.assertIn('holder details unavailable', output.getvalue())
+            self.assertNotIn('T-9', output.getvalue())
         self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_noticed_import_lists_only_and_deduplicates(self):
@@ -4047,9 +4122,12 @@ case "$*" in "venv "*) for a; do last=$a; done; mkdir -p "$last" ;; esac
         (self.repo / "node_modules").mkdir()
         (self.home / "bin/just").write_text(
             "#!/bin/sh\n[ -d .venv ] && [ -d node_modules ] || exit 9\n"
+            '[ "$WORK_DIR" = "$PWD/output" ] || exit 10\n'
+            '[ "$PRODUCT_DIR" = "$HOME/dev_workspace/proj/data" ] || exit 11\n'
             "echo 'Ran 1 test'; echo OK\n")
         (self.home / "bin/just").chmod(0o755)
         wt, _ = self.started()
+        self.commit_in(wt, '.task.toml', '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
         self.commit_in(wt, "b.txt")
         self.assertIn("PASS", self.raw_task("check", "proj", "5"))
         out = self.task("merge", "proj", "5")

@@ -406,6 +406,43 @@ def plan_time(value):
         return None
 
 
+def decision_content(text):
+    """Ignore only the frontmatter status field."""
+    lines = text.splitlines()
+    frontmatter = bool(lines and lines[0] == "---")
+    result = []
+    for index, line in enumerate(lines):
+        if index and line == "---":
+            frontmatter = False
+        if frontmatter and re.match(r"^status\s*:", line):
+            continue
+        result.append(line)
+    return result
+
+
+def decision_status_only(old, new):
+    remaining = iter(decision_content(old))
+    current = next(remaining, None)
+    for line in decision_content(new):
+        if current is not None and (line == current or
+                                    re.sub(r"~~(.+?)~~", r"\1", line) == current):
+            current = next(remaining, None)
+        elif not re.fullmatch(r"\s*\*?Replaced\b.*", line, re.I):
+            return False
+    return current is None
+
+
+def decision_changed(kb, name, before="HEAD", after=None):
+    old = run_git(kb, "show", f"{before}:{name}")
+    if after is None:
+        path = kb / name
+        new = path.read_text() if path.is_file() else None
+    else:
+        shown = run_git(kb, "show", f"{after}:{name}")
+        new = shown.stdout if shown.returncode == 0 else None
+    return old.returncode != 0 or new is None or not decision_status_only(old.stdout, new)
+
+
 def plan_info(repo):
     kb = CORTEX / f"cortex-kb-{repo.name}"
     path = kb / "INTENT.md"
@@ -448,7 +485,9 @@ def plan_info(repo):
     decisions = set()
     for line in run_git(kb, "status", "--porcelain", "-z", "--untracked-files=all", "--", "backlog/decisions").stdout.split("\0") if kb.exists() else []:
         if line:
-            decisions.add(line[3:] if line[2:3] == " " else line)
+            name = line[3:] if line[2:3] == " " else line
+            if decision_changed(kb, name):
+                decisions.add(name)
     if since and kb.exists():
         # Walk the default branch when it resolves, else the checked-out branch; first-parent
         # diffs catch decisions that arrive through merge commits.
@@ -467,7 +506,8 @@ def plan_info(repo):
                 else:
                     changed = run_git(kb, "show", "--name-only", "-z", "--format=", commit,
                                       "--", "backlog/decisions")
-                decisions.update(filter(None, changed.stdout.split("\0")))
+                decisions.update(name for name in changed.stdout.split("\0") if name and
+                                 decision_changed(kb, name, f"{commit}^1", commit))
     if decisions:
         reasons.append("decisions changed: " + ", ".join(sorted(decisions)))
     return dict(kb=kb, path=path, text=text, current=current, signed=signed, limit=limit,
@@ -656,7 +696,7 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
-def preserve_work(task: Task, path: Path, reuse_head=None):
+def preserve_work(task: Task, path: Path, reuse_head=None, *, strict=False):
     """Preserve evidence; list runtime data and individual copy failures."""
     source = path / ".work"
     if not source.exists() and not source.is_symlink():
@@ -724,6 +764,8 @@ def preserve_work(task: Task, path: Path, reuse_head=None):
         atomic_json(pending / "manifest.json", {"skipped_special_files": special, "skipped": skipped,
                                                 "head": reuse_head or (head.stdout.strip()
                                                                        if not head.returncode else None)})
+        if strict and errors:
+            raise OSError("evidence could not be fully read or copied")
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except (OSError, shutil.Error) as error:
@@ -756,6 +798,26 @@ def timeout_for(path: Path):
                 raise Stop(".task.toml check_timeout must be a positive number of seconds.")
             return value
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
+
+
+def configured_environment(path, repo=None):
+    config = path / ".task.toml"
+    try:
+        values = tomllib.loads(config.read_text()).get("env", {}) if config.exists() else {}
+    except (OSError, tomllib.TOMLDecodeError):
+        raise Stop(f"Cannot read {config}.") from None
+    if not isinstance(values, dict):
+        raise Stop(".task.toml [env] must be a table of plain strings.")
+    for name, value in values.items():
+        if any(word in name.upper() for word in ("TOKEN", "KEY", "SECRET", "PASSWORD")):
+            raise Stop(f".task.toml env key {name} looks like a credential; use secretspec.")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not isinstance(value, str) or "\0" in value:
+            raise Stop(".task.toml [env] requires valid environment names and plain strings.")
+    if not values:
+        return {}
+    repo = repo or main_repo(path)
+    return {name: value.replace("{repo}", str(repo.resolve())).replace("{worktree}", str(path.resolve()))
+            for name, value in values.items()}
 
 
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
@@ -798,6 +860,8 @@ def gate_holders():
                 record = json.loads(lock.with_suffix(".holder").read_text())
             except (OSError, ValueError):
                 record = {}
+            if not isinstance(record, dict) or record.get("pid") != pid:
+                record = {"repo": "holder details unavailable"}
             name = lock.stem.removeprefix("agent-task-gate-") if lock.stem != "agent-task-gate" else "slot-0"
             holders.append((name, pid, record.get("repo", "?"), record.get("task", "?"), record.get("since", "?")))
         except OSError:
@@ -882,7 +946,7 @@ def exclusive_gate_lock(task: Task, silent_unavailable=False, *, config_path=Non
                 release()
                 holders = [row for row in gate_holders() if not row[0].startswith("noslot-")]
                 if time.monotonic() >= deadline:
-                    detail = "; ".join(f"{repo}/{task_id} since {since}" for _, _, repo, task_id, since in holders)
+                    detail = "; ".join(f"pid {pid}, {repo}/{task_id} since {since}" for _, pid, repo, task_id, since in holders)
                     print(f"gate busy: held by {detail or 'another gate (holder details unavailable)'}",
                           file=sys.stderr, flush=True)
                     raise SystemExit(3)
@@ -1149,6 +1213,7 @@ def agent_environment():
 
 def lane_environment(task):
     env = agent_environment()
+    env.update(configured_environment(task.path, task.repo))
     state = task.path / ".work/state"
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
@@ -1919,6 +1984,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
     log = work / "check.log"
     passed = True
     timeout = timeout_for(path)
+    configured_env = configured_environment(path)
     run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
     with log.open("w") as out:
@@ -1937,6 +2003,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             private_index_directory = None
             try:
                 child_env = check_step_environment(run_id)
+                child_env.update(configured_env)
                 child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
@@ -3267,6 +3334,7 @@ def status(args):
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
+        print("  env keys: " + (", ".join(sorted(configured_environment(repo))) or "(none)"))
         if (CORTEX / f"cortex-kb-{repo.name}").exists():
             print("  " + plan_verdict(plan_info(repo)))
         for record in sorted((repo / '.work').glob('runner-*.json')):

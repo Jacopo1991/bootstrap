@@ -9,6 +9,7 @@ import os
 import importlib.machinery
 import importlib.util
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -19,6 +20,7 @@ TOOL = ROOT / "home/dot_local/bin/executable_workspace-tidy"
 TIDY_LOADER = importlib.machinery.SourceFileLoader("workspace_tidy_test", str(TOOL))
 TIDY_SPEC = importlib.util.spec_from_loader(TIDY_LOADER.name, TIDY_LOADER)
 TIDY_MODULE = importlib.util.module_from_spec(TIDY_SPEC)
+sys.dont_write_bytecode = True
 TIDY_SPEC.loader.exec_module(TIDY_MODULE)
 OLD = time.time() - 10 * 86400
 OLD_DATE = f"@{int(OLD)} +0000"
@@ -197,25 +199,27 @@ class Safety(unittest.TestCase):
         run(self.repo, "worktree", "add", "-q", *extra, str(path), old=True)
         return path
 
-    def tidy(self):
+    def tidy(self, apply=True):
         env = dict(os.environ, HOME=str(self.home), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
         env.pop("CODEX_HOME", None)
-        result = subprocess.run(["python3", str(TOOL), "--apply"], env=env, capture_output=True,
+        result = subprocess.run(["python3", str(TOOL), *(["--apply"] if apply else [])], env=env, capture_output=True,
                                 text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def test_ignored_state_is_kept_caches_are_not(self):
+    def test_work_evidence_is_archived_caches_are_not(self):
         state = self.worktree("state", "--detach")
         (state / ".work").mkdir()
-        (state / ".work/state.sqlite").write_text("live")
+        (state / ".work/report.md").write_text("evidence")
         cache = self.worktree("cache", "--detach")
         (cache / "node_modules").mkdir()
         (cache / "node_modules/x.js").write_text("x")
         age(state); age(cache)
         out = self.tidy()
-        self.assertTrue((state / ".work/state.sqlite").exists(), out)
-        self.assertIn("ignored file that is not a rebuildable cache", out)
+        self.assertFalse(state.exists(), out)
+        archived = list((self.home / '.local/state/task/archive/proj/state').glob('*/.work/report.md'))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0].read_text(), 'evidence')
         self.assertFalse(cache.exists(), out)
 
     def test_hidden_or_flagged_changes_are_kept(self):
@@ -271,15 +275,29 @@ class Safety(unittest.TestCase):
         (task / ".work").mkdir()
         (task / ".work/state.sqlite").write_text("task state")
         age(task)
-        out = self.tidy()
+        (task / '.work/report.md').write_text('current evidence')
+        out = self.tidy(apply=False)
         self.assertTrue(task.exists(), out)
-        self.assertIn("ignored file that is not a rebuildable cache", out)
-        archive = self.home / ".local/state/task/archive/proj/t28/t28-snapshot/.work"
-        archive.mkdir(parents=True)
-        (archive / "state.sqlite").write_text("task state")
+        self.assertIn('would archive .work', out)
+        archive = self.home / '.local/state/task/archive/proj/t28'
+        self.assertFalse(archive.exists())
         out = self.tidy()
         self.assertFalse(task.exists(), out)
-        self.assertEqual((archive / "state.sqlite").read_text(), "task state")
+        reports = list(archive.glob('*/.work/report.md'))
+        self.assertEqual(len(reports), 1, out)
+        self.assertEqual(reports[0].read_text(), 'current evidence')
+
+    def test_archive_failure_keeps_worktree_and_evidence(self):
+        path = self.worktree('archive-failure', '-b', 'archive-failure')
+        (path / '.work').mkdir()
+        (path / '.work/report.md').write_text('must survive')
+        age(path)
+        archive = self.home / '.local/state/task/archive'
+        archive.mkdir(parents=True)
+        (archive / 'proj').write_text('obstruct archive directory')
+        out = self.tidy()
+        self.assertIn('cannot archive .work', out)
+        self.assertEqual((path / '.work/report.md').read_text(), 'must survive')
 
     def test_moved_worktree_is_not_pruned(self):
         moved = self.worktree("moved", "--detach")
