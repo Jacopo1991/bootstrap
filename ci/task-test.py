@@ -1289,6 +1289,30 @@ store.write_text(json.dumps(prs))
                 process.wait()
             process.stdout.close()
 
+    def test_gate_tmp_ignores_checkout_tmpdir_and_cleans_up_on_exception(self):
+        wt, _ = self.started()
+        seen = []
+
+        def check_steps(*args, gate_environment, **kwargs):
+            temporary = Path(gate_environment['TMPDIR']).resolve()
+            seen.append(temporary)
+            self.assertTrue(temporary.is_dir())
+            self.assertFalse(temporary.is_relative_to(wt.resolve()))
+            self.assertFalse(temporary.is_relative_to(self.repo.resolve()))
+            self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(temporary.parent.stat().st_mode), 0o700)
+            self.assertEqual(list(temporary.iterdir()), [])
+            (temporary / 'leftover').write_text('gate data')
+            raise RuntimeError('gate interrupted')
+
+        with mock.patch.dict(os.environ, TMPDIR=str(wt), TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE, 'run_check_steps', side_effect=check_steps):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, 'gate interrupted'):
+                    TASK_MODULE.run_check(wt, '')
+                self.assertFalse(seen[-1].exists())
+        self.assertEqual(len(set(seen)), 2)
+
     def test_gate_drill_real_concurrency_isolation_and_cleanup(self):
         repos = []
         for name in ('clean', 'clash', 'always'):
@@ -1328,7 +1352,12 @@ store.write_text(json.dumps(prs))
             with (home / (kind + '-env')).open('a') as out:
                 out.write(json.dumps([str(temporary), slot, port]) + '\\n')
             assert temporary.is_dir(), temporary
-            assert temporary.resolve().parent == (pathlib.Path.cwd() / '.work/tmp').resolve(), temporary
+            assert not temporary.resolve().is_relative_to(pathlib.Path.cwd().resolve()), temporary
+            assert not temporary.resolve().is_relative_to((home / 'dev_workspace').resolve()), temporary
+            assert temporary.stat().st_mode & 0o777 == 0o700, temporary
+            assert temporary.parent.stat().st_mode & 0o777 == 0o700, temporary.parent
+            assert not list(temporary.iterdir()), temporary
+            (temporary / 'leftover').write_text(kind)
             assert port == 20000 + 200 * slot, (slot, port)
             if kind == 'clean':
                 (home / 'active').touch()
@@ -1357,11 +1386,15 @@ store.write_text(json.dumps(prs))
         self.assertEqual([row['verdict'] for row in rows], ['ok', 'clash', 'failing-alone'], out + logs + repr(rows))
         self.assertTrue(all(row['concurrent']['duration'] > 0 for row in rows))
         concurrent_slots = []
+        temporary_paths = []
         for name in ('clean', 'clash', 'always'):
             records = [json.loads(line) for line in (self.home / (name + '-env')).read_text().splitlines()]
             self.assertEqual(len(records), 1 if name == 'clean' else 2)
             concurrent_slots.append(records[0][1])
             for temporary, slot, port in records:
+                temporary_paths.append(temporary)
+                for repo in repos:
+                    self.assertFalse(Path(temporary).resolve().is_relative_to(repo.resolve()))
                 # Drill runs take no slot, so their port range starts above the 3 default slots.
                 self.assertGreaterEqual(slot, 3)
                 self.assertEqual(port, 20000 + 200 * slot)
@@ -1376,6 +1409,7 @@ store.write_text(json.dumps(prs))
             self.assertEqual({tuple(arguments) for arguments, _, _ in pre_commit_records},
                              {('run', '--all-files')}, logs)
         self.assertEqual(sorted(concurrent_slots), [3, 4, 5])
+        self.assertEqual(len(set(temporary_paths)), len(temporary_paths))
         self.assertIn('$ pre-commit run --all-files', logs)
         self.assertNotIn('--from-ref', logs)
         always_steps = [json.loads(path.read_text())['steps']
