@@ -84,6 +84,16 @@ elif cmd == 'lane':
     else:
         (wt / 'dirty').write_text('unfinished')
 elif cmd == 'wait':
+    if entry.get('finish_lane'):
+        lane = json.loads((work / 'lane.json').read_text())
+        assert lane['state'] == 'running'
+        os.kill(lane['pid'], 0)
+        assert (work / 'prompt.md').read_text() == 'original live prompt'
+        (wt / 'result').write_text('finished existing lane')
+        git(wt, 'add', 'result')
+        git(wt, 'commit', '-m', 'Finish existing lane')
+        (work / 'report.md').write_text('## What changed\nDone\n\n## How I verified\nTests\n')
+        save(work / 'lane.json', dict(lane, state='finished', exit_code=0))
     print('interrupted')
 elif cmd == 'review':
     save(state / 'review-run.json', dict(state='finished', builder=entry.get('builder', 'claude'),
@@ -146,7 +156,10 @@ class BatchTest(unittest.TestCase):
         self.assertFalse((self.home / 'overlap').exists())
         prompts = self.prompts() if (self.home / 'prompts.jsonl').exists() else []
         for prompt in prompts[prior_prompts:]:
-            self.assertTrue(prompt['prompt'].endswith(batch_module.BLOCK_INSTRUCTION + '\n'))
+            ending = (batch_module.FIX_SCOPE_INSTRUCTION if 'Fix round:' in prompt['prompt']
+                      else batch_module.BLOCK_INSTRUCTION)
+            self.assertTrue(prompt['prompt'].endswith(ending + '\n'))
+            self.assertIn(batch_module.BLOCK_INSTRUCTION, prompt['prompt'])
         for call in self.calls('review'):
             self.assertEqual(call[-2:], ['--append-prompt', batch_module.BLOCK_INSTRUCTION])
         return (self.repo / '.work/runner-test.done').read_text()
@@ -180,6 +193,21 @@ class BatchTest(unittest.TestCase):
         self.assertIn('one: merged', self.run_batch())
         self.assertEqual([c[0] for c in self.calls()[before:]],
                          ['runner-check', 'wait', 'check', 'review', 'merge'])
+
+    def test_resume_running_lane_waits_without_relaunch_or_prompt_write(self):
+        subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
+                       env=self.env, check=True, capture_output=True)
+        work = self.repo / '.worktrees/one/.work'
+        (work / 'lane.json').write_text(json.dumps(dict(state='running', pid=os.getpid(),
+                                                       builder='codex')))
+        (work / 'prompt.md').write_text('original live prompt')
+        self.scenario({'wait': [{'code': 3, 'output': 'still running'}, {'finish_lane': True}]})
+        before = len(self.calls())
+        self.assertIn('one: merged', self.run_batch())
+        self.assertEqual([c[0] for c in self.calls()[before:]],
+                         ['runner-check', 'wait', 'wait', 'check', 'review', 'merge'])
+        self.assertEqual((work / 'prompt.md').read_text(), 'original live prompt')
+        self.assertFalse(self.calls('lane'))
 
     def test_tasks_after_environment_instruction_still_run(self):
         self.source.write_text(self.source.read_text() +
@@ -290,6 +318,32 @@ class BatchTest(unittest.TestCase):
         self.scenario({'lane': [{'exit_code': 1, 'log': "ERROR: You've hit your usage limit. Try again later."}]})
         self.assertIn('batch: stopped:', self.run_batch(1))
         self.assertFalse(self.calls('check'))
+
+    def test_final_usage_limit_stops_without_fix_round_and_can_resume(self):
+        self.scenario({'lane': [{'exit_code': 2, 'final': "ERROR: You've hit your usage limit.\n\n"}]})
+        self.assertIn('batch: stopped: lane CLI:', self.run_batch(1))
+        self.assertEqual(len(self.calls('lane')), 1)
+        self.assertFalse(self.calls('check'))
+        self.scenario({})
+        self.assertTrue(self.run_batch().endswith('one: merged\nbatch: finished\n'))
+        self.assertEqual(len(self.calls('start')), 1)
+        self.assertEqual(len(self.calls('lane')), 1)
+
+    def test_resumed_running_lane_limit_stops_without_new_lane(self):
+        subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
+                       env=self.env, check=True, capture_output=True)
+        work = self.repo / '.worktrees/one/.work'
+        (work / 'lane.json').write_text(json.dumps(dict(state='running', pid=os.getpid(), builder='codex')))
+        runner = batch_module.Batch(self.repo, self.source)
+
+        def wait(*args, **kwargs):
+            (work / 'lane.json').write_text(json.dumps(dict(state='finished', exit_code=1, builder='codex')))
+            (work / 'final.md').write_text("ERROR: You've hit your usage limit.")
+
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(runner, 'require', side_effect=wait):
+            with self.assertRaisesRegex(batch_module.Stop, 'lane CLI:'):
+                runner.task(batch_module.parse(self.source)[0])
+        self.assertFalse(self.calls('lane'))
 
     def test_review_limit_stops(self):
         self.scenario({'review': [{'exit_code': 2, 'reply': "You've hit your weekly limit · resets 5pm (UTC)"}]})

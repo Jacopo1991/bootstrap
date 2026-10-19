@@ -6,6 +6,8 @@ import shutil
 from pathlib import Path
 import tempfile
 import importlib.util
+import subprocess
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("agent_drift", ROOT / "checks/agent-drift.py")
@@ -18,10 +20,22 @@ expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
             "agentdev-shell-mcp"}
 assert drift.EXPECTED_BINARIES == expected
+allowed_helpers = {"task_limits.py"}
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
 for script in (ROOT / "home/dot_local/bin").iterdir():
     if script.is_file():
-        assert script.name.removeprefix("executable_") in expected, script.name
+        assert script.name.removeprefix("executable_") in expected | allowed_helpers, script.name
+# Exercise imports from the installed layout, outside the source directory.
+with tempfile.TemporaryDirectory() as temp:
+    installed = Path(temp) / ".local/bin"
+    installed.mkdir(parents=True)
+    for name in ("task", "task-batch", *allowed_helpers):
+        source = name if name in allowed_helpers else "executable_" + name
+        shutil.copy2(ROOT / "home/dot_local/bin" / source, installed / name)
+    for name in ("task", "task-batch"):
+        result = subprocess.run([sys.executable, "-I", str(installed / name), "--help"],
+                                cwd=temp, capture_output=True, text=True)
+        assert result.returncode == 0, (name, result.stderr)
 assert drift.compare_sets(expected, expected) == []
 pins = drift.read_pins(ROOT / "home/.chezmoitemplates/pins.env")
 assert pins["CLAUDE_VERSION"] == "2.1.296", "Claude Code alias routing requires the pinned 2.1.296 release"

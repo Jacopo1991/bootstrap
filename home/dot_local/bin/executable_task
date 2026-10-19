@@ -57,6 +57,9 @@ import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from task_limits import cli_limit, lane_limit
+
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
@@ -144,6 +147,10 @@ GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FIL
 
 class Stop(Exception):
     """A clear, expected reason to stop; printed without a traceback."""
+
+
+class UsageLimit(Stop):
+    """A reviewer CLI ended with a terminal usage-limit diagnostic."""
 
 
 def frontmatter_title(text):
@@ -1103,7 +1110,7 @@ def task_run_pids(run_id):
     """Find this user's processes carrying a check/gate run marker, including new sessions."""
     if not run_id:
         return []
-    marker = f"TASK_RUN_ID={run_id}".encode()
+    markers = {f"{name}={run_id}".encode() for name in ("TASK_RUN_ID", "TASK_GATE_RUN_ID")}
     found = []
     try:
         processes = Path("/proc").iterdir()
@@ -1113,7 +1120,7 @@ def task_run_pids(run_id):
             try:
                 if entry.stat().st_uid != os.getuid():
                     continue
-                if marker in entry.joinpath("environ").read_bytes().split(b"\0"):
+                if markers.intersection(entry.joinpath("environ").read_bytes().split(b"\0")):
                     found.append(int(entry.name))
             except (OSError, PermissionError, ValueError):
                 continue
@@ -1247,7 +1254,7 @@ def require_pm(args):
 
 
 def stripped_agent_variable(name):
-    return name in GIT_OVERRIDE_ENV or name == "GIT_OVERRIDE_ENV" or name.startswith(("GIT_CONFIG", "TASK_RUN_"))
+    return name in GIT_OVERRIDE_ENV or name in {"GIT_OVERRIDE_ENV", "TASK_GATE_RUN_ID"} or name.startswith(("GIT_CONFIG", "TASK_RUN_"))
 
 
 def agent_environment():
@@ -1616,6 +1623,17 @@ def check_step_environment(run_id):
     return child_env
 
 
+def trusted_check_environment(path, run_id, gate_environment):
+    allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SHELL"}
+    environment = {key: value for key, value in os.environ.items()
+                   if key in allowed or key.startswith("LC_")}
+    environment.update(configured_environment(path))
+    environment.update(gate_environment)
+    # Keep cancellation of descendants in new sessions without inheriting TASK_RUN_*.
+    environment["TASK_GATE_RUN_ID"] = run_id
+    return environment
+
+
 def advisory_pre_commit_environment(path: Path, child_env):
     """Give advisory pre-commit its own disposable index inside the writable worktree."""
     work = path / ".work"
@@ -1836,6 +1854,7 @@ def runner_start(args):
                str(log), executable, str(done_offset), 'llm' if args.llm else 'batch', str(repo)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
+              '--property=KillMode=process',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
               '--setenv=PATH=' + os.environ.get('PATH', ''), *command]
     try:
@@ -2000,6 +2019,32 @@ def start(args):
     print(dispatch_text, end="")
 
 
+def sweep_gate_temporary(root):
+    """Remove only old, owned gate directories whose recorded holder is dead."""
+    cutoff = time.time() - 24 * 60 * 60
+    for directory in root.glob("gate-*"):
+        try:
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mtime >= cutoff):
+                continue
+            holder = directory / "holder.pid"
+            info = holder.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_size > 32):
+                continue
+            pid = int(holder.read_text())
+            if pid <= 0:
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                shutil.rmtree(directory)
+        except (OSError, ValueError, OverflowError):
+            # Missing/malformed holders and inaccessible processes are not evidence of death.
+            continue
+
+
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False, pre_commit_all_files=False):
     if advisory:
@@ -2011,12 +2056,14 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
     if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
             or stat.S_IMODE(info.st_mode) != 0o700):
         raise Stop(f"Gate temporary parent must be an owned directory with mode 0700: {temporary_root}")
-    with tempfile.TemporaryDirectory(prefix="gate-", dir=temporary_root) as temporary, \
-            gate_port_index(path) as slot:
-        environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
-                       "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
-        return run_check_steps(path, base, record, state, evidence_name, display_log,
-                               gate_environment=environment, pre_commit_all_files=pre_commit_all_files)
+    sweep_gate_temporary(temporary_root)
+    with tempfile.TemporaryDirectory(prefix="gate-", dir=temporary_root) as temporary:
+        (Path(temporary) / "holder.pid").write_text(str(os.getpid()) + "\n")
+        with gate_port_index(path) as slot:
+            environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
+                           "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
+            return run_check_steps(path, base, record, state, evidence_name, display_log,
+                                   gate_environment=environment, pre_commit_all_files=pre_commit_all_files)
 
 
 def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
@@ -2026,6 +2073,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
     pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
     has no base) it checks every file instead of being skipped.
     """
+    if not advisory and gate_environment is None:
+        return run_check(path, base, record, state, evidence_name, display_log,
+                         pre_commit_all_files=pre_commit_all_files)
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
@@ -2057,9 +2107,11 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             started = time.monotonic()
             private_index_directory = None
             try:
-                child_env = check_step_environment(run_id)
-                child_env.update(configured_env)
-                child_env.update(gate_environment or {})
+                child_env = (check_step_environment(run_id) if advisory else
+                             trusted_check_environment(path, run_id, gate_environment))
+                if advisory:
+                    child_env.update(configured_env)
+                    child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
@@ -2477,6 +2529,10 @@ def run_reviewer(command, path, prompt_file, reply_file):
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
+        output = reply_file if run["builder"] == "claude" else stderr_file
+        limit = cli_limit(run, output.read_text(errors="replace"))
+        if limit:
+            raise UsageLimit(f"Reviewer ended by usage limit ({limit}); no review recorded. Reply: {reply_file}")
         raise Stop(f"Reviewer exited with status {code}; no review recorded. Reply: {reply_file}")
 
 
@@ -2576,8 +2632,20 @@ def review(args):
             print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
             return 0
+        used_fallback = False
         for attempt in range(2):
-            run_reviewer(command, path, prompt_file, reply_file)
+            try:
+                run_reviewer(command, path, prompt_file, reply_file)
+            except UsageLimit:
+                if reviewer_route != ("claude", "opus"):
+                    raise
+                print("Boosted Claude reviewer hit a usage limit; retrying once with claude haiku.")
+                used_fallback = True
+                reviewer_route = ("claude", "haiku")
+                atomic_json(state / "review-routing.json", {"vendor": "claude", "model": "haiku",
+                                                            "fallback_from": "opus"})
+                command = command.replace("--model opus ", "--model haiku ", 1)
+                run_reviewer(command, path, prompt_file, reply_file)
             head = sha(path, "HEAD")
             try:
                 verdict, commit, _, _ = parse_review_reply(
@@ -2589,7 +2657,7 @@ def review(args):
                         break
             except ReviewParseError:
                 pass
-            if attempt:
+            if attempt or used_fallback:
                 raise Stop("review produced no verdict; rerun `task review`")
         args.record = str(reply_file)
         head = sha(path, "HEAD")
@@ -3499,6 +3567,9 @@ def status(args):
                 if lane_state == "running" and not pid_alive(lane_run.get("pid")):
                     lane_state = "interrupted"
                 result = f" (exit {lane_run['exit_code']})" if "exit_code" in lane_run else ""
+                limit = lane_limit(lane_run, path / ".work")
+                if limit:
+                    lane_state, result = "ended by usage limit", f" ({limit})"
                 print(f"    lane: {lane_state}{result} pid={lane_run.get('pid', '?')} "
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
                 if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
@@ -3900,6 +3971,7 @@ def wait_task(args):
     deadline = time.monotonic() + args.max * 60
     while True:
         runs = []
+        labels = []
         for file in (task.path / ".work/lane.json", run_record_path(task)):
             try:
                 run = json.loads(file.read_text())
@@ -3908,8 +3980,10 @@ def wait_task(args):
             if run.get("state") in {"running", "foreground", "starting"} and not pid_alive(run.get("pid")):
                 run["state"] = "interrupted"
             runs.append(run)
+            limit = lane_limit(run, task.path / ".work") if file.name == "lane.json" else ""
+            labels.append(f"lane: ended by usage limit ({limit})" if limit else run.get("state", "unknown"))
         if not any(r.get("state") in {"running", "foreground", "starting"} for r in runs):
-            print("; ".join(r.get("state", "unknown") for r in runs) or "not started")
+            print("; ".join(labels) or "not started")
             return 0
         if time.monotonic() >= deadline:
             print("still running")
