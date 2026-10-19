@@ -25,28 +25,39 @@ class GateToolsTest(unittest.TestCase):
         summary = lint[lint.index('echo "Gate suites finished'):]
         with tempfile.TemporaryDirectory() as directory:
             python = Path(directory) / 'python3'
-            # Simulate the socket helper's lane denial and trusted failure.
-            python.write_text('#!/bin/sh\n[ -z "${TASK_GATE_RUN_ID:-}" ] && exit 77\nexit 1\n')
+            # Force 77 even in trusted mode to test the runner's own policy.
+            python.write_text('#!/bin/sh\nexit 77\n')
             python.chmod(0o755)
-            for trusted in (False, True):
-                with self.subTest(trusted=trusted):
+            for run_id in (None, '', 'test'):
+                with self.subTest(run_id=run_id):
                     env = dict(os.environ, PATH=directory + ':' + os.environ['PATH'])
                     env.pop('TASK_GATE_RUN_ID', None)
-                    if trusted:
-                        env['TASK_GATE_RUN_ID'] = 'test'
+                    if run_id is not None:
+                        env['TASK_GATE_RUN_ID'] = run_id
                     result = subprocess.run(
                         ['bash', '-c', 'set -euo pipefail\nfailed=0\n' + runner +
                          'run bash ci/boundary-test.sh\nrun true\n' + summary],
                         cwd=ROOT, env=env, text=True, capture_output=True)
-                    self.assertEqual(result.returncode, int(trusted), result.stderr)
+                    self.assertEqual(result.returncode, int(run_id is not None), result.stderr)
                     self.assertIn('PASS: suite true', result.stderr)
                     self.assertNotIn('PASS: suite bash ci/boundary-test.sh', result.stderr)
-                    if trusted:
-                        self.assertIn('FAIL: bash ci/boundary-test.sh (exit 1)', result.stderr)
+                    if run_id is not None:
+                        self.assertIn('FAIL: bash ci/boundary-test.sh (exit 77)', result.stderr)
                         self.assertIn('failed=1, skipped=0', result.stdout)
                     else:
                         self.assertIn('SKIP: suite bash ci/boundary-test.sh', result.stderr)
                         self.assertIn('failed=0, skipped=1', result.stdout)
+
+                    # An unrelated suite cannot skip, even in a lane.
+                    result = subprocess.run(
+                        ['bash', '-c', 'set -euo pipefail\nfailed=0\n' + runner +
+                         "run bash -c 'exit 77'\nrun true\n" + summary],
+                        cwd=ROOT, env=env, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn('FAIL: bash -c exit 77 (exit 77)', result.stderr)
+                    self.assertNotIn('SKIP: suite', result.stderr)
+                    self.assertIn('PASS: suite true', result.stderr)
+                    self.assertIn('failed=1, skipped=0', result.stdout)
 
     def test_pinned_download_and_failures(self):
         # Exercise real checksum verification and extraction with local transport.

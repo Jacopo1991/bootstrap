@@ -9,11 +9,16 @@ export PATH="$tmp/gate-bin:$PATH"
 bash ci/gate-tools.sh "$tmp"
 failed=0
 skipped=0
+lane_skippable_suite() {
+  # Only the socket fixture suite may skip, and never in a trusted gate.
+  [[ ${TASK_GATE_RUN_ID+x} != x ]] || return 1
+  [[ $# == 2 && $1 == bash && $2 == ci/boundary-test.sh ]]
+}
 run() {
   echo "RUN: $*" >&2
   local status=0
   "$@" || status=$?
-  if (( status == 77 )); then
+  if (( status == 77 )) && lane_skippable_suite "$@"; then
     echo "SKIP: suite $*" >&2
     skipped=$((skipped + 1))
   elif (( status )); then
