@@ -234,8 +234,8 @@ with tempfile.TemporaryDirectory() as temp:
                    "file -bC"):
         command = "git status; " + helper
         assert policy.evaluate(event(command), roots), command
-    for command in ("git status; echo x > output",
-                    "git status; find . -exec touch file \\;", "git status; find . -delete",
+    assert policy.evaluate(event("git status; echo x > output"), roots) is None
+    for command in ("git status; find . -exec touch file \\;", "git status; find . -delete",
                     "git status; find . -fprint output", "git status; find . -fprintf output x",
                     "time sudo true", "timeout -s TERM -k 1 5 sudo true",
                     "PYTHONHASHSEED=0 uv sync", "PATH=/tmp uv sync", "pwd\nsudo true",
@@ -555,6 +555,36 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("cp safe.txt copied.txt", "mv copied.txt moved.txt",
                     "tee safe.txt", "printf fixture > safe.txt", "cp -t docs safe.txt"):
         assert policy.evaluate(event(command), roots) is None, command
+
+    # Recursive copies are confined to this worktree's .work, including globs.
+    work = current / ".work"
+    (work / "src/deep").mkdir(parents=True)
+    (work / "src/deep/file.txt").write_text("fixture")
+    (work / "dest").mkdir()
+    for command in ("cp -r .work/src .work/copy", "cp -a .work/src .work/dest",
+                    "cp -r .work/src/* .work/dest", "cp -a -- .work/src .work/copy",
+                    f"cp -r {work}/src {work}/copy"):
+        assert policy.evaluate(event(command), roots) is None, command
+    (work / "escape").symlink_to(sibling, target_is_directory=True)
+    (work / "dest/src").symlink_to(current / ".git", target_is_directory=True)
+    (work / "metadata/.git").mkdir(parents=True)
+    copy_denial = "Ambiguous options and whole-directory file transfers are blocked."
+    for command in ("cp -r .work/src docs", "cp -a docs .work/copy",
+                    "cp -r .work/src .work/escape/copy", "cp -a .work/escape .work/copy",
+                    "cp -r .work/src .work/dest", "cp -a .work/metadata .work/copy",
+                    "cp -r .work/* .work/copy", "cp -r .work/missing* .work/copy",
+                    "cp -r .work/src .work/../copy", "cp -rL .work/src .work/copy",
+                    "mv .work/src .work/copy", "cp -a .work/src .work/copy extra"):
+        assert policy.evaluate(event(command), roots) == copy_denial, command
+    (work / "dest/src").unlink()
+    for quiet in ([], ["-q"], ["--quiet"]):
+        command = " ".join(["git", "rm", "--cached", "-r", *quiet, ".work"])
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in ("git rm -r .work", "git rm --cached -r -f .work",
+                    "git rm --cached -r .work docs", "git rm --cached -r docs",
+                    "git rm --cached -r .", "git rm --cached -r .work/src"):
+        assert policy.evaluate(event(command), roots) == \
+            "Git directory mutations are blocked; use explicit non-metadata file paths.", command
 
     # Ordinary folders inside the repository may be deleted; anything holding Git
     # metadata, anything outside the repository and expanded operands may not.
@@ -882,7 +912,7 @@ with tempfile.TemporaryDirectory() as temp:
     # Every git-chain rejection says what to do instead (MadPlanner T-30 lost a session to these).
     for message in (policy.NETWORK_CHAIN_MESSAGE, policy.MIXED_CHAIN_MESSAGE, policy.STATE_CHAIN_MESSAGE):
         assert "git -C <path>" in message, message
-    for command in ("cd sub && git status", "mkdir -p sub && git add sub", "npm test && git add ."):
+    for command in ("git log | tee out.txt", "python3 x.py | git status"):
         assert policy.evaluate(event(command), roots) == policy.MIXED_CHAIN_MESSAGE, command
     assert policy.evaluate(event("git add safe.txt && git commit -m fixture"), roots) == \
         policy.STATE_CHAIN_MESSAGE
@@ -928,6 +958,14 @@ with tempfile.TemporaryDirectory() as temp:
     inner = source / ".worktrees" / "t1"
     subprocess.run(["git", "worktree", "add", "-q", "-b", "t1", str(inner)], cwd=source, check=True)
     (inner / "safe.txt").write_text("safe\n", encoding="utf-8")
+    (inner / ".work/src").mkdir(parents=True)
+    (inner / ".work/src/file.txt").write_text("fixture")
+    for command in ("cp -r .work/src .work/copy", "cp -a .work/src/* .work/copy",
+                    "git rm --cached -r .work", "git rm --cached -r -q .work",
+                    "git rm --cached -r --quiet .work"):
+        assert policy.evaluate(app_event(command, inner), roots) is None, command
+    for command in (f"cp -r {work}/src .work/copy", f"cp -a .work/src {work}/copy"):
+        assert policy.evaluate(app_event(command, inner), roots) == copy_denial, command
     def repo_event(command):
         return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(source)}
     for command in ("git -C .worktrees/t1 status", "git -C .worktrees/t1 add safe.txt"):
@@ -993,14 +1031,28 @@ with tempfile.TemporaryDirectory() as temp:
             "cd nested && rm -r ../scratch/deep ../.git", "env cd nested && ls", "cd a b && ls",
             "cd nested && git -C ../../sibling add safe.txt"):
         assert policy.evaluate(event(command), roots) is not None, command
-    # Mixed chains still refuse writes and commands outside the read-only set.
-    for command in ("git status && python3 x.py", "git add f && touch y",
-                    "cd nested && git status",
+    # Sequential mixed chains inspect each segment; pipes retain their old guard.
+    for separator in ("; ", "\n", " && "):
+        for first, second in (("git status", "python3 x.py"), ("git add f", "touch y"),
+                              ("git status", "rm safe.txt"), ("git status", "cp safe.txt y.txt"),
+                              ("git status", "env FOO=1 python3 x.py"),
+                              ("git status", "FOO=1"),
+                              ("python3 --version", "git status")):
+            command = first + separator + second
+            assert policy.evaluate(event(command), roots) is None, command
+        for network in ("git fetch origin", "git pull", "git push origin HEAD", "gh issue list"):
+            assert policy.evaluate(event("pwd" + separator + network), roots) == policy.NETWORK_CHAIN_MESSAGE
+        for denied in ("touch .git/config", "python3 -c x", "sudo true"):
+            assert policy.evaluate(event("git status" + separator + denied), roots) == \
+                policy.evaluate(event(denied), roots), denied
+    for command in ("time git status", "timeout 1 git status", "time true\ngit status",
+                    "timeout 1 true; git status", "cd nested && git status"):
+        assert policy.evaluate(event(command), roots) is None, command
+    for command in (
                     "git log | awk '{print $1}'", "git log | sed s/a/b/",
-                    "git status; rm safe.txt", "python3 x.py | git status",
+                    "python3 x.py | git status",
                     "git log | sort > out.txt", "git log | cat >> out.txt", "git log | head > out.txt",
-                    "git status && env FOO=1 python3 x.py", "git status && FOO=1",
-                    "git log | tee out.txt", "gh pr list | xargs echo", "git status && cp safe.txt y.txt",
+                    "git log | tee out.txt", "gh pr list | xargs echo",
                     "git log | sort -o out.txt", "git log | sort --output=out.txt", "git log | uniq in out"):
         assert policy.evaluate(event(command), roots) is not None, command
     # git commit -a/--all (and --include/--only/pathspec) would commit content the staged scan never saw.

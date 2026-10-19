@@ -7,6 +7,7 @@ Claude Code and Codex run it from their root-owned managed settings, as
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 from pathlib import Path
@@ -240,6 +241,52 @@ def transfer_paths(tokens: list[str], executable: str, cwd: str) -> tuple[list[s
         return None
     # mv deletes its source too; cp/install inspect sources for protected metadata.
     return sources + [destination], targets + (sources if executable == "mv" else [])
+
+
+def work_copy_paths(tokens: list[str], cwd: str, root: Path,
+                    metadata: tuple[Path, ...] | None) -> tuple[list[str], list[str]] | None:
+    """Narrow recursive-copy exception: literal/glob sources within this .work only.
+
+    Inspect both trees, including existing destination entries: cp can otherwise
+    follow a destination symlink or carry protected metadata inside a directory.
+    """
+    if len(tokens) < 4 or tokens[1] not in {"-r", "-a"} or metadata is None:
+        return None
+    operands = tokens[2:]
+    if operands[:1] == ["--"]:
+        operands = operands[1:]
+    if len(operands) < 2 or any(p.startswith("-") or re.search(r"[$`{}~]", p) for p in operands):
+        return None
+    work = root / ".work"
+    if not inside(str(work), cwd, root) or work.is_symlink():
+        return None
+    destination = operands[-1]
+    if glob.has_magic(destination):
+        return None
+    sources = []
+    for operand in operands[:-1]:
+        if not inside(operand, cwd, work):
+            return None
+        matches = glob.glob(str(Path(cwd) / operand)) if glob.has_magic(operand) else [operand]
+        if not matches:
+            return None
+        sources.extend(matches)
+    paths = sources + [destination]
+    for path in paths:
+        candidate = Path(cwd) / path
+        if not inside(path, cwd, work) or candidate.is_symlink():
+            return None
+        if protected_git_path(path, cwd, metadata):
+            return None
+        if candidate.is_dir():
+            if folder_delete_reason(candidate, root, metadata, "Copying"):
+                return None
+            for here, dirs, files in os.walk(candidate):
+                for name in dirs + files:
+                    child = Path(here) / name
+                    if child.is_symlink() or protected_git_path(str(child), cwd, metadata):
+                        return None
+    return paths, [destination]
 
 
 def git_config_read_only(arguments: list[str]) -> bool:
@@ -786,6 +833,11 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         if any(protected_git_path(arg, str(target), metadata) for arg in operands):
             return "Git file operands cannot modify or stage protected repository metadata."
         folders = [arg for arg in operands if (target / arg).is_dir()]
+        if (subcommand == "rm" and target == target_root
+                and arguments in (["--cached", "-r", ".work"],
+                                  ["--cached", "-r", "-q", ".work"],
+                                  ["--cached", "-r", "--quiet", ".work"])):
+            return None  # Index-only cleanup; never removes worktree files.
         if folders and subcommand in {"mv", "rm", "restore"}:
             return "Git directory mutations are blocked; use explicit non-metadata file paths."
         if folders and subcommand == "add":
@@ -1628,7 +1680,8 @@ def evaluate_command(command: str, cwd: str, root: Path,
             if network_command(head, unwrapped, effective):
                 return NETWORK_CHAIN_MESSAGE
         if any(head in {"git", "gh"} for head, _ in heads):
-            # git/gh are excluded from the sandbox; do not let a chain smuggle anything else along.
+            # Sequential segments get their ordinary checks below. Preserve the
+            # command-hiding helper guards and the stricter pipeline checks.
             for head, unwrapped in heads:
                 if head in {"git", "gh"}:
                     continue
@@ -1647,10 +1700,9 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                              and not token.startswith("--") and "C" in token)
                     for token in unwrapped[1:])
                 sed_writes = head == "sed" and not readonly_sed(unwrapped)
-                if (head not in MIXED_CHAIN_TEXT_TOOLS | {"git", "gh"}
-                        and not pure_lookup(unwrapped)) or writes or find_writes or rg_executes or file_writes:
-                    return MIXED_CHAIN_MESSAGE
-                if sed_writes:
+                if (find_writes or rg_executes or file_writes or not plain_chain and (
+                        (head not in MIXED_CHAIN_TEXT_TOOLS | {"git", "gh"}
+                         and not pure_lookup(unwrapped)) or writes or sed_writes)):
                     return MIXED_CHAIN_MESSAGE
     seen_changing = False
     branch_cwd = effective
@@ -1756,6 +1808,8 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     inspected: list[str] = []
     if executable in {"cp", "mv", "install"}:
         transfer = transfer_paths(tokens, executable, cwd)
+        if transfer is None and executable == "cp":
+            transfer = work_copy_paths(tokens, cwd, root, metadata)
         if transfer is None:
             return "Ambiguous options and whole-directory file transfers are blocked."
         inspected, targets = transfer
