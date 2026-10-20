@@ -11,6 +11,9 @@ import subprocess
 import sys
 import tempfile
 
+# Fixtures own their roots, independently of the enclosing lane.
+os.environ.pop("TASK_WORKTREE", None)
+
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "system/agent-policy/pre_tool_use.py"
 DROPIN = json.loads((ROOT / "system/claude-managed-mods.json").read_text(encoding="utf-8"))
