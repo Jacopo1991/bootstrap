@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -15,7 +16,9 @@ from task_limits import cli_limit, lane_limit
 
 TASK_LINE = re.compile(
     r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
-    r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?(?:\b.*)?$")
+    r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
+    r"(?:\b.*)?$")
+NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
 HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
                "Execution stopped by PreToolUse hook")
 BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end your final reply "
@@ -58,12 +61,18 @@ def parse(source):
             if re.fullmatch(r"\s*```\s*", line):
                 in_rules = False
             continue
-        match = TASK_LINE.match(line)
+        no_verify_field = NO_VERIFY.search(line)
+        match = TASK_LINE.match(NO_VERIFY.sub("", line))
         if match:
             ident, builder, model, seed, after = match.groups()
+            no_verify = no_verify_field[1].strip() if no_verify_field else None
+            if no_verify is not None and not no_verify.strip():
+                raise Stop("no-verify needs a nonempty reason")
             current = dict(id=ident, builder=builder.lower(), model=model,
-                           seed=seed, after=after, lines=[line])
+                           seed=seed, after=after, no_verify=no_verify, lines=[line])
             tasks.append(current)
+        elif re.match(r"(?i)^\s*(?:\d+\.|[-*])\s+[^:\s]+:\s*builder\b", line):
+            raise Stop("Invalid runner task line: " + line)
         elif current is not None:
             current["lines"].append(line)
     if not tasks:
@@ -149,10 +158,18 @@ class Batch:
 
     def lane_outcome(self, work):
         record = data(work / "lane.json")
-        limit = lane_limit(record, work)
-        if limit:
-            raise Stop(f"lane CLI: {limit}")
-        denied = terminal_block(read(work / "final.md"))
+        try:
+            started = datetime.fromisoformat(record["started_at"]).timestamp()
+        except (KeyError, ValueError, TypeError):
+            return
+        def fresh_read(name):
+            path = work / name
+            return read(path) if path.is_file() and path.stat().st_mtime > started else ""
+        for name in ("final.md", "lane.log"):
+            limit = cli_limit(record, fresh_read(name))
+            if limit:
+                raise Stop(f"lane CLI: {limit}")
+        denied = terminal_block(fresh_read("final.md"))
         if denied:
             raise Stop(f"lane: {denied}")
 
@@ -182,6 +199,8 @@ class Batch:
             options = ["--builder", task["builder"]]
             if task["seed"]:
                 options += ["--seed", task["seed"]]
+            if task.get("no_verify"):
+                options += ["--no-verify", task["no_verify"].strip()]
             dispatch = self.require("start", ident, *options)
         record = data(state / "task.json")
         # New task versions persist their dispatch instructions for resumed batches.
@@ -193,14 +212,17 @@ class Batch:
         dispatch += ("\nBefore reporting, run `task check` (advisory, from the worktree) on the final commit "
                      "and paste its final summary line (PASS/FAIL plus the log path) under `## Check` "
                      "in `.work/report.md`. A claim like 'tests pass' without that line is not evidence.\n")
+        dispatch += ("Write and edit files with your edit or apply_patch tool, never shell heredocs or cat >; "
+                     "avoid backticks in shell commands. If a merge-in is needed, run `git merge origin/main`.\n")
         started = time.monotonic()
         builder, model = task["builder"], task["model"]
         rounds, previous, findings, check_tail = 0, None, "", ""
         # Never launch a duplicate lane or overwrite the prompt of a running lane.
         previous_limit = lane_limit(data(work / "lane.json"), work) if resumed else ""
         if resumed:
+            was_running = data(work / "lane.json").get("state") == "running"
             self.require("wait", ident, "--max", box, retry=True)
-            if not previous_limit:
+            if was_running:
                 self.lane_outcome(work)
         run_lane = not resumed or not self.finished(path, record)
         if resumed and run_lane:

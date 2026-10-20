@@ -1030,10 +1030,13 @@ Inspection failures also deny this exception.
 Bare fetch resolves the branch-configured remote (falling back to origin)
 and verifies its effective GitHub URL. Pull, merge, checkout, switch and other
 Git writes remain limited to the current repo. Build agents never merge pull requests.
-The only local merge exception is `git merge [--no-edit] origin/<default branch>`
+The default-branch merge exception is `git merge [--no-edit] origin/<default branch>`
 inside the current repo on an attached non-default branch, with one effective
 GitHub origin URL and a resolvable symbolic `origin/HEAD`. Unknown/default/detached
 branches, other refs and every other merge option are denied by the shared hook.
+Plain `git merge main` is also allowed when `main` is the recorded origin default,
+with the same checks and an unambiguous local `main` ref. This uses the local
+branch, which may lag `origin/main`; dispatch guidance uses `origin/main`.
 The one other exception is `git merge --ff-only origin/<the current branch>` (catching up
 your own task branch from GitHub): same checks, exactly that argument form, never on the
 default branch, and the remote-tracking ref must resolve uniquely.

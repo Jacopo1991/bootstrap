@@ -3754,8 +3754,17 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         prompt = wt / ".work/prompt.md"
         prompt.write_text("Original outcome\n")
+        (wt / ".work/final.md").write_text("BLOCKED: git merge main\n")
+        (wt / ".work/final-1.md").write_text("older evidence\n")
+        report = wt / ".work/report.md"
+        report.write_text("## What changed\nStill working\n\nBLOCKED: cat > helper <<PY\n\n")
         self.raw_task("lane", "proj", "5", env=dict(self.env, SECRETSPEC_REASON=""))
         self.wait_for_lane(wt)
+        self.assertEqual((wt / ".work/final-1.md").read_text(), "older evidence\n")
+        archived = (wt / ".work/final-2.md").read_text()
+        self.assertIn("BLOCKED: git merge main", archived)
+        self.assertIn("BLOCKED: cat > helper <<PY", archived)
+        self.assertEqual(report.read_text(), "## What changed\nStill working\n")
         call = json.loads((wt / ".work/model-call.json").read_text())
         self.assertEqual(call["state_home"], str(wt / ".work/state"))
         self.assertEqual(call["reason"], "lane proj/T-5")
@@ -3837,9 +3846,72 @@ store.write_text(json.dumps(prs))
         (source / "single").write_text("changed")
         self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "single")
         self.assertEqual((wt / ".work/single").read_text(), "file")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--refresh")
+        self.assertEqual(json.loads((self.state() / "task.json").read_text())["seeds"],
+                         ["pinned", "single"])
+        record = json.loads((self.state() / "task.json").read_text())
+        self.assertEqual(record["seeds"], ["pinned", "single"])
         (source / "escape").symlink_to(self.home)
         for name in ("..", "../outside", str(self.home), "escape"):
             self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", name, code=1)
+
+    def test_setup_73_merge_gate_needs_recorded_and_configured_seeds(self):
+        source = self.repo / ".work"
+        source.mkdir(exist_ok=True)
+        (source / "hermes-130b8f2c").mkdir()
+        (source / "hermes-130b8f2c/runtime.py").write_text("runtime source")
+        (source / "configured").write_text("configured seed")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "hermes-130b8f2c")
+        wt = self.repo / ".worktrees/t5"
+        self.commit_in(wt, ".task.toml", 'drill_seeds = ["configured"]\n')
+        record = json.loads((self.state() / "task.json").read_text())
+        task = TASK_MODULE.Task(self.repo, "5")
+        observed = []
+        def check(gate, *args, **kwargs):
+            self.assertEqual((gate / ".work/hermes-130b8f2c/runtime.py").read_text(), "runtime source")
+            self.assertEqual((gate / ".work/configured").read_text(), "configured seed")
+            (gate / ".work/check.log").write_text("PASS seed-dependent gate")
+            observed.append(gate)
+            return True
+        with mock.patch.object(TASK_MODULE, "run_check", side_effect=check), \
+                mock.patch.object(TASK_MODULE, "HOME", self.home), \
+                mock.patch.dict(os.environ, self.env):
+            _, passed = TASK_MODULE.gate_merge_result(
+                task, self.repo, self.git(wt, "rev-parse", "HEAD"),
+                self.git(self.repo, "rev-parse", "HEAD"), record)
+        self.assertTrue(passed)
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(observed[0].exists())
+
+    def test_setup_68_runner_no_verify_validation_and_dispatch(self):
+        runner = self.home / "runner.md"
+        runner.write_text("1. docs: builder codex, model gpt-6-luna, no-verify: gate is its verification\n")
+        self.assertIn("runner file OK", self.raw_task("runner-check", "proj", str(runner)))
+        runner.write_text("1. docs: builder codex, model gpt-6-luna, no-verify: \n")
+        self.assertIn("nonempty reason", self.raw_task("runner-check", "proj", str(runner), code=1))
+        out = self.raw_task("start", "proj", "docs", "--builder", "codex",
+                            "--no-verify", "gate is its verification")
+        self.assertIn("edit or apply_patch tool, never shell heredocs or cat >", out)
+        self.assertIn("avoid backticks in shell commands", out)
+
+    def test_setup_68_runner_preserves_trailing_text_and_optional_field_positions(self):
+        runner = self.home / "runner.md"
+        (self.repo / ".work").mkdir(exist_ok=True)
+        (self.repo / ".work/pinned").write_text("seed")
+        for suffix in (
+                ", note here",
+                " some free text",
+                ", seed pinned, after: previous, note here",
+                ", note here, no-verify: manual check",
+                ", no-verify: manual check, seed pinned, after: previous, note here",
+                ", seed pinned, after: previous, note here, no-verify: manual check",
+                ", seed pinned, no-verify: manual check, after: previous"):
+            with self.subTest(suffix=suffix):
+                runner.write_text("1. previous: builder codex, model gpt-6-luna\n"
+                                  "2. docs: builder codex, model gpt-6-luna" + suffix + "\n")
+                self.assertIn("runner file OK", self.raw_task("runner-check", "proj", str(runner)))
+        runner.write_text("1. docs: builder codex, model gpt-6-luna, note here, no-verify: \n")
+        self.assertIn("nonempty reason", self.raw_task("runner-check", "proj", str(runner), code=1))
 
     def test_runner_check_models_ids_and_blocked_constructs(self):
         runner = self.home / "runner.md"
@@ -4461,7 +4533,7 @@ store.write_text(json.dumps(prs))
         self.commit_in(self.repo, "a.txt", "main\n")
         self.git(self.repo, "push", "-q", "origin", "main")
         out = self.task("merge", "proj", "5", code=1)
-        self.assertIn("main changed a.txt that this task also changed; ask the lane to merge main into its branch, then `task check` and a new review", out)
+        self.assertIn("main changed a.txt that this task also changed; ask the lane to run `git merge origin/main` on its branch, then `task check` and a new review", out)
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), lane_head, "lane head remains untouched")
         self.assertEqual(self.git(wt, "status", "--porcelain"), "", "merge aborted cleanly")
 
@@ -5274,7 +5346,7 @@ exit 1
         self.prepare_merge_evidence("5")
         lane_head = self.git(wt, "rev-parse", "HEAD")
         out = self.raw_task("merge", "proj", "5", code=1)
-        self.assertIn("main changed a.txt that this task also changed; ask the lane to merge main into its branch, then `task check` and a new review", out)
+        self.assertIn("main changed a.txt that this task also changed; ask the lane to run `git merge origin/main` on its branch, then `task check` and a new review", out)
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), lane_head)
 
     def test_round2_refused_push_is_resumable_without_override(self):

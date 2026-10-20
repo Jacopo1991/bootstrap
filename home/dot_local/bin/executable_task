@@ -1385,6 +1385,24 @@ def refresh_context(task):
         target.chmod(0o444)
 
 
+def archive_lane_final(work):
+    final, report = work / "final.md", work / "report.md"
+    text = report.read_text() if report.is_file() else ""
+    lines = text.rstrip().splitlines()
+    blocked = lines.pop() if lines and lines[-1].startswith("BLOCKED:") else ""
+    if final.exists() or blocked:
+        number = 1
+        while (work / f"final-{number}.md").exists():
+            number += 1
+        archived = work / f"final-{number}.md"
+        if final.exists():
+            final.rename(archived)
+        if blocked:
+            with archived.open("a") as stream:
+                stream.write("\n" + blocked + "\n")
+            report.write_text("\n".join(lines).rstrip() + "\n")
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
     path = task.worktree()
@@ -1432,7 +1450,7 @@ def lane(args):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
             if boost_notice:
                 print(boost_notice)
-            final.unlink(missing_ok=True)
+            archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--no-boost", "--_worker"]
             if args.timeout is not None:
@@ -1739,8 +1757,10 @@ def runner_check(args):
     in_text_rules = False
     task_line = re.compile(
         r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
-        r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?(?:\b.*)?$"
+        r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
+        r"(?:\b.*)?$"
     )
+    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
         if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
             in_text_rules = True
@@ -1752,10 +1772,12 @@ def runner_check(args):
         # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
-        parsed = task_line.match(line)
+        no_verify_match = no_verify_field.search(line)
+        parsed = task_line.match(no_verify_field.sub("", line))
         if parsed:
             task_lines += 1
             ident, builder, model, seed, after = parsed.groups()
+            no_verify = no_verify_match[1].strip() if no_verify_match else None
             try:
                 task = Task(repo, ident)
                 check_plan(task)
@@ -1764,6 +1786,11 @@ def runner_check(args):
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")
                 resolve_model(builder.lower(), model)
+                if no_verify is not None:
+                    if not no_verify.strip():
+                        raise Stop("no-verify needs a nonempty reason.")
+                    if task.file and verification_from(task.file.read_text()):
+                        raise Stop("--no-verify is only valid when the task has no Verify lines.")
                 if seed:
                     seed_source(repo, seed)
                 if after:
@@ -1774,6 +1801,8 @@ def runner_check(args):
             except Stop as error:
                 problems.append(f"line {number}: {error}")
             continue
+        if re.match(r"(?i)^\s*(?:\d+\.|[-*])\s+[^:\s]+:\s*builder\b", line):
+            problems.append(f"line {number}: invalid runner task line")
         for match in re.finditer(r"\btask\s+(start|lane)\s+([^`\n;&|]+)", line):
             try:
                 tokens = shlex.split(match.group(2))
@@ -2020,10 +2049,12 @@ def start(args):
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
     else:
+        previous_seeds = read_json_object(record_path).get("seeds", []) if record_path.exists() else []
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
-                  "milestone": frontmatter_value(task_text, "milestone")}
+                  "milestone": frontmatter_value(task_text, "milestone"),
+                  "seeds": list(dict.fromkeys(previous_seeds + args.seed))}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
         if args.refresh:
@@ -2034,6 +2065,11 @@ def start(args):
             report.write_text("# Task report\n\n## What changed\n\n(fill in)\n\n## How I verified\n\n(fill in)\n\n## Criteria\n\n" +
                               "\n".join(f"#{item['number']} not met: (fill in)" for item in criteria) +
                               "\n\n## Check\n\n(fill in)\n\n## Noticed, not done\n\n(none)\n")
+    seeds = list(dict.fromkeys(record.get("seeds", []) + args.seed))
+    if seeds != record.get("seeds", []):
+        record["seeds"] = seeds
+        record["revision"] = record_revision(record)
+        atomic_json(record_path, record)
     if args.no_verify:
         print(f"exception: verification omitted: {args.no_verify}")
     if "Verification and tools" in task_text:
@@ -2045,7 +2081,9 @@ def start(args):
     print("\nDispatch prompt:\n")
     refresh_context(task)
     dispatch = ["Context: .work/context/", f"{task.id}{title}",
-                f"Work only in {task.path} on branch {branch}."]
+                f"Work only in {task.path} on branch {branch}.",
+                "Write and edit files with your edit or apply_patch tool, never shell heredocs or cat >; "
+                "avoid backticks in shell commands."]
     if task.file:
         dispatch.append(f"Task: {task.file}")
     brief = task_text or ((work / "request.md").read_text() if (work / "request.md").is_file() else "")
@@ -2892,8 +2930,8 @@ def overlap_files(repo: Path, lane_head: str, base: str):
 
 def overlap_message(files):
     names = ", ".join(files) if files else "files with merge conflicts"
-    return (f"main changed {names} that this task also changed; ask the lane to merge main into its "
-            "branch, then `task check` and a new review")
+    return (f"main changed {names} that this task also changed; ask the lane to run `git merge origin/main` "
+            "on its branch, then `task check` and a new review")
 
 
 def gate_worktree_match(name):
@@ -2946,6 +2984,10 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
             run_git(gate, "merge", "--abort")
             raise Stop(overlap_message(conflicts))
         prepare_environment(repo, gate)
+        seeds = task_config(gate).get("drill_seeds", [])
+        if not isinstance(seeds, list) or not all(isinstance(name, str) for name in seeds):
+            raise Stop(".task.toml drill_seeds must be a list of seed names.")
+        seed_worktree(repo, gate, list(dict.fromkeys(record.get("seeds", []) + seeds)))
         gated_head = sha(gate, "HEAD")
         archived_log = task_state(task) / "gate-check.log"
         if exclusive_gate_enabled(gate):

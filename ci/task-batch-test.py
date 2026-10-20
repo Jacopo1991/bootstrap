@@ -21,6 +21,7 @@ sys.dont_write_bytecode = True
 loader.exec_module(batch_module)
 STUB = r'''#!/usr/bin/env python3
 import fcntl, json, os, pathlib, subprocess, sys
+from datetime import datetime, timezone
 home = pathlib.Path.home()
 lock = (home / 'command.lock').open('w')
 try:
@@ -72,7 +73,8 @@ elif cmd == 'lane':
     record['builder'] = options[options.index('--builder') + 1]
     save(state / 'task.json', record)
     save(work / 'lane.json', dict(state=entry.get('state', 'finished'),
-         builder=record['builder'], exit_code=entry.get('exit_code', 0)))
+         builder=record['builder'], exit_code=entry.get('exit_code', 0),
+         started_at=datetime.now(timezone.utc).isoformat()))
     (work / 'lane.log').write_text(entry.get('log', ''))
     (work / 'final.md').write_text(entry.get('final', ''))
     (work / 'check.log').write_text(entry.get('check_log', ''))
@@ -224,6 +226,76 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(len(self.calls('start')), 1)
         self.assertNotIn('STALE', self.prompts()[0]['prompt'])
 
+    def test_setup_72_resume_previous_finished_lane_blocked_final_relaunches(self):
+        subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
+                       env=self.env, check=True, capture_output=True)
+        work = self.repo / '.worktrees/one/.work'
+        (work / 'lane.json').write_text(json.dumps(dict(
+            state='finished', builder='codex', exit_code=1,
+            started_at='2026-10-19T23:00:00+00:00')))
+        (work / 'final.md').write_text('BLOCKED: python3 -I onboard/check.py — bwrap NETLINK_ROUTE')
+        self.assertIn('one: merged', self.run_batch())
+        self.assertEqual(len(self.calls('lane')), 1)
+
+    def test_stale_final_and_log_ignored_but_fresh_terminal_output_stops(self):
+        work = self.home / 'outcome'
+        work.mkdir()
+        (work / 'lane.json').write_text(json.dumps(dict(
+            state='finished', builder='codex', exit_code=1,
+            started_at='2026-10-20T01:00:00+00:00')))
+        runner = batch_module.Batch(self.repo, self.source)
+        start = batch_module.datetime.fromisoformat('2026-10-20T01:00:00+00:00').timestamp()
+        for filename, message in (
+                ('final.md', 'BLOCKED: git merge main'),
+                ('final.md', "ERROR: You've hit your usage limit."),
+                ('lane.log', "ERROR: You've hit your usage limit.")):
+            path = work / filename
+            path.write_text(message)
+            for stamp in (start - 10, start):
+                os.utime(path, (stamp, stamp))
+                runner.lane_outcome(work)
+            os.utime(path, (start + 1, start + 1))
+            with self.assertRaises(batch_module.Stop):
+                runner.lane_outcome(work)
+            path.unlink()
+
+    def test_setup_68_no_verify_passed_as_one_argument(self):
+        self.source.write_text('1. one: builder codex, model gpt-6-luna, '
+                               'no-verify: gate is its verification, no separate command\n')
+        self.run_batch()
+        self.assertEqual(self.calls('start')[0][-2:],
+                         ['--no-verify', 'gate is its verification, no separate command'])
+
+    def test_setup_68_parse_preserves_trailing_text_and_optional_field_positions(self):
+        for suffix, reason, seed, after in (
+                (', note here', None, None, None),
+                (' some free text', None, None, None),
+                (', seed pinned, after: previous, note here', None, 'pinned', 'previous'),
+                (', note here, no-verify: manual check', 'manual check', None, None),
+                (', no-verify: manual check, seed pinned, after: previous, note here',
+                 'manual check', 'pinned', 'previous'),
+                (', seed pinned, no-verify: manual check, after: previous',
+                 'manual check', 'pinned', 'previous'),
+                (', seed pinned, after: previous, note here, no-verify: manual check',
+                 'manual check', 'pinned', 'previous'),
+                (', no-verify: manual check, with notes', 'manual check, with notes', None, None)):
+            with self.subTest(suffix=suffix):
+                self.source.write_text('1. docs: builder codex, model gpt-6-luna' + suffix + '\n')
+                task = batch_module.parse(self.source)[0]
+                self.assertEqual((task['no_verify'], task['seed'], task['after']),
+                                 (reason, seed, after))
+        self.source.write_text('1. docs: builder codex, model gpt-6-luna, note here, no-verify: \n')
+        with self.assertRaisesRegex(batch_module.Stop, 'nonempty reason'):
+            batch_module.parse(self.source)
+
+    def test_setup_71_fix_prompts_require_edit_tools_and_origin_main(self):
+        self.scenario({'check': [{'code': 1}, {}]})
+        self.run_batch()
+        for item in self.prompts():
+            self.assertIn('edit or apply_patch tool, never shell heredocs or cat >', item['prompt'])
+            self.assertIn('avoid backticks in shell commands', item['prompt'])
+            self.assertIn('git merge origin/main', item['prompt'])
+
     def test_validation_and_plan_refusal_stop(self):
         for command in ('runner-check', 'start'):
             with self.subTest(command=command):
@@ -346,11 +418,13 @@ class BatchTest(unittest.TestCase):
         subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
                        env=self.env, check=True, capture_output=True)
         work = self.repo / '.worktrees/one/.work'
-        (work / 'lane.json').write_text(json.dumps(dict(state='running', pid=os.getpid(), builder='codex')))
+        (work / 'lane.json').write_text(json.dumps(dict(state='running', pid=os.getpid(), builder='codex',
+                                                       started_at='2000-01-01T00:00:00+00:00')))
         runner = batch_module.Batch(self.repo, self.source)
 
         def wait(*args, **kwargs):
-            (work / 'lane.json').write_text(json.dumps(dict(state='finished', exit_code=1, builder='codex')))
+            (work / 'lane.json').write_text(json.dumps(dict(state='finished', exit_code=1, builder='codex',
+                                                           started_at='2000-01-01T00:00:00+00:00')))
             (work / 'final.md').write_text("ERROR: You've hit your usage limit.")
 
         with mock.patch.dict(os.environ, self.env), mock.patch.object(runner, 'require', side_effect=wait):
@@ -439,7 +513,8 @@ class BatchTest(unittest.TestCase):
     def test_claude_final_hook_denials(self):
         work = self.home / 'hook-outcome'
         work.mkdir()
-        (work / 'lane.json').write_text(json.dumps(dict(state='finished', builder='claude', exit_code=1)))
+        (work / 'lane.json').write_text(json.dumps(dict(state='finished', builder='claude', exit_code=1,
+                                                       started_at='2000-01-01T00:00:00+00:00')))
         runner = batch_module.Batch(self.repo, self.source)
         for prefix in ('Blocked by PreToolUse hook', 'Execution stopped by PreToolUse hook'):
             for suffix in ('', ': required git command'):

@@ -653,7 +653,7 @@ def local_only_merge(arguments: list[str], target: Path, current: str) -> str | 
 
 def git_merge_preview(arguments: list[str], target: Path) -> str | None:
     """Read-only merge preview: git merge-tree --write-tree [--name-only] HEAD <source>, where
-    <source> is what git merge would accept here (origin/<default>, or main without a remote)."""
+    <source> is what git merge would accept here (origin/<default>, or the allowed local main)."""
     names = [argument for argument in arguments if argument != "--name-only"]
     if (len(arguments) - len(names) > 1 or len(names) != 3
             or names[0] != "--write-tree" or names[1] != "HEAD"):
@@ -665,6 +665,7 @@ def git_default_branch_merge(arguments: list[str], target: Path,
                              preview: bool = False) -> str | None:
     """Only merge the locally recorded GitHub origin default into a task branch, or
     fast-forward a task branch to its own origin/<branch> (catching up from GitHub).
+    Plain main is also accepted when main is origin's recorded default.
     Without any remote (local-only projects), merge the local main into a task branch."""
     try:
         def read_git(*args: str) -> str:
@@ -687,12 +688,16 @@ def git_default_branch_merge(arguments: list[str], target: Path,
             source, label = prefix + own, "its own origin branch"
         elif arguments in ([wanted], ["--no-edit", wanted]):
             source, label = default, "the origin default ref"
+        elif name == "main" and (arguments == ["main"]
+                                or (preview and arguments == ["--no-edit", "main"])):
+            source, label = "refs/heads/main", "the local default ref"
         else:
-            return ("Only git merge [--no-edit] origin/<default branch> or "
+            return ("Only git merge [--no-edit] origin/<default branch>, plain git merge main "
+                    "when main is the default, or "
                     "git merge --ff-only origin/<current branch> is allowed.")
         read_git("rev-parse", "--verify", source + "^{commit}")
-        if read_git("rev-parse", "--symbolic-full-name", "--verify",
-                    "origin/" + source[len(prefix):]) != source:
+        spelling = "main" if source == "refs/heads/main" else "origin/" + source[len(prefix):]
+        if read_git("rev-parse", "--symbolic-full-name", "--verify", spelling) != source:
             return "The merge source must resolve uniquely to " + label + "."
         if _merge_options_configured(target, current):
             return "Configured merge options or unreadable configuration are blocked."
