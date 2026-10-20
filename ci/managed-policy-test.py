@@ -263,6 +263,9 @@ with tempfile.TemporaryDirectory() as temp:
     fixture("justfile", "check:\n    env -i PATH=\"$PATH\" bash ci/lint.sh\n")
     fixture("Makefile", "check:\n\t$(CC) app.c\n")
     fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+    (root / "ci").mkdir()
+    fixture("ci/lint.sh", "#!/bin/sh\necho safe\n")
+    fixture("build.js", "console.log('safe');\n")
     fixture_git("add", ".")
     fixture_git("commit", "-qm", "base recipes")
     fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
@@ -338,7 +341,7 @@ with tempfile.TemporaryDirectory() as temp:
     fixture("justfile", "check:\n    echo safe\n")
     for command in ("just --justfile other check", "just --shell evil check",
                     "just check x=y", "make -f other", "npm run --prefix other check",
-                    "pnpm run --filter other check", "yarn run check", "bun run check",
+                    "pnpm run --filter other check",
                     "npm --prefix other run check", "pnpm --dir other run check", "pnpm check",
                     "JUST_DOTENV_COMMAND=evil just check", "JUST_JUSTFILE=other just check",
                     "MAKEFLAGS=evil make check", "npm_config_script_shell=evil npm run check"):
@@ -354,10 +357,106 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("npm run check", "pnpm run check"):
         assert judge(command), command
     fixture("package.json", '{"scripts":{"check":"bash allowed.sh","precheck":"echo ready"}}')
-    assert judge("npm run check") is None
+    for runner in ("npm", "pnpm", "yarn", "bun"):
+        assert judge(f"{runner} run check") is None
     fixture_git("update-ref", "-d", "refs/remotes/origin/main")
-    assert judge("just check")  # No merge-base trust without a base.
+    assert judge("just check") is None  # Local main is a valid fallback.
+
+    # Assignment controls apply to typed input, env wrappers and judged files.
+    for name in ("CDPATH", "BASH_ENV", "ENV", "PATH", "IFS", "GLOBIGNORE",
+                 "PROMPT_COMMAND", "SHELLOPTS", "ZDOTDIR", "FPATH", "cdpath", "path"):
+        for command in (f"{name}=evil", f"{name}+=evil", f"{name}[0]=evil",
+                        f"{name}=evil bash allowed.sh",
+                        f"env {name}=evil bash allowed.sh"):
+            assert judge(command), command
+        fixture("assignment.sh", f"{name}=evil\n")
+        assert judge("bash assignment.sh"), name
+        assert judge("source ./assignment.sh"), name
+    (root / "sub").mkdir()
+    (root / "evil/sub").mkdir(parents=True)
+    fixture("sub/run.sh", "echo safe\n")
+    fixture("evil/sub/run.sh", "git clone x y\n")
+    fixture("assignment.sh", f"CDPATH={root}/evil\n")
+    for command in (f"CDPATH={root}/evil; cd sub && bash run.sh",
+                    "source ./assignment.sh && cd sub && bash run.sh"):
+        assert judge(command), command
+    assert judge(">out.txt") is None
+    for command in ("echo hi >/dev/null && bash allowed.sh",
+                    ">/dev/null && bash allowed.sh",
+                    "echo hi 2>/dev/null && bash allowed.sh"):
+        assert judge(command) is None, (command, judge(command))
+    for command in ("bash allowed.sh && bash allowed.sh",
+                    "just check && just check", "echo hi >out.txt && bash allowed.sh",
+                    "touch allowed.sh && . ./allowed.sh"):
+        assert judge(command), command
+    # Package lifecycle and fetch-and-run controls apply across supported runners.
+    for runner in ("npm", "pnpm", "yarn", "bun"):
+        fixture("package.json", '{"scripts":{"preinstall":"bash denied.sh"}}')
+        for action in ("install", "ci", "run check"):
+            assert judge(f"{runner} {action}"), (runner, action)
+        fixture("package.json", '{"scripts":{"prepare":"bash allowed.sh"}}')
+        for action in ("install", "ci", "run check"):
+            assert judge(f"{runner} {action}") is None, (runner, action)
+        for action in ("exec echo safe", "dlx anything", "x anything", "create anything"):
+            assert judge(f"{runner} {action}"), (runner, action)
+    assert judge("bunx anything")
+    (root / "node_modules/.bin").mkdir(parents=True)
+    fixture("node_modules/.bin/local-tool", "#!/bin/sh\necho safe\n")
+    assert judge("npx --no-install local-tool") is None
+    assert judge("npx --no local-tool") is None
+    for command in ("npx local-tool", "npx --no-install missing", "npx --yes local-tool",
+                    "npx --no-install --package=other local-tool"):
+        assert judge(command), command
+    fixture("node_modules/.bin/local-tool", "#!/bin/sh\ngit clone x y\n")
+    assert judge("npx --no-install local-tool")
     print("PASS: recursive scripts and changed recipes denied; allowed scripts and base recipes pass")
+
+# Local-only bases, trusted recipes and transitive gate inputs.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    fixture_git("init", "-q", "-b", "main")
+    fixture_git("config", "user.name", "Policy Fixture")
+    fixture_git("config", "user.email", "policy@example.invalid")
+    fixture("justfile", 'check:\n    env -i PATH="$PATH" bash gate.sh\n')
+    fixture("Makefile", "check:\n\tbash gate.sh\n")
+    fixture("package.json", '{"scripts":{"check":"bash gate.sh","prepare":"bash gate.sh"}}')
+    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n. ./source.sh\n./direct.sh\ncd sub && bash run.sh\n")
+    fixture("child.sh", "#!/bin/sh\necho safe\n")
+    fixture("source.sh", "#!/bin/sh\necho safe\n")
+    fixture("direct.sh", "#!/bin/sh\necho safe\n")
+    (root / "sub").mkdir()
+    fixture("sub/run.sh", "#!/bin/sh\necho safe\n")
+    fixture_git("add", ".")
+    fixture_git("commit", "-qm", "trusted gate")
+    fixture_git("checkout", "-qb", "lane")
+    commands = ("just check", "make check", "npm run check", "pnpm run check",
+                "yarn run check", "bun run check", "npm install", "pnpm ci")
+    for command in commands:
+        assert judge(command) is None, (command, judge(command))
+    for script in ("gate.sh", "child.sh", "source.sh", "direct.sh", "sub/run.sh"):
+        original = (root / script).read_text()
+        fixture(script, "#!/bin/sh\ngit clone x y\n")
+        for command in commands:
+            assert judge(command), (script, command)
+        fixture_git("add", script)
+        assert judge("just check")  # staged changed script
+        fixture_git("commit", "-qm", "changed script")
+        assert judge("just check")  # committed changed script
+        fixture(script, original)
+    fixture_git("add", ".")
+    fixture_git("commit", "-qm", "restore trusted scripts")
+    fixture_git("branch", "-m", "main", "master")
+    assert judge("just check") is None  # second local default
+    fixture_git("branch", "-m", "master", "trunk")
+    fixture_git("checkout", "-qb", "source-lane", "trunk")
+    assert judge("just check") is None  # branch creation reflog names trunk
+    fixture_git("checkout", "trunk")
+    fixture_git("checkout", "-qb", "head-lane")
+    assert judge("just check") is None  # Created from HEAD, checkout names trunk
+    fixture_git("branch", "-D", "trunk")
+    reason = judge("just check")
+    assert reason and "No recipe base found" in reason, reason
+    print("PASS: local default/source bases and changed trusted gate inputs")
 
 # #76: entering a scratch Git repository must not move the task boundary.
 with tempfile.TemporaryDirectory() as temp:

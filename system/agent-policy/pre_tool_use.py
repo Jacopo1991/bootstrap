@@ -43,10 +43,12 @@ WRAPPER_OPTIONS = {  # (switches, options taking a value)
     "nice": (set(), {"-n", "--adjustment"}),
     "stdbuf": (set(), {"-i", "-o", "-e", "--input", "--output", "--error"}),
 }
-ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=.*$")
 # Variables that change what runs or where Git looks: never settable from a command.
 UNSAFE_ENV_PREFIXES = ("GIT_", "GH_", "LD_", "DYLD_", "BASH_", "PYTHON", "PERL", "RUBY")
 UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "VISUAL",
+                    "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND", "SHELLOPTS", "ZDOTDIR",
+                    "FPATH", "fpath", "path", "cdpath", "EXECIGNORE", "POSIXLY_CORRECT",
                     "NODE_OPTIONS", "NODE_PATH", "SSH_ASKPASS", "GITHUB_TOKEN",
                     "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "MAKEFLAGS", "MFLAGS", "MAKEFILES",
                     "JUSTFILE", "JUST_SHELL", "JUST_SHELL_ARG", "JUST_WORKING_DIRECTORY",
@@ -1427,6 +1429,7 @@ def split_command(command: str) -> tuple[list[str], list[str]] | str:
 
 
 def unsafe_env_name(name: str) -> bool:
+    name = name.removesuffix("+").split("[", 1)[0]
     return name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES)
 
 
@@ -1643,13 +1646,47 @@ def script_reason(tokens: list[str], cwd: str, root: Path,
         return "Script cannot be read or judged safely."
 
 
+def recipe_base(root: Path) -> str:
+    """Prefer origin's default, then local defaults, then the lane's source branch."""
+    candidates = []
+    try:
+        candidates.append(_read_git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"))
+    except subprocess.CalledProcessError:
+        pass
+    candidates.extend(("refs/heads/main", "refs/heads/master"))
+    try:
+        current = _read_git(root, "symbolic-ref", "--short", "HEAD")
+        messages = _read_git(root, "reflog", "show", "--format=%gs", f"refs/heads/{current}")
+        for message in reversed(messages.splitlines()):
+            if message.startswith("branch: Created from "):
+                source = message.removeprefix("branch: Created from ")
+                if source != "HEAD":
+                    candidates.append(source if source.startswith("refs/heads/")
+                                      else f"refs/heads/{source}")
+                else:
+                    checkout = _read_git(root, "reflog", "show", "--format=%gs", "HEAD")
+                    for move in reversed(checkout.splitlines()):
+                        match = re.fullmatch(r"checkout: moving from (.+) to (.+)", move)
+                        if match and match[2] == current:
+                            candidates.append(f"refs/heads/{match[1]}")
+                            break
+                break
+    except subprocess.CalledProcessError:
+        pass
+    for candidate in candidates:
+        try:
+            base = _read_git(root, "merge-base", "HEAD", candidate)
+            if re.fullmatch(r"[0-9a-f]{40,64}", base):
+                return base
+        except subprocess.CalledProcessError:
+            continue
+    raise ValueError("No recipe base found: need origin/HEAD, local main/master, or the worktree source branch.")
+
+
 def recipe_changed(path: Path, root: Path) -> bool:
     """Compare the working file (including untracked files) to the merge base."""
     relative = path.relative_to(root).as_posix()
-    default = _read_git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
-    base = _read_git(root, "merge-base", "HEAD", default)
-    if not re.fullmatch(r"[0-9a-f]{40,64}", base):
-        raise ValueError("missing merge base")
+    base = recipe_base(root)
     entry = _read_git(root, "ls-tree", base, "--", relative)
     if not entry:
         return True
@@ -1664,26 +1701,109 @@ def recipe_changed(path: Path, root: Path) -> bool:
     return result.returncode == 1
 
 
+def trusted_script_changes(text: str, cwd: str, root: Path,
+                           approved_roots: tuple[Path, ...] | None, depth: int,
+                           seen: frozenset[Path] = frozenset()) -> str | None:
+    """Inspect literal script inputs of trusted bodies, including gate wrappers.
+
+    Trust in existing shell syntax is retained; it does not transfer to changed
+    literal script operands. Scan wrapper arguments too (e.g. `run bash ci/x.sh`).
+    This is not a parser for dynamically constructed paths or other languages.
+    """
+    if depth >= INDIRECTION_DEPTH:
+        return "Script/recipe recursion limit reached."
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
+    lexer.whitespace_split = True
+    words = list(lexer)
+    for index, word in enumerate(words):
+        head = Path(word).name
+        if word == "cd" and index + 1 < len(words):
+            target = words[index + 1]
+            if target == "--" and index + 2 < len(words):
+                target = words[index + 2]
+            if not SHELL_EXPANSION.search(target) and not target.startswith("-"):
+                cwd = str((Path(cwd) / target).resolve())
+        shell = head in SHELL_PROGRAMS | {"source", "."}
+        interpreter = shell or head in INTERPRETERS or bool(re.fullmatch(r"python[0-9.]+", head))
+        operand = None
+        if interpreter:
+            rest = words[index + 1:]
+            while rest and rest[0] in {"-e", "-u", "-eu", "-ue", "-x", "--"}:
+                rest = rest[1:]
+            if rest and not rest[0].startswith("-"):
+                operand = rest[0]
+        elif "/" in word and not word.startswith("-"):
+            operand = word
+        if operand is None or SHELL_EXPANSION.search(operand):
+            continue
+        path = Path(cwd) / operand
+        if not path.is_file():
+            if interpreter and ("/" in operand or Path(operand).suffix in {".sh", ".py", ".js"}):
+                return "Trusted recipe script cannot be read safely."
+            continue
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root):
+            return "Trusted recipe script must stay inside the repository."
+        if resolved in seen:
+            continue
+        changed = path.is_symlink() or recipe_changed(path, root)
+        body = program_text(path)
+        if changed:
+            if interpreter and not shell:
+                return "Changed non-shell script cannot be judged safely."
+            reason = judge_program(body, cwd, root, approved_roots, depth + 1,
+                                   allow_cd=head not in {"source", "."})
+        elif shell or body.startswith(("#!/bin/sh", "#!/bin/bash", "#!/usr/bin/env bash",
+                                       "#!/usr/bin/env sh")):
+            reason = trusted_script_changes(body, cwd, root, approved_roots, depth + 1,
+                                            seen | {resolved})
+        else:
+            reason = None
+        if reason:
+            return reason
+    return None
+
+
 def recipe_reason(tokens: list[str], cwd: str, root: Path,
                   approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
     runner = Path(tokens[0]).name.lower()
+    if runner in {"bunx"}:
+        return "Fetch-and-run package commands are blocked."
+    if runner == "npx":
+        if depth >= INDIRECTION_DEPTH:
+            return "Script/recipe recursion limit reached."
+        args = tokens[1:]
+        if not args or args[0] not in {"--no-install", "--no"}:
+            return "npx requires explicit --no-install or --no and an installed local binary."
+        args = args[1:]
+        if not args or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args[0]):
+            return "npx requires a literal local binary without runner options."
+        path = Path(cwd) / "node_modules" / ".bin" / args[0]
+        if not path.is_file() or not os.access(path, os.X_OK):
+            return "npx binary is not already installed in node_modules/.bin."
+        if not path.resolve().is_relative_to(Path(cwd).resolve() / "node_modules"):
+            return "npx binary must resolve within local node_modules."
+        return evaluate_segment([str(path), *args[1:]], cwd, root, approved_roots, depth + 1)
     names = {"just": ("justfile", "Justfile", ".justfile"),
              "make": ("GNUmakefile", "makefile", "Makefile"),
              "gmake": ("GNUmakefile", "makefile", "Makefile"),
-             "npm": ("package.json",), "pnpm": ("package.json",)}
+             "npm": ("package.json",), "pnpm": ("package.json",),
+             "yarn": ("package.json",), "bun": ("package.json",)}
     if runner not in names:
-        if runner in {"yarn", "bun", "npx"}:
-            return "Recipe runner cannot be judged reliably."
         return None
     args = tokens[1:]
-    if runner in {"npm", "pnpm"}:
-        if args and args[0] in {"install", "ci", "add", "remove", "uninstall", "update",
-                               "outdated", "audit", "list", "ls", "view", "info", "exec",
-                               "dlx", "--version", "--help"}:
-            return None  # Package operations/exec remain separate residual paths.
-        if not args or args[0] not in {"run", "run-script", "test", "start", "stop", "restart"}:
+    package_runner = runner in {"npm", "pnpm", "yarn", "bun"}
+    if package_runner:
+        if args and args[0] in {"exec", "dlx", "x", "create"}:
+            return "Fetch-and-run package commands are blocked."
+        if args and args[0] in {"outdated", "audit", "list", "ls", "view", "info",
+                               "--version", "--help"}:
+            return None
+        if not args or args[0] not in {"run", "run-script", "test", "start", "stop", "restart",
+                                      "install", "ci", "add", "remove", "uninstall", "update"}:
             return "Package runner shorthand and global options cannot be judged reliably."
-        args = args[1:] if args[0] in {"run", "run-script"} else args
+        # All script values are checked below, including install/prepare hooks.
+        args = args[1:]
     if any(not re.fullmatch(r"[A-Za-z0-9_.:-]+", arg) or arg.startswith("-") for arg in args):
         return "Recipe options, overrides and parameters cannot be judged safely."
     if depth >= INDIRECTION_DEPTH:
@@ -1692,7 +1812,7 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         directory = Path(cwd).resolve()
         while True:
             candidates = [directory / name for name in names[runner] if (directory / name).exists()]
-            if (candidates or runner not in {"just", "npm"} or directory == root
+            if (candidates or runner not in {"just", "npm", "yarn", "bun"} or directory == root
                     or root not in directory.parents):
                 break
             directory = directory.parent
@@ -1704,8 +1824,9 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         text = program_text(path)
         # Local runner settings can replace the shell or load executable hooks,
         # independently of an unchanged recipe file.
-        config_names = (".npmrc", ".pnpmfile.cjs", "pnpm-workspace.yaml") if runner in {
-            "npm", "pnpm"} else (".env",) if runner == "just" else ()
+        config_names = (".npmrc", ".pnpmfile.cjs", "pnpm-workspace.yaml",
+                        ".yarnrc", ".yarnrc.yml", "bunfig.toml") if package_runner else (
+                            ".env",) if runner == "just" else ()
         config_directory = directory
         has_config = False
         while True:
@@ -1723,13 +1844,20 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
             return "Just imports and modules cannot be judged reliably."
         if runner in {"make", "gmake"} and re.search(r"(?m)^\s*(?:-?include|sinclude)\b", text):
             return "Make includes cannot be judged reliably."
-        if not recipe_changed(path, root):
-            return None
+        changed = recipe_changed(path, root)
+        if not changed:
+            if package_runner:
+                package = json.loads(text)
+                scripts = package.get("scripts", {})
+                if not isinstance(scripts, dict) or not all(isinstance(b, str) for b in scripts.values()):
+                    return "Package scripts cannot be judged safely."
+                text = "\n".join(scripts.values())
+            return trusted_script_changes(text, str(directory), root, approved_roots, depth)
         if has_config:
             return "Changed recipes with runner configuration cannot be judged reliably."
         if runner in {"make", "gmake"}:
             return "Changed Make definitions cannot be judged reliably."
-        if runner in {"npm", "pnpm"}:
+        if package_runner:
             package = json.loads(text)
             scripts = package.get("scripts", {}) if isinstance(package, dict) else None
             if not isinstance(scripts, dict) or not all(isinstance(body, str) for body in scripts.values()):
@@ -1761,7 +1889,11 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
                                    allow_cd=False)
             if reason:
                 return reason
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+    except ValueError as exc:
+        if str(exc).startswith("No recipe base found:"):
+            return str(exc)
+        return "Recipe definition or merge base cannot be read safely."
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         return "Recipe definition or merge base cannot be read safely."
     return None
 
@@ -1972,8 +2104,8 @@ def evaluate_command(command: str, cwd: str, root: Path,
         if (unwrapped and head == "git" and position > 0
                 and git_subcommand(unwrapped, effective) in STATE_DEPENDENT_GIT and seen_changing):
             return STATE_CHAIN_MESSAGE
-        indirect = head in SHELL_PROGRAMS | {"source", "", "just", "make", "gmake", "npm", "pnpm",
-                                           "yarn", "bun", "npx"}
+        indirect = head in SHELL_PROGRAMS | {"source", ".", "", "just", "make", "gmake", "npm", "pnpm",
+                                           "yarn", "bun", "bunx", "npx"}
         if unwrapped and "/" in unwrapped[0]:
             try:
                 indirect |= (Path(effective) / unwrapped[0]).resolve().parent not in {
@@ -1987,9 +2119,14 @@ def evaluate_command(command: str, cwd: str, root: Path,
             return reason
         if unwrapped:
             sub = git_subcommand(unwrapped, effective) if head == "git" else None
-            redirects = any(token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
-                            for token in tokens)
-            if redirects or not (head in READ_ONLY_COMMANDS or head == "sed" and readonly_sed(unwrapped)
+            output_ops = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+            redirects = any(token in output_ops
+                            and (i + 1 >= len(tokens) or tokens[i + 1] not in NULL_DEVICES)
+                            for i, token in enumerate(tokens))
+            redirect_only = len(unwrapped) % 2 == 0 and all(
+                unwrapped[i] in output_ops for i in range(0, len(unwrapped), 2))
+            if redirects or not (redirect_only or head in READ_ONLY_COMMANDS
+                    or head == "sed" and readonly_sed(unwrapped)
                     or sub in READ_ONLY_GIT or pure_lookup(unwrapped)):
                 seen_changing = True
     return None
@@ -2055,6 +2192,8 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
         else:
             command_tokens.append(token)
     tokens = command_tokens
+    if not tokens:
+        return None
     reason = script_reason(tokens, cwd, root, approved_roots, depth)
     if reason:
         return Denial("command.script", reason)

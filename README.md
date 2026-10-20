@@ -301,6 +301,26 @@ Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
 
 #### Managed guardrails
 
+Literal shell scripts and changed recipe bodies are judged by the command policy.
+Recipe comparisons use the merge base with `origin/HEAD`, falling back to local
+`main`, `master`, then the worktree's source branch recorded in Git's reflogs.
+Without a usable base, recipe execution is denied with an explanatory message.
+Trusted recipes and gate shell scripts also have their literal script inputs
+checked when those inputs change from base; dynamically constructed paths remain
+outside this inspection.
+
+Run scripts and recipes in separate calls after commands that may change files.
+A script or recipe run itself counts as changing for later scripts in the same
+chain: `bash a.sh && bash b.sh` and `just check && just lint` are refused because
+the first run could rewrite the second definition. Redirects to `/dev/null` do
+not count as file changes. Shell assignments affecting resolution or startup
+(including `CDPATH`, `PATH`, `BASH_ENV` and `ENV`) are refused.
+
+Package scripts and install lifecycle scripts use the same checks for npm, pnpm,
+Yarn and Bun. Fetch-and-run forms (`exec`, `dlx`, `x`, `create`, and `bunx`) are
+refused. `npx` requires explicit `--no-install` or `--no`, an existing executable
+in local `node_modules/.bin`, and a script the policy can judge.
+
 The guardrails are root-owned, so an agent in any permission mode (including Claude
 `--dangerously-skip-permissions` and Codex `--dangerously-bypass-approvals-and-sandbox`)
 cannot edit or switch them off. Nothing in them limits bypass or auto mode, the approval
