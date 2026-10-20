@@ -272,7 +272,8 @@ with tempfile.TemporaryDirectory() as temp:
     fixture_git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     fixture_git("checkout", "-qb", "lane")
     for command in ("just check", "make check", "npm run check", "pnpm run check"):
-        assert judge(command) is None, (command, judge(command))
+        assert judge(command), command  # Unchanged is not an execution exemption.
+    assert judge("task check") is None
     fixture("allowed.sh", "#!/bin/sh\n# Plain commands keep working.\necho safe\npwd\n")
     fixture("denied.sh", "#!/bin/bash\ngit clone https://example.invalid/repo stolen\n")
     fixture("nested.sh", "bash denied.sh\n")
@@ -428,10 +429,10 @@ with tempfile.TemporaryDirectory() as temp:
     fixture_git("init", "-q", "-b", "main")
     fixture_git("config", "user.name", "Policy Fixture")
     fixture_git("config", "user.email", "policy@example.invalid")
-    fixture("justfile", 'check:\n    env -i PATH="$PATH" bash gate.sh\n')
+    fixture("justfile", 'check:\n    bash gate.sh\n')
     fixture("Makefile", "check:\n\tbash gate.sh\n")
     fixture("package.json", '{"scripts":{"check":"bash gate.sh","prepare":"bash gate.sh"}}')
-    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n. ./source.sh\n./direct.sh\npython3 -I check.py\ncd sub && bash run.sh\n")
+    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n")
     fixture("check.py", "#!/usr/bin/python3\nprint('safe')\n")
     fixture("child.sh", "#!/bin/sh\necho safe\n")
     fixture("source.sh", "#!/bin/sh\necho safe\n")
@@ -441,11 +442,13 @@ with tempfile.TemporaryDirectory() as temp:
     fixture_git("add", ".")
     fixture_git("commit", "-qm", "trusted gate")
     fixture_git("checkout", "-qb", "lane")
-    commands = ("just check", "make check", "npm run check", "pnpm run check",
+    commands = ("just check", "npm run check", "pnpm run check",
                 "yarn run check", "bun run check", "npm install", "pnpm ci")
     for command in commands:
         assert judge(command) is None, (command, judge(command))
-    for script in ("gate.sh", "child.sh", "source.sh", "direct.sh", "sub/run.sh"):
+    assert judge("make check")
+    assert judge("task check") is None
+    for script in ("gate.sh", "child.sh"):
         original = (root / script).read_text()
         fixture(script, "#!/bin/sh\ngit clone x y\n")
         for command in commands:
@@ -458,7 +461,9 @@ with tempfile.TemporaryDirectory() as temp:
     fixture_git("add", ".")
     fixture_git("commit", "-qm", "restore trusted scripts")
     fixture("check.py", "#!/usr/bin/python3\nprint('changed')\n")
+    fixture("gate.sh", "#!/bin/sh\npython3 -I check.py\n")
     assert judge("just check")  # Interpreter flags must not hide changed inputs.
+    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n")
     fixture("check.py", "#!/usr/bin/python3\nprint('safe')\n")
     fixture_git("branch", "-m", "main", "master")
     assert judge("just check") is None  # second local default
@@ -472,6 +477,65 @@ with tempfile.TemporaryDirectory() as temp:
     reason = judge("just check")
     assert reason and "No recipe base found" in reason, reason
     print("PASS: local default/source bases and changed trusted gate inputs")
+
+# Round 4: typed commands, judged files and unchanged recipes share strict checks.
+# All dangerous bodies are inert strings; only the safe positive recipe executes.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    fixture_git("init", "-q", "-b", "main")
+    fixture_git("config", "user.name", "Policy Fixture")
+    fixture_git("config", "user.email", "policy@example.invalid")
+    (root / "sub").mkdir()
+    (root / "evil" / "sub").mkdir(parents=True)
+    fixture("sub/run.sh", "echo safe\n")
+    fixture("evil/sub/run.sh", "git clone x y\n")
+    bad = (
+        f"printf -v CDPATH {root}/evil; cd sub && bash run.sh",
+        f"read CDPATH <<< {root}/evil; cd sub && bash run.sh",
+        "printf -v target value", "printf -vCDPATH evil", 'printf "$option" target value',
+        "printf >/dev/null -v CDPATH evil", "printf 2>/dev/null -v CDPATH evil",
+        ">/dev/null printf -v CDPATH evil", "2>/dev/null read CDPATH",
+        ">/dev/null cd sub && bash run.sh", "let CDPATH=1",
+        "read target", "read -a target", "mapfile target", "readarray target",
+        "getopts a target", "declare CDPATH=evil", "typeset CDPATH=evil",
+        "local CDPATH=evil", "export CDPATH=evil", "readonly CDPATH=evil",
+        "declare -n target=CDPATH", "hash -p ./evil/bash bash", "hash -r",
+        "enable -f evil.so evil", "alias cd=evil", "shopt -s cdable_vars",
+        "set -o posix; echo safe", "set -o pipefail; echo safe",
+        "builtin printf -v CDPATH evil", "command printf -v CDPATH evil",
+        "cd -P sub && bash run", "cd -- sub && bash run.sh",
+        "pushd sub; bash run.sh", "popd; bash run.sh", 'cd "$target" && bash run.sh',
+        "cd && bash run.sh", "bash run", 'bash "$script"',
+    )
+    for body in bad:
+        assert judge(body), body
+        for wrapper in ("builtin", "command", "command --", "env"):
+            assert judge(f"{wrapper} {body}"), (wrapper, body)
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "unchanged review scenario")
+        assert not policy.recipe_changed(root / "justfile", root)
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
+        assert judge("task check") is None
+    for body in ("run bash sub/run.sh", "python3 check.py", "node build.js"):
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+    for body in ("echo safe", "printf '%s' safe", "printf '%s' -value", "printf -- -v",
+                 "cat sub/run.sh", "command -v bash"):
+        assert judge(body) is None, body
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh") is None, body
+    fixture("justfile", "check:\n    printf '%s\\n' safe\n")
+    fixture_git("add", "justfile")
+    fixture_git("commit", "-qm", "modelled positive recipe")
+    assert judge("just check") is None
+    result = subprocess.run(["just", "check"], cwd=root, check=True, capture_output=True, text=True)
+    assert result.stdout == "safe\n", result
+    print("PASS: Round 4 builtin/cwd controls, unchanged recipes fail closed, task check allowed")
 
 # #76: entering a scratch Git repository must not move the task boundary.
 with tempfile.TemporaryDirectory() as temp:
@@ -723,9 +787,6 @@ with tempfile.TemporaryDirectory() as temp:
         "ls 2> /dev/null",
         "git log 2>&1 | head",
         f"git -C {temp} status --short && sed -n '1,80p' {temp}/file",
-        "set -o pipefail; cat file | tee output",
-        "set -e; set -u; set -o pipefail; cat file | tee /tmp/hook-friction-output",
-        "set -euo pipefail; cat file | tee output",
         "if [ -d .work/context ]; then find .work/context -maxdepth 1 -type f -printf '%f\\n' | sort; else printf 'X\\n'; fi",
         "if test -f file; then cat file; fi",
         "set -eu; if test -f file; then cat file; fi",
@@ -740,6 +801,9 @@ with tempfile.TemporaryDirectory() as temp:
         "git status && sed -n --in-p 's/a/b/' file",
     )
     denied = (
+        "set -o pipefail; cat file | tee output",
+        "set -e; set -u; set -o pipefail; cat file | tee /tmp/hook-friction-output",
+        "set -euo pipefail; cat file | tee output",
         r"rm -rf a\ 2>/dev/null",
         'rm -rf "a 2">/dev/null',
         r"chmod -R 777 a\ 2>/dev/null",

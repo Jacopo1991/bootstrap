@@ -63,7 +63,9 @@ SHELL_CONSTRUCTS = {"eval", "source", ".", "export", "declare", "typeset", "read
                     "local", "set", "unset", "alias", "unalias", "builtin", "shopt", "trap",
                     "coproc", "function", "if", "then", "else", "elif", "fi", "for", "while",
                     "until", "do", "done", "case", "esac", "select", "time", "!", "{", "}",
-                    "(", ")", "[[", "]]"}
+                    "(", ")", "[[", "]]", "read", "mapfile", "readarray", "getopts",
+                    "hash", "rehash", "enable", "disable", "pushd", "popd",
+                    "autoload", "emulate", "zmodload", "noglob", "nocorrect", "printf", "let"}
 CHAIN_SEPARATORS = {";", "&&", "||", "|"}
 # Segments that cannot change repository state before a state-dependent Git command.
 READ_ONLY_COMMANDS = {"cd", "echo", "printf", "true", "false", "pwd", "ls", "cat", "head",
@@ -1591,6 +1593,17 @@ def judge_program(text: str, cwd: str, root: Path,
             return tokens
         if tokens and re.match(r"\d*[<>]", tokens[0]):
             return "Script leading redirections cannot be judged safely."
+        if tokens:
+            head = Path(tokens[0]).name.lower()
+            if (head in INTERPRETERS - SHELL_PROGRAMS
+                    or re.fullmatch(r"python[0-9.]+", head)):
+                return "Non-shell script execution cannot be judged safely."
+            modelled = (READ_ONLY_COMMANDS | MIXED_CHAIN_TEXT_TOOLS | WRITERS | AWK_NAMES
+                        | SHELL_CONSTRUCTS | SHELL_PROGRAMS | {"git", "gh", "just", "make",
+                            "gmake", "npm", "pnpm", "yarn", "yarnpkg", "bun", "npx",
+                            "bunx", "pnpx", "command", "type", "which"})
+            if "/" not in tokens[0] and head not in modelled:
+                return "Script command cannot be modelled safely."
         if tokens and (not allow_cd and tokens[0] == "cd" or tokens[0].endswith("()")):
             return "Script cwd changes and functions cannot be judged safely."
         if tokens and tokens[0] in {
@@ -1702,75 +1715,15 @@ def recipe_changed(path: Path, root: Path) -> bool:
 
 
 def trusted_script_changes(text: str, cwd: str, root: Path,
-                           approved_roots: tuple[Path, ...] | None, depth: int,
-                           seen: frozenset[Path] = frozenset()) -> str | None:
-    """Inspect literal script inputs of trusted bodies, including gate wrappers.
+                           approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
+    """Judge unchanged bodies too; only the task check entry retains gate trust.
 
-    Trust in existing shell syntax is retained; it does not transfer to changed
-    literal script operands. Scan wrapper arguments too (e.g. `run bash ci/x.sh`).
-    This is not a parser for dynamically constructed paths or other languages.
+    Recipe lines can execute in separate shells, so cwd changes are refused.
+    Executed shell files recurse through script_reason with the same evaluator.
     """
     if depth >= INDIRECTION_DEPTH:
         return "Script/recipe recursion limit reached."
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>\n")
-    lexer.whitespace_split = True
-    words = list(lexer)
-    for index, word in enumerate(words):
-        head = Path(word).name
-        if word == "cd" and index + 1 < len(words):
-            target = words[index + 1]
-            if target == "--" and index + 2 < len(words):
-                target = words[index + 2]
-            if not SHELL_EXPANSION.search(target) and not target.startswith("-"):
-                cwd = str((Path(cwd) / target).resolve())
-        shell = head in SHELL_PROGRAMS | {"source", "."}
-        interpreter = shell or head in INTERPRETERS or bool(re.fullmatch(r"python[0-9.]+", head))
-        operand = None
-        if interpreter:
-            rest = words[index + 1:]
-            # The options themselves are trusted here, but must not hide a
-            # literal script operand (e.g. python3 -I ci/check.py).
-            while rest and rest[0].startswith("-"):
-                rest = rest[1:]
-            if rest and not rest[0].startswith("-"):
-                operand = rest[0]
-        elif ("/" in word or Path(word).suffix in {".sh", ".py", ".js", ".mjs", ".cjs"}) \
-                and not word.startswith("-"):
-            operand = word
-        if operand is None or SHELL_EXPANSION.search(operand):
-            continue
-        path = Path(cwd) / operand
-        if not path.is_file():
-            if interpreter and ("/" in operand or Path(operand).suffix in {".sh", ".py", ".js"}):
-                return "Trusted recipe script cannot be read safely."
-            continue
-        resolved = path.resolve()
-        if not interpreter:
-            if resolved.parent in {Path("/usr/bin"), Path("/usr/local/bin")}:
-                continue
-            if path.suffix not in {".sh", ".py", ".js", ".mjs", ".cjs"} and not os.access(path, os.X_OK):
-                continue
-        if not resolved.is_relative_to(root):
-            return "Trusted recipe script must stay inside the repository."
-        if resolved in seen:
-            continue
-        changed = path.is_symlink() or recipe_changed(path, root)
-        body = program_text(path)
-        if changed:
-            if interpreter and not shell or not interpreter and path.suffix in {
-                    ".py", ".js", ".mjs", ".cjs"}:
-                return "Changed non-shell script cannot be judged safely."
-            reason = judge_program(body, cwd, root, approved_roots, depth + 1,
-                                   allow_cd=head not in {"source", "."})
-        elif shell or body.startswith(("#!/bin/sh", "#!/bin/bash", "#!/usr/bin/env bash",
-                                       "#!/usr/bin/env sh")):
-            reason = trusted_script_changes(body, cwd, root, approved_roots, depth + 1,
-                                            seen | {resolved})
-        else:
-            reason = None
-        if reason:
-            return reason
-    return None
+    return judge_program(text, cwd, root, approved_roots, depth, allow_cd=False)
 
 
 def recipe_reason(tokens: list[str], cwd: str, root: Path,
@@ -1870,15 +1823,12 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
                 return "Package scripts cannot be judged safely."
             if script_name is not None and script_name not in scripts:
                 return "Package run target must be explicitly defined; binary/file fallbacks are blocked."
-        changed = recipe_changed(path, root)
-        if not changed:
-            if package_runner:
-                text = "\n".join(scripts.values())
-            return trusted_script_changes(text, str(directory), root, approved_roots, depth)
+        # A base establishes provenance, never an exception to command judging.
+        recipe_changed(path, root)
         if has_config:
-            return "Changed recipes with runner configuration cannot be judged reliably."
+            return "Recipes with runner configuration cannot be judged reliably."
         if runner in {"make", "gmake"}:
-            return "Changed Make definitions cannot be judged reliably."
+            return "Make definitions cannot be judged reliably; use task check for the gate."
         if package_runner:
             bodies = list(scripts.values())  # Includes lifecycle hooks, not just the named script.
         else:
@@ -1903,8 +1853,7 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
                     return "Changed Just syntax cannot be judged reliably."
             bodies = ["\n".join(body) for body in bodies]
         for body in bodies:
-            reason = judge_program(body, str(directory), root, approved_roots, depth + 1,
-                                   allow_cd=False)
+            reason = trusted_script_changes(body, str(directory), root, approved_roots, depth + 1)
             if reason:
                 return reason
     except ValueError as exc:
@@ -2026,9 +1975,6 @@ def evaluate_command(command: str, cwd: str, root: Path,
         while options and valid:
             option, *options = options
             if re.fullmatch(r"-[eu]+", option):
-                continue
-            if re.fullmatch(r"-[eu]*o", option) and options[:1] == ["pipefail"]:
-                options = options[1:]
                 continue
             valid = False
         if not valid or not operators or operators[0] not in {";", "&&"}:
@@ -2160,7 +2106,23 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if not tokens:
         return None
     executable = Path(tokens[0]).name.lower()
-    if executable in SHELL_CONSTRUCTS - {"source", "."} or tokens[0].startswith(("(", "{")) or any(
+    if re.match(r"\d*[<>]", tokens[0]) or (
+            tokens[0].isdigit() and len(tokens) > 1 and re.match(r"[<>]", tokens[1])):
+        if len(tokens) != 2 or tokens[0] not in {">", ">>", ">|"}:
+            return "Leading shell redirections cannot be judged safely."
+    if executable == "printf":
+        # Redirections can precede options. Never let one hide an assignment.
+        args = tokens[1:]
+        redirects = {"<", ">", ">>", ">|", "&>", "&>>", ">&", "<>", "<&", "<<<"}
+        while args:
+            if args[0].isdigit() and len(args) > 1 and args[1] in redirects:
+                args = args[1:]
+            if args[0] not in redirects:
+                break
+            args = args[2:]
+        if args and (args[0].startswith("-v") or SHELL_EXPANSION.search(args[0])):
+            return "Shell builtin assignment via printf -v cannot be judged safely."
+    if executable in SHELL_CONSTRUCTS - {"source", ".", "printf"} or tokens[0].startswith(("(", "{")) or any(
             tokens[i] in {"<", ">", ">>"} and tokens[i + 1].startswith("(")
             for i in range(len(tokens) - 1)):
         return "Shell constructs (eval, source, export, subshells, loops, process substitution) are blocked."
