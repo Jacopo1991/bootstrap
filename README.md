@@ -632,6 +632,48 @@ behind when a call hung. Long-lived processes go through `start_process` and
   speaks MCP to the real `~/.local/bin/agentdev-shell-mcp`, lists its tools and runs `echo ok` as
   `agent`; the fresh-distro CI run (`ci/distro.sh`) does the same.
 
+### Browser tests in a project gate
+
+`gate-browser` runs browser and persona specs in the trusted host gate using the
+machine verification pack (no install or download). Lanes write specs; invoking
+the helper without `TASK_GATE_RUN_ID` prints
+`SKIP (lane: browser tests run in the trusted gate)` and exits 77.
+Suite aggregators must count 77 as a skip only in lanes; it is a failure in a
+trusted gate. Bootstrap's `ci/lint.sh` does this for its browser fixture suite.
+
+Add this recipe to the project's code repository and call it from its `check`
+suite, with that same skip handling:
+
+```just
+browser:
+    gate-browser --server 'exec npm run dev -- --host "$HOST" --port "$PORT" --strictPort' --ready / 'acceptance/**/*.spec.ts'
+```
+
+The server command must honor `HOST=127.0.0.1` and `PORT`, and fail on an occupied
+port. Use `exec` for a single server process; the helper stops its process group
+on success, failure, readiness timeout or interruption. The default port is
+`TASK_GATE_PORT_BASE`; `--port-offset 0..199` selects another port in that gate's
+reserved range. Run helpers sequentially or assign distinct offsets.
+Preserve `TASK_GATE_RUN_ID`, `TASK_GATE_PORT_BASE` and `TMPDIR` if the check recipe
+clears its environment. Do not set a gate run ID in a lane.
+
+Specs import `test`/`expect` from `@playwright/test` and use `page.goto('/')`.
+The helper supplies the machine modules, Chromium, `baseURL`, and a generated
+configuration; it does not load a project's Playwright config. Browser context
+requests and WebSockets are restricted to the allocated origin; service workers
+are blocked. Specs and server commands are trusted project code: Node fetch,
+custom browser contexts and subprocesses are not a network sandbox and must not
+contact external origins. Readiness accepts a local path and does not follow
+redirects. `--timeout` sets readiness seconds (default 30); the browser suite has
+a two-minute limit.
+
+The list reporter prints each spec result followed by a helper PASS/FAIL summary.
+Server logs, JSON results, failure traces and screenshots live in a unique
+`$TMPDIR/gate-browser-*` directory for the lifetime of the gate TMPDIR.
+`python3 ci/gate-browser-test.py` checks lane skipping and, in the trusted gate,
+runs a static page in Chromium and checks allocated ports and teardown after
+passing and failing specs.
+
 ### Verification pack (Playwright)
 
 Tooling for SPEC-0015 (independent black-box verification of a task's acceptance

@@ -13,9 +13,12 @@ bash ci/gate-tools.sh "$tmp"
 failed=0
 skipped=0
 lane_skippable_suite() {
-  # Only the socket fixture suite may skip, and never in a trusted gate.
+  # Socket/browser suites may skip in lanes, never in a trusted gate.
   if [[ -n ${TASK_GATE_RUN_ID:-} ]]; then return 1; fi
-  [[ $# == 2 && $1 == bash && $2 == ci/boundary-test.sh ]]
+  [[ $# == 2 ]] && {
+    [[ $1 == bash && $2 == ci/boundary-test.sh ]] ||
+      [[ $1 == python3 && $2 == ci/gate-browser-test.py ]]
+  }
 }
 run() {
   echo "RUN: $*" >&2
@@ -49,6 +52,7 @@ run bash ci/new-project-test.sh
 run bash ci/pre-commit-test.sh
 run python3 ci/osv-db-test.py
 run python3 ci/verification-pack-test.py
+run python3 ci/gate-browser-test.py
 run python3 ci/skills-hooks-test.py
 run python3 ci/workspace-tidy-test.py
 run python3 ci/task-test.py
