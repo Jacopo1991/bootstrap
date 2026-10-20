@@ -4,6 +4,9 @@ ROOT=$(cd -- "$(dirname -- "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 cd "$ROOT"
+# Policy fixtures create independent temporary repositories and supply their own
+# lane anchors. Do not make them inherit the enclosing build lane's boundary.
+unset TASK_WORKTREE
 # Missing tools use the same checksum-pinned fallback on hosts and fresh CI.
 export PATH="$tmp/gate-bin:$PATH"
 bash ci/gate-tools.sh "$tmp"

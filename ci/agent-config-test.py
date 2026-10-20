@@ -10,6 +10,9 @@ import tempfile
 import tomllib
 import atexit
 
+# Fixtures own their roots, independently of the enclosing lane.
+os.environ.pop("TASK_WORKTREE", None)
+
 audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
 atexit.register(audit_state.cleanup)
 os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name

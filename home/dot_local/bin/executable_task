@@ -927,14 +927,22 @@ def gate_slots():
     return count
 
 
+def gate_directory():
+    override = os.environ.get("TASK_GATE_DIR")
+    root = Path(override) if override else Path("/tmp/agent-task-gates")
+    if not override:
+        root.mkdir(exist_ok=True)
+    return root
+
+
 def gate_paths(name):
-    root = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    root = gate_directory()
     stem = "agent-task-gate" if name == "slot-0" else f"agent-task-gate-{name}"
     return root / (stem + ".lock"), root / (stem + ".holder")
 
 
 def gate_holders():
-    root = Path(os.environ.get("TASK_GATE_DIR", "/tmp"))
+    root = gate_directory()
     holders = []
     for lock in sorted(root.glob("agent-task-gate*.lock")):
         try:
@@ -1296,7 +1304,7 @@ def require_pm(args):
 
 
 def stripped_agent_variable(name):
-    return name in GIT_OVERRIDE_ENV or name in {"GIT_OVERRIDE_ENV", "TASK_GATE_RUN_ID"} or name.startswith(("GIT_CONFIG", "TASK_RUN_"))
+    return name in GIT_OVERRIDE_ENV or name in {"GIT_OVERRIDE_ENV", "TASK_GATE_RUN_ID", "TASK_WORKTREE"} or name.startswith(("GIT_CONFIG", "TASK_RUN_"))
 
 
 def agent_environment():
@@ -1312,6 +1320,12 @@ def lane_environment(task):
     state = task.path / ".work/state"
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
+    temporary = task.path / ".work/tmp"
+    if not temporary.resolve().is_relative_to(task.path.resolve()):
+        raise Stop("Lane TMPDIR must stay inside the task worktree.")
+    temporary.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(temporary.resolve())
+    env["TASK_WORKTREE"] = str(task.path.resolve())
     if not env.get("SECRETSPEC_REASON", "").strip():
         env["SECRETSPEC_REASON"] = f"lane {task.repo.name}/{task.id}"
     return env
@@ -1474,11 +1488,18 @@ def lane(args):
     code = 1
     timed_out = False
     try:
+        environment = lane_environment(task)
+        if builder == "claude":
+            settings = work / "claude-settings.json"
+            atomic_json(settings, {"sandbox": {"filesystem": {"allowWrite": [
+                environment["TMPDIR"], str(gate_directory().resolve()),
+            ]}}})
+            command.extend(["--settings", str(settings)])
         with tempfile.TemporaryFile() as source:
             source.write(b"Read the pinned task context in .work/context/ before working.\n\n" + prompt.read_bytes())
             source.seek(0)
             with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output:
-                child = subprocess.Popen(command, cwd=path, env=lane_environment(task), stdin=source,
+                child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          stdout=subprocess.PIPE if output else None)
                 try:
                     deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None

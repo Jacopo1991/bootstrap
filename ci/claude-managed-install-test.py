@@ -95,7 +95,9 @@ assert "deny" not in user["permissions"] and "hooks" not in user
 
 # The deployed managed hook, run exactly as configured, still denies blocked commands.
 pre_tool_use = next(argv for argv in argvs if argv[8].endswith("/pre_tool_use.py"))
-env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+# The deployed hook fixture owns its temporary root, not the enclosing lane.
+env = {k: v for k, v in os.environ.items()
+       if not k.startswith("GIT_") and k != "TASK_WORKTREE"}
 with tempfile.TemporaryDirectory() as cwd:
     env["AGENT_POLICY_STATE_DIR"] = str(Path(cwd) / "audit-state")
     for command in ("wsl.exe -d AgentDev", "sudo true"):
