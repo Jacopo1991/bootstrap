@@ -2487,7 +2487,10 @@ store.write_text(json.dumps(prs))
             "![alt](/home/agent/x.png)"), "alt")
 
     def setUp(self):
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        # Includes AF_UNIX fixtures: nested gate TMPDIR paths exceed 108 bytes.
+        socket_test = self._testMethodName == 'test_reliability_special_files_archive_manifest_and_publication'
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory(
+            dir='/tmp' if socket_test else None, prefix='s')))
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
         for name, body in STUBS.items():
@@ -5633,6 +5636,30 @@ Reviewer: claude strict-model
         self.assertIn("already live", out)
         stdout, _ = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 0, stdout)
+
+    def test_sighup_at_foreground_lock_creation_records_interruption(self):
+        self.started()
+        # Deliver the signal exactly when the lock first becomes visible,
+        # before foreground_lock has written run.json or returned to main.
+        code = textwrap.dedent('''\
+            import os, runpy, signal, sys
+            module = runpy.run_path(sys.argv[1])
+            original_open = os.open
+            def interrupt_on_lock(path, flags, *args, **kwargs):
+                fd = original_open(path, flags, *args, **kwargs)
+                if str(path).endswith('/run.lock'):
+                    os.kill(os.getpid(), signal.SIGHUP)
+                return fd
+            os.open = interrupt_on_lock
+            sys.exit(module['main'](['check', 'proj', '5']))
+        ''')
+        result = subprocess.run([sys.executable, '-c', code, str(TOOL)],
+                                cwd=self.home, env=self.env, capture_output=True,
+                                text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        run = json.loads((self.state() / 'run.json').read_text())
+        self.assertEqual(run['state'], 'interrupted')
+        self.assertFalse((self.state() / 'run.lock').exists())
 
     def test_round3_sighup_marks_foreground_run_interrupted_and_cancel_clears_lock(self):
         self.started()

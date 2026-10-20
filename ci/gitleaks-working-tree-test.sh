@@ -69,5 +69,5 @@ if FIXTURE_REPO=$repo bash "$ROOT/ci/gitleaks-working-tree.sh" "$tmp/gitleaks" "
   exit 1
 fi
 echo 'PASS: repository allowlist is applied and unallowlisted secrets still fail'
-grep -Fq "\"\$tmp/gitleaks\" git --redact --no-banner ." "$ROOT/ci/lint.sh"
+grep -Fq 'run gitleaks git --redact --no-banner .' "$ROOT/ci/lint.sh"
 echo 'PASS: gitleaks git remains enabled for tracked history'
