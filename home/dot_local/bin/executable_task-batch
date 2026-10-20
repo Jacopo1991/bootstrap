@@ -32,6 +32,7 @@ FIX_SCOPE_INSTRUCTION = ("Fix only inside this task's scope. If a finding needs 
                          "the task forbids, do not make them: end your final reply with `BLOCKED:` "
                          "and the finding.")
 OUTPUT_LOCK = threading.Lock()
+LAUNCH_LOCK = threading.Lock()
 
 
 def terminal_block(output):
@@ -143,6 +144,11 @@ class Batch:
         self.stopping = stopping if stopping is not None else threading.Event()
         self.ident = ident
 
+    def stop(self):
+        # Do not let a worker pass its stop check while another launches a CLI.
+        with LAUNCH_LOCK:
+            self.stopping.set()
+
     def output(self, text):
         prefix = f"[{self.ident}] " if self.ident else ""
         with OUTPUT_LOCK:
@@ -158,10 +164,12 @@ class Batch:
     def call(self, command, *args, retry=False):
         argv = ["task", command, str(self.repo), *map(str, args)]
         while True:
-            if self.stopping.is_set():
-                raise Stop("batch is stopping")
-            self.output("+ " + shlex.join(argv))
-            with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
+            with LAUNCH_LOCK:
+                if self.stopping.is_set():
+                    raise Stop("batch is stopping")
+                self.output("+ " + shlex.join(argv))
+                child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            with child:
                 while True:
                     try:
                         output, _ = child.communicate(timeout=0.1)
@@ -226,6 +234,10 @@ class Batch:
         denied = terminal_block(read(state / "review-response.md"))
         if denied:
             raise Stop(f"reviewer: {denied}")
+        routing = data(state / "review-routing.json")
+        builder = data(state / "task.json").get("builder")
+        if routing.get("fallback_from") and routing.get("vendor") == builder:
+            raise Stop("reviewer fallback used the builder vendor; independent review required before merge")
 
     def task(self, task):
         ident, box = task["id"], task["box"]
@@ -351,7 +363,7 @@ class Batch:
         try:
             return self.task(task)
         except BaseException:
-            self.stopping.set()
+            self.stop()
             raise
 
     def run(self):
@@ -361,8 +373,8 @@ class Batch:
             self.append("batch: finished")
             return 0
         except (Exception, KeyboardInterrupt) as error:
-            self.stopping.set()
-            self.append(f"batch: stopped: {error or 'interrupted'}")
+            self.stop()
+            self.append(f"batch: stopped: {str(error) or 'interrupted'}")
             return 1
 
     def gate_slots(self):
@@ -426,7 +438,7 @@ class Batch:
                     else:
                         consecutive = 0
         finally:
-            self.stopping.set()
+            self.stop()
             pool.shutdown(wait=False, cancel_futures=True)
 
 

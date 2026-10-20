@@ -444,6 +444,9 @@ Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
 default. An explicit `--model` always wins; `--no-boost` disables tier routing.
 The launch notice explains the decision. Reviews keep their usual cheap models
 and usage-limit handling regardless of boost.
+Usage limits retry once on the other reviewer vendor and record its actual
+identity. If that fallback uses the builder's vendor, the batch stops for an
+independent review; the merge gate still requires the other vendor.
 
 The shared routing constant is in `home/dot_local/bin/task_routing.py`.
 Optional `~/.config/task/routing.json` overrides defaults and hard/design models,

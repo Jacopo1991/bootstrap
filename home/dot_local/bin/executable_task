@@ -2100,7 +2100,7 @@ def runner_start(args):
 
 def start(args):
     repo = resolve_repo(args.repo)
-    common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     with (common / "task-start.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         return start_locked(args, repo)

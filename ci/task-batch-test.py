@@ -128,6 +128,22 @@ print(entry.get('output', 'OK'))
 
 
 class BatchTest(unittest.TestCase):
+    def test_same_builder_reviewer_fallback_stops_before_merge_or_fixes(self):
+        self.source.write_text('1. one: builder codex, tier hard\n')
+        self.scenario({})
+        original = batch_module.Batch.reviewer_outcome
+        def fallback(worker, state):
+            (state / 'review-routing.json').write_text(json.dumps(
+                dict(vendor='codex', model='gpt-6-luna', fallback_from=['claude', 'haiku'])))
+            return original(worker, state)
+        runner = batch_module.Batch(self.repo, self.source)
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(batch_module.Batch, 'reviewer_outcome', fallback):
+            self.assertEqual(runner.run(), 1)
+        self.assertIn('independent review required', runner.done.read_text())
+        self.assertEqual(len(self.calls('lane')), 1)
+        self.assertEqual(self.calls('merge'), [])
+
     def test_tier_only_dispatch_and_missing_route(self):
         self.source.write_text('1. one: builder codex, tier hard\n')
         self.run_batch()
@@ -183,6 +199,8 @@ class BatchTest(unittest.TestCase):
                     try:
                         self.assertEqual(runner.run(), 1)
                         self.assertIn('batch: stopped:', runner.done.read_text())
+                        if interruption:
+                            self.assertIn('batch: stopped: interrupted', runner.done.read_text())
                         self.assertFalse(exited.is_set())
                         self.assertEqual(set(launched), {'one', 'two'})
                     finally:
