@@ -610,6 +610,101 @@ class TaskTool(unittest.TestCase):
         with self.assertRaisesRegex(TASK_MODULE.Stop, 'plain strings'):
             TASK_MODULE.configured_environment(wt)
 
+    def test_gate_matrix_environment_evidence_and_selection(self):
+        config = (ROOT / 'ci/fixtures/gate-matrix.toml').read_text()
+        self.commit_in(self.repo, '.task.toml', config)
+        wt, _ = self.started()
+        (wt / '.task.toml').write_text(config)
+        script = self.home / 'during-check.sh'
+        script.write_text(
+            '#!/bin/sh\n'
+            'printf "%s|%s|%s|%s\\n" "$PH_PRODUCT_DIR" "$PH_PRODUCT_PYTHON" '
+            '"$TMPDIR" "$TASK_GATE_SLOT" >> "$PWD/.work/matrix-observed"\n'
+            'test ! -e "$TMPDIR/leftover" || touch FAIL\n'
+            'touch "$TMPDIR/leftover"\n')
+        script.chmod(0o755)
+        for advisory in (False, True):
+            observed = wt / '.work/matrix-observed'
+            observed.unlink(missing_ok=True)
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                    contextlib.redirect_stdout(output):
+                self.assertTrue(TASK_MODULE.run_check(wt, '', state=self.state(), advisory=advisory))
+            rows = [row.split('|') for row in observed.read_text().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0], f'{self.repo}/.work/madplanner-a7dc343-ph')
+            self.assertEqual(rows[1][0], f'{wt}/.work/fake')
+            self.assertEqual(rows[1][1], f'{wt}/.work/fake/.venv/bin/python')
+            self.assertNotEqual(rows[0][2], rows[1][2])
+            self.assertEqual(rows[0][3], rows[1][3])
+            self.assertTrue(all(not Path(row[2]).exists() for row in rows))
+            destination = wt / '.work' if advisory else self.state()
+            evidence = json.loads((destination / 'check.json').read_text())
+            self.assertEqual([row['name'] for row in evidence['variants']], ['real', 'fake'])
+            self.assertEqual(evidence['result'], 'passed')
+            history = json.loads((destination / 'checks.jsonl').read_text().splitlines()[-1])
+            self.assertEqual(history['variants'], evidence['variants'])
+            self.assertIn('variant real: PASS', output.getvalue())
+            self.assertIn('variant fake: PASS', output.getvalue())
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, '', advisory=True, variant='fake'))
+            evidence = json.loads((wt / '.work/check.json').read_text())
+            self.assertEqual([row['name'] for row in evidence['variants']], ['fake'])
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'only available'):
+                TASK_MODULE.run_check(wt, '', variant='fake')
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'Unknown gate variant'):
+                TASK_MODULE.run_check(wt, '', advisory=True, variant='missing')
+        self.assertIn('gate variants: real, fake', self.task('status', 'proj'))
+
+    def test_gate_matrix_failure_runs_remaining_variants(self):
+        self.commit_in(self.repo, '.task.toml', (ROOT / 'ci/fixtures/gate-matrix.toml').read_text())
+        wt, _ = self.started()
+        (wt / '.task.toml').write_text((ROOT / 'ci/fixtures/gate-matrix.toml').read_text())
+        script = self.home / 'during-check.sh'
+        script.write_text('#!/bin/sh\ncase "$PH_PRODUCT_DIR" in\n'
+                          '*/fake) rm -f FAIL;;\n*) touch FAIL;;\nesac\n')
+        script.chmod(0o755)
+        for name in ('check.json', 'gate-check.json', 'drill-check.json'):
+            with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                self.assertFalse(TASK_MODULE.run_check(wt, '', state=self.state(), evidence_name=name,
+                                                      pre_commit_all_files=name == 'drill-check.json'))
+            evidence = json.loads((self.state() / name).read_text())
+            self.assertEqual(evidence['result'], 'failed')
+            self.assertEqual([row['result'] for row in evidence['variants']], ['failed', 'passed'])
+            self.assertIn('=== variant real ===', (wt / '.work/check.log').read_text())
+            self.assertIn('=== variant fake ===', (wt / '.work/check.log').read_text())
+
+    def test_gate_matrix_validation(self):
+        bad_configs = [
+            'gate_variant = "fake"',
+            '[[gate_variant]]\nname = ""',
+            '[[gate_variant]]\nname = "fake"\n[[gate_variant]]\nname = "fake"',
+            '[[gate_variant]]\nname = "fake"\nenv = "invalid"',
+        ]
+        for key in ('TMPDIR', 'TASK_GATE_SLOT', 'API_TOKEN', 'PASSWORD', 'TASK_RUN_ID'):
+            bad_configs.append(f'[[gate_variant]]\nname = "fake"\n[gate_variant.env]\n{key} = "bad"')
+        bad_configs.append('[[gate_variant]]\nname = "fake"\n[gate_variant.env]\nCOUNT = 2')
+        for config in bad_configs:
+            with self.subTest(config=config):
+                (self.repo / '.task.toml').write_text(config)
+                with self.assertRaises(TASK_MODULE.Stop):
+                    TASK_MODULE.gate_variants(self.repo)
+
+    def test_gate_matrix_timeout_keeps_failure_evidence(self):
+        wt, _ = self.started()
+        config = (ROOT / 'ci/fixtures/gate-matrix.toml').read_text().replace('2700', '1')
+        (wt / '.task.toml').write_text(config)
+        script = self.home / 'during-check.sh'
+        script.write_text('#!/bin/sh\ncase "$PH_PRODUCT_DIR" in\n'
+                          '*/fake) :;;\n*) sleep 10;;\nesac\n')
+        script.chmod(0o755)
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            self.assertFalse(TASK_MODULE.run_check(wt, '', state=self.state()))
+        evidence = json.loads((self.state() / 'check.json').read_text())
+        self.assertEqual(evidence['result'], 'failed')
+        self.assertTrue(evidence['variants'][0]['steps'][0]['timeout'])
+        self.assertEqual(evidence['variants'][1]['result'], 'passed')
+
     def test_decision_status_only_changes(self):
         name = 'backlog/decisions/d-status.md'
         (self.kb / 'backlog/decisions').mkdir()

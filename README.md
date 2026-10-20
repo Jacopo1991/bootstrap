@@ -478,6 +478,28 @@ for tasks first reviewed in the last 14 days, and mean total reviews for tasks
 merged in that period with available review history. Legacy records are used
 when available; missing history is excluded. Archive copies are deduplicated.
 
+Optional `.task.toml` gate variants run sequentially under the same slot and port
+reservation, each with a fresh `TMPDIR`. Every variant must pass. Each variant's
+`env` overrides `[env]`, using the same reserved-name and credential checks and
+`{repo}` / `{worktree}` expansion:
+
+```toml
+[[gate_variant]]
+name = "real" # Empty overrides use the base [env].
+
+[[gate_variant]]
+name = "fake"
+[gate_variant.env]
+PH_PRODUCT_DIR = "{worktree}/.work/fake"
+```
+
+When variants are declared, these are the runs; add an empty variant to include
+the base configuration. With no variants, the gate runs once as before.
+Checks, merge gates and gate drills all run the matrix. Advisory lane checks
+also accept `task check --variant fake`; trusted checks always run every variant.
+The combined check log labels each run, and JSON evidence and history include
+per-variant results. `task status` lists variant names.
+
 Always launch build lanes through `task lane`, including from a batch runner:
 
 ```sh

@@ -893,6 +893,10 @@ def timeout_for(path: Path):
 
 def configured_environment(path, repo=None):
     values = task_config(path).get("env", {})
+    return expand_environment(values, path, repo)
+
+
+def expand_environment(values, path, repo=None):
     if not isinstance(values, dict):
         raise Stop(".task.toml [env] must be a table of plain strings.")
     for name, value in values.items():
@@ -907,6 +911,23 @@ def configured_environment(path, repo=None):
     repo = repo or main_repo(path)
     return {name: value.replace("{repo}", str(repo.resolve())).replace("{worktree}", str(path.resolve()))
             for name, value in values.items()}
+
+
+def gate_variants(path):
+    entries = task_config(path).get("gate_variant", [])
+    if not isinstance(entries, list):
+        raise Stop(".task.toml gate_variant must be an array of tables.")
+    variants = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Stop(".task.toml gate_variant must contain tables.")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise Stop(".task.toml gate_variant requires a simple nonempty name.")
+        if name in variants:
+            raise Stop(".task.toml gate_variant names must be unique.")
+        variants[name] = expand_environment(entry.get("env", {}), path)
+    return variants
 
 
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
@@ -2152,7 +2173,18 @@ def sweep_gate_temporary(root):
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-              advisory=False, pre_commit_all_files=False, cancelled=None):
+              advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
+    variants = gate_variants(path)
+    configured_environment(path)  # Validate the base even when a variant overrides it.
+    if variant is not None:
+        if not advisory:
+            raise Stop("--variant is only available for advisory lane checks.")
+        if variant not in variants:
+            raise Stop(f"Unknown gate variant: {variant}.")
+        variants = {variant: variants[variant]}
+    if variants:
+        return run_check_matrix(path, base, record, state, evidence_name, display_log,
+                                advisory, pre_commit_all_files, cancelled, variants)
     if advisory:
         return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
                                cancelled=cancelled)
@@ -2174,8 +2206,46 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
                                    cancelled=cancelled)
 
 
+def run_check_matrix(path, base, record, state, evidence_name, display_log,
+                     advisory, pre_commit_all_files, cancelled, variants):
+    work = path / ".work"
+    work.mkdir(exist_ok=True)
+    destination = work if advisory else (state or task_state(Task(main_repo(path), path.name)))
+    destination.mkdir(parents=True, exist_ok=True)
+    results = []
+    logs = []
+    # Reserve the port range once, including for drills without an exclusive slot.
+    with gate_port_index(path) as slot:
+        for name, environment in variants.items():
+            # Advisory checks need a writable parent inside their lane.
+            with tempfile.TemporaryDirectory(prefix="variant-", dir=work if advisory else "/tmp") as temporary:
+                gate_environment = dict(environment, TMPDIR=temporary, TASK_GATE_SLOT=str(slot),
+                                        TASK_GATE_PORT_BASE=str(20000 + 200 * slot))
+                evidence = []
+                passed = run_check_steps(
+                    path, base, record, state, evidence_name, display_log, advisory=advisory,
+                    gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
+                    cancelled=cancelled, evidence_sink=evidence)
+                results.append(dict(evidence[0], name=name))
+                logs.append(f"=== variant {name} ===\n" + (work / "check.log").read_text())
+                print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
+    log = work / "check.log"
+    log.write_text("\n".join(logs))
+    passed = all(row["result"] == "passed" for row in results)
+    evidence = {key: value for key, value in results[0].items() if key not in {"name", "steps", "result"}}
+    evidence.update(result="passed" if passed else "failed", variants=results,
+                    steps=[step for row in results for step in row["steps"]])
+    save_check_evidence(destination, evidence_name, evidence, log)
+    if not advisory and evidence_name == "check.json":
+        try: task_event(Task(main_repo(path), path.name), "check")
+        except OSError: pass
+    print(("PASS" if passed else "FAIL") + f" (log: {display_log or log})")
+    return passed
+
+
 def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-                    advisory=False, gate_environment=None, pre_commit_all_files=False, cancelled=None):
+                    advisory=False, gate_environment=None, pre_commit_all_files=False, cancelled=None,
+                    evidence_sink=None):
     """Run the repository's gate in <path>; return True when it passes.
 
     pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
@@ -2269,9 +2339,11 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
                                 "trusted": state is not None, "advisory": state is None}
-                    if evidence_name == "check.json" and state is None:
+                    if evidence_sink is not None:
+                        evidence_sink.append(evidence)
+                    elif evidence_name == "check.json" and state is None:
                         save_check_evidence(work, "check.json", evidence, log)
-                    if state:
+                    if state and evidence_sink is None:
                         save_check_evidence(state, evidence_name, evidence, log)
                         if evidence_name == "check.json":
                             try: task_event(Task(main_repo(path), path.name), "check")
@@ -2297,9 +2369,11 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 "record_revision": record.get("revision") if record else "",
                 "result": "passed" if passed else "failed", "steps": results,
                 "time": utc_now(), "trusted": state is not None, "advisory": state is None}
-    if evidence_name == "check.json" and state is None:
+    if evidence_sink is not None:
+        evidence_sink.append(evidence)
+    elif evidence_name == "check.json" and state is None:
         save_check_evidence(work, "check.json", evidence, log)
-    if state:
+    if state and evidence_sink is None:
         save_check_evidence(state, evidence_name, evidence, log)
         if evidence_name == "check.json":
             try: task_event(Task(main_repo(path), path.name), "check")
@@ -2354,14 +2428,14 @@ def check(args):
         with advisory_check_lock(path):
             if exclusive_gate_enabled(path, advisory=True):
                 with exclusive_gate_lock(task, silent_unavailable=True, config_path=path, advisory=True):
-                    passed = run_check(path, base, record, None, advisory=True)
+                    passed = run_check(path, base, record, None, advisory=True, variant=args.variant)
             else:
-                passed = run_check(path, base, record, None, advisory=True)
+                passed = run_check(path, base, record, None, advisory=True, variant=args.variant)
     elif exclusive_gate_enabled(path):
         with exclusive_gate_lock(task, config_path=path):
-            passed = run_check(path, base, record, task_state(task), advisory=False)
+            passed = run_check(path, base, record, task_state(task), advisory=False, variant=args.variant)
     else:
-        passed = run_check(path, base, record, task_state(task), advisory=False)
+        passed = run_check(path, base, record, task_state(task), advisory=False, variant=args.variant)
     return 0 if passed else 1
 
 
@@ -3706,6 +3780,11 @@ def status(args):
         except (OSError, ValueError):
             keys = f"unavailable (Cannot read environment for {repo}.)"
         print("  env keys: " + keys)
+        try:
+            names = ", ".join(gate_variants(repo)) or "(none)"
+        except (Stop, OSError, ValueError) as error:
+            names = f"unavailable ({error})"
+        print("  gate variants: " + names)
         print("  " + quality_summary(repo))
         if (CORTEX / f"cortex-kb-{repo.name}").exists():
             print("  " + plan_verdict(plan_info(repo)))
@@ -4443,6 +4522,7 @@ def main(argv=None):
     sub.add_argument("file")
     sub.add_argument("--llm", action="store_true", help="use the legacy Codex runner for this release")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
+    sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
     sub.add_argument("--detach", action="store_true")
     sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
