@@ -30,6 +30,7 @@ from pathlib import Path
 from policy_test_env import isolate_policy_environment
 
 # Keep only explicit test selection and trusted-gate socket-test semantics.
+LANE_TMPDIR = os.environ.get("TMPDIR")
 isolate_policy_environment("TASK_TEST_TOOL", "TASK_GATE_RUN_ID")
 
 audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
@@ -906,8 +907,11 @@ class TaskTool(unittest.TestCase):
                 ('codex', 'gpt-6-luna', ['--no-boost'], 'gpt-6-luna'),
                 ('claude', 'sonnet', ['--no-boost'], 'sonnet'),
                 ('codex', 'gpt-6-astra', ['--no-boost'], 'gpt-6-astra')]:
+            (wt / '.work/model-call.json').unlink(missing_ok=True)
+            (wt / '.work/final.md').unlink(missing_ok=True)
             out = self.task('lane', 'proj', '5', '--builder', builder, '--model', requested, *extra)
             record = self.wait_for_lane(wt)
+            self.assertEqual(record['exit_code'], 0)
             self.assertEqual(record['model'], expected)
             self.assertEqual(record['cli_model'], expected)
             call = json.loads((wt / '.work/model-call.json').read_text())
@@ -2612,6 +2616,11 @@ store.write_text(json.dumps(prs))
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY)
+        # Fixture isolation must not change the temp grant inherited by lanes.
+        if LANE_TMPDIR is None:
+            self.env.pop("TMPDIR", None)
+        else:
+            self.env["TMPDIR"] = LANE_TMPDIR
         for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"):
             self.env.pop(marker, None)
         self.gate_dir = self.home / "shared-gate"
@@ -3792,6 +3801,69 @@ store.write_text(json.dumps(prs))
         self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))
         self.assertFalse((self.home / "runner-record.json").exists())
 
+    def assert_claude_temporary_path(self, temporary):
+        root = Path("/tmp") / f"claude-{os.getuid()}"
+        parent = Path(LANE_TMPDIR).resolve() if LANE_TMPDIR else root
+        trusted = False
+        if parent.parent == root and __import__("re").fullmatch(r"lane-[0-9a-f]{8}", parent.name):
+            info = parent.stat()
+            trusted = info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+        self.assertEqual(temporary.parent, parent if trusted else root)
+        self.assertRegex(temporary.name, r"^lane-[0-9a-f]{8}$")
+        # Preserve the original short-path bound plus exactly one lane component.
+        self.assertLess(len(os.fsencode(temporary)), 54 if trusted else 40)
+
+    def test_claude_temporary_parent_trust_and_cleanup(self):
+        root = self.home / "claude-root"
+        root.mkdir(mode=0o700)
+        outer = root / "lane-1234abcd"
+        outer.mkdir(mode=0o700)
+        unrelated = self.home / "unrelated"
+        unrelated.mkdir(mode=0o700)
+        alias = self.home / "outer-link"
+        alias.symlink_to(outer)
+        task = TASK_MODULE.Task(self.repo, "5")
+        real_lstat = Path.lstat
+        for candidate, mode, owner, nested in (
+                (outer, 0o700, os.getuid(), True),
+                (alias, 0o700, os.getuid(), True),
+                (unrelated, 0o700, os.getuid(), False),
+                (outer, 0o755, os.getuid(), False),
+                (outer, 0o700, os.getuid() + 1, False)):
+            with self.subTest(candidate=candidate, mode=mode, owner=owner):
+                outer.chmod(mode)
+
+                def lane_stat(path, *args, **kwargs):
+                    info = real_lstat(path, *args, **kwargs)
+                    if path == outer:
+                        return mock.Mock(st_mode=info.st_mode, st_uid=owner)
+                    return info
+
+                with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
+                        mock.patch.dict(os.environ, TMPDIR=str(candidate)), \
+                        mock.patch.object(Path, "lstat", lane_stat):
+                    env = TASK_MODULE.lane_environment(task, builder="claude")
+                    temporary = Path(env["TMPDIR"])
+                    self.assertEqual(temporary.parent, outer if nested else root)
+                    self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+                    self.assertEqual(temporary.stat().st_uid, os.getuid())
+                    (temporary / "probe").write_text("private")
+                    # Cancellation must validate the recorded path independently
+                    # of the cancelling process's environment.
+                    with mock.patch.dict(os.environ, TMPDIR=str(unrelated)):
+                        TASK_MODULE.cleanup_lane_temporary(str(temporary))
+                    self.assertFalse(temporary.exists())
+                    self.assertTrue(outer.is_dir())
+        outer.chmod(0o700)
+        with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root):
+            with self.assertRaises(TASK_MODULE.Stop):
+                TASK_MODULE.cleanup_lane_temporary(str(unrelated))
+            linked = root / "lane-deadbeef"
+            linked.symlink_to(unrelated)
+            with self.assertRaises(TASK_MODULE.Stop):
+                TASK_MODULE.cleanup_lane_temporary(str(linked / "lane-12345678"))
+        self.assertTrue(unrelated.is_dir())
+
     def test_claude_lane_uses_pinned_builder_and_logs_final_and_failure(self):
         self.stub_models()
         self.raw_task("start", "proj", "5", "--builder", "claude")
@@ -3808,8 +3880,7 @@ store.write_text(json.dumps(prs))
                                        "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         allowed = settings["sandbox"]["filesystem"]["allowWrite"]
-        self.assertRegex(call["tmpdir"], rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
-        self.assertLess(len(os.fsencode(call["tmpdir"])), 40)
+        self.assert_claude_temporary_path(Path(call["tmpdir"]))
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(call["task_worktree"], str(wt))
         self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir),
@@ -3890,8 +3961,7 @@ store.write_text(json.dumps(prs))
         temporary = Path(call["tmpdir"])
         socket_denied = False
         try:
-            self.assertRegex(str(temporary), rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
-            self.assertLess(len(os.fsencode(temporary)), 40)
+            self.assert_claude_temporary_path(temporary)
             self.assertEqual(temporary.stat().st_uid, os.getuid())
             self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
             settings = json.loads((wt / ".work/claude-settings.json").read_text())
