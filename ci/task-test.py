@@ -14,6 +14,7 @@ import io
 import json
 import os
 import signal
+import socket
 import time
 import shutil
 import stat
@@ -3793,7 +3794,9 @@ store.write_text(json.dumps(prs))
                                        "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         allowed = settings["sandbox"]["filesystem"]["allowWrite"]
-        self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
+        self.assertRegex(call["tmpdir"], rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
+        self.assertLess(len(os.fsencode(call["tmpdir"])), 40)
+        self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(call["task_worktree"], str(wt))
         self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir)])
         self.assertNotIn("/tmp", allowed)
@@ -3812,8 +3815,6 @@ store.write_text(json.dumps(prs))
                 mock.patch.object(TASK_MODULE.os, "open", side_effect=sandbox_open):
             with self.assertRaises(PermissionError):
                 os.open("/tmp/unlisted-lane-probe", os.O_CREAT | os.O_RDWR, 0o600)
-            with tempfile.TemporaryFile(dir=call["tmpdir"]) as temporary:
-                temporary.write(b"writable lane temp")
             with TASK_MODULE.exclusive_gate_lock(task, silent_unavailable=True, advisory=True):
                 self.assertIsNotNone(TASK_MODULE.GATE_SLOT.get())
                 lock, _ = TASK_MODULE.gate_paths("slot-0")
@@ -3843,10 +3844,61 @@ store.write_text(json.dumps(prs))
                                             "--allowedTools", "Bash Read Write Edit Glob Grep",
                                             "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
-        self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
+        self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
                          [call["tmpdir"], str(self.gate_dir)])
         self.assertEqual(record["model"], "opus")
+
+    def test_claude_long_lane_temp_is_private_socket_writable_and_removed(self):
+        self.stub_models()
+        name = "t110-electricity-overview-uses-the-" + "long-repository-path-" * 2
+        self.raw_task("start", "proj", name, "--builder", "claude")
+        wt = self.repo / ".worktrees" / name
+        self.assertGreater(len(str(wt / ".work/tmp")), 108)
+        (wt / ".work/prompt.md").write_text("Approved Claude task.\n")
+        release = self.home / "release"
+        self.raw_task("lane", "proj", name, env=dict(self.env, LANE_STUB_RELEASE=str(release)))
+        call = self.wait_for_lane(wt, finished=False)
+        temporary = Path(call["tmpdir"])
+        try:
+            self.assertRegex(str(temporary), rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
+            self.assertLess(len(os.fsencode(temporary)), 40)
+            self.assertEqual(temporary.stat().st_uid, os.getuid())
+            self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+            settings = json.loads((wt / ".work/claude-settings.json").read_text())
+            self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
+                             [str(temporary), str(self.gate_dir)])
+            self.assertEqual(call["task_worktree"], str(wt))
+            self.assertEqual(call["state_home"], str(wt / ".work/state"))
+            with socket.socket(socket.AF_UNIX) as bridge:
+                bridge.bind(str(temporary / "srt-mux-3583008-1.sock"))
+            with tempfile.TemporaryFile(dir=temporary) as probe:
+                probe.write(b"writable")
+        finally:
+            release.touch()
+            self.wait_for_lane(wt)
+        self.assertFalse(temporary.exists())
+
+    def test_claude_lane_temp_removed_on_timeout_and_cancel(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / ".work/prompt.md").write_text("Approved Claude task.\n")
+        env = dict(self.env, LANE_STUB_RELEASE=str(self.home / "release"))
+        self.raw_task("lane", "proj", "5", "--builder", "claude", "--timeout", "0.01", env=env)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = json.loads((wt / ".work/lane.json").read_text())
+            if run["state"] == "timed_out":
+                break
+            time.sleep(0.02)
+        self.assertEqual(run["state"], "timed_out")
+        self.assertFalse(Path(run["temporary"]).exists())
+        self.assert_group_stopped(run["pid"])
+        (wt / ".work/model-call.json").unlink()
+        self.raw_task("lane", "proj", "5", env=env)
+        call = self.wait_for_lane(wt, finished=False)
+        self.raw_task("cancel", "proj", "5")
+        self.assertFalse(Path(call["tmpdir"]).exists())
 
     def test_lane_rejects_model_from_other_builder(self):
         self.stub_models()
