@@ -3,26 +3,35 @@
 
 Removes only what is provably finished and nothing else:
 - hand-made worktrees inside a repository (<repo>/.worktrees/<name>, <repo>/.claude/worktrees/<name>)
-  that are clean, unlocked, not in use, idle for a day, hold no ignored files beyond rebuildable
-  caches and .work evidence (archived first), and whose every commit (HEAD and its reflog) is
-  already in the default branch;
+  that are clean, unlocked, not in use, idle for a day, and whose every commit (HEAD and its
+  reflog) is already in the default branch. Ignored rebuildable caches are discarded; .work and
+  every other ignored file (logs, .bash_profile, *.egg-info, ...) are archived first, with
+  relative paths preserved, under ~/.local/state/task/archive/<repo>/<worktree>/. An ignored
+  file that looks like a secret (.env, .env.*, *.pem, *.key, id_rsa*, id_ed25519*, anything
+  under secrets/) is never copied and keeps the worktree in place;
 - local branches whose commits, including their reflog, are all in the default branch.
 - Codex app worktrees under `$CODEX_HOME/worktrees` that are clean and whose branch is merged
   or whose detached commit is reachable from a default branch.
 Everything else is reported for the PM, never changed: worktrees elsewhere, ~/project-data,
 plain folders, second checkouts. Finished, clean Codex app worktrees in $CODEX_HOME/worktrees are
-reported and removed only with --apply; unfinished or dirty Codex worktrees are retained.
+reported and removed only with --apply; unfinished or dirty Codex worktrees are retained, and
+ignored non-cache files still block them.
+Unmerged worktrees idle for more than 7 days are reported and listed by `task status` under
+"Needs attention" (finish, adopt or delete); they are never removed.
 
 Usage: workspace-tidy            report only
        workspace-tidy --apply    also remove finished worktrees and merged branches
 The report is also written to ~/.local/state/workspace-tidy/report.txt.
 """
 import argparse
+import fnmatch
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -42,6 +51,9 @@ TIDY_DIRS = (".worktrees", ".claude/worktrees")      # the only places removal m
 REBUILDABLE = {"node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
                ".ruff_cache", ".cache", "dist", "build", ".next", ".astro", ".turbo", "coverage",
                ".tox", ".parcel-cache", "target"}
+# Ignored files that look like secrets are never copied; any path part may match.
+SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "secrets")
+ARCHIVE_LIMIT = 200 * 1024 ** 2    # more ignored data than this stays where it is
 IN_PROGRESS = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD",
                "BISECT_LOG")
 
@@ -132,8 +144,41 @@ def paths_in_use() -> list[Path]:
     return found
 
 
-def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
-    """Why this worktree must not be removed, or None when removing it loses nothing."""
+def secret_looking(parts: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatch(part.lower(), pattern) for part in parts for pattern in SECRET_PATTERNS)
+
+
+def collect_ignored(path: Path, relative: Path, found: list[Path]) -> str | None:
+    """Add the files under an ignored entry to `found`; return why they cannot be archived."""
+    if secret_looking(relative.parts):
+        return f"ignored file that looks like a secret: {relative}"
+    full = path / relative
+    if full.is_symlink() or full.is_file():
+        found.append(relative)
+        return None
+    if not full.is_dir():
+        return f"ignored special file: {relative}"
+    for root, dirs, files in os.walk(full):
+        base = Path(root).relative_to(path)
+        dirs[:] = [name for name in dirs if name not in REBUILDABLE]
+        for name in sorted(dirs + files):
+            child = base / name
+            target = path / child
+            if secret_looking(child.parts):
+                return f"ignored file that looks like a secret: {child}"
+            if target.is_symlink() or target.is_file():
+                found.append(child)
+            elif not target.is_dir():
+                return f"ignored special file: {child}"
+    return None
+
+
+def removal_blocker(path: Path, gitdir: Path, in_use: list[Path],
+                    archivable: list[Path] | None = None) -> str | None:
+    """Why this worktree must not be removed, or None when removing it loses nothing.
+
+    With `archivable`, ignored non-cache files no longer block: they are collected there for the
+    caller to archive. Without it they block, as for Codex worktrees."""
     if any(inside(cwd, path) for cwd in in_use):
         return "in use by a running process"
     if any((gitdir / name).exists() for name in IN_PROGRESS):
@@ -153,8 +198,15 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path]) -> str | None:
             return "uncommitted or untracked changes"
         if parts and parts[0] == ".work":
             continue
-        if not any(part in REBUILDABLE for part in parts):
+        if any(part in REBUILDABLE for part in parts):
+            continue
+        if archivable is None:
             return f"ignored file that is not a rebuildable cache: {item[3:]}"
+        problem = collect_ignored(path, Path(*parts), archivable)
+        if problem:
+            return problem
+    if sum((path / name).lstat().st_size for name in archivable or ()) > ARCHIVE_LIMIT:
+        return "ignored files over 200 MB"
     flags = git(path, "ls-files", "-v").stdout.splitlines()
     sparse = git(path, "config", "--bool", "core.sparseCheckout").stdout.strip() == "true"
     if any(line[:1].islower() or (line[:1] == "S" and not sparse) for line in flags):
@@ -174,6 +226,30 @@ def archive_work(repo, path, report):
         report.append(f"{repo.name}: kept {path}: cannot archive .work: {error}")
         return False
     return True
+
+
+def archive_ignored(repo, path, files, report):
+    """Copy ignored non-cache files, relative paths preserved, next to the .work archive."""
+    base = HOME / ".local/state/task/archive" / repo.name / path.name
+    pending = None
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=base))
+        for relative in files:
+            target = pending / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if (path / relative).is_symlink():
+                target.symlink_to(os.readlink(path / relative))
+            else:
+                shutil.copy2(path / relative, target)
+        destination = base / f"{path.name}-ignored-{pending.name.removeprefix('.pending-')}"
+        pending.rename(destination)
+    except OSError as error:
+        if pending:
+            shutil.rmtree(pending, ignore_errors=True)
+        report.append(f"{repo.name}: kept {path}: cannot archive ignored files: {error}")
+        return None
+    return destination
 
 
 def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], apply: bool,
@@ -231,6 +307,33 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
             report.append(f"{prefix} could not be removed: {result.stderr.strip()}")
 
 
+def worktree_state(repo: Path, entry: dict, refs: list[str], now: float) -> tuple[Path, bool, float]:
+    """The git directory, whether every commit is in the default branch, and idle seconds."""
+    path = Path(entry["worktree"])
+    gitdir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or "/nonexistent")
+    head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
+    age = now - last_activity(repo, path, gitdir, head)
+    merged = bool(refs) and all_contained(repo, {head} | reflog_commits(path, "HEAD"), refs)
+    return gitdir, merged, age
+
+
+def stale_unmerged(repo: Path, now: float) -> list[dict]:
+    """Unmerged worktrees under the managed folders idle for more than STALE_DAYS."""
+    refs = default_refs(repo)
+    found = []
+    for entry in worktree_list(repo)[1:]:
+        path = Path(entry["worktree"])
+        if ("locked" in entry or "prunable" in entry or inside(path, CODEX_WORKTREES)
+                or not any(inside(path, repo / place) for place in TIDY_DIRS)):
+            continue
+        _, merged, age = worktree_state(repo, entry, refs, now)
+        if not merged and age > STALE_DAYS * 86400:
+            branch = entry.get("branch") if isinstance(entry.get("branch"), str) else None
+            found.append({"path": path, "branch": branch[len("refs/heads/"):] if branch else "detached",
+                          "days": int(age // 86400)})
+    return found
+
+
 def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: list[str],
               done: list[str], seen_codex: set[Path]) -> None:
     refs = default_refs(repo)
@@ -254,29 +357,33 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
             report.append(f"{repo.name}: worktree outside the repository: {path} ({label}); when idle: "
                           f"git -C {repo} worktree move {path} {repo}/.worktrees/{path.name}")
             continue
-        gitdir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or "/nonexistent")
-        head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
-        age = now - last_activity(repo, path, gitdir, head)
-        merged = bool(refs) and all_contained(repo, {head} | reflog_commits(path, "HEAD"), refs)
+        gitdir, merged, age = worktree_state(repo, entry, refs, now)
         if not merged or age <= GRACE:
-            if age > STALE_DAYS * 86400:
-                state = "unmerged work" if not merged else "finished"
-                report.append(f"{repo.name}: open worktree {path} ({label}, {state}, idle {int(age // 86400)} days)")
+            if not merged and age > STALE_DAYS * 86400:
+                report.append(f"{repo.name}: open worktree {path} ({label}, unmerged work, "
+                              f"idle {int(age // 86400)} days); finish, adopt or delete")
             continue
-        blocker = removal_blocker(path, gitdir, in_use)
+        ignored = []
+        blocker = removal_blocker(path, gitdir, in_use, ignored)
         if blocker:
             report.append(f"{repo.name}: finished worktree kept: {path} ({label}): {blocker}")
         elif not apply:
-            archive = "would archive .work and " if (path / ".work").exists() else ""
+            parts = [name for name, present in ((".work", (path / ".work").exists()),
+                                                (f"{len(ignored)} ignored files", bool(ignored))) if present]
+            archive = f"would archive {' and '.join(parts)} and " if parts else ""
             report.append(f"{repo.name}: finished worktree {path} ({label}) {archive}would be removed")
         else:
             source = path / ".work"
             if (source.exists() or source.is_symlink()) and not archive_work(repo, path, report):
                 continue
+            saved = archive_ignored(repo, path, ignored, report) if ignored else None
+            if ignored and not saved:
+                continue
             # The blocker checked all changes; --force also discards disposable session files.
             result = git(repo, "worktree", "remove", "--force", str(path))
             if result.returncode == 0:
-                done.append(f"{repo.name}: removed finished worktree {path} ({label})")
+                kept = f"; archived {len(ignored)} ignored files to {saved}" if saved else ""
+                done.append(f"{repo.name}: removed finished worktree {path} ({label}){kept}")
                 checked_out.discard(branch)
             else:
                 report.append(f"{repo.name}: could not remove {path}: {result.stderr.strip()}")

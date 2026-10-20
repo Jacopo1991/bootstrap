@@ -1341,7 +1341,7 @@ home = pathlib.Path(os.environ['HOME'])
 (home / 'service-args').write_text(json.dumps(sys.argv[1:]))
 sys.exit(int(os.environ.get('SERVICE_EXIT', '0')))
 """,
-            'codex': """#!/usr/bin/env python3
+            'task-batch': """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 work = pathlib.Path.cwd() / '.work'
 (work / 'runner-call').write_text(json.dumps(dict(args=sys.argv[1:], prompt=sys.stdin.read(),
@@ -1355,7 +1355,6 @@ if os.environ.get('RUNNER_FINAL'):
         stream.write(os.environ['RUNNER_FINAL'] + '\\n')
 sys.exit(7)
 """}
-        scripts['task-batch'] = scripts['codex']
         for name, body in scripts.items():
             path = self.home / 'bin' / name
             path.write_text(body)
@@ -1420,16 +1419,11 @@ sys.exit(7)
                                          f'without a final line; see {runner.with_suffix(".log")}\n')
                     self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
 
-    def test_runner_llm_opt_in(self):
+    def test_runner_llm_flag_removed(self):
         runner = self.runner_fixture()
-        self.raw_task('runner-start', 'proj', str(runner), '--llm')
-        args = json.loads((self.home / 'service-args').read_text())
-        subprocess.run(args[args.index(sys.executable):], cwd=self.repo, env=self.env,
-                       check=False, capture_output=True)
-        call = json.loads((runner.parent / 'runner-call').read_text())
-        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
-                                        '-m', 'gpt-6-luna', '-'])
-        self.assertEqual(call['prompt'], runner.read_text())
+        out = self.raw_task('runner-start', 'proj', str(runner), '--llm', code=2)
+        self.assertIn('unrecognized arguments: --llm', out)
+        self.assertFalse((self.home / 'service-args').exists())
 
     def test_runner_fallback_survives_callers_group_and_cancel(self):
         runner = self.runner_fixture('setsid')
@@ -3326,6 +3320,33 @@ store.write_text(json.dumps(prs))
         again = self.task("start", "proj", "5", "--builder", "codex")
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
+
+    def test_status_lists_idle_unmerged_worktrees_and_never_removes_them(self):
+        old = int(time.time()) - 10 * 86400
+        stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
+        for name, idle in (('stale', True), ('recent', False)):
+            path = self.repo / '.worktrees' / name
+            self.git(self.repo, 'worktree', 'add', '-q', '-b', name, str(path))
+            (path / f'{name}.txt').write_text(name)
+            self.git(path, 'add', f'{name}.txt')
+            subprocess.run(['git', '-C', str(path), 'commit', '-qm', name], check=True,
+                           env=dict(self.env, **(stamp if idle else {})), capture_output=True)
+            if idle:
+                gitdir = Path(self.git(path, 'rev-parse', '--absolute-git-dir'))
+                for marker in (path / '.git', gitdir / 'logs/HEAD'):
+                    os.utime(marker, (old, old))
+        merged = self.repo / '.worktrees/merged'
+        self.git(self.repo, 'worktree', 'add', '-q', '-b', 'merged', str(merged))
+        for marker in (merged / '.git', Path(self.git(merged, 'rev-parse', '--absolute-git-dir')) / 'logs/HEAD'):
+            os.utime(marker, (old, old))
+        for args in ((), ('proj',)):
+            attention = self.raw_task('status', *args).split('Needs attention:', 1)[1]
+            self.assertIn(f"idle worktree: proj {self.repo / '.worktrees/stale'} (branch stale, idle 10 days, "
+                          "unmerged): finish, adopt or delete", attention)
+            self.assertNotIn('recent', attention)
+            self.assertNotIn('.worktrees/merged', attention)
+        for name in ('stale', 'recent', 'merged'):
+            self.assertTrue((self.repo / '.worktrees' / name).is_dir())
 
     def test_setup_requests_are_pm_intake_and_status_attention(self):
         out = self.raw_task("note", "proj", "5", "setup", "Please configure the new provider")

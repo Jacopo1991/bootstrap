@@ -222,6 +222,89 @@ class Safety(unittest.TestCase):
         self.assertEqual(archived[0].read_text(), 'evidence')
         self.assertFalse(cache.exists(), out)
 
+    def branches(self):
+        return set(run(self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/").stdout.split())
+
+    def ignore(self, *patterns):
+        with (self.repo / ".git/info/exclude").open("a") as stream:
+            stream.write("\n".join(patterns) + "\n")
+
+    def archive_files(self):
+        root = self.home / ".local/state/task/archive"
+        return sorted(str(item.relative_to(root)) for item in root.rglob("*") if item.is_file()) \
+            if root.exists() else []
+
+    def test_ignored_non_cache_files_are_archived_then_worktree_is_removed(self):
+        self.ignore("logs/", ".bash_profile", "*.egg-info/")
+        path = self.worktree("ignored", "-b", "ignored")
+        (path / "logs").mkdir()
+        (path / "logs/run.log").write_text("log line")
+        (path / ".bash_profile").write_text("export X=1")
+        (path / "pkg.egg-info").mkdir()
+        (path / "pkg.egg-info/PKG-INFO").write_text("info")
+        (path / "node_modules").mkdir()
+        (path / "node_modules/x.js").write_text("x")
+        age(path)
+        out = self.tidy(apply=False)
+        self.assertIn("would archive 3 ignored files and would be removed", out)
+        self.assertTrue((path / "logs/run.log").exists())
+        self.assertIn("ignored", self.branches())
+        self.assertEqual(self.archive_files(), [])
+        out = self.tidy()
+        self.assertFalse(path.exists(), out)
+        self.assertNotIn("ignored", self.branches())
+        base = self.home / ".local/state/task/archive/proj/ignored"
+        for relative, text in (("logs/run.log", "log line"), (".bash_profile", "export X=1"),
+                               ("pkg.egg-info/PKG-INFO", "info")):
+            copies = list(base.glob(f"ignored-ignored-*/{relative}"))
+            self.assertEqual([copy.read_text() for copy in copies], [text], out)
+        self.assertEqual(list(base.glob("*/node_modules")), [], "caches are not archived")
+
+    def test_secret_looking_ignored_files_keep_the_worktree_and_are_never_copied(self):
+        self.ignore(".env", "secrets/", "logs/")
+        env =self.worktree("with-env", "-b", "with-env")
+        (env / ".env").write_text("TOKEN=hunter2")
+        (env / "logs").mkdir()
+        (env / "logs/run.log").write_text("fine to archive, but not alone")
+        nested = self.worktree("with-secrets", "-b", "with-secrets")
+        (nested / "secrets").mkdir()
+        (nested / "secrets/token").write_text("hunter2")
+        for path in (env, nested):
+            age(path)
+        out = self.tidy()
+        self.assertEqual((env / ".env").read_text(), "TOKEN=hunter2", out)
+        self.assertEqual((nested / "secrets/token").read_text(), "hunter2", out)
+        self.assertIn("finished worktree kept", out)
+        self.assertIn("looks like a secret", out)
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(self.archive_files(), [], "nothing is copied when a secret blocks removal")
+        self.assertTrue({"with-env", "with-secrets"} <= self.branches())
+
+    def test_other_blockers_still_keep_a_worktree_with_ignored_files(self):
+        self.ignore("logs/")
+        dirty = self.worktree("dirty-logs", "-b", "dirty-logs")
+        (dirty / "logs").mkdir()
+        (dirty / "logs/run.log").write_text("log")
+        (dirty / "a.txt").write_text("edited")
+        age(dirty)
+        out = self.tidy()
+        self.assertEqual((dirty / "a.txt").read_text(), "edited", out)
+        self.assertTrue((dirty / "logs/run.log").exists())
+        self.assertEqual(self.archive_files(), [])
+
+    def test_ignored_archive_failure_keeps_worktree(self):
+        self.ignore("logs/")
+        path = self.worktree("ignored-failure", "-b", "ignored-failure")
+        (path / "logs").mkdir()
+        (path / "logs/run.log").write_text("must survive")
+        age(path)
+        archive = self.home / ".local/state/task/archive"
+        archive.mkdir(parents=True)
+        (archive / "proj").write_text("obstruct archive directory")
+        out = self.tidy()
+        self.assertIn("cannot archive ignored files", out)
+        self.assertEqual((path / "logs/run.log").read_text(), "must survive")
+
     def test_hidden_or_flagged_changes_are_kept(self):
         hidden = self.worktree("hidden", "--detach")
         run(self.repo, "config", "status.showUntrackedFiles", "no")
