@@ -54,11 +54,18 @@ with tempfile.TemporaryDirectory() as temporary:
             # Never merge into default, even when the merge would be a no-op.
             denied("git merge origin/" + default)
             denied("git merge --no-edit origin/" + default)
+            denied("git merge main")
             git(repo, "switch", "-q", "-c", "task")
             for executable in ("git", "/usr/bin/git"):
                 for middle in ("", "--no-edit "):
                     allowed(executable + " merge " + middle + "origin/" + default)
-                for tail in ("other", "HEAD", default, "origin/HEAD", "origin/task",
+                if default == "main":
+                    allowed(executable + " merge main")
+                else:
+                    denied(executable + " merge " + default)
+                    denied(executable + " merge main")
+                for tail in ("other", "HEAD", "--no-edit main", "--ff-only main",
+                             "--squash main", "main other", "origin/HEAD", "origin/task",
                              "origin/" + default + "~1", "upstream/" + default,
                              "--abort", "--continue", "--edit origin/" + default,
                              "--squash origin/" + default, "--strategy=fixture origin/" + default,
@@ -72,6 +79,14 @@ with tempfile.TemporaryDirectory() as temporary:
                 denied("GIT_SSH_COMMAND=fixture " + executable + " merge origin/" + default)
                 denied(executable + " -c core.hooksPath=fixture merge origin/" + default)
                 denied(executable + " --config-env=alias.merge=FIXTURE merge origin/" + default)
+            if default == "main":
+                git(repo, "tag", "main")
+                denied("git merge main")
+                git(repo, "tag", "-d", "main")
+                git(repo, "config", "branch.task.mergeOptions", "--squash")
+                denied("git merge main")
+                git(repo, "config", "--unset-all", "branch.task.mergeOptions")
+                allowed("git merge main")
             # Catching up the current branch from its own origin branch: fast-forward only.
             git(repo, "update-ref", "refs/remotes/origin/task", "HEAD")
             for executable in ("git", "/usr/bin/git"):
