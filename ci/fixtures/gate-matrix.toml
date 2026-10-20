@@ -1,0 +1,18 @@
+# Product Harness shaped pins; empty real overrides retain the base selection.
+check_timeout = 2700
+drill_seeds = ["hermes-130b8f2c"]
+
+[env]
+PH_PRODUCT_DIR = "{repo}/.work/madplanner-a7dc343-ph"
+PH_PRODUCT_PYTHON = "{repo}/.work/madplanner-a7dc343-ph/.venv/bin/python"
+PH_SELF_DESCRIPTION = "{repo}/.work/madplanner-a7dc343-ph/harness/self-description.json"
+
+[[gate_variant]]
+name = "real"
+
+[[gate_variant]]
+name = "fake"
+[gate_variant.env]
+PH_PRODUCT_DIR = "{worktree}/.work/fake"
+PH_PRODUCT_PYTHON = "{worktree}/.work/fake/.venv/bin/python"
+PH_SELF_DESCRIPTION = "{worktree}/.work/fake/harness/self-description.json"
