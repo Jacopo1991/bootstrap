@@ -294,13 +294,15 @@ with tempfile.TemporaryDirectory() as temp:
     (root / "binary").write_bytes(b"\x7fELF\x00fixture")
     (root / "alias.sh").symlink_to(root / "denied.sh")
     fixture("bash", "sudo true\n")
+    fixture("env", "sudo true\n")
+    fixture("timeout", "sudo true\n")
     fixture("custom-shell.sh", f"#!{root}/bash\necho safe\n")
     (root / "git-alias").symlink_to("/usr/bin/git")
     os.mkfifo(root / "fifo")
     for command in ("bash missing.sh", "./missing.sh", "bash binary", "./binary",
                     "bash alias.sh", "bash fifo", "sh -s", "bash", "bash --rcfile allowed.sh",
                     "source allowed.sh", "./bash allowed.sh", "./custom-shell.sh",
-                    "./git-alias clone x y"):
+                    "./git-alias clone x y", "./env echo safe", "./timeout 3 echo safe"):
         assert judge(command), command
     (root / "child").mkdir()
     fixture("cd.sh", "cd child\necho safe\n")

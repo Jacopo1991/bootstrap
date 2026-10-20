@@ -1446,6 +1446,9 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
             return "xargs, setsid, nohup and other command-hiding wrappers are blocked."
         if wrapper not in EVALUATED_WRAPPERS:
             return tokens
+        if "/" in tokens[0] and Path(tokens[0]).parent not in {
+                Path("/bin"), Path("/usr/bin"), Path("/usr/local/bin")}:
+            return "Custom wrapper executable paths cannot be judged safely."
         index = 1
         if wrapper == "env":
             while index < len(tokens):
