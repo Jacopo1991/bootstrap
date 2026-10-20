@@ -27,8 +27,10 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-# Fixtures own their roots; lane-anchor tests set TASK_WORKTREE explicitly.
-os.environ.pop("TASK_WORKTREE", None)
+from policy_test_env import isolate_policy_environment
+
+# Keep only explicit test selection and trusted-gate socket-test semantics.
+isolate_policy_environment("TASK_TEST_TOOL", "TASK_GATE_RUN_ID")
 
 audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
 atexit.register(audit_state.cleanup)

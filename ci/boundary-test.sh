@@ -28,7 +28,7 @@ socket_template=${TMPDIR:-/tmp}/s.XXXXXXXX
 socket_path=$socket_template/WSL/123_interop
 if (( $(LC_ALL=C printf '%s' "$socket_path" | wc -c) >= 108 )); then
   socket_root=/tmp/task-gate-$(id -u)
-  mkdir -p -m 700 "$socket_root"
+  (umask 077; mkdir -p "$socket_root")
   socket_template=$socket_root/s.XXXXXXXX
 fi
 tmp=$(mktemp -d "$socket_template")

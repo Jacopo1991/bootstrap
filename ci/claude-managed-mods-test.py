@@ -11,8 +11,9 @@ import subprocess
 import sys
 import tempfile
 
-# Fixtures own their roots, independently of the enclosing lane.
-os.environ.pop("TASK_WORKTREE", None)
+from policy_test_env import isolate_policy_environment
+
+isolate_policy_environment()
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "system/agent-policy/pre_tool_use.py"

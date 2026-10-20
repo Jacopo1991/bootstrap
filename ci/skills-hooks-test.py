@@ -237,7 +237,7 @@ class UpdateCommand(unittest.TestCase):
 
 def hook(event: dict) -> dict | None:
     result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event), capture_output=True,
-                            text=True, timeout=30)
+                            text=True, timeout=30, env={"PATH": os.environ["PATH"]})
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout) if result.stdout.strip() else None
 
@@ -291,7 +291,8 @@ class Reminder(unittest.TestCase):
 
     def test_bad_input_never_fails(self):
         for stdin in ("", "not json", "[]", '{"hook_event_name":"PreToolUse","tool_input":7}'):
-            result = subprocess.run([sys.executable, str(HOOK)], input=stdin, capture_output=True, text=True)
+            result = subprocess.run([sys.executable, str(HOOK)], input=stdin, capture_output=True,
+                                    text=True, env={"PATH": os.environ["PATH"]})
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.stdout.strip(), "")
 

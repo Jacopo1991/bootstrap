@@ -19,8 +19,9 @@ import tempfile
 import tomllib
 from unittest.mock import patch
 
-# Fixtures own their roots; lane-anchor tests set TASK_WORKTREE explicitly.
-os.environ.pop("TASK_WORKTREE", None)
+from policy_test_env import isolate_policy_environment
+
+isolate_policy_environment()
 
 audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
 atexit.register(audit_state.cleanup)

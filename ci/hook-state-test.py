@@ -25,11 +25,12 @@ with tempfile.TemporaryDirectory(prefix="hook-state-guard-") as temp:
     state = base / "state"
     home.mkdir()
     state.mkdir()
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith("GIT_") and k != "AGENT_POLICY_STATE_DIR"}
+    env = {k: os.environ[k] for k in ("PATH", "TASK_GATE_RUN_ID") if k in os.environ}
     # All suite-owned temporary directories live under state. HOME is outside
     # it so an inherited/default audit destination is detected after each run.
     env.update(HOME=str(home), TMPDIR=str(state), PYTHONDONTWRITEBYTECODE="1")
+    # Reproduce a lane's anchors: suites must replace them before policy calls.
+    env.update(TASK_WORKTREE=str(ROOT), XDG_STATE_HOME=str(home / "lane-state"))
     for suite in sorted(SUITES):
         if suite == "claude-managed-install-test.py":
             # Exercise the actual deployed-hook calling block without running
