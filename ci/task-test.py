@@ -4130,6 +4130,67 @@ store.write_text(json.dumps(prs))
         self.assertIn("claude-final", log)
         self.assertIn("lane: finished (exit 3)", self.raw_task("status", "proj"))
 
+    def test_claude_worker_cleans_temp_before_publishing_finished(self):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / ".work"
+        (work / "prompt.md").write_text("task\n")
+        record = work / "lane.json"
+        record.write_text(json.dumps({"state": "running", "pid": os.getpid()}))
+        publish = TASK_MODULE.atomic_json
+        terminal = []
+
+        def observe(path, run):
+            if path == record and run["state"] == "finished":
+                # Observe at the publication boundary, with no polling or sleeps.
+                self.assertFalse(Path(run["temporary"]).exists())
+                terminal.append(run.copy())
+            publish(path, run)
+
+        args = SimpleNamespace(repo=str(self.repo), id="5", builder="claude", tier=None,
+                               model="opus", no_boost=True, _worker=True, timeout=None)
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, "HOME", self.home), \
+                mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
+            self.assertEqual(TASK_MODULE.lane(args), 0)
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(json.loads(record.read_text())["state"], "finished")
+
+    def test_lane_finalization_cleanup_order_and_failure(self):
+        record = self.home / "lane.json"
+        root = self.home / "claude-temp"
+        root.mkdir()
+        for state in ("finished", "timed_out", "cancelled", "interrupted"):
+            for missing in ("neither", "inner", "outer"):
+                with self.subTest(state=state, missing=missing):
+                    outer = root / "lane-12345678"
+                    outer.mkdir(mode=0o700, exist_ok=True)
+                    temporary = outer / "lane-87654321"
+                    temporary.mkdir(mode=0o700)
+                    if missing == "inner":
+                        temporary.rmdir()
+                    elif missing == "outer":
+                        shutil.rmtree(outer)
+                    run = {"state": "running", "temporary": str(temporary)}
+                    record.write_text(json.dumps(run))
+                    publish = TASK_MODULE.atomic_json
+
+                    def observe(path, value):
+                        self.assertFalse(temporary.exists())
+                        self.assertEqual(json.loads(record.read_text())["state"], "running")
+                        publish(path, value)
+
+                    with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
+                            mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
+                        TASK_MODULE.finalize_lane_record(record, run, state)
+                    self.assertEqual(json.loads(record.read_text())["state"], state)
+            for error in (PermissionError("denied"), TASK_MODULE.Stop("unsafe path")):
+                with self.subTest(state=state, error=type(error).__name__), \
+                        mock.patch.object(TASK_MODULE, "cleanup_lane_temporary", side_effect=error), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    TASK_MODULE.finalize_lane_record(record, {}, state)
+                    self.assertEqual(json.loads(record.read_text())["state"], state)
+
     def test_claude_lane_accepts_opus_and_records_selected_model(self):
         self.stub_models()
         self.raw_task("start", "proj", "5", "--builder", "claude")

@@ -1391,6 +1391,18 @@ def cleanup_lane_temporary(temporary):
             pass  # An outer lane may finish concurrently.
 
 
+def finalize_lane_record(path, run, state, **fields):
+    # A terminal record is the completion signal to waiters and batch runners.
+    # Cleanup must precede publication, but a cleanup failure must not hide exit.
+    try:
+        cleanup_lane_temporary(run.get("temporary"))
+    except (OSError, Stop) as error:
+        print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
+    finally:
+        run.update(state=state, ended_at=utc_now(), **fields)
+        atomic_json(path, run)
+
+
 def private_claude_lane(path, root):
     if path.parent != root or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
         return False
@@ -1629,16 +1641,13 @@ def lane(args):
                     code = child.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    run.update(state="timed_out", exit_code=None, ended_at=utc_now())
-                    atomic_json(lane_record, run)
-                    cleanup_lane_temporary(temporary)
+                    finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
-        atomic_json(lane_record, run)
-        cleanup_lane_temporary(temporary)
+        finalize_lane_record(lane_record, run, "timed_out" if timed_out else "finished",
+                             exit_code=None if timed_out else code)
     return code
 
 
@@ -4141,14 +4150,11 @@ def cancel(args):
         try:
             os.killpg(int(lane_run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, PermissionError) as error:
-            lane_run.update(state="interrupted", ended_at=utc_now())
-            atomic_json(lane_path, lane_run)
+            finalize_lane_record(lane_path, lane_run, "interrupted")
             reason = "could not stop (permission denied)" if isinstance(error, PermissionError) else "already stopped"
             print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
             return 0
-        lane_run.update(state="cancelled", ended_at=utc_now())
-        atomic_json(lane_path, lane_run)
-        cleanup_lane_temporary(lane_run.get("temporary"))
+        finalize_lane_record(lane_path, lane_run, "cancelled")
         print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
         return 0
     run_path = task_state(task) / "run.json"
@@ -4424,8 +4430,7 @@ def repair(args):
             except (OSError, ValueError):
                 lane_run = {}
             if lane_run.get("state") == "running" and not pid_alive(lane_run.get("pid")):
-                lane_run.update(state="interrupted", ended_at=utc_now())
-                atomic_json(lane_path, lane_run)
+                finalize_lane_record(lane_path, lane_run, "interrupted")
                 print(f"Repaired interrupted lane: {repo.name}/{task.id}")
             lock = task_state(task) / "run.lock"
             had_lock = lock.exists()
