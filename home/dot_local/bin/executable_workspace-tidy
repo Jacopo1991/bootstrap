@@ -8,7 +8,8 @@ Removes only what is provably finished and nothing else:
   every other ignored file (logs, .bash_profile, *.egg-info, ...) are archived first, with
   relative paths preserved, under ~/.local/state/task/archive/<repo>/<worktree>/. An ignored
   file that looks like a secret (.env, .env.*, *.pem, *.key, id_rsa*, id_ed25519*, anything
-  under secrets/) is never copied and keeps the worktree in place;
+  under secrets/), anywhere including .work and .claude, is never copied and keeps the
+  worktree in place; the size of ignored files is not a condition;
 - local branches whose commits, including their reflog, are all in the default branch.
 - Codex app worktrees under `$CODEX_HOME/worktrees` that are clean and whose branch is merged
   or whose detached commit is reachable from a default branch.
@@ -53,7 +54,6 @@ REBUILDABLE = {"node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", 
                ".tox", ".parcel-cache", "target"}
 # Ignored files that look like secrets are never copied; any path part may match.
 SECRET_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*", "secrets")
-ARCHIVE_LIMIT = 200 * 1024 ** 2    # more ignored data than this stays where it is
 IN_PROGRESS = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD", "REVERT_HEAD",
                "BISECT_LOG")
 
@@ -148,6 +148,21 @@ def secret_looking(parts: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatch(part.lower(), pattern) for part in parts for pattern in SECRET_PATTERNS)
 
 
+def secret_in(path: Path, relative: Path) -> str | None:
+    """Why an ignored entry holds a secret-looking file; walks the whole entry, caches included."""
+    if secret_looking(relative.parts):
+        return f"ignored file that looks like a secret: {relative}"
+    full = path / relative
+    if full.is_symlink() or not full.is_dir():
+        return None
+    for root, dirs, files in os.walk(full):
+        base = Path(root).relative_to(path)
+        for name in dirs + files:
+            if secret_looking((base / name).parts):
+                return f"ignored file that looks like a secret: {base / name}"
+    return None
+
+
 def collect_ignored(path: Path, relative: Path, found: list[Path]) -> str | None:
     """Add the files under an ignored entry to `found`; return why they cannot be archived."""
     if secret_looking(relative.parts):
@@ -193,10 +208,17 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path],
             continue
         parts = Path(item[3:].rstrip("/")).parts
         if item[:3] in ("!! ", "?? ") and parts and parts[0] == ".claude":
-            continue  # session-local settings and transcripts are disposable
+            # session-local settings and transcripts are disposable, unless they hold a secret
+            problem = secret_in(path, Path(*parts)) if item.startswith("!! ") else None
+            if problem:
+                return problem
+            continue
         if not item.startswith("!! "):
             return "uncommitted or untracked changes"
         if parts and parts[0] == ".work":
+            problem = secret_in(path, Path(*parts))   # .work is archived whole
+            if problem:
+                return problem
             continue
         if any(part in REBUILDABLE for part in parts):
             continue
@@ -205,8 +227,6 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path],
         problem = collect_ignored(path, Path(*parts), archivable)
         if problem:
             return problem
-    if sum((path / name).lstat().st_size for name in archivable or ()) > ARCHIVE_LIMIT:
-        return "ignored files over 200 MB"
     flags = git(path, "ls-files", "-v").stdout.splitlines()
     sparse = git(path, "config", "--bool", "core.sparseCheckout").stdout.strip() == "true"
     if any(line[:1].islower() or (line[:1] == "S" and not sparse) for line in flags):

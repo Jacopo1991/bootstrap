@@ -280,6 +280,28 @@ class Safety(unittest.TestCase):
         self.assertEqual(self.archive_files(), [], "nothing is copied when a secret blocks removal")
         self.assertTrue({"with-env", "with-secrets"} <= self.branches())
 
+    def test_secrets_under_work_and_claude_keep_the_worktree_and_are_never_copied(self):
+        self.ignore(".claude/")
+        work = self.worktree("work-env", "-b", "work-env")
+        (work / ".work").mkdir()
+        (work / ".work/report.md").write_text("evidence")
+        (work / ".work/.env").write_text("TOKEN=hunter2")
+        claude = self.worktree("claude-secret", "-b", "claude-secret")
+        (claude / ".claude/secrets").mkdir(parents=True)
+        (claude / ".claude/secrets/token").write_text("hunter2")
+        for path in (work, claude):
+            age(path)
+        out = self.tidy(apply=False)
+        self.assertNotIn("would be removed", out)
+        out = self.tidy()
+        self.assertEqual((work / ".work/.env").read_text(), "TOKEN=hunter2", out)
+        self.assertEqual((work / ".work/report.md").read_text(), "evidence", out)
+        self.assertEqual((claude / ".claude/secrets/token").read_text(), "hunter2", out)
+        self.assertEqual(out.count("looks like a secret"), 2, out)
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(self.archive_files(), [], "no .work archive when a secret blocks removal")
+        self.assertTrue({"work-env", "claude-secret"} <= self.branches())
+
     def test_other_blockers_still_keep_a_worktree_with_ignored_files(self):
         self.ignore("logs/")
         dirty = self.worktree("dirty-logs", "-b", "dirty-logs")
