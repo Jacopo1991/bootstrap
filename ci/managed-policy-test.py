@@ -240,6 +240,123 @@ spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/a
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
+# Script and recipe controls inspect inert fixture text; no denied command runs.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    def judge(command):
+        return policy.evaluate({"tool_name": "Bash", "cwd": temp,
+                                "tool_input": {"command": command}}, (root,))
+
+    def fixture(name, body):
+        path = root / name
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def fixture_git(*args):
+        return subprocess.run(["git", *args], cwd=root, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    fixture_git("init", "-q", "-b", "main")
+    fixture_git("config", "user.name", "Policy Fixture")
+    fixture_git("config", "user.email", "policy@example.invalid")
+    fixture("justfile", "check:\n    env -i PATH=\"$PATH\" bash ci/lint.sh\n")
+    fixture("Makefile", "check:\n\t$(CC) app.c\n")
+    fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+    fixture_git("add", ".")
+    fixture_git("commit", "-qm", "base recipes")
+    fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
+    fixture_git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    fixture_git("checkout", "-qb", "lane")
+    for command in ("just check", "make check", "npm run check", "pnpm run check"):
+        assert judge(command) is None, (command, judge(command))
+    fixture("allowed.sh", "#!/bin/sh\n# Plain commands keep working.\necho safe\npwd\n")
+    fixture("denied.sh", "#!/bin/bash\ngit clone https://example.invalid/repo stolen\n")
+    fixture("nested.sh", "bash denied.sh\n")
+    fixture("sourced.sh", ". ./denied.sh\n")
+    for command in ("bash allowed.sh", "sh -- allowed.sh", "zsh allowed.sh",
+                    "dash -- allowed.sh", "./allowed.sh", str(root / "allowed.sh"),
+                    "source ./allowed.sh", ". ./allowed.sh", "env timeout 3 bash allowed.sh"):
+        assert judge(command) is None, (command, judge(command))
+    for name in ("denied.sh", "nested.sh", "sourced.sh"):
+        for command in (f"bash {name}", f"./{name}", f". ./{name}", f"source ./{name}"):
+            assert judge(command), command
+    for body in ("sudo true\n", "echo ok; git clone x y\n", "bash -c true\n",
+                 "for x in a; do echo x; done\n", "echo $(id)\n", "$PROGRAM\n",
+                 "echo ok\\\n; sudo true\n",
+                 "pushd child\necho safe\n", "hash -p ./denied.sh echo\necho safe\n",
+                 "noglob sudo true\n", "repeat 2 sudo true\n",
+                 ">out sudo true\n",
+                 "f() { sudo true; }\nf\n", "#!/usr/bin/python3\nprint('safe')\n",
+                 ". ./cycle.sh\n"):
+        fixture("cycle.sh", body)
+        assert judge("bash cycle.sh"), body
+    (root / "binary").write_bytes(b"\x7fELF\x00fixture")
+    (root / "alias.sh").symlink_to(root / "denied.sh")
+    fixture("bash", "sudo true\n")
+    fixture("custom-shell.sh", f"#!{root}/bash\necho safe\n")
+    (root / "git-alias").symlink_to("/usr/bin/git")
+    os.mkfifo(root / "fifo")
+    for command in ("bash missing.sh", "./missing.sh", "bash binary", "./binary",
+                    "bash alias.sh", "bash fifo", "sh -s", "bash", "bash --rcfile allowed.sh",
+                    "source allowed.sh", "./bash allowed.sh", "./custom-shell.sh",
+                    "./git-alias clone x y"):
+        assert judge(command), command
+    (root / "child").mkdir()
+    fixture("cd.sh", "cd child\necho safe\n")
+    assert judge("bash cd.sh") is None
+    assert judge(". ./cd.sh")
+    fixture("cd.sh", "cd child\nbash ../denied.sh\n")
+    assert judge("bash cd.sh")
+    for command in ("touch allowed.sh; bash allowed.sh",
+                    "printf safe > allowed.sh; ./allowed.sh",
+                    "cp denied.sh allowed.sh; source ./allowed.sh"):
+        assert judge(command), command
+    with patch.object(policy, "program_text", side_effect=PermissionError):
+        assert judge("bash allowed.sh")
+    fixture("huge.sh", "x" * (policy.PROGRAM_LIMIT + 1))
+    assert judge("./huge.sh")
+    fixture("justfile", "check:\n    git clone https://example.invalid/repo stolen\n")
+    assert judge("just check")
+    fixture_git("add", "justfile")
+    assert judge("just check")  # staged
+    fixture_git("commit", "-qm", "changed recipe")
+    assert judge("just check")  # committed on lane, still changed from merge base
+    fixture("justfile", "check: prep\n    bash allowed.sh\nprep:\n    echo safe\n")
+    assert judge("just check") is None
+    fixture("justfile", "check: prep\n    echo safe\nprep:\n    bash denied.sh\n")
+    assert judge("just check")
+    for body in ("check:\n    just check\n", "import 'extra.just'\ncheck:\n    echo safe\n",
+                 "set shell := ['bash', '-c']\ncheck:\n    echo safe\n",
+                 "check arg:\n    {{arg}}\n", "check:\n    echo `id`\n",
+                 "check:\n    -sudo true\n", "check:\n    @-git clone x y\n",
+                 "check:\n    #!/usr/bin/python3\n    print('safe')\n"):
+        fixture("justfile", body)
+        assert judge("just check"), body
+    fixture("justfile", "check:\n    echo safe\n")
+    for command in ("just --justfile other check", "just --shell evil check",
+                    "just check x=y", "make -f other", "npm run --prefix other check",
+                    "pnpm run --filter other check", "yarn run check", "bun run check",
+                    "npm --prefix other run check", "pnpm --dir other run check", "pnpm check",
+                    "JUST_DOTENV_COMMAND=evil just check", "JUST_JUSTFILE=other just check",
+                    "MAKEFLAGS=evil make check", "npm_config_script_shell=evil npm run check"):
+        assert judge(command), command
+    for name, command in ((".env", "just check"), (".npmrc", "npm run check"),
+                          (".pnpmfile.cjs", "pnpm run check")):
+        fixture(name, "fixture=changed\n")
+        assert judge(command), (name, command)
+        (root / name).unlink()
+    fixture("Makefile", "check:\n\techo safe\n")
+    assert judge("make check")  # No partial Make parser.
+    fixture("package.json", '{"scripts":{"check":"echo safe","precheck":"bash denied.sh"}}')
+    for command in ("npm run check", "pnpm run check"):
+        assert judge(command), command
+    fixture("package.json", '{"scripts":{"check":"bash allowed.sh","precheck":"echo ready"}}')
+    assert judge("npm run check") is None
+    fixture_git("update-ref", "-d", "refs/remotes/origin/main")
+    assert judge("just check")  # No merge-base trust without a base.
+    print("PASS: recursive scripts and changed recipes denied; allowed scripts and base recipes pass")
+
 # #76: entering a scratch Git repository must not move the task boundary.
 with tempfile.TemporaryDirectory() as temp:
     base = Path(temp)
@@ -284,9 +401,9 @@ with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "
 with tempfile.TemporaryDirectory() as temp:
     root = Path(temp)
     for command in (
-            "task merge proj 5", "/usr/local/bin/task review proj 5",
+            "task merge proj 5",
             "python3 /home/agent/dev_workspace/bootstrap/home/dot_local/bin/executable_task close proj 5",
-            "sh /usr/local/bin/task start proj 5", "env task note proj 5 improve x",
+            "env task note proj 5 improve x",
             "task cancel proj 5", "task denials", "task lane proj 5",
             "task review proj 5 --record review.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
@@ -298,6 +415,7 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("task status proj", "task check", "task runner-check proj runner.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     assert policy.evaluate_command("echo see task start for details", temp, root, (root,)) is None
+    assert policy.evaluate_command("sh /usr/local/bin/task start proj 5", temp, root, (root,))
     state_target = str(Path.home() / ".local/state/task/proj/t5/review.json")
     assert policy.evaluate_command(f"printf x > {state_target}", temp, root, (root,))
     assert policy.evaluate({"tool_name": "Write", "cwd": temp,

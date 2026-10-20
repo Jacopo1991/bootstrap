@@ -48,7 +48,11 @@ ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 UNSAFE_ENV_PREFIXES = ("GIT_", "GH_", "LD_", "DYLD_", "BASH_", "PYTHON", "PERL", "RUBY")
 UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "VISUAL",
                     "NODE_OPTIONS", "NODE_PATH", "SSH_ASKPASS", "GITHUB_TOKEN",
-                    "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS"}
+                    "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "MAKEFLAGS", "MFLAGS", "MAKEFILES",
+                    "JUSTFILE", "JUST_SHELL", "JUST_SHELL_ARG", "JUST_WORKING_DIRECTORY",
+                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND",
+                    "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
+                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
 INTERPRETERS = {"bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "python",
                 "node", "nodejs", "deno", "bun", "ruby", "perl", "php", "lua"}
 INLINE_FLAG = re.compile(r"^-[A-Za-z]{1,4}$")
@@ -1536,13 +1540,236 @@ def network_command(head: str, tokens: list[str], cwd: str) -> bool:
     return False
 
 
+SHELL_PROGRAMS = {"bash", "sh", "zsh", "dash"}
+INDIRECTION_DEPTH = 8
+PROGRAM_LIMIT = 128 * 1024
+
+
+def program_text(path: Path) -> str:
+    """Bound reads, including special files, before interpreting any source."""
+    with open(path, "rb", buffering=0, opener=lambda p, flags: os.open(
+            p, flags | os.O_NONBLOCK)) as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError("not a regular file")
+        data = stream.read(PROGRAM_LIMIT + 1)
+    if len(data) > PROGRAM_LIMIT or any(c == 127 or c < 32 and c not in (9, 10, 13) for c in data):
+        raise ValueError("binary or oversized file")
+    return data.decode("utf-8")
+
+
+def judge_program(text: str, cwd: str, root: Path,
+                  approved_roots: tuple[Path, ...] | None, depth: int,
+                  allow_cd: bool = True) -> str | None:
+    # This deliberately accepts a small shell language. Do not interpret another
+    # language as shell, expand variables, execute a parser, or discard unknown syntax.
+    lines = text.splitlines()
+    if lines and lines[0].startswith("#!"):
+        interpreter = shlex.split(lines[0][2:])
+        if interpreter[:1] == ["/usr/bin/env"] and len(interpreter) == 2:
+            interpreter = ["/usr/bin/" + interpreter[1]]
+        if len(interpreter) != 1 or interpreter[0] not in {
+                f"{directory}/{shell}" for directory in ("/bin", "/usr/bin")
+                for shell in SHELL_PROGRAMS}:
+            return "Script interpreter cannot be judged safely."
+    body = "\n".join(line for line in lines if line.strip() and not line.lstrip().startswith("#"))
+    if re.search(r"[$`*?{}\[\]#]", body) or "\\\n" in body:
+        return "Script expansion or syntax cannot be judged safely."
+    # source changes the caller's cwd, while recipe lines may run in separate
+    # shells. Do not pretend to propagate that state across those boundaries.
+    split = split_command(body)
+    if isinstance(split, str):
+        return split
+    for segment in split[0]:
+        tokens = unwrap_command(shlex.split(segment))
+        if isinstance(tokens, str):
+            return tokens
+        if tokens and re.match(r"\d*[<>]", tokens[0]):
+            return "Script leading redirections cannot be judged safely."
+        if tokens and (not allow_cd and tokens[0] == "cd" or tokens[0].endswith("()")):
+            return "Script cwd changes and functions cannot be judged safely."
+        if tokens and tokens[0] in {
+                "pushd", "popd", "hash", "rehash", "enable", "disable", "autoload",
+                "emulate", "zmodload", "noglob", "nocorrect", "repeat", "foreach", "end", "-"}:
+            return "Script shell state or command modifiers cannot be judged safely."
+    return evaluate_command(body, cwd, root, approved_roots, depth)
+
+
+def script_reason(tokens: list[str], cwd: str, root: Path,
+                  approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
+    head = Path(tokens[0]).name.lower()
+    path = None
+    if "/" in tokens[0]:
+        path = Path(cwd) / tokens[0]
+        try:
+            resolved = path.resolve()
+            # Installed commands retain their existing argument checks. Workspace
+            # files with the same basename must not inherit that trust.
+            if resolved.parent in {Path("/usr/bin"), Path("/usr/local/bin")}:
+                info = resolved.stat()
+                # Sandboxes may map root ownership to an overflow uid.
+                if (info.st_uid != os.geteuid() or info.st_uid == 0) and not info.st_mode & 0o022:
+                    if (path.parent not in {Path("/bin"), Path("/usr/bin"), Path("/usr/local/bin")}
+                            and head != resolved.name and not {head, resolved.name} <= SHELL_PROGRAMS):
+                        return "Executable aliases cannot be judged safely."
+                    path = None
+        except (OSError, ValueError, RuntimeError):
+            return "Script cannot be read or judged safely."
+    if path is None and head in SHELL_PROGRAMS:
+        args = tokens[1:]
+        while args and args[0] in {"-e", "-u", "-eu", "-ue", "-x", "--"}:
+            option, *args = args
+            if option == "--":
+                break
+        if not args or args[0].startswith("-"):
+            return "Shell program requires a readable literal script and supported options."
+        path = Path(cwd) / args[0]
+    elif path is None and (head == "source" or tokens[0] == "."):
+        if len(tokens) != 2 or "/" not in tokens[1]:
+            return "Sourced files require one explicit literal path."
+        path = Path(cwd) / tokens[1]
+    if path is None:
+        return None
+    if depth >= INDIRECTION_DEPTH:
+        return "Script/recipe recursion limit reached."
+    if SHELL_EXPANSION.search(str(path)):
+        return "Script path must be literal."
+    try:
+        return judge_program(program_text(path), cwd, root, approved_roots, depth + 1,
+                             allow_cd=head != "source" and tokens[0] != ".")
+    except (OSError, ValueError, RuntimeError):
+        return "Script cannot be read or judged safely."
+
+
+def recipe_changed(path: Path, root: Path) -> bool:
+    """Compare the working file (including untracked files) to the merge base."""
+    relative = path.relative_to(root).as_posix()
+    default = _read_git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    base = _read_git(root, "merge-base", "HEAD", default)
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base):
+        raise ValueError("missing merge base")
+    entry = _read_git(root, "ls-tree", base, "--", relative)
+    if not entry:
+        return True
+    if not entry.startswith(("100644 blob ", "100755 blob ")):
+        raise ValueError("recipe is not a regular tracked file")
+    result = policy_subprocess(
+        ["git", "diff", "--no-ext-diff", "--no-textconv", "--quiet", base, "--", relative],
+        cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, timeout=3)
+    if result.returncode not in {0, 1}:
+        raise ValueError("cannot compare recipe")
+    return result.returncode == 1
+
+
+def recipe_reason(tokens: list[str], cwd: str, root: Path,
+                  approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
+    runner = Path(tokens[0]).name.lower()
+    names = {"just": ("justfile", "Justfile", ".justfile"),
+             "make": ("GNUmakefile", "makefile", "Makefile"),
+             "gmake": ("GNUmakefile", "makefile", "Makefile"),
+             "npm": ("package.json",), "pnpm": ("package.json",)}
+    if runner not in names:
+        if runner in {"yarn", "bun", "npx"}:
+            return "Recipe runner cannot be judged reliably."
+        return None
+    args = tokens[1:]
+    if runner in {"npm", "pnpm"}:
+        if args and args[0] in {"install", "ci", "add", "remove", "uninstall", "update",
+                               "outdated", "audit", "list", "ls", "view", "info", "exec",
+                               "dlx", "--version", "--help"}:
+            return None  # Package operations/exec remain separate residual paths.
+        if not args or args[0] not in {"run", "run-script", "test", "start", "stop", "restart"}:
+            return "Package runner shorthand and global options cannot be judged reliably."
+        args = args[1:] if args[0] in {"run", "run-script"} else args
+    if any(not re.fullmatch(r"[A-Za-z0-9_.:-]+", arg) or arg.startswith("-") for arg in args):
+        return "Recipe options, overrides and parameters cannot be judged safely."
+    if depth >= INDIRECTION_DEPTH:
+        return "Script/recipe recursion limit reached."
+    try:
+        directory = Path(cwd).resolve()
+        while True:
+            candidates = [directory / name for name in names[runner] if (directory / name).exists()]
+            if (candidates or runner not in {"just", "npm"} or directory == root
+                    or root not in directory.parents):
+                break
+            directory = directory.parent
+        if len(candidates) != 1:
+            return "Cannot identify one recipe definition safely."
+        path = candidates[0]
+        if path.is_symlink() or not path.resolve().is_relative_to(root):
+            return "Recipe definition must be a regular file in the current repository."
+        text = program_text(path)
+        # Local runner settings can replace the shell or load executable hooks,
+        # independently of an unchanged recipe file.
+        config_names = (".npmrc", ".pnpmfile.cjs", "pnpm-workspace.yaml") if runner in {
+            "npm", "pnpm"} else (".env",) if runner == "just" else ()
+        config_directory = directory
+        has_config = False
+        while True:
+            for name in config_names:
+                config = config_directory / name
+                if config.exists():
+                    has_config = True
+                    if config.is_symlink() or recipe_changed(config, root):
+                        return "Changed runner configuration cannot be judged reliably."
+            if config_directory == root or root not in config_directory.parents:
+                break
+            config_directory = config_directory.parent
+        # These can import definitions that changed independently of this file.
+        if runner == "just" and re.search(r"(?m)^\s*(?:import|mod)\b", text):
+            return "Just imports and modules cannot be judged reliably."
+        if runner in {"make", "gmake"} and re.search(r"(?m)^\s*(?:-?include|sinclude)\b", text):
+            return "Make includes cannot be judged reliably."
+        if not recipe_changed(path, root):
+            return None
+        if has_config:
+            return "Changed recipes with runner configuration cannot be judged reliably."
+        if runner in {"make", "gmake"}:
+            return "Changed Make definitions cannot be judged reliably."
+        if runner in {"npm", "pnpm"}:
+            package = json.loads(text)
+            scripts = package.get("scripts", {}) if isinstance(package, dict) else None
+            if not isinstance(scripts, dict) or not all(isinstance(body, str) for body in scripts.values()):
+                return "Package scripts cannot be judged safely."
+            bodies = list(scripts.values())  # Includes lifecycle hooks, not just the named script.
+        else:
+            bodies = []
+            body = []
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                if line[0].isspace():
+                    if not bodies:
+                        return "Just recipe body without a literal header."
+                    command = line.lstrip().removeprefix("@")
+                    if command.startswith(("-", "+", "@")):
+                        return "Just command prefixes cannot be judged reliably."
+                    body.append(command)
+                elif line.startswith("#"):
+                    continue
+                elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*:\s*(?:[A-Za-z_][A-Za-z0-9_-]*\s*)*", line):
+                    body = []
+                    bodies.append(body)
+                else:
+                    return "Changed Just syntax cannot be judged reliably."
+            bodies = ["\n".join(body) for body in bodies]
+        for body in bodies:
+            reason = judge_program(body, str(directory), root, approved_roots, depth + 1,
+                                   allow_cd=False)
+            if reason:
+                return reason
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return "Recipe definition or merge base cannot be read safely."
+    return None
+
+
 def evaluate_command(command: str, cwd: str, root: Path,
-                     approved_roots: tuple[Path, ...] | None) -> str | None:
+                     approved_roots: tuple[Path, ...] | None, depth: int = 0) -> str | None:
     repeat = re.fullmatch(
         r"for [A-Za-z_][A-Za-z0-9_]* in (?:\$\(seq 1 [0-9]+\)|\{1\.\.[0-9]+\});\s*do (.+?);\s*done\s*",
         command)
     if repeat:
-        return evaluate_command(repeat[1], cwd, root, approved_roots)
+        return evaluate_command(repeat[1], cwd, root, approved_roots, depth)
     if "$(" in command or "`" in command:
         return "Dynamic ($(...), backtick) shell commands are blocked."
     loop = re.fullmatch(r"for ([A-Za-z_][A-Za-z0-9_]*) in (.+?);\s*do (.+?);\s*done\s*", command)
@@ -1562,7 +1789,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
             for value in operands:
                 expanded = body.replace("${" + variable + "}", shlex.quote(value)).replace(
                     "$" + variable, shlex.quote(value))
-                reason = evaluate_command(expanded, cwd, root, approved_roots)
+                reason = evaluate_command(expanded, cwd, root, approved_roots, depth)
                 if reason:
                     return reason
             return None
@@ -1742,19 +1969,31 @@ def evaluate_command(command: str, cwd: str, root: Path,
         if (unwrapped and head == "git" and position > 0
                 and git_subcommand(unwrapped, effective) in STATE_DEPENDENT_GIT and seen_changing):
             return STATE_CHAIN_MESSAGE
-        reason = evaluate_segment(tokens, effective, root, approved_roots)
+        indirect = head in SHELL_PROGRAMS | {"source", "", "just", "make", "gmake", "npm", "pnpm",
+                                           "yarn", "bun", "npx"}
+        if unwrapped and "/" in unwrapped[0]:
+            try:
+                indirect |= (Path(effective) / unwrapped[0]).resolve().parent not in {
+                    Path("/usr/bin"), Path("/usr/local/bin")}
+            except (OSError, ValueError, RuntimeError):
+                return "Script path cannot be resolved safely."
+        if seen_changing and indirect:
+            return "Run scripts and recipes separately from commands that may change their definitions."
+        reason = evaluate_segment(tokens, effective, root, approved_roots, depth)
         if reason:
             return reason
         if unwrapped:
             sub = git_subcommand(unwrapped, effective) if head == "git" else None
-            if not (head in READ_ONLY_COMMANDS or head == "sed" and readonly_sed(unwrapped)
+            redirects = any(token in {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+                            for token in tokens)
+            if redirects or not (head in READ_ONLY_COMMANDS or head == "sed" and readonly_sed(unwrapped)
                     or sub in READ_ONLY_GIT or pure_lookup(unwrapped)):
                 seen_changing = True
     return None
 
 
 def evaluate_segment(tokens: list[str], cwd: str, root: Path,
-                     approved_roots: tuple[Path, ...] | None) -> str | None:
+                     approved_roots: tuple[Path, ...] | None, depth: int = 0) -> str | None:
     """Apply the single-command rules to one chain segment (wrappers already vetted)."""
     unwrapped = unwrap_command(tokens)
     if isinstance(unwrapped, str):
@@ -1763,7 +2002,7 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if not tokens:
         return None
     executable = Path(tokens[0]).name.lower()
-    if executable in SHELL_CONSTRUCTS or tokens[0].startswith(("(", "{")) or any(
+    if executable in SHELL_CONSTRUCTS - {"source", "."} or tokens[0].startswith(("(", "{")) or any(
             tokens[i] in {"<", ">", ">>"} and tokens[i + 1].startswith("(")
             for i in range(len(tokens) - 1)):
         return "Shell constructs (eval, source, export, subshells, loops, process substitution) are blocked."
@@ -1813,6 +2052,12 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
         else:
             command_tokens.append(token)
     tokens = command_tokens
+    reason = script_reason(tokens, cwd, root, approved_roots, depth)
+    if reason:
+        return Denial("command.script", reason)
+    reason = recipe_reason(tokens, cwd, root, approved_roots, depth)
+    if reason:
+        return Denial("command.recipe", reason)
     args = [t for t in tokens[1:] if not t.startswith("-")]
     targets: list[str] = []
     inspected: list[str] = []

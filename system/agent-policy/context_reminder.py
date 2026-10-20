@@ -24,6 +24,7 @@ PROMPT_REMINDER = "\n".join((
     "tests or writes in the same call; git/gh network commands (fetch, pull, push, gh ...) never chained.",
     "- Verification: use the verify-ui skill only when the task has a UI to verify.",
     "- Anything under .github or GitHub settings: read the github-ci skill first.",
+    "- Running a denied command through a script, recipe or any indirection is the same bypass; stop and report instead.",
 ))
 
 WORKFLOW_REMINDER = (

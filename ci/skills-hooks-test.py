@@ -254,6 +254,8 @@ class Reminder(unittest.TestCase):
                        "git/gh network commands", "on their own", "git -C <path>", "verify-ui", "github-ci",
                        ".github"):
             self.assertIn(needle, text)
+        self.assertEqual(text.splitlines()[-1],
+                         "- Running a denied command through a script, recipe or any indirection is the same bypass; stop and report instead.")
 
     def test_prompt_text_is_never_echoed(self):
         out = hook({"hook_event_name": "UserPromptSubmit", "prompt": "SECRET-PROMPT-TEXT"})
