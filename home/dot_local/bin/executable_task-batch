@@ -17,7 +17,8 @@ from task_limits import cli_limit, lane_limit
 TASK_LINE = re.compile(
     r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
     r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
-    r"(?:,\s*no-verify:\s*(.*))?\s*$")
+    r"(?:\b.*)?$")
+NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
 HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
                "Execution stopped by PreToolUse hook")
 BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end your final reply "
@@ -60,9 +61,11 @@ def parse(source):
             if re.fullmatch(r"\s*```\s*", line):
                 in_rules = False
             continue
-        match = TASK_LINE.match(line)
+        no_verify_field = NO_VERIFY.search(line)
+        match = TASK_LINE.match(NO_VERIFY.sub("", line))
         if match:
-            ident, builder, model, seed, after, no_verify = match.groups()
+            ident, builder, model, seed, after = match.groups()
+            no_verify = no_verify_field[1].strip() if no_verify_field else None
             if no_verify is not None and not no_verify.strip():
                 raise Stop("no-verify needs a nonempty reason")
             current = dict(id=ident, builder=builder.lower(), model=model,

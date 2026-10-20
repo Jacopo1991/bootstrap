@@ -653,7 +653,7 @@ def local_only_merge(arguments: list[str], target: Path, current: str) -> str | 
 
 def git_merge_preview(arguments: list[str], target: Path) -> str | None:
     """Read-only merge preview: git merge-tree --write-tree [--name-only] HEAD <source>, where
-    <source> is what git merge would accept here (origin/<default>, or main without a remote)."""
+    <source> is what git merge would accept here (origin/<default>, or the allowed local main)."""
     names = [argument for argument in arguments if argument != "--name-only"]
     if (len(arguments) - len(names) > 1 or len(names) != 3
             or names[0] != "--write-tree" or names[1] != "HEAD"):
@@ -688,7 +688,8 @@ def git_default_branch_merge(arguments: list[str], target: Path,
             source, label = prefix + own, "its own origin branch"
         elif arguments in ([wanted], ["--no-edit", wanted]):
             source, label = default, "the origin default ref"
-        elif arguments == ["main"] and name == "main" and not preview:
+        elif name == "main" and (arguments == ["main"]
+                                or (preview and arguments == ["--no-edit", "main"])):
             source, label = "refs/heads/main", "the local default ref"
         else:
             return ("Only git merge [--no-edit] origin/<default branch>, plain git merge main "

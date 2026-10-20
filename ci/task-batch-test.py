@@ -226,7 +226,7 @@ class BatchTest(unittest.TestCase):
         self.assertEqual(len(self.calls('start')), 1)
         self.assertNotIn('STALE', self.prompts()[0]['prompt'])
 
-    def test_setup_72_resume_old_blocked_final_relaunches(self):
+    def test_setup_72_resume_previous_finished_lane_blocked_final_relaunches(self):
         subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
                        env=self.env, check=True, capture_output=True)
         work = self.repo / '.worktrees/one/.work'
@@ -265,6 +265,28 @@ class BatchTest(unittest.TestCase):
         self.run_batch()
         self.assertEqual(self.calls('start')[0][-2:],
                          ['--no-verify', 'gate is its verification, no separate command'])
+
+    def test_setup_68_parse_preserves_trailing_text_and_optional_field_positions(self):
+        for suffix, reason, seed, after in (
+                (', note here', None, None, None),
+                (' some free text', None, None, None),
+                (', seed pinned, after: previous, note here', None, 'pinned', 'previous'),
+                (', note here, no-verify: manual check', 'manual check', None, None),
+                (', no-verify: manual check, seed pinned, after: previous, note here',
+                 'manual check', 'pinned', 'previous'),
+                (', seed pinned, no-verify: manual check, after: previous',
+                 'manual check', 'pinned', 'previous'),
+                (', seed pinned, after: previous, note here, no-verify: manual check',
+                 'manual check', 'pinned', 'previous'),
+                (', no-verify: manual check, with notes', 'manual check, with notes', None, None)):
+            with self.subTest(suffix=suffix):
+                self.source.write_text('1. docs: builder codex, model gpt-6-luna' + suffix + '\n')
+                task = batch_module.parse(self.source)[0]
+                self.assertEqual((task['no_verify'], task['seed'], task['after']),
+                                 (reason, seed, after))
+        self.source.write_text('1. docs: builder codex, model gpt-6-luna, note here, no-verify: \n')
+        with self.assertRaisesRegex(batch_module.Stop, 'nonempty reason'):
+            batch_module.parse(self.source)
 
     def test_setup_71_fix_prompts_require_edit_tools_and_origin_main(self):
         self.scenario({'check': [{'code': 1}, {}]})

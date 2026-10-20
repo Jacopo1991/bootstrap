@@ -61,9 +61,12 @@ with tempfile.TemporaryDirectory() as temporary:
                     allowed(executable + " merge " + middle + "origin/" + default)
                 if default == "main":
                     allowed(executable + " merge main")
+                    allowed(executable + " merge-tree --write-tree HEAD main")
+                    allowed(executable + " merge-tree --write-tree --name-only HEAD main")
                 else:
                     denied(executable + " merge " + default)
                     denied(executable + " merge main")
+                    denied(executable + " merge-tree --write-tree HEAD main")
                 for tail in ("other", "HEAD", "--no-edit main", "--ff-only main",
                              "--squash main", "main other", "origin/HEAD", "origin/task",
                              "origin/" + default + "~1", "upstream/" + default,
@@ -82,9 +85,11 @@ with tempfile.TemporaryDirectory() as temporary:
             if default == "main":
                 git(repo, "tag", "main")
                 denied("git merge main")
+                denied("git merge-tree --write-tree HEAD main")
                 git(repo, "tag", "-d", "main")
                 git(repo, "config", "branch.task.mergeOptions", "--squash")
                 denied("git merge main")
+                denied("git merge-tree --write-tree HEAD main")
                 git(repo, "config", "--unset-all", "branch.task.mergeOptions")
                 allowed("git merge main")
             # Catching up the current branch from its own origin branch: fast-forward only.

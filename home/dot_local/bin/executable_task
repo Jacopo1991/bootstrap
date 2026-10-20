@@ -1758,8 +1758,9 @@ def runner_check(args):
     task_line = re.compile(
         r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
         r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
-        r"(?:,\s*no-verify:\s*(.*))?\s*$"
+        r"(?:\b.*)?$"
     )
+    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
         if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
             in_text_rules = True
@@ -1771,10 +1772,12 @@ def runner_check(args):
         # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
-        parsed = task_line.match(line)
+        no_verify_match = no_verify_field.search(line)
+        parsed = task_line.match(no_verify_field.sub("", line))
         if parsed:
             task_lines += 1
-            ident, builder, model, seed, after, no_verify = parsed.groups()
+            ident, builder, model, seed, after = parsed.groups()
+            no_verify = no_verify_match[1].strip() if no_verify_match else None
             try:
                 task = Task(repo, ident)
                 check_plan(task)

@@ -3894,6 +3894,25 @@ store.write_text(json.dumps(prs))
         self.assertIn("edit or apply_patch tool, never shell heredocs or cat >", out)
         self.assertIn("avoid backticks in shell commands", out)
 
+    def test_setup_68_runner_preserves_trailing_text_and_optional_field_positions(self):
+        runner = self.home / "runner.md"
+        (self.repo / ".work").mkdir(exist_ok=True)
+        (self.repo / ".work/pinned").write_text("seed")
+        for suffix in (
+                ", note here",
+                " some free text",
+                ", seed pinned, after: previous, note here",
+                ", note here, no-verify: manual check",
+                ", no-verify: manual check, seed pinned, after: previous, note here",
+                ", seed pinned, after: previous, note here, no-verify: manual check",
+                ", seed pinned, no-verify: manual check, after: previous"):
+            with self.subTest(suffix=suffix):
+                runner.write_text("1. previous: builder codex, model gpt-6-luna\n"
+                                  "2. docs: builder codex, model gpt-6-luna" + suffix + "\n")
+                self.assertIn("runner file OK", self.raw_task("runner-check", "proj", str(runner)))
+        runner.write_text("1. docs: builder codex, model gpt-6-luna, note here, no-verify: \n")
+        self.assertIn("nonempty reason", self.raw_task("runner-check", "proj", str(runner), code=1))
+
     def test_runner_check_models_ids_and_blocked_constructs(self):
         runner = self.home / "runner.md"
         (self.kb / "backlog/tasks").mkdir(parents=True, exist_ok=True)
