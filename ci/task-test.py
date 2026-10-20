@@ -1004,7 +1004,8 @@ class TaskTool(unittest.TestCase):
             for tier in ('routine', 'hard', 'design'):
                 expected = default if tier == 'routine' else {'codex': 'gpt-6.1-sol', 'claude': 'opus'}[vendor]
                 self.assertEqual(route(self.home, vendor, tier), expected)
-                self.assertEqual(route(self.home, vendor, tier, boosted=False), default)
+                no_boost_expected = 'gpt-6.1-sol' if vendor == 'codex' and tier == 'hard' else default
+                self.assertEqual(route(self.home, vendor, tier, boosted=False), no_boost_expected)
         config = self.home / '.config/task'
         config.mkdir(parents=True, exist_ok=True)
         (config / 'routing.json').write_text(json.dumps(dict(models={'claude': {'hard': 'opus'}}, extra_lanes=1)))
