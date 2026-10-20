@@ -59,11 +59,16 @@ def save(path, value):
 def git(path, *args):
     return subprocess.check_output(['git', '-C', str(path), *args], text=True).strip()
 if cmd == 'start':
-    git(repo, 'worktree', 'add', '-b', name, str(wt))
-    work.mkdir()
-    state.mkdir(parents=True)
-    save(state / 'task.json', dict(base_sha=git(wt, 'rev-parse', 'HEAD'), branch=name,
-         builder=options[options.index('--builder') + 1], revision='revision', criteria=[]))
+    if not wt.exists():
+        git(repo, 'worktree', 'add', '-b', name, str(wt))
+        work.mkdir()
+        state.mkdir(parents=True)
+        save(state / 'task.json', dict(base_sha=git(wt, 'rev-parse', 'HEAD'), branch=name,
+             builder=options[options.index('--builder') + 1], revision='revision', criteria=[]))
+    if '--seed' in options:
+        import shutil
+        seed = options[options.index('--seed') + 1]
+        shutil.copy2(repo / '.work' / seed, work / seed)
     print('Dispatch prompt:\nContext: .work/context/\nCommit and fill .work/report.md.')
 elif cmd == 'lane':
     prompt = (work / 'prompt.md').read_text()
@@ -562,11 +567,23 @@ class BatchTest(unittest.TestCase):
         self.assertIn('batch: stopped: Expecting property name', self.run_batch(1))
 
     def test_seed_numeric_id_and_default_box(self):
+        (self.repo / '.work').mkdir(exist_ok=True)
+        (self.repo / '.work/pinned').write_text('seed')
         self.source.write_text('1. T-12: builder claude, model sonnet, seed pinned\nRequest\n')
         self.run_batch()
         self.assertEqual(self.calls('start')[0][-2:], ['--seed', 'pinned'])
         self.assertIn('/t12/', self.prompts()[0]['path'])
         self.assertIn('90', self.calls('lane')[0])
+
+    def test_resume_existing_worktree_applies_named_seed(self):
+        subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
+                       env=self.env, check=True, capture_output=True)
+        (self.repo / '.work').mkdir(exist_ok=True)
+        (self.repo / '.work/pinned').write_text('resumed input')
+        self.source.write_text('1. one: builder codex, model gpt-6-luna, seed pinned\nRequest\n')
+        self.run_batch()
+        self.assertEqual(self.calls('start')[-1][-2:], ['--seed', 'pinned'])
+        self.assertEqual((self.repo / '.worktrees/one/.work/pinned').read_text(), 'resumed input')
 
 
 if __name__ == '__main__':

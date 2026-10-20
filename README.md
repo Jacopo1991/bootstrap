@@ -454,6 +454,16 @@ Plain `task review <repo> <id>` still prints the prompt and headless command for
 manual use; `--record <file>` still records a supplied reply. `--run` and `--record`
 are mutually exclusive, and all review modes refuse in a sandboxed session.
 
+Reports may accumulate rounds with repeated `## Criteria` headings. Merge and review
+use only the final block, which must contain every pinned criterion marked `met`
+with evidence. A missing or incomplete final block blocks; earlier `not met` rows
+are superseded and cannot supply missing final-round evidence.
+
+`task start --seed <name>` copies the main checkout's `.work/<name>` into the
+task worktree, including an existing worktree. Resumed runner lines naming a seed
+apply it through the same start path. Identical targets are left alone; a differing
+file or directory stops with a conflict message and preserves lane work.
+
 Before reporting, builders run advisory `task check` from the worktree on the final
 commit and paste its final PASS/FAIL line, including the log path, under `## Check`
 in `.work/report.md`. `review --run` requires a passing check for that head and
@@ -809,7 +819,8 @@ PyPI and about six for npm (its database is about 200 MB).
   `Jacopo1991/cortex-core`; hand copies and other sources are `global-skill-outside-bootstrap`.
 - **Prompt reminder:** `agent-policy/context_reminder.py` is wired as a native
   `UserPromptSubmit` hook for Claude Code and Codex (`hookSpecificOutput.additionalContext`,
-  reminders for slim-workflow, stopping after two failed attempts or at the time box, reporting as
+  reminders for slim-workflow, stopping when the same check/test fails after two real fix
+  attempts or at the time box (the task brief's stop rules take precedence), reporting as
   the task or skill asks, the given worktree and PM adoption of direct requests, git/gh commands
   on their own, verify-ui only for tasks with a UI to verify, and github-ci). For Claude Code
   it is also a `PreToolUse` hook that adds a "read the github-ci skill first" note before a
@@ -817,6 +828,8 @@ PyPI and about six for npm (its database is about 200 MB).
   `gh secret set`, `gh workflow run`, `gh api` with a write method on a settings endpoint). It
   only adds context; it never blocks, and `pre_tool_use.py` stays the policy gate. Codex has the
   same per-prompt reminder; only Claude Code gets the tool-call note.
+  Missing files, wrong paths and hook denials are resolved within authority or reported;
+  they do not count as repeated failing checks and guardrails must never be bypassed.
 - **Windows, run by the founder** from elevated PowerShell (the founder's own gh login, tasks run
   in the logged-in session, not S4U): `windows\install-skills-task.ps1` installs the skills for the
   Windows-side Claude Code and Codex (`--force` once) and registers `MachineBootstrap-Skills-Update`

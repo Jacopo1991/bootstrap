@@ -18,7 +18,7 @@ import sys
 PROMPT_REMINDER = "\n".join((
     "Reminders (bootstrap hook):",
     "- Follow the slim-workflow skill.",
-    "- Stop after two failed attempts at the same problem or at the time box; report what you have.",
+    "- Task brief stop rules take precedence. Otherwise stop at the time box or after the same check/test fails after two real fix attempts; report what you have. Missing files, wrong paths or hook denials: resolve within authority or report, never bypass guardrails.",
     "- Report as the task or skill asks. Work in the worktree you were given; the PM adopts direct requests with `task start <repo> <branch>`.",
     "- Run git and gh on their own: `git -C <path> ...`, never `cd <path> && git`, and no builds, "
     "tests or writes in the same call; git/gh network commands (fetch, pull, push, gh ...) never chained.",

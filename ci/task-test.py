@@ -174,6 +174,16 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_cumulative_report_uses_only_final_criteria_block(self):
+        criteria = [{"number": 1}, {"number": 2}]
+        old = "## Criteria\n#1 not met: failing check\n#2 not met: missing work\n"
+        final = "## Criteria\n#1 met: regression check passes\n#2 met: seed verified\n"
+        self.assertEqual(TASK_MODULE.report_criteria(old + final, criteria), final.split('\n', 1)[1])
+        for tail in ("", "## Criteria", "## Criteria\n", "## Criteria\n#1 met: verified\n",
+                     "## Criteria\n#1 met: verified\n#2 not met: failed\n"):
+            with self.subTest(tail=tail), self.assertRaises(TASK_MODULE.Stop):
+                TASK_MODULE.report_criteria(final + tail if tail else "", criteria)
+
     def test_quality_dispatch_brief_and_evidence_instruction(self):
         task = self.kb / "backlog/tasks/t-5 - Add-the-b-file.md"
         task.write_text(task.read_text() + "\n## Read first\n\na.txt and justfile\n\n"
@@ -4050,6 +4060,22 @@ store.write_text(json.dumps(prs))
             self.raw_task("check", "proj", "5")
         self.raw_task("merge", "proj", "5")
 
+    def test_cumulative_criteria_merge_rejects_incomplete_final_round(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        report = wt / '.work/report.md'
+        complete = report.read_text()
+        old = complete.replace(' met:', ' not met:').replace('implemented and verified', '(fill in)')
+        for last in ('## Criteria\n', '## Criteria\n#1 met: verified\n'):
+            report.write_text(old + '\n' + last)
+            self.assertIn('final Criteria block', self.raw_task('merge', 'proj', '5', code=1))
+        report.write_text(old + '\n' + complete)
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertIn('use only the last Criteria block', prompt)
+        self.assertIn('missing or incomplete last block is Blocking', prompt)
+        self.raw_task('merge', 'proj', '5')
+
     def test_start_seeds_files_directories_existing_worktree_and_refuses_escape(self):
         source = self.repo / ".work"
         source.mkdir(exist_ok=True)
@@ -4059,14 +4085,19 @@ store.write_text(json.dumps(prs))
         self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "pinned", "--seed", "single")
         wt = self.repo / ".worktrees/t5"
         self.assertEqual((wt / ".work/pinned/code").read_text(), "original")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "pinned", "--seed", "single")
+        (source / "added").write_text("resumed seed")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "added")
+        self.assertEqual((wt / ".work/added").read_text(), "resumed seed")
         (source / "single").write_text("changed")
-        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "single")
+        output = self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "single", code=1)
+        self.assertIn("Seed target already exists and differs", output)
         self.assertEqual((wt / ".work/single").read_text(), "file")
         self.raw_task("start", "proj", "5", "--builder", "codex", "--refresh")
         self.assertEqual(json.loads((self.state() / "task.json").read_text())["seeds"],
-                         ["pinned", "single"])
+                         ["pinned", "single", "added"])
         record = json.loads((self.state() / "task.json").read_text())
-        self.assertEqual(record["seeds"], ["pinned", "single"])
+        self.assertEqual(record["seeds"], ["pinned", "single", "added"])
         (source / "escape").symlink_to(self.home)
         for name in ("..", "../outside", str(self.home), "escape"):
             self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", name, code=1)
