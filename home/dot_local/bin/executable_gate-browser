@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Run local browser specs with the bootstrap Playwright install in a trusted gate."""
+import argparse
+import glob
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+
+def stop(process):
+    if process is None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+        # The leader may exit before its children.
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
+def main():
+    if not os.environ.get("TASK_GATE_RUN_ID"):
+        print("SKIP (lane: browser tests run in the trusted gate)")
+        return 77
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server", required=True, help="shell command using $HOST and $PORT")
+    parser.add_argument("--ready", default="/", help="readiness path on the allocated origin")
+    parser.add_argument("--timeout", type=float, default=30)
+    parser.add_argument("--port-offset", type=int, default=0)
+    parser.add_argument("specs", nargs="+", help="quoted spec globs, relative to project root")
+    args = parser.parse_args()
+    server = runner = None
+    out = None
+    status = 1
+    try:
+        base = int(os.environ["TASK_GATE_PORT_BASE"])
+        if not (0 <= args.port_offset < 200 and 1024 <= base <= 65336):
+            raise ValueError("invalid gate port base or offset (0..199)")
+        if not args.ready.startswith("/") or args.ready.startswith("//"):
+            raise ValueError("--ready must be a local absolute path")
+        if args.timeout <= 0:
+            raise ValueError("--timeout must be positive")
+        port = base + args.port_offset
+        origin = f"http://127.0.0.1:{port}"
+        specs = sorted({str(Path(p).resolve()) for pattern in args.specs
+                        for p in glob.glob(pattern, recursive=True) if Path(p).is_file()})
+        if not specs:
+            raise ValueError("no specs matched")
+        modules = Path.home() / ".local/share/bootstrap/npm/node_modules"
+        playwright = Path.home() / ".local/bin/playwright"
+        if not (modules / "@playwright/test").is_dir() or not playwright.is_file():
+            raise ValueError("bootstrap verify pack is missing")
+        out = Path(tempfile.mkdtemp(prefix="gate-browser-", dir=os.environ["TMPDIR"]))
+        env = dict(os.environ, HOST="127.0.0.1", PORT=str(port),
+                   VERIFY_URL=origin, VERIFY_OUT=str(out),
+                   NODE_PATH=str(modules),
+                   PLAYWRIGHT_BROWSERS_PATH=str(Path.home() / ".cache/ms-playwright"))
+        # A generated config keeps all reports and browser artifacts in the gate TMPDIR.
+        (out / "playwright.config.cjs").write_text(
+            "module.exports = " + json.dumps({
+                "testDir": str(out), "testMatch": "gate.spec.cjs", "workers": 1,
+                "timeout": 30000, "globalTimeout": 120000,
+                "outputDir": str(out / "artifacts"),
+                "reporter": [["list"], ["json", {"outputFile": str(out / "results.json")}]],
+                "use": {"baseURL": origin, "browserName": "chromium",
+                        "serviceWorkers": "block", "trace": "retain-on-failure",
+                        "screenshot": "only-on-failure"},
+            }) + ";\n")
+        (out / "gate.spec.cjs").write_text(
+            "const { test, expect } = require('@playwright/test');\n"
+            f"const origin = {json.dumps(origin)};\n"
+            "test.beforeEach(async ({ context }) => {\n"
+            "  await context.route('**/*', route => new URL(route.request().url()).origin === origin\n"
+            "    ? route.continue() : route.abort('blockedbyclient'));\n"
+            "  await context.routeWebSocket('**/*', ws => {\n"
+            "    if (new URL(ws.url()).origin === origin.replace('http:', 'ws:')) ws.connectToServer();\n"
+            "    else ws.close();\n"
+            "  });\n"
+            "});\n" + "\n".join(f"require({json.dumps(p)});" for p in specs) + "\n")
+        with (out / "server.log").open("w") as log:
+            server = subprocess.Popen(["bash", "-c", args.server], env=env,
+                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            # Do not follow redirects, which could send readiness traffic to external origins.
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+            opener.add_handler(NoRedirect())
+            deadline = time.monotonic() + args.timeout
+            while True:
+                if server.poll() is not None:
+                    raise ValueError("server exited before readiness")
+                try:
+                    with opener.open(origin + args.ready, timeout=1) as response:
+                        if response.status == 200:
+                            break
+                except (urllib.error.URLError, TimeoutError):
+                    pass
+                if time.monotonic() >= deadline:
+                    raise ValueError("server readiness timed out")
+                time.sleep(0.1)
+            runner = subprocess.Popen([str(playwright), "test", "--config",
+                                       str(out / "playwright.config.cjs")],
+                                      env=env, start_new_session=True)
+            status = runner.wait()
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"gate-browser: {exc}", file=sys.stderr)
+    finally:
+        stop(runner)
+        stop(server)
+        print(f"gate-browser: {'PASS' if status == 0 else 'FAIL'}; artifacts: {out or 'none'}")
+    return status
+
+
+def interrupted(signum, frame):
+    raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
