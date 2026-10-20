@@ -9,7 +9,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import threading
+import time
 from unittest import mock
+from policy_test_env import isolate_policy_environment
+
+isolate_policy_environment()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,13 +128,62 @@ print(entry.get('output', 'OK'))
 
 
 class BatchTest(unittest.TestCase):
+    def test_tier_runner_field_dispatch(self):
+        self.source.write_text('1. one: builder codex, model gpt-6-luna, tier design\n')
+        self.assertEqual(batch_module.parse(self.source)[0]['tier'], 'design')
+        self.run_batch()
+        for command in ('start', 'lane'):
+            call = self.calls(command)[0]
+            self.assertEqual(call[call.index('--tier') + 1], 'design')
+        self.source.write_text('1. one: builder codex, model gpt-6-luna, tier unknown\n')
+        with self.assertRaises(batch_module.Stop):
+            batch_module.parse(self.source)
+
+    def test_boost_capacity_dependencies_and_gate_bound(self):
+        config = self.home / '.config/task'
+        config.mkdir(parents=True)
+        state = self.home / '.local/state/task'
+        state.mkdir(parents=True)
+        boost = state / 'boost.json'
+        for vendor in ('codex', 'claude'):
+            for boosted, slots, expected in ((False, 3, 1), (True, 3, 3), (True, 2, 2), (True, 1, 1)):
+                with self.subTest(vendor=vendor, boosted=boosted, slots=slots):
+                    (config / 'gate.toml').write_text(f'slots = {slots}\n')
+                    boost.write_text(json.dumps({vendor: '2099-01-01T00:00:00+00:00'} if boosted else {}))
+                    tasks = [dict(id=str(i), builder=vendor, after='0' if i == 3 else None) for i in range(5)]
+                    lock = threading.Lock()
+                    active, maximum, completed = 0, 0, set()
+                    def execute(worker, task):
+                        nonlocal active, maximum
+                        with lock:
+                            if task['after']:
+                                self.assertIn(task['after'], completed)
+                            active += 1
+                            maximum = max(maximum, active)
+                        time.sleep(0.04)
+                        with lock:
+                            active -= 1
+                            completed.add(task['id'])
+                        return 'merged'
+                    runner = batch_module.Batch(self.repo, self.source)
+                    with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module.Batch, 'task', execute):
+                        runner.schedule(tasks)
+                    self.assertEqual(maximum, expected)
+                    self.assertEqual(len(completed), 5)
+        boost.write_text(json.dumps({'codex': '2000-01-01T00:00:00+00:00'}))
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(runner.capacity()[0], 1)
+        boost.write_text(json.dumps({'codex': '2099-01-01T00:00:00+00:00'}))
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(runner.capacity()[1]['claude'], 1)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.repo = self.home / 'dev_workspace/proj'
         self.repo.mkdir(parents=True)
-        self.env = dict(os.environ, HOME=str(self.home),
+        self.env = dict(HOME=str(self.home), PATH=os.environ['PATH'],
                         GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
                         GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid',
                         GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid')

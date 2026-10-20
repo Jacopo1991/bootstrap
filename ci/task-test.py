@@ -906,23 +906,48 @@ class TaskTool(unittest.TestCase):
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('task\n')
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
-        for builder, requested, extra, expected in [
-                ('codex', 'gpt-6-luna', [], 'gpt-6-astra'),
-                ('claude', 'sonnet', [], 'fable'),
-                ('codex', 'gpt-6-luna', ['--no-boost'], 'gpt-6-luna'),
-                ('claude', 'sonnet', ['--no-boost'], 'sonnet'),
-                ('codex', 'gpt-6-astra', ['--no-boost'], 'gpt-6-astra')]:
+        for builder in ('codex', 'claude'):
+            for tier in ('routine', 'hard', 'design'):
+                expected = {'codex': {'routine': 'gpt-6-luna', 'hard': 'gpt-6-astra', 'design': 'gpt-6-astra'},
+                            'claude': {'routine': 'sonnet', 'hard': 'fable', 'design': 'opus'}}[builder][tier]
+                (wt / '.work/model-call.json').unlink(missing_ok=True)
+                (wt / '.work/final.md').unlink(missing_ok=True)
+                out = self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier)
+                record = self.wait_for_lane(wt)
+                self.assertEqual(record['model'], expected)
+                self.assertIn(f'tier {tier}', out)
+                explicit = 'gpt-6-luna' if builder == 'codex' else 'sonnet'
+                (wt / '.work/model-call.json').unlink(missing_ok=True)
+                (wt / '.work/final.md').unlink(missing_ok=True)
+                self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier, '--model', explicit)
+                self.assertEqual(self.wait_for_lane(wt)['model'], explicit)
             (wt / '.work/model-call.json').unlink(missing_ok=True)
             (wt / '.work/final.md').unlink(missing_ok=True)
-            out = self.task('lane', 'proj', '5', '--builder', builder, '--model', requested, *extra)
-            record = self.wait_for_lane(wt)
-            self.assertEqual(record['exit_code'], 0)
-            self.assertEqual(record['model'], expected)
-            self.assertEqual(record['cli_model'], expected)
-            call = json.loads((wt / '.work/model-call.json').read_text())
-            self.assertIn(expected, call['args'])
-            if not extra:
-                self.assertIn(f'boost: {requested} -> {expected}', out)
+            self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost')
+            self.assertEqual(self.wait_for_lane(wt)['model'], explicit)
+
+    def test_tier_file_flag_state_and_status(self):
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: hard\n')
+        self.task('start', 'proj', '5', '--builder', 'codex')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'hard')
+        self.assertIn('tier=hard', self.task('status', 'proj'))
+        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex', '--tier', 'design')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
+
+    def test_tier_defaults_and_override_policy(self):
+        from task_routing import route, lane_limits
+        for vendor, default in [('codex', 'gpt-6-luna'), ('claude', 'sonnet')]:
+            for tier in ('routine', 'hard', 'design'):
+                self.assertEqual(route(self.home, vendor, tier), default)
+        config = self.home / '.config/task'
+        config.mkdir(parents=True, exist_ok=True)
+        (config / 'routing.json').write_text(json.dumps(dict(models={'claude': {'hard': 'opus'}}, extra_lanes=1)))
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        self.assertEqual(route(self.home, 'claude', 'hard'), 'opus')
+        self.assertEqual(route(self.home, 'claude', 'routine'), 'sonnet')
+        self.assertEqual(route(self.home, 'claude', 'hard', 'sonnet'), 'sonnet')
+        self.assertEqual(lane_limits(self.home, 3), {'codex': 1, 'claude': 2})
 
     def test_boost_reviewer_models_and_recorded_identity(self):
         self.stub_reviewers()
@@ -930,7 +955,7 @@ class TaskTool(unittest.TestCase):
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
         head = self.git(wt, 'rev-parse', 'HEAD')
         reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
-        for builder, vendor, model in [('codex', 'claude', 'opus'), ('claude', 'codex', 'gpt-6.1-sol')]:
+        for builder, vendor, model in [('codex', 'claude', 'haiku'), ('claude', 'codex', 'gpt-6-luna')]:
             self.task('start', 'proj', '5', '--refresh', '--builder', builder)
             self.raw_task("check", "proj", '5')
             self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
@@ -938,29 +963,10 @@ class TaskTool(unittest.TestCase):
             self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
             self.assertIn(model, json.loads((wt / '.work/reviewer-call.json').read_text())['args'])
 
-    def test_boosted_claude_limit_falls_back_once_and_records_actual_reviewer(self):
-        self.stub_reviewers()
-        wt, _ = self.started()
-        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
-        head = self.git(wt, 'rev-parse', 'HEAD')
-        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
-        self.raw_task("check", "proj", '5')
-        out = self.raw_task('review', 'proj', '5', '--run', env=dict(self.env,
-                            REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit · resets 5pm (UTC)\n\n",
-                            REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
-        calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
-        self.assertEqual([call[call.index('--model') + 1] for call in calls], ['opus', 'haiku'])
-        self.assertIn('retrying once', out)
-        route = json.loads((self.state() / 'review-routing.json').read_text())
-        self.assertEqual(route, dict(vendor='claude', model='haiku', fallback_from='opus'))
-        review = json.loads((self.state() / 'review.json').read_text())
-        self.assertEqual((review['reviewer'], review['model'], review['verdict']), ('claude', 'haiku', 'PASS'))
-        self.assertEqual((self.state() / 'review.md').read_text(), reply)
-
     def test_review_limit_without_boost_or_after_fallback_is_not_retried(self):
         self.stub_reviewers()
         wt, _ = self.started()
-        for boosted, expected in ((False, ['haiku']), (True, ['opus', 'haiku'])):
+        for boosted, expected in ((False, ['haiku']), (True, ['haiku'])):
             with self.subTest(boosted=boosted):
                 (wt / '.work/reviewer-count').unlink(missing_ok=True)
                 (wt / '.work/reviewer-calls.jsonl').unlink(missing_ok=True)
@@ -985,19 +991,7 @@ class TaskTool(unittest.TestCase):
                                      REVIEW_STUB_EXIT='1'))
         self.assertIn('exited with status 1', out)
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
-        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'opus')
-
-    def test_boosted_claude_fallback_without_verdict_stops_after_one_try(self):
-        self.stub_reviewers()
-        wt, _ = self.started()
-        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
-        self.raw_task("check", "proj", '5')
-        out = self.raw_task('review', 'proj', '5', '--run', code=1,
-                            env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit",
-                                     REVIEW_STUB_FIRST_EXIT='1', REVIEW_STUB_REPLY='No verdict'))
-        self.assertIn('review produced no verdict', out)
-        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
-        self.assertFalse((self.state() / 'review.json').exists())
+        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'haiku')
 
     def test_boosted_codex_limit_is_reported_without_fallback(self):
         self.stub_reviewers()
@@ -4328,6 +4322,9 @@ store.write_text(json.dumps(prs))
         (self.repo / ".work").mkdir(exist_ok=True)
         (self.repo / ".work/pinned").write_text("seed")
         for suffix in (
+                ", tier hard",
+                ", tier design, seed pinned, after: previous",
+                ", no-verify: manual check, tier routine, after: previous",
                 ", note here",
                 " some free text",
                 ", seed pinned, after: previous, note here",
@@ -4358,6 +4355,7 @@ store.write_text(json.dumps(prs))
             "```\n")
         self.assertIn("runner file OK (2 tasks)", self.raw_task("runner-check", "proj", str(runner)))
         for contents, expected in (
+            ("1. docs: builder codex, model gpt-6-luna, tier extreme\n", "invalid tier"),
             ("1. docs: builder codex, model sonnet\n", "not available for the codex builder"),
             ("1. docs: builder codex, model gpt-6-luna, seed absent\n", "Seed does not exist"),
             ("1. docs: builder codex, model gpt-6-luna, seed ..\n", "Invalid seed name"),

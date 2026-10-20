@@ -4,10 +4,10 @@
 The sandbox protects private task state from lanes running as the same Unix user.
 Write capability there determines trust; vendor environment markers do not.
 
-  task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
+  task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
   task runner-start <repo> <runner-file> [--llm]
-  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
+  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
@@ -22,6 +22,8 @@ Write capability there determines trust; vendor environment markers do not.
   task status [<repo>]
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
+    Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
+    Explicit --model always wins. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -59,6 +61,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_limits import cli_limit, lane_limit
+from task_routing import TIERS, route, lane_limits, active
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -370,10 +373,16 @@ def read_json_object(path):
         return {}
 
 
+def task_tier(text, flag=None):
+    values = re.findall(r"(?im)^Tier:\s*(.*?)\s*$", text)
+    value = flag or (values[0].lower() if values else "routine")
+    if value not in TIERS or (not flag and len(set(values)) > 1):
+        raise Stop("Tier must be routine, hard or design")
+    return value
+
+
 def active_boosts():
-    now = datetime.now(timezone.utc)
-    return {vendor: until for vendor, until in read_json_object(HOME / ".local/state/task/boost.json").items()
-            if vendor in {"claude", "codex"} and plan_time(until) and now < plan_time(until)}
+    return active(HOME)
 
 
 def boost(args):
@@ -402,7 +411,8 @@ def boost(args):
 
 def boost_line():
     active = active_boosts()
-    return "boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items())) if active else ""
+    return ("boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items()))
+            + " (tier routing + batch capacity; routine and reviews unchanged)" if active else "")
 
 
 def plan_time(value):
@@ -1511,13 +1521,12 @@ def lane(args):
     record = load_record(task)
     refresh_context(task)
     builder = args.builder or record["builder"]
-    model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
+    tier = args.tier or record.get("tier", "routine")
+    model = route(HOME, builder, tier, args.model, not args.no_boost and not args._worker)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
-        upgraded = "gpt-6-astra" if builder == "codex" else "fable"
-        boost_notice = f"boost: {model} -> {upgraded} (until {until})"
-        model = cli_model = upgraded
+        boost_notice = f"boost: tier {tier}, {builder} -> {model} ({'explicit model' if args.model else 'tier routing'}; until {until})"
     else:
         boost_notice = ""
     work = path / ".work"
@@ -1554,7 +1563,7 @@ def lane(args):
                 print(boost_notice)
             archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
-                      "--builder", builder, "--model", model, "--no-boost", "--_worker"]
+                      "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
@@ -1565,9 +1574,10 @@ def lane(args):
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
-            if builder != record["builder"]:
-                print(f"Updating task builder from {record['builder']} to {builder}.")
+            if builder != record["builder"] or tier != record.get("tier", "routine"):
+                print(f"Updating task builder from {record['builder']} to {builder}; tier={tier}.")
                 record["builder"] = builder
+                record["tier"] = tier
                 record["revision"] = record_revision(record)
                 atomic_json(task_state(task) / "task.json", record)
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
@@ -1891,7 +1901,7 @@ def runner_check(args):
         r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
         r"(?:\b.*)?$"
     )
-    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
+    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:)|$)")
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
         if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
             in_text_rules = True
@@ -1904,7 +1914,10 @@ def runner_check(args):
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
         no_verify_match = no_verify_field.search(line)
-        parsed = task_line.match(no_verify_field.sub("", line))
+        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line)
+        if tier_field and tier_field[1].lower() not in TIERS:
+            problems.append(f"line {number}: invalid tier {tier_field[1]}")
+        parsed = task_line.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", no_verify_field.sub("", line)))
         if parsed:
             task_lines += 1
             ident, builder, model, seed, after = parsed.groups()
@@ -2179,9 +2192,14 @@ def start(args):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
+        if args.tier and args.tier != record.get("tier", "routine"):
+            record["tier"] = args.tier
+            record["revision"] = record_revision(record)
+            atomic_json(record_path, record)
     else:
         previous_seeds = read_json_object(record_path).get("seeds", []) if record_path.exists() else []
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
+                  "tier": task_tier(task_text, args.tier),
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone"),
@@ -2868,8 +2886,6 @@ def review(args):
     if not args.record:
         reviewer_route = (("claude", "haiku") if record["builder"] == "codex"
                           else ("codex", "gpt-6-luna"))
-        if reviewer_route[0] in active_boosts():
-            reviewer_route = (reviewer_route[0], "opus" if reviewer_route[0] == "claude" else "gpt-6.1-sol")
         if reviewer_route[0] == record["builder"]:
             raise Stop("reviewer vendor must differ from builder")
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
@@ -2983,7 +2999,7 @@ def review(args):
             except UsageLimit:
                 if reviewer_route != ("claude", "opus"):
                     raise
-                print("Boosted Claude reviewer hit a usage limit; retrying once with claude haiku.")
+                print("Claude reviewer hit a usage limit; retrying once with claude haiku.")
                 used_fallback = True
                 reviewer_route = ("claude", "haiku")
                 atomic_json(state / "review-routing.json", {"vendor": "claude", "model": "haiku",
@@ -3879,6 +3895,7 @@ def status(args):
     if active:
         print(active)
     print(f"Gate slots: {gate_slots()}")
+    print(f"Batch lane limits: {lane_limits(HOME, gate_slots())}; total bounded by gate slots")
     for row in gate_holders():
         print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
@@ -3972,7 +3989,7 @@ def status(args):
                 except (ValueError, TypeError): pass
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
-            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} head={head[:7]} "
+            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} tier={record.get('tier', 'routine') if record else 'routine'} head={head[:7]} "
                   f"{run_label} "
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
@@ -4590,6 +4607,8 @@ def main(argv=None):
         sub.add_argument("id")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
+        if name in {"start", "lane"}:
+            sub.add_argument("--tier", choices=TIERS, help="task Tier line or routine by default")
         if name == "start":
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
@@ -4622,7 +4641,7 @@ def main(argv=None):
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
-    sub = commands.add_parser("boost")
+    sub = commands.add_parser("boost", help="temporary tier routing and extra batch capacity; reviews unchanged")
     sub.add_argument("action", nargs="?", choices=("off",))
     sub.add_argument("--claude-until")
     sub.add_argument("--codex-until")
@@ -4745,7 +4764,7 @@ def main(argv=None):
     except SystemExit as stop:
         finish_detached(stop.code or 0)
         raise
-    except Stop as stop:
+    except (Stop, ValueError) as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1

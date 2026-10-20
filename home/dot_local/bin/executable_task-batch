@@ -7,18 +7,21 @@ import shlex
 import subprocess
 import sys
 import time
+import tomllib
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_limits import cli_limit, lane_limit
+from task_routing import TIERS, lane_limits
 
 
 TASK_LINE = re.compile(
     r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
     r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
     r"(?:\b.*)?$")
-NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
+NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:)|$)")
 HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
                "Execution stopped by PreToolUse hook")
 BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end your final reply "
@@ -72,14 +75,18 @@ def parse(source):
                 in_rules = False
             continue
         no_verify_field = NO_VERIFY.search(line)
-        match = TASK_LINE.match(NO_VERIFY.sub("", line))
+        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line)
+        match = TASK_LINE.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", NO_VERIFY.sub("", line)))
         if match:
             ident, builder, model, seed, after = match.groups()
+            tier = tier_field[1].lower() if tier_field else None
+            if tier is not None and tier not in TIERS:
+                raise Stop(f"Invalid tier: {tier}")
             no_verify = no_verify_field[1].strip() if no_verify_field else None
             if no_verify is not None and not no_verify.strip():
                 raise Stop("no-verify needs a nonempty reason")
             current = dict(id=ident, builder=builder.lower(), model=model,
-                           seed=seed, after=after, no_verify=no_verify, lines=[line])
+                           seed=seed, after=after, tier=tier, no_verify=no_verify, lines=[line])
             tasks.append(current)
         elif re.match(r"(?i)^\s*(?:\d+\.|[-*])\s+[^:\s]+:\s*builder\b", line):
             raise Stop("Invalid runner task line: " + line)
@@ -207,6 +214,8 @@ class Batch:
         dispatch = ""
         if not resumed or task["seed"]:
             options = ["--builder", task["builder"]]
+            if task.get("tier"):
+                options += ["--tier", task["tier"]]
             if task["seed"]:
                 options += ["--seed", task["seed"]]
             if task.get("no_verify"):
@@ -252,7 +261,8 @@ class Batch:
                 if rounds or findings:
                     prompt += FIX_SCOPE_INSTRUCTION + "\n"
                 (work / "prompt.md").write_text(prompt)
-                self.require("lane", ident, "--builder", builder, "--model", model, "--timeout", box)
+                options = ["--tier", task["tier"]] if task.get("tier") else []
+                self.require("lane", ident, "--builder", builder, "--model", model, "--timeout", box, *options)
                 self.require("wait", ident, "--max", box, retry=True)
                 self.lane_outcome(work)
             if time.monotonic() - started >= 3 * box * 60:
@@ -313,30 +323,71 @@ class Batch:
     def run(self):
         try:
             self.require("runner-check", self.source)
-            parked, consecutive = set(), 0
-            for task in parse(self.source):
-                self.current = task["id"]
-                if task["after"] and name(task["after"]) in parked:
-                    self.append(f"{self.current}: not started: after {task['after']}")
-                    parked.add(name(self.current))
-                    continue
-                outcome = self.task(task)
-                self.append(f"{self.current}: {outcome}")
-                self.current = None
-                if outcome.startswith("parked:"):
-                    parked.add(name(task["id"]))
-                    consecutive += 1
-                    if consecutive == 2:
-                        raise Stop("two tasks parked in a row")
-                else:
-                    consecutive = 0
+            self.schedule(parse(self.source))
             self.append("batch: finished")
             return 0
         except (Exception, KeyboardInterrupt) as error:
-            if self.current:
-                self.append(f"{self.current}: stopped: {error}")
             self.append(f"batch: stopped: {error}")
             return 1
+
+    def gate_slots(self):
+        config = Path.home() / ".config/task/gate.toml"
+        slots = tomllib.loads(read(config)).get("slots", 3)
+        if type(slots) is not int or slots < 1:
+            raise Stop("gate slots must be a positive integer")
+        return slots
+
+    def capacity(self):
+        slots = self.gate_slots()
+        limits = lane_limits(Path.home(), slots)
+        return min(slots, max(limits.values())), limits
+
+    def schedule(self, tasks):
+        pending, completed, parked = list(tasks), set(), set()
+        consecutive = 0
+        # Each worker owns its per-task state. Only this scheduler writes outcomes.
+        with ThreadPoolExecutor(max_workers=self.gate_slots()) as pool:
+            running = {}
+            while pending or running:
+                total, limits = self.capacity()
+                for task in list(pending):
+                    dependency = name(task["after"]) if task["after"] else None
+                    if dependency in parked:
+                        self.append(f"{task['id']}: not started: after {task['after']}")
+                        parked.add(name(task["id"]))
+                        completed.add(name(task["id"]))
+                        pending.remove(task)
+                        continue
+                    if dependency and dependency not in completed:
+                        continue
+                    count = sum(t["builder"] == task["builder"] for t in running.values())
+                    if len(running) >= total or count >= limits[task["builder"]]:
+                        continue
+                    pending.remove(task)
+                    worker = Batch(self.repo, self.source)
+                    running[pool.submit(worker.task, task)] = task
+                if not running:
+                    if pending:
+                        raise Stop("unresolved after dependencies")
+                    break
+                finished, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    task = running.pop(future)
+                    try:
+                        outcome = future.result()
+                    except Exception as error:
+                        self.append(f"{task['id']}: stopped: {error}")
+                        raise
+                    self.append(f"{task['id']}: {outcome}")
+                    completed.add(name(task["id"]))
+                    if outcome.startswith("parked:"):
+                        parked.add(name(task["id"]))
+                        consecutive += 1
+                        if consecutive == 2:
+                            raise Stop("two tasks parked in a row")
+                    else:
+                        consecutive = 0
+
 
 
 def main():

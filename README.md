@@ -423,6 +423,34 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 ### Task batches and lanes
 
+`task start` and `task lane` accept `--tier routine|hard|design`. Tasks may
+declare `Tier: hard` alongside their `Verify:` lines; the default is routine.
+The flag takes precedence and the tier is pinned in task state and shown by
+`task status`. Runner lines accept `, tier hard`, for example:
+`1. example: builder codex, model gpt-6-luna, tier hard, after: previous`.
+Runner model fields are explicit model choices and take precedence over routing.
+
+`task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
+temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.
+Without boost, all tiers use the usual builder default (Codex gpt-6-luna,
+Claude sonnet). While that vendor is boosted, hard uses Codex gpt-6-astra or
+Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
+default. An explicit `--model` always wins; `--no-boost` disables tier routing.
+The launch notice explains the decision. Reviews keep their usual cheap models
+and usage-limit handling regardless of boost.
+
+The shared routing constant is in `home/dot_local/bin/task_routing.py`.
+Optional `~/.config/task/routing.json` overrides defaults and hard/design models,
+for example `{"models":{"claude":{"hard":"fable"}},"extra_lanes":2}`.
+Model keys are `default`, `hard`, `design` under `codex` or `claude`.
+`extra_lanes` is a nonnegative integer, default 2. The batch runner normally
+runs one task at a time; an active vendor boost permits 1 + extra_lanes tasks
+for that vendor. Total concurrency is capped by the largest current vendor
+limit and the slots in `~/.config/task/gate.toml` (default 3).
+Dependencies wait for their predecessor to merge; parked predecessors skip
+their dependants. Expiry reduces new dispatches without interrupting live work.
+`task status` shows the effective vendor limits and gate slots.
+
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
 `--dangerously-bypass-approvals-and-sandbox`; the managed policy hook stays active.
