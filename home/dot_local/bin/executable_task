@@ -3375,7 +3375,7 @@ def merge(args):
         shutil.copy2(report_path, archive / "report.md")
     check_log = path / ".work/check.log"
     if check_log.is_file():
-        shutil.copy2(check_log, archive / "check.log")
+        shutil.copy2(check_log, archive / "advisory-check.log")
     completed_step(task, "archived")
     if args.keep:
         return 0
@@ -4337,10 +4337,13 @@ def repair_published(task, base):
     atomic_json(state / 'merge.json', {'head': head, 'commit': commit, 'time': merged_at})
     print(update_local_default(task.repo, default_branch(task.repo), base))
     if task.path.exists():
-        for name in ('report.md', 'check.log'):
+        for name in ('report.md',):
             source = task.path / '.work' / name
             if source.is_file():
                 shutil.copy2(source, state / name)
+        advisory = task.path / '.work/check.log'
+        if advisory.is_file():
+            shutil.copy2(advisory, state / 'advisory-check.log')
         if not (untracked(task.path) + ignored_leftovers(task.path)):
             preserve_work(task.repo, task.name, task.path, reuse_head=head)
             branch = git(task.path, 'branch', '--show-current')

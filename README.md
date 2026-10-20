@@ -515,6 +515,9 @@ in the task's state directory; merge gates write `gate-check.log` there and
 drills write `drill-check.log` in their evidence directory. They leave the lane
 log untouched. Check JSON and history record the log path and summary; status
 and review prompts identify the corresponding trusted or advisory log.
+Merge and published-merge repair preserve the trusted `check.log` in state
+and archive the lane log separately as `advisory-check.log`. Batch fix rounds
+read the log recorded by the latest check, including trusted PM checks.
 
 Always launch build lanes through `task lane`, including from a batch runner:
 

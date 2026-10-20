@@ -113,6 +113,8 @@ prompt = sys.stdin.read()
     'state_home': os.environ.get('XDG_STATE_HOME'),
     'reason': os.environ.get('SECRETSPEC_REASON'),
     'tmpdir': os.environ.get('TMPDIR'),
+    'tmp_mode': pathlib.Path(os.environ['TMPDIR']).stat().st_mode & 0o7777,
+    'tmp_owner': pathlib.Path(os.environ['TMPDIR']).stat().st_uid,
     'task_worktree': os.environ.get('TASK_WORKTREE'),
 }))
 release = os.environ.get('LANE_STUB_RELEASE')
@@ -3799,16 +3801,26 @@ store.write_text(json.dumps(prs))
         self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))
         self.assertFalse((self.home / "runner-record.json").exists())
 
-    def assert_claude_temporary_path(self, temporary):
+    def assert_claude_temporary_path(self, temporary, call=None):
         root = Path("/tmp") / f"claude-{os.getuid()}"
-        parent = next((candidate for candidate in (Path(self.env["TMPDIR"]),
-                       *Path(self.env["TMPDIR"]).parents)
-                       if candidate.parent == root and candidate.name.startswith("lane-")), root)
+        # Locate the outer grant from the fixture's actual location, independently
+        # of the TMPDIR passed to the product under test.
+        parents = [candidate for candidate in root.glob("lane-????????")
+                   if self.home.resolve().is_relative_to(candidate)]
+        self.assertLessEqual(len(parents), 1)
+        parent = parents[0] if parents else root
         trusted = parent != root
         self.assertEqual(temporary.parent, parent)
         self.assertRegex(temporary.name, r"^lane-[0-9a-f]{8}$")
-        # Preserve the original short-path bound plus exactly one lane component.
+        # PM-approved bounds: top-level <40, nested <54 bytes.
         self.assertLess(len(os.fsencode(temporary)), 54 if trusted else 40)
+        self.assertLess(len(os.fsencode(temporary / "srt-mux-3583008-1.sock")), 108)
+        if call is None:
+            self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+            self.assertEqual(temporary.stat().st_uid, os.getuid())
+        else:
+            self.assertEqual(call["tmp_mode"], 0o700)
+            self.assertEqual(call["tmp_owner"], os.getuid())
 
     def test_claude_temporary_parent_trust_and_cleanup(self):
         root = self.home / "claude-root"
@@ -3923,6 +3935,46 @@ store.write_text(json.dumps(prs))
         self.assertIn(str(log), status)
         self.assertIn(evidence["log"], status)
 
+    def test_batch_tail_uses_actual_check_log(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "batch_log_test", str(ROOT / "home/dot_local/bin/executable_task-batch"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        batch = importlib.util.module_from_spec(spec)
+        loader.exec_module(batch)
+        wt, _ = self.started()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+            advisory = (wt / ".work/check.log").read_text()
+            (wt / "FAIL").touch()
+            self.assertFalse(TASK_MODULE.run_check(wt, "", state=self.state()))
+            evidence = json.loads((self.state() / "check.json").read_text())
+            self.assertTrue(evidence["trusted"])
+            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
+                             Path(evidence["log"]).read_text())
+            self.assertNotEqual(batch.check_output(self.state(), wt / ".work"), advisory)
+            (wt / "FAIL").unlink()
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
+                             (wt / ".work/check.log").read_text())
+
+    def test_repair_published_preserves_trusted_check_log(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        self.assertTrue(evidence["trusted"])
+        trusted = Path(evidence["log"]).read_bytes()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            (wt / "FAIL").touch()
+            self.assertFalse(TASK_MODULE.run_check(wt, "", advisory=True))
+        advisory = (wt / ".work/check.log").read_bytes()
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.git(self.repo, "merge", "--no-ff", "-m", "Published fixture", head)
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            TASK_MODULE.repair_published(TASK_MODULE.Task(self.repo, "5"), head)
+        self.assertEqual(Path(evidence["log"]).read_bytes(), trusted)
+        self.assertEqual((self.state() / "advisory-check.log").read_bytes(), advisory)
+
     def test_claude_lane_uses_pinned_builder_and_logs_final_and_failure(self):
         self.stub_models()
         self.raw_task("start", "proj", "5", "--builder", "claude")
@@ -3939,7 +3991,7 @@ store.write_text(json.dumps(prs))
                                        "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         allowed = settings["sandbox"]["filesystem"]["allowWrite"]
-        self.assert_claude_temporary_path(Path(call["tmpdir"]))
+        self.assert_claude_temporary_path(Path(call["tmpdir"]), call)
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(call["task_worktree"], str(wt))
         self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir),
@@ -4005,6 +4057,7 @@ store.write_text(json.dumps(prs))
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
                          [call["tmpdir"], str(self.gate_dir), f"/tmp/task-gate-{os.getuid()}"])
+        self.assert_claude_temporary_path(Path(call["tmpdir"]), call)
         self.assertEqual(record["model"], "opus")
 
     def test_claude_long_lane_temp_is_private_socket_writable_and_removed(self):
@@ -4872,6 +4925,13 @@ store.write_text(json.dumps(prs))
     def test_merge_gates_merge_result_without_changing_lane_and_is_idempotent(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        self.assertTrue(evidence["trusted"])
+        trusted = Path(evidence["log"]).read_bytes()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+        advisory = (wt / ".work/check.log").read_bytes()
         lane_head = self.git(wt, "rev-parse", "HEAD")
         # main moves on in the meantime (another task merged)
         other = self.home / "other"
@@ -4897,6 +4957,8 @@ store.write_text(json.dumps(prs))
         self.assertEqual(self.git(self.repo, "rev-parse", "main"), tip, "main checkout fast-forwarded")
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
         self.assertFalse(wt.exists(), out)
+        self.assertEqual(Path(evidence["log"]).read_bytes(), trusted)
+        self.assertEqual((self.state() / "advisory-check.log").read_bytes(), advisory)
         self.assertNotIn("t5-add-the-b-file", self.git(self.repo, "branch"))
         self.assertIn("already merged", self.raw_task("merge", "proj", "5"))
 
