@@ -195,7 +195,7 @@ class Batch:
             return "merged"
         resumed = path.is_dir() and (state / "task.json").is_file()
         dispatch = ""
-        if not resumed:
+        if not resumed or task["seed"]:
             options = ["--builder", task["builder"]]
             if task["seed"]:
                 options += ["--seed", task["seed"]]

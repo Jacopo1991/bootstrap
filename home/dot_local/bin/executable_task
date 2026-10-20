@@ -1820,6 +1820,18 @@ def seed_source(repo, name):
     return source
 
 
+def same_seed(source, destination):
+    if source.is_symlink() or destination.is_symlink():
+        return (source.is_symlink() and destination.is_symlink()
+                and os.readlink(source) == os.readlink(destination))
+    if source.is_dir() and destination.is_dir():
+        children = {entry.name for entry in source.iterdir()}
+        return children == {entry.name for entry in destination.iterdir()} and all(
+            same_seed(source / name, destination / name) for name in children)
+    return (source.is_file() and destination.is_file()
+            and source.read_bytes() == destination.read_bytes())
+
+
 def seed_worktree(repo, path, names):
     source_root = repo / ".work"
     destination_root = path / ".work"
@@ -1830,6 +1842,9 @@ def seed_worktree(repo, path, names):
     for source in sources:
         destination = destination_root / source.name
         if destination.exists() or destination.is_symlink():
+            if not same_seed(source, destination):
+                raise Stop(f"Seed target already exists and differs: {destination}; "
+                           "preserving lane work. Resolve the conflict before retrying.")
             continue
         if source.is_dir():
             shutil.copytree(source, destination, symlinks=True)
@@ -2873,7 +2888,10 @@ def review(args):
                           else default_branch(task.repo))
         review_base = git(task.repo, "merge-base", review_base, head)
         prompt.append(f"Diff range: {review_base}...{head}")
-        prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
+        report_path = path / '.work/report.md'
+        prompt.append("For cumulative reports, use only the last Criteria block; earlier rounds are superseded. "
+                      "A missing or incomplete last block is Blocking; never fall back to an earlier complete round.")
+        prompt.append(f"Reviewer instructions: read {report_path} alongside the diff; "
                       "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
         if record["criteria"]:
@@ -3008,6 +3026,27 @@ def review(args):
     return 0
 
 
+def report_criteria(content, criteria):
+    """Validate the final round, never fall back to a superseded complete round."""
+    blocks = re.findall(r"(?ms)^## Criteria[ \t]*(?:\n|\Z)(.*?)(?=^## |\Z)", content)
+    text = blocks[-1] if blocks else ""
+    rows = re.findall(r"(?im)^\s*(?:(?:[-*]|\d+\.)\s+)?#?(\d+)\s+(met|not met):\s*([^\n]*)", text)
+    required = {item['number'] for item in criteria}
+    if (len(rows) != len(required) or {int(row[0]) for row in rows} != required
+            or any(status.lower() != "met" or not evidence.strip() or "(fill in)" in evidence.lower()
+                   for _, status, evidence in rows)):
+        raise Stop("Missing or incomplete final Criteria block: every criterion must be met with evidence.")
+    return text
+
+
+def current_report(content):
+    """Keep cumulative prose, but discard superseded criteria for report validation."""
+    blocks = list(re.finditer(r"(?ms)^## Criteria[ \t]*(?:\n|\Z).*?(?=^## |\Z)", content))
+    for block in reversed(blocks[:-1]):
+        content = content[:block.start()] + content[block.end():]
+    return content
+
+
 def merge_gate(task, path, head):
     missing = []
     record = load_record(task)
@@ -3023,9 +3062,9 @@ def merge_gate(task, path, head):
             or review.get("reviewer") == record["builder"]):
         missing.append("recorded PASS review for lane head with every criterion pass by the other vendor")
     report = path / ".work/report.md"
-    if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", report.read_text(), re.M):
+    content = current_report(report.read_text()) if report.is_file() else ""
+    if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", content, re.M):
         # Blank headings and explanatory placeholders mean the lane has not completed its report.
-        content = report.read_text() if report.is_file() else ""
         headings = (("What changed", "How I verified", "Criteria", "Noticed, not done")
                     if record["criteria"] else ("What changed", "How I verified"))
         sections = [re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", content)
@@ -3033,12 +3072,11 @@ def merge_gate(task, path, head):
         if not all(match and match.group(1).strip() for match in sections) or "(fill in)" in content:
             missing.append("filled .work/report.md")
     if report.is_file():
-        content = report.read_text()
-        section = re.search(r"(?ms)^## Criteria\s*\n(.*?)(?=^## |\Z)", content)
-        criteria_text = section.group(1) if section else ""
-        if any(not re.search(rf"(?m)^\s*(?:(?:[-*]|\d+\.)\s+)?#?{item['number']}\s+(?:met|not met):\s*\S.+$",
-                             criteria_text, re.I) for item in record["criteria"]):
-            missing.append("criterion evidence in .work/report.md")
+        if record["criteria"]:
+            try:
+                report_criteria(content, record["criteria"])
+            except Stop:
+                missing.append("criterion evidence in final Criteria block of .work/report.md")
     if missing:
         error = Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
         error.missing_steps = missing
