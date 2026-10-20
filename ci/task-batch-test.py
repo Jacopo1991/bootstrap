@@ -479,6 +479,25 @@ class BatchTest(unittest.TestCase):
         self.assertIn('criterion 1 missing', prompts[1]['prompt'])
         self.assertNotIn('optional', prompts[1]['prompt'])
 
+    def test_external_after_without_merge_record_parks_only_dependant(self):
+        self.source.write_text('1. dependent: builder codex, model gpt-6-luna, after: prepare\n'
+                               '2. independent: builder codex, model gpt-6-luna\n')
+        self.scenario({})
+        done = self.run_batch()
+        self.assertIn('dependent: not started: after prepare (no merge record)', done)
+        self.assertIn('independent: merged', done)
+        self.assertEqual([call[2] for call in self.calls('lane')], ['independent'])
+
+    def test_external_after_with_merge_record_is_satisfied(self):
+        self.source.write_text('1. dependent: builder codex, model gpt-6-luna, after: prepare\n')
+        merge = self.home / '.local/state/task/proj/prepare/merge.json'
+        merge.parent.mkdir(parents=True)
+        merge.write_text(json.dumps({'head': 'already-merged'}))
+        self.scenario({})
+        done = self.run_batch()
+        self.assertIn('dependent: merged', done)
+        self.assertEqual([call[2] for call in self.calls('lane')], ['dependent'])
+
     def test_escalation_and_round_three_park(self):
         self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}') for i in range(4)]})
         self.assertIn('parked: fix rounds exhausted', self.run_batch())
@@ -513,7 +532,7 @@ class BatchTest(unittest.TestCase):
                         models = {'claude': {'routine': 'sonnet', 'hard': 'fable' if boosted else 'opus',
                                              'design': 'opus'},
                                   'codex': {'routine': 'gpt-6-luna',
-                                            'hard': 'gpt-6-astra' if boosted else 'gpt-6.1-sol',
+                                            'hard': 'gpt-6.1-sol',
                                             'design': 'gpt-6-astra' if boosted else 'gpt-6.1-sol'}}
                         prompts = [p for p in self.prompts() if Path(p['path']).parents[1].name == ident]
                         self.assertEqual([p['routed_model'] for p in prompts],

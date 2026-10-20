@@ -1538,7 +1538,8 @@ def lane(args):
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
-        boost_notice = f"boost: tier {tier}, {builder} -> {model} ({'explicit model' if args.model else 'tier routing'}; until {until})"
+        route_kind = 'explicit model' if args.model else ('default routing' if tier == 'routine' else 'tier routing')
+        boost_notice = f"boost: tier {tier}, {builder} -> {model} ({route_kind}; until {until})"
     else:
         boost_notice = ""
     work = path / ".work"

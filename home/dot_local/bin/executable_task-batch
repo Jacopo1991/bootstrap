@@ -393,6 +393,7 @@ class Batch:
 
     def schedule(self, tasks):
         pending, completed, parked = list(tasks), set(), set()
+        in_file = {name(task["id"]) for task in tasks}
         consecutive = 0
         # Each worker owns its per-task state. Only this scheduler writes outcomes.
         pool = ThreadPoolExecutor(max_workers=self.gate_slots())
@@ -402,6 +403,17 @@ class Batch:
                 total, limits = self.capacity()
                 for task in list(pending):
                     dependency = name(task["after"]) if task["after"] else None
+                    if dependency and dependency not in in_file and dependency not in completed:
+                        merge_record = (Path.home() / ".local/state/task" / self.repo.name /
+                                        dependency / "merge.json")
+                        if merge_record.is_file():
+                            completed.add(dependency)
+                        else:
+                            self.append(f"{task['id']}: not started: after {task['after']} (no merge record)")
+                            parked.add(name(task["id"]))
+                            completed.add(name(task["id"]))
+                            pending.remove(task)
+                            continue
                     if dependency in parked:
                         self.append(f"{task['id']}: not started: after {task['after']}")
                         parked.add(name(task["id"]))
@@ -410,7 +422,11 @@ class Batch:
                         continue
                     if dependency and dependency not in completed:
                         continue
-                    count = sum(t["builder"] == task["builder"] for t in running.values())
+                    def current_builder(running_task):
+                        state = (Path.home() / ".local/state/task" / self.repo.name /
+                                 name(running_task["id"]) / "task.json")
+                        return data(state).get("builder", running_task["builder"])
+                    count = sum(current_builder(t) == task["builder"] for t in running.values())
                     if len(running) >= total or count >= limits[task["builder"]]:
                         continue
                     pending.remove(task)

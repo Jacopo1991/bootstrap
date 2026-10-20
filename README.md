@@ -442,9 +442,10 @@ the final vendor swap applies. Explicit-model tasks keep their model escalation 
 temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.
 Without boost, routine uses the usual builder default (Codex gpt-6-luna,
 Claude sonnet); hard and design use Codex gpt-6.1-sol or Claude opus.
-While that vendor is boosted, hard uses Codex gpt-6-astra or
+While that vendor is boosted, hard uses Codex gpt-6.1-sol or
 Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
-default. An explicit `--model` always wins; `--no-boost` disables tier routing.
+default. An explicit `--model` always wins; `--no-boost` disables boosted tier
+routing, while Codex hard remains gpt-6.1-sol.
 The launch notice explains the decision. Reviews keep their usual cheap models
 and usage-limit handling regardless of boost.
 Usage limits retry once on the other reviewer vendor and record its actual

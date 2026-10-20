@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 TIERS = ("routine", "hard", "design")
 ROUTING = {
-    "codex": {"default": "gpt-6-luna", "hard": "gpt-6-astra", "design": "gpt-6-astra"},
+    "codex": {"default": "gpt-6-luna", "hard": "gpt-6.1-sol", "design": "gpt-6-astra"},
     "claude": {"default": "sonnet", "hard": "fable", "design": "opus"},
 }
 UNBOOSTED = {"codex": "gpt-6.1-sol", "claude": "opus"}
@@ -62,7 +62,11 @@ def route(home, vendor, tier, explicit=None, boosted=True):
     values = models[vendor]
     if explicit:
         return explicit
-    if tier == "routine" or not boosted:
+    if tier == "routine":
+        return values["default"]
+    if vendor == "codex" and tier == "hard":
+        return "gpt-6.1-sol"
+    if not boosted:
         return values["default"]
     return values[tier] if vendor in active(home) else UNBOOSTED[vendor]
 

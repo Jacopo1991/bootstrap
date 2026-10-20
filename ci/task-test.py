@@ -970,7 +970,7 @@ class TaskTool(unittest.TestCase):
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
         for builder in ('codex', 'claude'):
             for tier in ('routine', 'hard', 'design'):
-                expected = {'codex': {'routine': 'gpt-6-luna', 'hard': 'gpt-6-astra', 'design': 'gpt-6-astra'},
+                expected = {'codex': {'routine': 'gpt-6-luna', 'hard': 'gpt-6.1-sol', 'design': 'gpt-6-astra'},
                             'claude': {'routine': 'sonnet', 'hard': 'fable', 'design': 'opus'}}[builder][tier]
                 (wt / '.work/model-call.json').unlink(missing_ok=True)
                 (wt / '.work/final.md').unlink(missing_ok=True)
@@ -986,7 +986,8 @@ class TaskTool(unittest.TestCase):
             (wt / '.work/model-call.json').unlink(missing_ok=True)
             (wt / '.work/final.md').unlink(missing_ok=True)
             self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost')
-            self.assertEqual(self.wait_for_lane(wt)['model'], explicit)
+            no_boost_hard = 'gpt-6.1-sol' if builder == 'codex' else explicit
+            self.assertEqual(self.wait_for_lane(wt)['model'], no_boost_hard)
 
     def test_tier_file_flag_state_and_status(self):
         task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
