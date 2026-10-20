@@ -10,17 +10,13 @@ import tempfile
 import tomllib
 import atexit
 
-# Fixtures own their roots, independently of the enclosing lane.
-os.environ.pop("TASK_WORKTREE", None)
+from policy_test_env import isolate_policy_environment
+
+isolate_policy_environment()
 
 audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
 atexit.register(audit_state.cleanup)
 os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
-
-# Agent sessions export GIT_CONFIG_*/GIT_EDITOR/...; the hook (rightly) refuses them,
-# so the fixtures below need a clean Git environment.
-for name in [name for name in os.environ if name.startswith("GIT_")]:
-    del os.environ[name]
 
 ROOT = Path(__file__).resolve().parents[1]
 assert (ROOT / ".chezmoiroot").read_text(encoding="utf-8").strip() == "home"

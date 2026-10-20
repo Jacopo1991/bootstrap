@@ -8,16 +8,13 @@ import subprocess
 import tempfile
 from unittest.mock import patch
 
-# Fixtures own their roots, independently of the enclosing lane.
-os.environ.pop("TASK_WORKTREE", None)
+from policy_test_env import isolate_policy_environment
+
+isolate_policy_environment()
 
 audit_state = tempfile.TemporaryDirectory(prefix="agent-policy-test-")
 atexit.register(audit_state.cleanup)
 os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
-
-# Agent sessions export Git overrides; the policy hook correctly refuses them.
-for name in [name for name in os.environ if name.startswith("GIT_")]:
-    del os.environ[name]
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location(

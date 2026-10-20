@@ -269,6 +269,8 @@ class RefreshTests(unittest.TestCase):
         self.env = {
             "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(self.temp),
             "QMD_CORTEX_DIR": str(self.cortex), "GIT_CONFIG_GLOBAL": "/dev/null",
+            # A lane TMPDIR can be nested inside the real checkout.
+            "GIT_CEILING_DIRECTORIES": str(self.temp),
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
