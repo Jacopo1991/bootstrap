@@ -540,6 +540,8 @@ with tempfile.TemporaryDirectory() as temp:
             assert judge(runner) is None, (runner, body)
     for body in ("printf [ab]", "printf {a,b}", "printf *", "printf ?", "printf ~"):
         assert judge(body), body
+    # Later data operands retain their pre-existing typed-command treatment.
+    assert judge("printf '%s' *") is None
     fixture("justfile", "check:\n    printf '%s\\n' safe\n")
     fixture_git("add", "justfile")
     fixture_git("commit", "-qm", "modelled positive recipe")

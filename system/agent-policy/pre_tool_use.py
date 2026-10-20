@@ -1571,6 +1571,19 @@ def mask_print_literals(text: str) -> str:
                   lambda match: re.sub(r"[~*?{}\[\]#]", "x", match[0]), text)
 
 
+def printf_format(tokens: list[str]) -> str:
+    """Find the option/format operand even when redirections precede it."""
+    args = tokens[1:]
+    redirects = {"<", ">", ">>", ">|", "&>", "&>>", ">&", "<>", "<&", "<<<"}
+    while args:
+        if args[0].isdigit() and len(args) > 1 and args[1] in redirects:
+            args = args[1:]
+        if args[0] not in redirects:
+            return args[0]
+        args = args[2:]
+    return ""
+
+
 def judge_program(text: str, cwd: str, root: Path,
                   approved_roots: tuple[Path, ...] | None, depth: int,
                   allow_cd: bool = True) -> str | None:
@@ -1968,10 +1981,14 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                     drop.update(range(index, index + len(expected)))
                     word_start = char.isspace()
                 tokens = [token for index, token in enumerate(tokens) if index not in drop]
-            print_tokens = unwrap_command(tokens)
+            print_lexer = shlex.shlex(mask_print_literals(text), posix=True,
+                                     punctuation_chars=";&|<>")
+            print_lexer.whitespace_split = True
+            print_lexer.commenters = ""
+            print_tokens = unwrap_command(list(print_lexer))
             if (isinstance(print_tokens, list) and print_tokens
                     and Path(print_tokens[0]).name == "printf"
-                    and SHELL_EXPANSION.search(mask_print_literals(text))):
+                    and SHELL_EXPANSION.search(printf_format(print_tokens))):
                 return "Shell expansion in printf cannot be judged safely."
             all_tokens.append(tokens)
         except ValueError:
@@ -2123,16 +2140,8 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
         if len(tokens) != 2 or tokens[0] not in {">", ">>", ">|"}:
             return "Leading shell redirections cannot be judged safely."
     if executable == "printf":
-        # Redirections can precede options. Never let one hide an assignment.
-        args = tokens[1:]
-        redirects = {"<", ">", ">>", ">|", "&>", "&>>", ">&", "<>", "<&", "<<<"}
-        while args:
-            if args[0].isdigit() and len(args) > 1 and args[1] in redirects:
-                args = args[1:]
-            if args[0] not in redirects:
-                break
-            args = args[2:]
-        if args and (args[0].startswith("-v") or re.search(r"[$`]", args[0])):
+        format_word = printf_format(tokens)
+        if format_word.startswith("-v") or re.search(r"[$`]", format_word):
             return "Shell builtin assignment via printf -v cannot be judged safely."
     if executable in SHELL_CONSTRUCTS - {"source", ".", "printf"} or tokens[0].startswith(("(", "{")) or any(
             tokens[i] in {"<", ">", ">>"} and tokens[i + 1].startswith("(")
