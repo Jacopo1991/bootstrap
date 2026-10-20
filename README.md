@@ -510,6 +510,12 @@ also accept `task check --variant fake`; trusted checks always run every variant
 The combined check log labels each run, and JSON evidence and history include
 per-variant results. `task status` lists variant names.
 
+Advisory lane checks write `.work/check.log`. Trusted checks write `check.log`
+in the task's state directory; merge gates write `gate-check.log` there and
+drills write `drill-check.log` in their evidence directory. They leave the lane
+log untouched. Check JSON and history record the log path and summary; status
+and review prompts identify the corresponding trusted or advisory log.
+
 Always launch build lanes through `task lane`, including from a batch runner:
 
 ```sh
