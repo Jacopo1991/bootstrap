@@ -11,7 +11,7 @@ failed=0
 skipped=0
 lane_skippable_suite() {
   # Only the socket fixture suite may skip, and never in a trusted gate.
-  [[ ${TASK_GATE_RUN_ID+x} != x ]] || return 1
+  if [[ -n ${TASK_GATE_RUN_ID:-} ]]; then return 1; fi
   [[ $# == 2 && $1 == bash && $2 == ci/boundary-test.sh ]]
 }
 run() {

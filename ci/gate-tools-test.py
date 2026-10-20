@@ -19,6 +19,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GateToolsTest(unittest.TestCase):
+    def test_socket_directory_respects_tmpdir_and_byte_limit(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            base = Path(directory)
+            python = base / 'python3'
+            python.write_text('#!/bin/sh\nprintf "fixture: %s\\n" "$2"\nexit 77\n')
+            python.chmod(0o755)
+            for name in ('short', 'a' * 90, 'é' * 45):
+                with self.subTest(name=name):
+                    temporary = base / name
+                    temporary.mkdir()
+                    env = dict(os.environ, PATH=directory + ':' + os.environ['PATH'],
+                               TMPDIR=str(temporary), TASK_GATE_RUN_ID='')
+                    result = subprocess.run(['bash', 'ci/boundary-test.sh'], cwd=ROOT,
+                                            env=env, text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 77, result.stderr)
+                    fixture = next(line.removeprefix('fixture: ') for line in
+                                   result.stdout.splitlines() if line.startswith('fixture: '))
+                    self.assertLess(len(os.fsencode(fixture)), 108)
+                    expected = temporary if name == 'short' else Path('/tmp')
+                    self.assertEqual(Path(fixture).parents[2], expected)
+
     def test_boundary_skip_reaches_lint_summary(self):
         lint = (ROOT / 'ci/lint.sh').read_text()
         runner = lint.split('failed=0\n', 1)[1].split('run bash ci/gate-tools.sh', 1)[0]
@@ -35,13 +56,15 @@ class GateToolsTest(unittest.TestCase):
                     if run_id is not None:
                         env['TASK_GATE_RUN_ID'] = run_id
                     result = subprocess.run(
+                        (['env', '-i', 'PATH=' + env['PATH'], 'TASK_GATE_RUN_ID=']
+                         if run_id == '' else []) +
                         ['bash', '-c', 'set -euo pipefail\nfailed=0\n' + runner +
                          'run bash ci/boundary-test.sh\nrun true\n' + summary],
                         cwd=ROOT, env=env, text=True, capture_output=True)
-                    self.assertEqual(result.returncode, int(run_id is not None), result.stderr)
+                    self.assertEqual(result.returncode, int(bool(run_id)), result.stderr)
                     self.assertIn('PASS: suite true', result.stderr)
                     self.assertNotIn('PASS: suite bash ci/boundary-test.sh', result.stderr)
-                    if run_id is not None:
+                    if run_id:
                         self.assertIn('FAIL: bash ci/boundary-test.sh (exit 77)', result.stderr)
                         self.assertIn('failed=1, skipped=0', result.stdout)
                     else:
@@ -148,10 +171,11 @@ class GateToolsTest(unittest.TestCase):
                 target.chmod(0o755)
 
     def test_socket_denial_is_never_skipped_in_trusted_gate(self):
-        for trusted in (False, True):
+        for run_id in (None, '', 'test'):
+            trusted = bool(run_id)
             for code in (errno.EPERM, errno.EACCES, errno.ENOENT):
-                with self.subTest(trusted=trusted, code=code):
-                    environment = {"TASK_GATE_RUN_ID": "test"} if trusted else {}
+                with self.subTest(run_id=run_id, code=code):
+                    environment = {"TASK_GATE_RUN_ID": run_id} if run_id is not None else {}
                     with patch.dict(os.environ, environment, clear=True), \
                          patch.object(sys, "argv", ["boundary-sockets.py", "fixture"]), \
                          patch("socket.socket", side_effect=OSError(code, "fixture denial")), \

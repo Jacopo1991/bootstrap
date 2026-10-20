@@ -22,8 +22,14 @@ check_mount deny 'mount under drive directory' 'share /mnt/z/work ext4 rw 0 0'
 check_mount deny 'mixed system and drive mounts' $'drivers /usr/lib/wsl/drivers 9p ro,aname=drivers 0 0\nC:\\134 /windows 9p rw,aname=drvfs 0 0'
 check_mount allow 'ordinary Linux mounts' $'/dev/sdc / ext4 rw 0 0\ntmpfs /mnt/cache tmpfs rw 0 0'
 
-# AF_UNIX paths must fit even when the gate supplies a deeply nested TMPDIR.
-tmp=$(mktemp -d /tmp/s.XXXXXXXX)
+# Prefer TMPDIR; fall back to a short /tmp directory when the longest socket
+# path plus its terminating NUL would exceed AF_UNIX's 108-byte limit.
+socket_template=${TMPDIR:-/tmp}/s.XXXXXXXX
+socket_path=$socket_template/WSL/123_interop
+if (( $(LC_ALL=C printf '%s' "$socket_path" | wc -c) >= 108 )); then
+  socket_template=/tmp/s.XXXXXXXX
+fi
+tmp=$(mktemp -d "$socket_template")
 trap 'rm -rf "$tmp"' EXIT
 mkdir "$tmp/WSL"
 mkdir -p "$tmp/proc/789"
