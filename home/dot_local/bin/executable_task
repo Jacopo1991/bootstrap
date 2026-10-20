@@ -1154,10 +1154,6 @@ def gate_port_index(path: Path):
         os.close(descriptor)
 
 
-def gate_holder_alive(lock_path):
-    return gate_holder_pid(lock_path) is not None
-
-
 def gate_holder_pid(lock_path):
     """Kernel lock identity survives PID namespace differences."""
     info = lock_path.stat()
