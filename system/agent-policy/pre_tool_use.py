@@ -1354,6 +1354,40 @@ def command_rule(reason: str) -> str:
     return "command.other"
 
 
+def shell_quote_state(command: str) -> list[tuple[bool, bool]]:
+    """Mark real quoted spans and escape pairs without removing shell spelling.
+
+    Escaped quotes outside quotes are data. In double quotes, backslash
+    escapes only shell special characters; single quotes have no escapes.
+    """
+    states: list[tuple[bool, bool]] = []
+    quote: str | None = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote and char in "\n\r":
+            raise ValueError("Quoted multi-line shell strings are blocked.")
+        if (char == "\\" and quote != "'" and index + 1 < len(command)
+                and (quote is None or command[index + 1] in '$`"\\\n\r')):
+            if command[index + 1] in "\n\r":
+                raise ValueError("Shell line continuations are blocked.")
+            states.extend([(quote is not None, True)] * 2)
+            index += 2
+            continue
+        quoted = quote is not None
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+            quoted = True
+        states.append((quoted, False))
+        index += 1
+    if quote:
+        raise ValueError("Shell syntax is unrecognized; blocked by policy.")
+    return states
+
+
 def split_command(command: str) -> tuple[list[str], list[str]] | str:
     """Split on unquoted ; && || | into segments; return a reason for anything else.
 
@@ -1362,30 +1396,17 @@ def split_command(command: str) -> tuple[list[str], list[str]] | str:
     segments: list[str] = []
     operators: list[str] = []
     current = ""
-    quote: str | None = None
+    try:
+        states = shell_quote_state(command)
+    except ValueError as error:
+        return str(error)
     redirect = False
     index = 0
     while index < len(command):
         char = command[index]
         was_redirect, redirect = redirect, False
-        if quote:
-            if char in "\n\r":
-                return "Quoted multi-line shell strings are blocked."
-            current += char
-            if char == "\\" and quote == '"' and index + 1 < len(command):
-                if command[index + 1] in "\n\r":
-                    return "Shell line continuations are blocked."
-                index += 1
-                current += command[index]
-            elif char == quote:
-                quote = None
-        elif char == "\\" and index + 1 < len(command):
-            if command[index + 1] in "\n\r":
-                return "Shell line continuations are blocked."
-            index += 1
-            current += char + command[index]
-        elif char in "'\"":
-            quote = char
+        quoted, escaped = states[index]
+        if quoted or escaped:
             current += char
         elif command[index:index + 3] == "<<<":
             current += "<<<"
@@ -1419,8 +1440,6 @@ def split_command(command: str) -> tuple[list[str], list[str]] | str:
         else:
             current += char
         index += 1
-    if quote:
-        return "Shell syntax is unrecognized; blocked by policy."
     if current.strip():
         segments.append(current)
     elif operators and operators[-1] != ";":
@@ -1566,9 +1585,9 @@ def program_text(path: Path) -> str:
 
 
 def mask_print_literals(text: str) -> str:
-    """Hide quoted print punctuation, preserving dynamic shell syntax checks."""
-    return re.sub(r"'[^']*'|\"(?:\\.|[^\"\\])*\"",
-                  lambda match: re.sub(r"[~*?{}\[\]#]", "x", match[0]), text)
+    """Hide punctuation only inside real quotes; leave expansions visible."""
+    return "".join("x" if quoted and char in "~*?{}[]#" else char
+                   for char, (quoted, _) in zip(text, shell_quote_state(text)))
 
 
 def printf_format(tokens: list[str]) -> str:

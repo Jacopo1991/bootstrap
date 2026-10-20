@@ -540,6 +540,28 @@ with tempfile.TemporaryDirectory() as temp:
             assert judge(runner) is None, (runner, body)
     for body in ("printf [ab]", "printf {a,b}", "printf *", "printf ?", "printf ~"):
         assert judge(body), body
+    # Round 6: escaped quotes outside quotes cannot hide an unquoted glob.
+    # Inspect these payloads only; never run their redirects or expansions.
+    for body in (r"printf >\' ?v 'PATH' \'", r'printf >\" ?v "PATH" \"'):
+        assert judge(body), body
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "escaped quote printf negative")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
+    # Echo cannot assign, but judged bodies must still reject unquoted globs.
+    for body in (r"echo >\' ?v 'PATH' \'", r'echo >\" ?v "PATH" \"'):
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "escaped quote echo negative")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
     # Later data operands retain their pre-existing typed-command treatment.
     assert judge("printf '%s' *") is None
     fixture("justfile", "check:\n    printf '%s\\n' safe\n")
