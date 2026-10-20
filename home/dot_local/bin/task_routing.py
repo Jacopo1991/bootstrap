@@ -7,6 +7,7 @@ ROUTING = {
     "codex": {"default": "gpt-6-luna", "hard": "gpt-6-astra", "design": "gpt-6-astra"},
     "claude": {"default": "sonnet", "hard": "fable", "design": "opus"},
 }
+UNBOOSTED = {"codex": "gpt-6.1-sol", "claude": "opus"}
 
 
 class RoutingParseError(ValueError):
@@ -59,7 +60,11 @@ def route(home, vendor, tier, explicit=None, boosted=True):
         raise RoutingParseError(f"Invalid tier: {tier}")
     models, _ = policy(home)
     values = models[vendor]
-    return explicit or values[tier if boosted and vendor in active(home) and tier != "routine" else "default"]
+    if explicit:
+        return explicit
+    if tier == "routine" or not boosted:
+        return values["default"]
+    return values[tier] if vendor in active(home) else UNBOOSTED[vendor]
 
 
 def lane_limits(home, slots):

@@ -77,8 +77,15 @@ if cmd == 'start':
     print('Dispatch prompt:\nContext: .work/context/\nCommit and fill .work/report.md.')
 elif cmd == 'lane':
     prompt = (work / 'prompt.md').read_text()
+    sys.path.insert(0, os.environ['TASK_TEST_ROUTING_DIR'])
+    from task_routing import route
+    vendor = options[options.index('--builder') + 1]
+    tier = options[options.index('--tier') + 1] if '--tier' in options else 'routine'
+    explicit = options[options.index('--model') + 1] if '--model' in options else None
+    routed_model = route(home, vendor, tier, explicit)
     with (home / 'prompts.jsonl').open('a') as out:
-        out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options)) + '\n')
+        out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options,
+                                 routed_model=routed_model)) + '\n')
     record = json.loads((state / 'task.json').read_text())
     record['builder'] = options[options.index('--builder') + 1]
     save(state / 'task.json', record)
@@ -265,6 +272,7 @@ class BatchTest(unittest.TestCase):
         self.repo = self.home / 'dev_workspace/proj'
         self.repo.mkdir(parents=True)
         self.env = dict(HOME=str(self.home), PATH=os.environ['PATH'],
+                        TASK_TEST_ROUTING_DIR=str(ROOT / 'home/dot_local/bin'),
                         GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
                         GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid',
                         GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid')
@@ -478,6 +486,40 @@ class BatchTest(unittest.TestCase):
         self.assertEqual([c[c.index('--model') + 1] for c in lanes],
                          ['gpt-6-luna', 'gpt-6-luna', 'gpt-6.1-sol', 'opus'])
         self.assertEqual(lanes[-1][lanes[-1].index('--builder') + 1], 'claude')
+
+    def test_tier_only_fix_rounds_preserve_routing(self):
+        state = self.home / '.local/state/task'
+        state.mkdir(parents=True)
+        for vendor in ('claude', 'codex'):
+            for boosted in (False, True):
+                for tier in ('routine', 'hard', 'design'):
+                    with self.subTest(vendor=vendor, boosted=boosted, tier=tier):
+                        ident = f'{vendor}-{boosted}-{tier}'
+                        self.source.write_text(f'1. {ident}: builder {vendor}, tier {tier}\n')
+                        (state / 'boost.json').write_text(json.dumps(
+                            {v: '2099-01-01T00:00:00+00:00' for v in ('claude', 'codex')}
+                            if boosted else {}))
+                        self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}')
+                                                  for i in range(4)]})
+                        self.assertIn('parked: fix rounds exhausted', self.run_batch())
+                        lanes = [c for c in self.calls('lane') if c[2] == ident]
+                        self.assertEqual(len(lanes), 4)
+                        self.assertTrue(all('--model' not in c for c in lanes))
+                        raised = 'hard' if tier == 'routine' else tier
+                        self.assertEqual([c[c.index('--tier') + 1] for c in lanes],
+                                         [tier, tier, raised, raised])
+                        other = 'codex' if vendor == 'claude' else 'claude'
+                        self.assertEqual([c[c.index('--builder') + 1] for c in lanes],
+                                         [vendor, vendor, vendor, other])
+                        models = {'claude': {'routine': 'sonnet', 'hard': 'fable' if boosted else 'opus',
+                                             'design': 'opus'},
+                                  'codex': {'routine': 'gpt-6-luna',
+                                            'hard': 'gpt-6-astra' if boosted else 'gpt-6.1-sol',
+                                            'design': 'gpt-6-astra' if boosted else 'gpt-6.1-sol'}}
+                        prompts = [p for p in self.prompts() if Path(p['path']).parents[1].name == ident]
+                        self.assertEqual([p['routed_model'] for p in prompts],
+                                         [models[vendor][tier], models[vendor][tier],
+                                          models[vendor][raised], models[other][raised]])
 
     def test_strong_model_skips_round_two(self):
         self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6-astra'))

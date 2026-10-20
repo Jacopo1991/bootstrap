@@ -245,7 +245,7 @@ class TaskTool(unittest.TestCase):
         (wt / '.work/prompt.md').write_text('Implement task')
         out = self.task('lane', 'proj', '5', '--tier', 'hard')
         self.wait_for_lane(wt)
-        self.assertIn('route: hard -> codex gpt-6-luna', out)
+        self.assertIn('route: hard -> codex gpt-6.1-sol', out)
         self.assertIn('Updating task tier to hard.', out)
         self.assertNotIn('Updating task builder', out)
 
@@ -1001,7 +1001,9 @@ class TaskTool(unittest.TestCase):
         from task_routing import route, lane_limits
         for vendor, default in [('codex', 'gpt-6-luna'), ('claude', 'sonnet')]:
             for tier in ('routine', 'hard', 'design'):
-                self.assertEqual(route(self.home, vendor, tier), default)
+                expected = default if tier == 'routine' else {'codex': 'gpt-6.1-sol', 'claude': 'opus'}[vendor]
+                self.assertEqual(route(self.home, vendor, tier), expected)
+                self.assertEqual(route(self.home, vendor, tier, boosted=False), default)
         config = self.home / '.config/task'
         config.mkdir(parents=True, exist_ok=True)
         (config / 'routing.json').write_text(json.dumps(dict(models={'claude': {'hard': 'opus'}}, extra_lanes=1)))

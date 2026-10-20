@@ -435,11 +435,15 @@ The flag takes precedence and the tier is pinned in task state and shown by
 
 Without a model, the batch passes `--tier` to `task lane` for routing.
 An explicit runner model takes precedence over tier routing.
+After two failed rounds, tier-only routine tasks rise to hard; hard and design
+keep their tier. Tier-only fixes keep routing without a model pin, including
+the final vendor swap. Explicit-model tasks keep their model escalation rules.
 
 `task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
 temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.
-Without boost, all tiers use the usual builder default (Codex gpt-6-luna,
-Claude sonnet). While that vendor is boosted, hard uses Codex gpt-6-astra or
+Without boost, routine uses the usual builder default (Codex gpt-6-luna,
+Claude sonnet); hard and design use Codex gpt-6.1-sol or Claude opus.
+While that vendor is boosted, hard uses Codex gpt-6-astra or
 Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
 default. An explicit `--model` always wins; `--no-boost` disables tier routing.
 The launch notice explains the decision. Reviews keep their usual cheap models

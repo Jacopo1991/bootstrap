@@ -272,6 +272,8 @@ class Batch:
                      "avoid backticks in shell commands. If a merge-in is needed, run `git merge origin/main`.\n")
         started = time.monotonic()
         builder, model = task["builder"], task["model"]
+        tier = task.get("tier")
+        tier_only = model is None
         rounds, previous, findings, check_tail = 0, None, "", ""
         # Never launch a duplicate lane or overwrite the prompt of a running lane.
         previous_limit = lane_limit(data(work / "lane.json"), work) if resumed else ""
@@ -298,7 +300,7 @@ class Batch:
                 if rounds or findings:
                     prompt += FIX_SCOPE_INSTRUCTION + "\n"
                 (work / "prompt.md").write_text(prompt)
-                options = ["--tier", task["tier"]] if task.get("tier") else []
+                options = ["--tier", tier] if tier else []
                 if model:
                     options += ["--model", model]
                 self.require("lane", ident, "--builder", builder, "--timeout", box, *options)
@@ -349,14 +351,17 @@ class Batch:
             previous = signature
             rounds += 1
             if rounds == 2:
-                stronger = "gpt-6.1-sol" if builder == "codex" else "opus"
-                if model in {"gpt-6.1-sol", "gpt-6-astra", "opus", "claude-opus-5-5", "fable", "claude-fable-5-1"}:
+                if tier_only:
+                    if tier == "routine":
+                        tier = "hard"
+                elif model in {"gpt-6.1-sol", "gpt-6-astra", "opus", "claude-opus-5-5", "fable", "claude-fable-5-1"}:
                     rounds = 3
                 else:
-                    model = stronger
+                    model = "gpt-6.1-sol" if builder == "codex" else "opus"
             if rounds == 3:
                 builder = "claude" if builder == "codex" else "codex"
-                model = "opus" if builder == "claude" else "gpt-6.1-sol"
+                if not tier_only:
+                    model = "opus" if builder == "claude" else "gpt-6.1-sol"
             run_lane = True
 
     def run_task(self, task):
