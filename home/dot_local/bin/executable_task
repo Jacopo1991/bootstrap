@@ -956,6 +956,16 @@ def gate_directory():
     return root
 
 
+def gate_temporary_root():
+    root = Path("/tmp") / f"task-gate-{os.getuid()}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise Stop(f"Gate temporary parent must be an owned directory with mode 0700: {root}")
+    return root
+
+
 def gate_paths(name):
     root = gate_directory()
     stem = "agent-task-gate" if name == "slot-0" else f"agent-task-gate-{name}"
@@ -1547,6 +1557,7 @@ def lane(args):
             settings = work / "claude-settings.json"
             atomic_json(settings, {"sandbox": {"filesystem": {"allowWrite": [
                 environment["TMPDIR"], str(gate_directory().resolve()),
+                str(gate_temporary_root()),
             ]}}})
             command.extend(["--settings", str(settings)])
         with tempfile.TemporaryFile() as source:
@@ -2224,12 +2235,7 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
                                cancelled=cancelled)
     # Do not inherit TMPDIR: callers may point it inside a checkout.
-    temporary_root = Path("/tmp") / f"task-gate-{os.getuid()}"
-    temporary_root.mkdir(mode=0o700, exist_ok=True)
-    info = temporary_root.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o700):
-        raise Stop(f"Gate temporary parent must be an owned directory with mode 0700: {temporary_root}")
+    temporary_root = gate_temporary_root()
     sweep_gate_temporary(temporary_root)
     with tempfile.TemporaryDirectory(prefix="gate-", dir=temporary_root) as temporary:
         (Path(temporary) / "holder.pid").write_text(str(os.getpid()) + "\n")
@@ -2253,7 +2259,8 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
             # Advisory checks need a writable parent inside their lane.
-            with tempfile.TemporaryDirectory(prefix="variant-", dir=work if advisory else "/tmp") as temporary:
+            with tempfile.TemporaryDirectory(
+                    prefix="variant-", dir=work if advisory else gate_temporary_root()) as temporary:
                 gate_environment = dict(environment, TMPDIR=temporary, TASK_GATE_SLOT=str(slot),
                                         TASK_GATE_PORT_BASE=str(20000 + 200 * slot))
                 evidence = []

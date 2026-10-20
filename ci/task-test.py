@@ -2590,8 +2590,10 @@ store.write_text(json.dumps(prs))
     def setUp(self):
         # Includes AF_UNIX fixtures: nested gate TMPDIR paths exceed 108 bytes.
         socket_test = self._testMethodName == 'test_reliability_special_files_archive_manifest_and_publication'
+        # Documented short AF_UNIX fallback, inside the lane's gate-temp grant.
+        socket_root = TASK_MODULE.gate_temporary_root() if socket_test else None
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory(
-            dir='/tmp' if socket_test else None, prefix='s')))
+            dir=socket_root, prefix='s')))
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
         for name, body in STUBS.items():
@@ -3798,23 +3800,37 @@ store.write_text(json.dumps(prs))
         self.assertLess(len(os.fsencode(call["tmpdir"])), 40)
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(call["task_worktree"], str(wt))
-        self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir)])
+        self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir),
+                                   f"/tmp/task-gate-{os.getuid()}"])
         self.assertNotIn("/tmp", allowed)
         # Reproduce the read-only /tmp boundary: only the generated exceptions
         # and the checkout are writable. Exercise actual tempfile and lock opens.
         real_open = os.open
+        real_mkdir = os.mkdir
 
-        def sandbox_open(path, flags, *args, **kwargs):
+        def writable(path):
             resolved = Path(path).resolve()
             if not any(resolved.is_relative_to(Path(base)) for base in [str(wt), *allowed]):
                 raise PermissionError("Claude sandbox: read-only /tmp")
+
+        def sandbox_open(path, flags, *args, **kwargs):
+            writable(path)
             return real_open(path, flags, *args, **kwargs)
+
+        def sandbox_mkdir(path, *args, **kwargs):
+            writable(path)
+            return real_mkdir(path, *args, **kwargs)
 
         task = TASK_MODULE.Task(self.repo, "5")
         with mock.patch.dict(os.environ, HOME=str(self.home), TASK_GATE_DIR=str(self.gate_dir)), \
-                mock.patch.object(TASK_MODULE.os, "open", side_effect=sandbox_open):
+                mock.patch.object(TASK_MODULE.os, "open", side_effect=sandbox_open), \
+                mock.patch.object(TASK_MODULE.os, "mkdir", side_effect=sandbox_mkdir):
             with self.assertRaises(PermissionError):
                 os.open("/tmp/unlisted-lane-probe", os.O_CREAT | os.O_RDWR, 0o600)
+            with tempfile.TemporaryDirectory(
+                    prefix="gate-", dir=TASK_MODULE.gate_temporary_root()) as gate:
+                with tempfile.TemporaryFile(dir=gate) as probe:
+                    probe.write(b"writable")
             with TASK_MODULE.exclusive_gate_lock(task, silent_unavailable=True, advisory=True):
                 self.assertIsNotNone(TASK_MODULE.GATE_SLOT.get())
                 lock, _ = TASK_MODULE.gate_paths("slot-0")
@@ -3846,7 +3862,7 @@ store.write_text(json.dumps(prs))
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
-                         [call["tmpdir"], str(self.gate_dir)])
+                         [call["tmpdir"], str(self.gate_dir), f"/tmp/task-gate-{os.getuid()}"])
         self.assertEqual(record["model"], "opus")
 
     def test_claude_long_lane_temp_is_private_socket_writable_and_removed(self):
@@ -3860,6 +3876,7 @@ store.write_text(json.dumps(prs))
         self.raw_task("lane", "proj", name, env=dict(self.env, LANE_STUB_RELEASE=str(release)))
         call = self.wait_for_lane(wt, finished=False)
         temporary = Path(call["tmpdir"])
+        socket_denied = False
         try:
             self.assertRegex(str(temporary), rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
             self.assertLess(len(os.fsencode(temporary)), 40)
@@ -3867,17 +3884,24 @@ store.write_text(json.dumps(prs))
             self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
             settings = json.loads((wt / ".work/claude-settings.json").read_text())
             self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
-                             [str(temporary), str(self.gate_dir)])
+                             [str(temporary), str(self.gate_dir), f"/tmp/task-gate-{os.getuid()}"])
             self.assertEqual(call["task_worktree"], str(wt))
             self.assertEqual(call["state_home"], str(wt / ".work/state"))
-            with socket.socket(socket.AF_UNIX) as bridge:
-                bridge.bind(str(temporary / "srt-mux-3583008-1.sock"))
+            try:
+                with socket.socket(socket.AF_UNIX) as bridge:
+                    bridge.bind(str(temporary / "srt-mux-3583008-1.sock"))
+            except PermissionError:
+                if os.environ.get("TASK_GATE_RUN_ID"):
+                    raise
+                socket_denied = True
             with tempfile.TemporaryFile(dir=temporary) as probe:
                 probe.write(b"writable")
         finally:
             release.touch()
             self.wait_for_lane(wt)
         self.assertFalse(temporary.exists())
+        if socket_denied:
+            self.skipTest("lane sandbox forbids Unix sockets; temp writes and cleanup passed")
 
     def test_claude_lane_temp_removed_on_timeout_and_cancel(self):
         self.stub_models()

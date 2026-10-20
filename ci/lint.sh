@@ -29,7 +29,7 @@ run() {
     skipped=$((skipped + 1))
   elif (( status )); then
     echo "FAIL: $* (exit $status)" >&2
-    failed=1
+    failed=$((failed + 1))
   else
     echo "PASS: suite $*" >&2
   fi
@@ -85,4 +85,4 @@ run gitleaks git --redact --no-banner .
 run bash ci/gitleaks-working-tree.sh gitleaks "$ROOT" "$tmp/working-tree-scan"
 
 echo "Gate suites finished (failed=$failed, skipped=$skipped)"
-exit "$failed"
+(( failed == 0 ))
