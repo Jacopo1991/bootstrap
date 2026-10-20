@@ -420,7 +420,8 @@ with tempfile.TemporaryDirectory() as temp:
     fixture("justfile", 'check:\n    env -i PATH="$PATH" bash gate.sh\n')
     fixture("Makefile", "check:\n\tbash gate.sh\n")
     fixture("package.json", '{"scripts":{"check":"bash gate.sh","prepare":"bash gate.sh"}}')
-    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n. ./source.sh\n./direct.sh\ncd sub && bash run.sh\n")
+    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n. ./source.sh\n./direct.sh\npython3 -I check.py\ncd sub && bash run.sh\n")
+    fixture("check.py", "#!/usr/bin/python3\nprint('safe')\n")
     fixture("child.sh", "#!/bin/sh\necho safe\n")
     fixture("source.sh", "#!/bin/sh\necho safe\n")
     fixture("direct.sh", "#!/bin/sh\necho safe\n")
@@ -445,6 +446,9 @@ with tempfile.TemporaryDirectory() as temp:
         fixture(script, original)
     fixture_git("add", ".")
     fixture_git("commit", "-qm", "restore trusted scripts")
+    fixture("check.py", "#!/usr/bin/python3\nprint('changed')\n")
+    assert judge("just check")  # Interpreter flags must not hide changed inputs.
+    fixture("check.py", "#!/usr/bin/python3\nprint('safe')\n")
     fixture_git("branch", "-m", "main", "master")
     assert judge("just check") is None  # second local default
     fixture_git("branch", "-m", "master", "trunk")

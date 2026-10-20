@@ -1728,11 +1728,14 @@ def trusted_script_changes(text: str, cwd: str, root: Path,
         operand = None
         if interpreter:
             rest = words[index + 1:]
-            while rest and rest[0] in {"-e", "-u", "-eu", "-ue", "-x", "--"}:
+            # The options themselves are trusted here, but must not hide a
+            # literal script operand (e.g. python3 -I ci/check.py).
+            while rest and rest[0].startswith("-"):
                 rest = rest[1:]
             if rest and not rest[0].startswith("-"):
                 operand = rest[0]
-        elif "/" in word and not word.startswith("-"):
+        elif ("/" in word or Path(word).suffix in {".sh", ".py", ".js", ".mjs", ".cjs"}) \
+                and not word.startswith("-"):
             operand = word
         if operand is None or SHELL_EXPANSION.search(operand):
             continue
@@ -1742,6 +1745,11 @@ def trusted_script_changes(text: str, cwd: str, root: Path,
                 return "Trusted recipe script cannot be read safely."
             continue
         resolved = path.resolve()
+        if not interpreter:
+            if resolved.parent in {Path("/usr/bin"), Path("/usr/local/bin")}:
+                continue
+            if path.suffix not in {".sh", ".py", ".js", ".mjs", ".cjs"} and not os.access(path, os.X_OK):
+                continue
         if not resolved.is_relative_to(root):
             return "Trusted recipe script must stay inside the repository."
         if resolved in seen:
@@ -1749,7 +1757,8 @@ def trusted_script_changes(text: str, cwd: str, root: Path,
         changed = path.is_symlink() or recipe_changed(path, root)
         body = program_text(path)
         if changed:
-            if interpreter and not shell:
+            if interpreter and not shell or not interpreter and path.suffix in {
+                    ".py", ".js", ".mjs", ".cjs"}:
                 return "Changed non-shell script cannot be judged safely."
             reason = judge_program(body, cwd, root, approved_roots, depth + 1,
                                    allow_cd=head not in {"source", "."})
