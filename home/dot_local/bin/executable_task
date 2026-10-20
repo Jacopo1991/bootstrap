@@ -1335,16 +1335,45 @@ def agent_environment():
             if not stripped_agent_variable(name)}
 
 
-def lane_environment(task):
+def claude_temporary_root():
+    root = Path("/tmp") / f"claude-{os.getuid()}"
+    root.mkdir(mode=0o700, exist_ok=True)
+    info = root.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or info.st_mode & 0o022):
+        raise Stop(f"Claude temporary parent must be an owned, non-writable-by-others directory: {root}")
+    return root
+
+
+def cleanup_lane_temporary(temporary):
+    if not temporary:
+        return
+    path = Path(temporary)
+    # Cancellation reads a lane-controlled record; never remove arbitrary paths.
+    if (path.parent != claude_temporary_root()
+            or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name)):
+        raise Stop("Invalid Claude lane temporary directory.")
+    if path.exists():
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise Stop("Claude lane temporary directory must be owned by the user.")
+        shutil.rmtree(path)
+
+
+def lane_environment(task, builder="codex"):
     env = agent_environment()
     env.update(configured_environment(task.path, task.repo))
     state = task.path / ".work/state"
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
-    temporary = task.path / ".work/tmp"
-    if not temporary.resolve().is_relative_to(task.path.resolve()):
-        raise Stop("Lane TMPDIR must stay inside the task worktree.")
-    temporary.mkdir(parents=True, exist_ok=True)
+    if builder == "claude":
+        temporary = claude_temporary_root() / f"lane-{secrets.token_hex(4)}"
+        temporary.mkdir(mode=0o700)
+    else:
+        temporary = task.path / ".work/tmp"
+        if not temporary.resolve().is_relative_to(task.path.resolve()):
+            raise Stop("Lane TMPDIR must stay inside the task worktree.")
+        temporary.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(temporary.resolve())
     env["TASK_WORKTREE"] = str(task.path.resolve())
     if not env.get("SECRETSPEC_REASON", "").strip():
@@ -1508,9 +1537,13 @@ def lane(args):
             return 0
     code = 1
     timed_out = False
+    temporary = None
     try:
-        environment = lane_environment(task)
+        environment = lane_environment(task, builder)
         if builder == "claude":
+            temporary = environment["TMPDIR"]
+            run["temporary"] = temporary
+            atomic_json(lane_record, run)
             settings = work / "claude-settings.json"
             atomic_json(settings, {"sandbox": {"filesystem": {"allowWrite": [
                 environment["TMPDIR"], str(gate_directory().resolve()),
@@ -1544,11 +1577,13 @@ def lane(args):
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     run.update(state="timed_out", exit_code=None, ended_at=utc_now())
+                    cleanup_lane_temporary(temporary)
                     atomic_json(lane_record, run)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
+        cleanup_lane_temporary(temporary)
         run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
         atomic_json(lane_record, run)
     return code
@@ -3990,6 +4025,7 @@ def cancel(args):
             print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
             return 0
         lane_run.update(state="cancelled", ended_at=utc_now())
+        cleanup_lane_temporary(lane_run.get("temporary"))
         atomic_json(lane_path, lane_run)
         print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
         return 0
