@@ -322,6 +322,8 @@ not count as file changes. Shell assignments affecting resolution or startup
 forms (`printf -v`, `read`, `mapfile`, `readarray`, `getopts`, declarations), shell
 resolution changes (`hash`, `enable`, aliases, `shopt`, `set -o`) and wrappers
 around them are denied. Plain prints and read-only commands remain allowed.
+Quoted print literals may contain brackets, braces, stars, question marks and
+tildes; these characters do not make a print an assignment or shell expansion.
 Only literal `cd <path>` is modelled in typed commands and ordinary shell files;
 cwd options, variable operands and directory-stack operations are denied.
 
@@ -337,6 +339,10 @@ This inspection is not a process sandbox: inherited environment, mutable install
 commands, dependency lifecycle code, executable tool configuration and concurrent
 file replacement remain execution boundaries for the OS sandbox. The trusted
 `task check` gate runs arbitrary project verification through its existing controls.
+The lane check is advisory: its worktree recipes and scripts are mutable. The PM's
+merge gate provides trusted verification. The task executable, rather than the
+command hook, enforces PM/lane authority for other task routes; `task status`
+remains available for inspection.
 
 The guardrails are root-owned, so an agent in any permission mode (including Claude
 `--dangerously-skip-permissions` and Codex `--dangerously-bypass-approvals-and-sandbox`)

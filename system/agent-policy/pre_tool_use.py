@@ -1565,6 +1565,12 @@ def program_text(path: Path) -> str:
     return data.decode("utf-8")
 
 
+def mask_print_literals(text: str) -> str:
+    """Hide quoted print punctuation, preserving dynamic shell syntax checks."""
+    return re.sub(r"'[^']*'|\"(?:\\.|[^\"\\])*\"",
+                  lambda match: re.sub(r"[~*?{}\[\]#]", "x", match[0]), text)
+
+
 def judge_program(text: str, cwd: str, root: Path,
                   approved_roots: tuple[Path, ...] | None, depth: int,
                   allow_cd: bool = True) -> str | None:
@@ -1580,8 +1586,6 @@ def judge_program(text: str, cwd: str, root: Path,
                 for shell in SHELL_PROGRAMS}:
             return "Script interpreter cannot be judged safely."
     body = "\n".join(line for line in lines if line.strip() and not line.lstrip().startswith("#"))
-    if re.search(r"[$`*?{}\[\]#]", body) or "\\\n" in body:
-        return "Script expansion or syntax cannot be judged safely."
     # source changes the caller's cwd, while recipe lines may run in separate
     # shells. Do not pretend to propagate that state across those boundaries.
     split = split_command(body)
@@ -1595,6 +1599,9 @@ def judge_program(text: str, cwd: str, root: Path,
             return "Script leading redirections cannot be judged safely."
         if tokens:
             head = Path(tokens[0]).name.lower()
+            syntax = mask_print_literals(segment) if head in {"printf", "echo"} else segment
+            if re.search(r"[$`*?{}\[\]#]", syntax) or "\\\n" in body:
+                return "Script expansion or syntax cannot be judged safely."
             if (head in INTERPRETERS - SHELL_PROGRAMS
                     or re.fullmatch(r"python[0-9.]+", head)):
                 return "Non-shell script execution cannot be judged safely."
@@ -1961,6 +1968,11 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                     drop.update(range(index, index + len(expected)))
                     word_start = char.isspace()
                 tokens = [token for index, token in enumerate(tokens) if index not in drop]
+            print_tokens = unwrap_command(tokens)
+            if (isinstance(print_tokens, list) and print_tokens
+                    and Path(print_tokens[0]).name == "printf"
+                    and SHELL_EXPANSION.search(mask_print_literals(text))):
+                return "Shell expansion in printf cannot be judged safely."
             all_tokens.append(tokens)
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
@@ -2120,7 +2132,7 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
             if args[0] not in redirects:
                 break
             args = args[2:]
-        if args and (args[0].startswith("-v") or SHELL_EXPANSION.search(args[0])):
+        if args and (args[0].startswith("-v") or re.search(r"[$`]", args[0])):
             return "Shell builtin assignment via printf -v cannot be judged safely."
     if executable in SHELL_CONSTRUCTS - {"source", ".", "printf"} or tokens[0].startswith(("(", "{")) or any(
             tokens[i] in {"<", ">", ">>"} and tokens[i + 1].startswith("(")

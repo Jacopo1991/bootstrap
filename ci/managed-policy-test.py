@@ -525,10 +525,21 @@ with tempfile.TemporaryDirectory() as temp:
     for body in ("run bash sub/run.sh", "python3 check.py", "node build.js"):
         assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
     for body in ("echo safe", "printf '%s' safe", "printf '%s' -value", "printf -- -v",
+                 "printf '[%s]\\n' x", "printf '{\"ok\":true}\\n'",
+                 "printf '* ? ~ { } [ ]\\n'", 'printf "[*?~{}]\\n"',
+                 "echo '[*?~{}]'", 'echo "[*?~{}]"',
                  "cat sub/run.sh", "command -v bash"):
         assert judge(body) is None, body
         fixture("probe.sh", body + "\n")
         assert judge("bash probe.sh") is None, body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "unchanged positive print scenario")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner) is None, (runner, body)
+    for body in ("printf [ab]", "printf {a,b}", "printf *", "printf ?", "printf ~"):
+        assert judge(body), body
     fixture("justfile", "check:\n    printf '%s\\n' safe\n")
     fixture_git("add", "justfile")
     fixture_git("commit", "-qm", "modelled positive recipe")
