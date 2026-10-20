@@ -235,6 +235,39 @@ assert install.index('sudo mv -f -- "$policy_temp" "$policy_dir/$script"') < pub
 spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/agent-policy/pre_tool_use.py")
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
+
+# #76: entering a scratch Git repository must not move the task boundary.
+with tempfile.TemporaryDirectory() as temp:
+    base = Path(temp)
+    root = base / "task"
+    nested = root / ".work/new-product"
+    sibling = base / "other"
+    for directory in (root, nested, sibling):
+        directory.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(directory)], check=True)
+    (root / ".work/escape").symlink_to(sibling, target_is_directory=True)
+    lane_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    lane_env["TASK_WORKTREE"] = str(root)
+    with patch.dict(os.environ, lane_env, clear=True):
+        for tool, data in (
+                ("Bash", {"command": f"cd {root}"}),
+                ("Bash", {"command": f"git -C {root} add file.txt"}),
+                ("Bash", {"command": "git add file.txt"}),
+                ("Edit", {"file_path": str(root / "file.txt")}),
+                ("Write", {"file_path": str(root / "file.txt")})):
+            event = {"tool_name": tool, "cwd": str(nested), "tool_input": data}
+            reason = policy.evaluate(event, (base,))
+            assert reason is None, (event, reason)
+        for tool, data in (
+                ("Bash", {"command": f"cd {sibling}"}),
+                ("Bash", {"command": f"git -C {sibling} add file.txt"}),
+                ("Write", {"file_path": str(sibling / "file.txt")}),
+                ("Edit", {"file_path": str(root / ".work/escape/file.txt")}),
+                ("Write", {"file_path": str(nested / ".git/config")})):
+            assert policy.evaluate({"tool_name": tool, "cwd": str(nested),
+                                    "tool_input": data}, (base,)), data
+        assert policy.evaluate({"tool_name": "Write", "cwd": str(sibling),
+                                "tool_input": {"file_path": str(sibling / "file.txt")}}, (base,))
 with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "POLICY_CONTROL": "kept"}):
     with patch.object(policy.subprocess, "run") as run:
         policy.policy_subprocess(["git", "status"], check=True)

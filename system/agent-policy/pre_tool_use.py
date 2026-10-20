@@ -761,7 +761,8 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return "Git target is outside approved code and knowledge roots."
     # A linked worktree of the current repository (e.g. <repo>/.worktrees/<task>) is the same
     # repository: it shares the object store, refs and secret-scanned index rules.
-    cross_repo = target_root != root and not same_repository(target_root, root)
+    scratch_repo = inside(str(target_root), cwd, root / ".work")
+    cross_repo = target_root != root and not scratch_repo and not same_repository(target_root, root)
     sibling_fetch = cross_repo and subcommand == "fetch"
     if sibling_fetch and arguments not in ([], ["origin"]):
         return "Sibling fetch permits only fetch or fetch origin; options/refspecs are blocked."
@@ -1275,7 +1276,11 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     if git_environment_override(event, data):
         return Denial("git.environment_override", "Git configuration and execution environment overrides are blocked.")
     cwd = str(event.get("cwd") or os.getcwd())
-    root = root_for(cwd, approved_roots)
+    anchor = os.environ.get("TASK_WORKTREE")
+    root = root_for(anchor or cwd, approved_roots)
+    if anchor and (not Path(anchor).is_absolute() or root != Path(anchor).resolve()
+                   or not inside(cwd, cwd, root)):
+        return Denial("workspace.boundary", "Work outside the lane task worktree is blocked.")
     if str(root) == "/__bootstrap_outside_approved_roots__":
         return Denial("workspace.boundary", "Work outside approved code and knowledge roots is blocked.")
     if tool in {"PowerShell", "Computer", "ComputerUse"}:

@@ -105,6 +105,8 @@ prompt = sys.stdin.read()
     'env_names': sorted(os.environ),
     'state_home': os.environ.get('XDG_STATE_HOME'),
     'reason': os.environ.get('SECRETSPEC_REASON'),
+    'tmpdir': os.environ.get('TMPDIR'),
+    'task_worktree': os.environ.get('TASK_WORKTREE'),
 }))
 release = os.environ.get('LANE_STUB_RELEASE')
 if release:
@@ -3653,6 +3655,9 @@ store.write_text(json.dumps(prs))
         call = self.wait_for_lane(wt, finished=False)
         try:
             self.assertEqual(call["cwd"], str(wt))
+            self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
+            self.assertEqual(call["task_worktree"], str(wt))
+            self.assertTrue(Path(call["tmpdir"]).is_dir())
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
             self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
                                             "--output-last-message", str(wt / ".work/final.md"), "-"])
@@ -3686,7 +3691,37 @@ store.write_text(json.dumps(prs))
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
         self.assertEqual(call["args"], ["-p", "--model", "sonnet", "--effort", "high",
                                        "--permission-mode", "acceptEdits", "--allowedTools",
-                                       "Bash Read Write Edit Glob Grep"])
+                                       "Bash Read Write Edit Glob Grep",
+                                       "--settings", str(wt / ".work/claude-settings.json")])
+        settings = json.loads((wt / ".work/claude-settings.json").read_text())
+        allowed = settings["sandbox"]["filesystem"]["allowWrite"]
+        self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
+        self.assertEqual(call["task_worktree"], str(wt))
+        self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir)])
+        self.assertNotIn("/tmp", allowed)
+        # Reproduce the read-only /tmp boundary: only the generated exceptions
+        # and the checkout are writable. Exercise actual tempfile and lock opens.
+        real_open = os.open
+
+        def sandbox_open(path, flags, *args, **kwargs):
+            resolved = Path(path).resolve()
+            if not any(resolved.is_relative_to(Path(base)) for base in [str(wt), *allowed]):
+                raise PermissionError("Claude sandbox: read-only /tmp")
+            return real_open(path, flags, *args, **kwargs)
+
+        task = TASK_MODULE.Task(self.repo, "5")
+        with mock.patch.dict(os.environ, HOME=str(self.home), TASK_GATE_DIR=str(self.gate_dir)), \
+                mock.patch.object(TASK_MODULE.os, "open", side_effect=sandbox_open):
+            with self.assertRaises(PermissionError):
+                os.open("/tmp/unlisted-lane-probe", os.O_CREAT | os.O_RDWR, 0o600)
+            with tempfile.TemporaryFile(dir=call["tmpdir"]) as temporary:
+                temporary.write(b"writable lane temp")
+            with TASK_MODULE.exclusive_gate_lock(task, silent_unavailable=True, advisory=True):
+                self.assertIsNotNone(TASK_MODULE.GATE_SLOT.get())
+                lock, _ = TASK_MODULE.gate_paths("slot-0")
+                with lock.open("r+") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
         self.assertEqual(call["cwd"], str(wt))
         self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
         self.assertEqual(record["exit_code"], 3)
@@ -3884,13 +3919,28 @@ store.write_text(json.dumps(prs))
         blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}
         blocked.update(GIT_CONFIG="blocked", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="override",
                        GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner",
-                       TASK_GATE_RUN_ID="gate")
+                       TASK_GATE_RUN_ID="gate", TASK_WORKTREE="/stale/runner")
         kept = {"GIT_AUTHOR_NAME": "builder", "GIT_AUTHOR_EMAIL": "builder@example.invalid",
                 "GIT_COMMITTER_NAME": "builder", "GIT_COMMITTER_EMAIL": "builder@example.invalid",
                 "GIT_OPTIONAL_LOCKS": "0", "GIT_FUTURE_VARIABLE": "value",
                 "CODEX_THREAD_ID": "runner", "PATH": "tools"}
         with mock.patch.dict(os.environ, dict(blocked, **kept), clear=True):
             self.assertEqual(TASK_MODULE.agent_environment(), kept)
+
+    def test_lane_temp_cannot_allowlist_a_symlink_outside_the_worktree(self):
+        wt, _ = self.started()
+        (wt / ".work/tmp").symlink_to(self.home, target_is_directory=True)
+        task = TASK_MODULE.Task(self.repo, "5")
+        with self.assertRaisesRegex(TASK_MODULE.Stop, "TMPDIR must stay inside"):
+            TASK_MODULE.lane_environment(task)
+
+    def test_default_gate_directory_is_shared_and_narrow(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(Path, "mkdir") as mkdir:
+            lock, holder = TASK_MODULE.gate_paths("slot-0")
+            self.assertEqual(lock, Path("/tmp/agent-task-gates/agent-task-gate.lock"))
+            self.assertEqual(holder.parent, lock.parent)
+            mkdir.assert_called_once_with(exist_ok=True)
 
     def test_lane_git_override_set_matches_the_hook(self):
         import ast
