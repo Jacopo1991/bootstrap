@@ -24,6 +24,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
@@ -112,6 +113,8 @@ prompt = sys.stdin.read()
     'state_home': os.environ.get('XDG_STATE_HOME'),
     'reason': os.environ.get('SECRETSPEC_REASON'),
     'tmpdir': os.environ.get('TMPDIR'),
+    'tmp_mode': pathlib.Path(os.environ['TMPDIR']).stat().st_mode & 0o7777,
+    'tmp_owner': pathlib.Path(os.environ['TMPDIR']).stat().st_uid,
     'task_worktree': os.environ.get('TASK_WORKTREE'),
 }))
 release = os.environ.get('LANE_STUB_RELEASE')
@@ -296,6 +299,7 @@ class TaskTool(unittest.TestCase):
                 for hour, result in ((11, older), (12, newest)):
                     if result:
                         evidence = dict(base, result=result, trusted=False, advisory=True,
+                                        log=str(wt / '.work/check.log'),
                                         time=f'2026-10-19T{hour}:00:00+00:00',
                                         summary_tail=f'advisory {result} evidence')
                         advisory_history.append(json.dumps(evidence))
@@ -305,6 +309,8 @@ class TaskTool(unittest.TestCase):
                 verdict = 'PASS' if allowed else 'FAIL'
                 self.assertIn(f'Verdict: {verdict}; head: {head}; trusted: {bool(trusted)}', prompt)
                 self.assertIn('trusted evidence' if trusted else f'advisory {newest} evidence', prompt)
+                expected_log = self.state() / 'check.log' if trusted else wt / '.work/check.log'
+                self.assertIn(f'Log: {expected_log}', prompt)
                 call = wt / '.work/reviewer-call.json'
                 call.unlink(missing_ok=True)
                 output = self.raw_task('review', 'proj', '5', '--run',
@@ -684,8 +690,8 @@ class TaskTool(unittest.TestCase):
             evidence = json.loads((self.state() / name).read_text())
             self.assertEqual(evidence['result'], 'failed')
             self.assertEqual([row['result'] for row in evidence['variants']], ['failed', 'passed'])
-            self.assertIn('=== variant real ===', (wt / '.work/check.log').read_text())
-            self.assertIn('=== variant fake ===', (wt / '.work/check.log').read_text())
+            self.assertIn('=== variant real ===', (self.state() / Path(name).with_suffix('.log')).read_text())
+            self.assertIn('=== variant fake ===', (self.state() / Path(name).with_suffix('.log')).read_text())
 
     def test_gate_matrix_validation(self):
         bad_configs = [
@@ -906,8 +912,11 @@ class TaskTool(unittest.TestCase):
                 ('codex', 'gpt-6-luna', ['--no-boost'], 'gpt-6-luna'),
                 ('claude', 'sonnet', ['--no-boost'], 'sonnet'),
                 ('codex', 'gpt-6-astra', ['--no-boost'], 'gpt-6-astra')]:
+            (wt / '.work/model-call.json').unlink(missing_ok=True)
+            (wt / '.work/final.md').unlink(missing_ok=True)
             out = self.task('lane', 'proj', '5', '--builder', builder, '--model', requested, *extra)
             record = self.wait_for_lane(wt)
+            self.assertEqual(record['exit_code'], 0)
             self.assertEqual(record['model'], expected)
             self.assertEqual(record['cli_model'], expected)
             call = json.loads((wt / '.work/model-call.json').read_text())
@@ -2297,7 +2306,7 @@ store.write_text(json.dumps(prs))
         evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
         self.assertEqual(len(evidence), 1)
         rows = json.loads(evidence[0].read_text())
-        logs = '\n'.join(log.read_text() for log in evidence[0].parent.glob('*/check.log'))
+        logs = '\n'.join(log.read_text() for log in evidence[0].parent.glob('*/drill-check.log'))
         self.assertEqual([row['verdict'] for row in rows], ['ok', 'clash', 'failing-alone'], out + logs + repr(rows))
         self.assertTrue(all(row['concurrent']['duration'] > 0 for row in rows))
         concurrent_slots = []
@@ -3450,7 +3459,7 @@ store.write_text(json.dumps(prs))
         self.commit_in(wt, "b.txt")
         out = self.task("check", "proj", "t5")
         self.assertIn("PASS", out)
-        self.assertTrue((wt / ".work/check.log").is_file())
+        self.assertTrue((self.state() / "check.log").is_file())
         self.assertEqual(self.git(wt, "status", "--porcelain"), "", ".work stays out of status")
         self.assertIn("PASS", self.task("check", cwd=wt), "inside the worktree no arguments are needed")
         (wt / "a.txt").write_text("changed\n")
@@ -3792,6 +3801,180 @@ store.write_text(json.dumps(prs))
         self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))
         self.assertFalse((self.home / "runner-record.json").exists())
 
+    def assert_claude_temporary_path(self, temporary, call=None):
+        root = Path("/tmp") / f"claude-{os.getuid()}"
+        # Locate the outer grant from the fixture's actual location, independently
+        # of the TMPDIR passed to the product under test.
+        parents = [candidate for candidate in root.glob("lane-????????")
+                   if self.home.resolve().is_relative_to(candidate)]
+        self.assertLessEqual(len(parents), 1)
+        parent = parents[0] if parents else root
+        trusted = parent != root
+        self.assertEqual(temporary.parent, parent)
+        self.assertRegex(temporary.name, r"^lane-[0-9a-f]{8}$")
+        # PM-approved bounds: top-level <40, nested <54 bytes.
+        self.assertLess(len(os.fsencode(temporary)), 54 if trusted else 40)
+        self.assertLess(len(os.fsencode(temporary / "srt-mux-3583008-1.sock")), 108)
+        if call is None:
+            self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+            self.assertEqual(temporary.stat().st_uid, os.getuid())
+        else:
+            self.assertEqual(call["tmp_mode"], 0o700)
+            self.assertEqual(call["tmp_owner"], os.getuid())
+
+    def test_claude_temporary_parent_trust_and_cleanup(self):
+        root = self.home / "claude-root"
+        root.mkdir(mode=0o700)
+        outer = root / "lane-1234abcd"
+        outer.mkdir(mode=0o700)
+        unrelated = self.home / "unrelated"
+        unrelated.mkdir(mode=0o700)
+        alias = self.home / "outer-link"
+        alias.symlink_to(outer)
+        fixture = outer / "policy-fixture-example"
+        fixture.mkdir(mode=0o700)
+        task = TASK_MODULE.Task(self.repo, "5")
+        real_lstat = Path.lstat
+        for candidate, mode, owner, nested in (
+                (outer, 0o700, os.getuid(), True),
+                (alias, 0o700, os.getuid(), True),
+                (fixture, 0o700, os.getuid(), True),
+                (unrelated, 0o700, os.getuid(), False),
+                (outer, 0o755, os.getuid(), False),
+                (outer, 0o700, os.getuid() + 1, False)):
+            with self.subTest(candidate=candidate, mode=mode, owner=owner):
+                outer.chmod(mode)
+
+                def lane_stat(path, *args, **kwargs):
+                    info = real_lstat(path, *args, **kwargs)
+                    if path == outer:
+                        return mock.Mock(st_mode=info.st_mode, st_uid=owner)
+                    return info
+
+                with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
+                        mock.patch.dict(os.environ, TMPDIR=str(candidate)), \
+                        mock.patch.object(Path, "lstat", lane_stat):
+                    env = TASK_MODULE.lane_environment(task, builder="claude")
+                    temporary = Path(env["TMPDIR"])
+                    self.assertEqual(temporary.parent, outer if nested else root)
+                    self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
+                    self.assertEqual(temporary.stat().st_uid, os.getuid())
+                    (temporary / "probe").write_text("private")
+                    # Cancellation must validate the recorded path independently
+                    # of the cancelling process's environment.
+                    with mock.patch.dict(os.environ, TMPDIR=str(unrelated)):
+                        TASK_MODULE.cleanup_lane_temporary(str(temporary))
+                    self.assertFalse(temporary.exists())
+                    self.assertTrue(outer.is_dir())
+        outer.chmod(0o700)
+        with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root):
+            with self.assertRaises(TASK_MODULE.Stop):
+                TASK_MODULE.cleanup_lane_temporary(str(unrelated))
+            linked = root / "lane-deadbeef"
+            linked.symlink_to(unrelated)
+            with self.assertRaises(TASK_MODULE.Stop):
+                TASK_MODULE.cleanup_lane_temporary(str(linked / "lane-12345678"))
+        self.assertTrue(unrelated.is_dir())
+
+    def test_fixture_subprocess_uses_isolated_tmpdir(self):
+        fixture = Path(self.env['TMPDIR'])
+        self.assertTrue(fixture.name.startswith('policy-fixture-'))
+        script = self.home / 'temporary-probe.py'
+        script.write_text('import tempfile\nfrom pathlib import Path\n'
+                          'with tempfile.TemporaryDirectory() as temp:\n'
+                          '    print(Path(temp).parent)\n')
+        result = subprocess.run([sys.executable, str(script)], env=self.env,
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), str(fixture))
+
+    def test_nested_claude_cleanup_after_outer_removed(self):
+        root = self.home / "claude-root"
+        root.mkdir(mode=0o700)
+        outer = root / "lane-1234abcd"
+        outer.mkdir(mode=0o700)
+        inner = outer / "lane-abcdef12"
+        inner.mkdir(mode=0o700)
+        shutil.rmtree(outer)
+        with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root):
+            TASK_MODULE.cleanup_lane_temporary(str(inner))
+        self.assertFalse(outer.exists())
+
+    def test_cancel_nested_claude_after_outer_removed(self):
+        wt, _ = self.started()
+        root = self.home / "claude-root"
+        root.mkdir(mode=0o700)
+        outer = root / "lane-1234abcd"
+        outer.mkdir(mode=0o700)
+        inner = outer / "lane-abcdef12"
+        inner.mkdir(mode=0o700)
+        lane = wt / ".work/lane.json"
+        lane.write_text(json.dumps(dict(state="running", pid=123456, temporary=str(inner))))
+        shutil.rmtree(outer)
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, "HOME", self.home), \
+                mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
+                mock.patch.object(TASK_MODULE, "pid_alive", return_value=True), \
+                mock.patch.object(TASK_MODULE.os, "killpg"):
+            TASK_MODULE.cancel(SimpleNamespace(repo=str(self.repo), id="5"))
+        self.assertEqual(json.loads(lane.read_text())["state"], "cancelled")
+
+    def test_trusted_check_preserves_advisory_log(self):
+        wt, _ = self.started()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+            log = wt / ".work/check.log"
+            before = log.read_bytes()
+            (wt / "FAIL").touch()
+            with mock.patch.dict(os.environ, TASK_RUN_ID="trusted-test"):
+                self.assertFalse(TASK_MODULE.run_check(wt, "", state=self.state()))
+        self.assertEqual(log.read_bytes(), before)
+        evidence = json.loads((self.state() / "check.json").read_text())
+        self.assertEqual(evidence["log"], str(self.state() / "check.log"))
+        self.assertIn("exit 1", Path(evidence["log"]).read_text())
+        status = self.raw_task("status", "proj")
+        self.assertIn(str(log), status)
+        self.assertIn(evidence["log"], status)
+
+    def test_batch_tail_uses_actual_check_log(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "batch_log_test", str(ROOT / "home/dot_local/bin/executable_task-batch"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        batch = importlib.util.module_from_spec(spec)
+        loader.exec_module(batch)
+        wt, _ = self.started()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+            advisory = (wt / ".work/check.log").read_text()
+            (wt / "FAIL").touch()
+            self.assertFalse(TASK_MODULE.run_check(wt, "", state=self.state()))
+            evidence = json.loads((self.state() / "check.json").read_text())
+            self.assertTrue(evidence["trusted"])
+            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
+                             Path(evidence["log"]).read_text())
+            self.assertNotEqual(batch.check_output(self.state(), wt / ".work"), advisory)
+            (wt / "FAIL").unlink()
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
+                             (wt / ".work/check.log").read_text())
+
+    def test_repair_published_preserves_trusted_check_log(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        self.assertTrue(evidence["trusted"])
+        trusted = Path(evidence["log"]).read_bytes()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            (wt / "FAIL").touch()
+            self.assertFalse(TASK_MODULE.run_check(wt, "", advisory=True))
+        advisory = (wt / ".work/check.log").read_bytes()
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.git(self.repo, "merge", "--no-ff", "-m", "Published fixture", head)
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            TASK_MODULE.repair_published(TASK_MODULE.Task(self.repo, "5"), head)
+        self.assertEqual(Path(evidence["log"]).read_bytes(), trusted)
+        self.assertEqual((self.state() / "advisory-check.log").read_bytes(), advisory)
+
     def test_claude_lane_uses_pinned_builder_and_logs_final_and_failure(self):
         self.stub_models()
         self.raw_task("start", "proj", "5", "--builder", "claude")
@@ -3808,8 +3991,7 @@ store.write_text(json.dumps(prs))
                                        "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         allowed = settings["sandbox"]["filesystem"]["allowWrite"]
-        self.assertRegex(call["tmpdir"], rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
-        self.assertLess(len(os.fsencode(call["tmpdir"])), 40)
+        self.assert_claude_temporary_path(Path(call["tmpdir"]), call)
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(call["task_worktree"], str(wt))
         self.assertEqual(allowed, [call["tmpdir"], str(self.gate_dir),
@@ -3875,6 +4057,7 @@ store.write_text(json.dumps(prs))
         self.assertFalse(Path(call["tmpdir"]).exists())
         self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
                          [call["tmpdir"], str(self.gate_dir), f"/tmp/task-gate-{os.getuid()}"])
+        self.assert_claude_temporary_path(Path(call["tmpdir"]), call)
         self.assertEqual(record["model"], "opus")
 
     def test_claude_long_lane_temp_is_private_socket_writable_and_removed(self):
@@ -3890,8 +4073,7 @@ store.write_text(json.dumps(prs))
         temporary = Path(call["tmpdir"])
         socket_denied = False
         try:
-            self.assertRegex(str(temporary), rf"^/tmp/claude-{os.getuid()}/lane-[0-9a-f]{{8}}$")
-            self.assertLess(len(os.fsencode(temporary)), 40)
+            self.assert_claude_temporary_path(temporary)
             self.assertEqual(temporary.stat().st_uid, os.getuid())
             self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o700)
             settings = json.loads((wt / ".work/claude-settings.json").read_text())
@@ -4743,6 +4925,13 @@ store.write_text(json.dumps(prs))
     def test_merge_gates_merge_result_without_changing_lane_and_is_idempotent(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        self.assertTrue(evidence["trusted"])
+        trusted = Path(evidence["log"]).read_bytes()
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
+        advisory = (wt / ".work/check.log").read_bytes()
         lane_head = self.git(wt, "rev-parse", "HEAD")
         # main moves on in the meantime (another task merged)
         other = self.home / "other"
@@ -4768,6 +4957,8 @@ store.write_text(json.dumps(prs))
         self.assertEqual(self.git(self.repo, "rev-parse", "main"), tip, "main checkout fast-forwarded")
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "")
         self.assertFalse(wt.exists(), out)
+        self.assertEqual(Path(evidence["log"]).read_bytes(), trusted)
+        self.assertEqual((self.state() / "advisory-check.log").read_bytes(), advisory)
         self.assertNotIn("t5-add-the-b-file", self.git(self.repo, "branch"))
         self.assertIn("already merged", self.raw_task("merge", "proj", "5"))
 

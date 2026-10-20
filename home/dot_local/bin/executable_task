@@ -672,7 +672,7 @@ def brief_field(text, heading):
 
 
 def save_check_evidence(destination, name, evidence, log):
-    evidence = dict(evidence, summary_tail="\n".join(log.read_text(errors="replace").splitlines()[-20:]))
+    evidence = dict(evidence, log=str(log), summary_tail="\n".join(log.read_text(errors="replace").splitlines()[-20:]))
     atomic_json(destination / name, evidence)
     with (destination / "checks.jsonl").open("a") as stream:
         stream.write(json.dumps(dict(evidence, kind=name)) + "\n")
@@ -1360,14 +1360,36 @@ def cleanup_lane_temporary(temporary):
         return
     path = Path(temporary)
     # Cancellation reads a lane-controlled record; never remove arbitrary paths.
-    if (path.parent != claude_temporary_root()
-            or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name)):
+    root = claude_temporary_root()
+    if not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
+        raise Stop("Invalid Claude lane temporary directory.")
+    if (path.parent.parent == root
+            and re.fullmatch(r"lane-[0-9a-f]{8}", path.parent.name)):
+        try:
+            path.parent.lstat()
+        except FileNotFoundError:
+            return  # The outer lane already removed its entire private tree.
+    if path.parent != root and not private_claude_lane(path.parent, root):
         raise Stop("Invalid Claude lane temporary directory.")
     if path.exists():
         info = path.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise Stop("Claude lane temporary directory must be owned by the user.")
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass  # An outer lane may finish concurrently.
+
+
+def private_claude_lane(path, root):
+    if path.parent != root or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700)
 
 
 def lane_environment(task, builder="codex"):
@@ -1377,7 +1399,13 @@ def lane_environment(task, builder="codex"):
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
     if builder == "claude":
-        temporary = claude_temporary_root() / f"lane-{secrets.token_hex(4)}"
+        root = claude_temporary_root()
+        # Nest only in a verified outer lane grant, keeping bridge sockets short.
+        inherited = os.environ.get("TMPDIR")
+        parent = Path(inherited).resolve() if inherited else root
+        parent = next((candidate for candidate in (parent, *parent.parents)
+                       if private_claude_lane(candidate, root)), root)
+        temporary = parent / f"lane-{secrets.token_hex(4)}"
         temporary.mkdir(mode=0o700)
     else:
         temporary = task.path / ".work/tmp"
@@ -1588,15 +1616,15 @@ def lane(args):
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     run.update(state="timed_out", exit_code=None, ended_at=utc_now())
-                    cleanup_lane_temporary(temporary)
                     atomic_json(lane_record, run)
+                    cleanup_lane_temporary(temporary)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        cleanup_lane_temporary(temporary)
         run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
         atomic_json(lane_record, run)
+        cleanup_lane_temporary(temporary)
     return code
 
 
@@ -2233,6 +2261,13 @@ def sweep_gate_temporary(root):
             continue
 
 
+def check_log_path(path, state, evidence_name, advisory):
+    if advisory:
+        return path / ".work/check.log"
+    destination = state or task_state(Task(main_repo(path), path.name))
+    return destination / Path(evidence_name).with_suffix(".log")
+
+
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
     variants = gate_variants(path)
@@ -2284,9 +2319,9 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                     gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
                     cancelled=cancelled, evidence_sink=evidence)
                 results.append(dict(evidence[0], name=name))
-                logs.append(f"=== variant {name} ===\n" + (work / "check.log").read_text())
+                logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
                 print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
-    log = work / "check.log"
+    log = check_log_path(path, state, evidence_name, advisory)
     log.write_text("\n".join(logs))
     passed = all(row["result"] == "passed" for row in results)
     evidence = {key: value for key, value in results[0].items() if key not in {"name", "steps", "result"}}
@@ -2321,7 +2356,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         state.mkdir(parents=True, exist_ok=True)
     else:
         state = None
-    log = work / "check.log"
+    log = check_log_path(path, state, evidence_name, advisory)
     passed = True
     timeout = timeout_for(path)
     configured_env = configured_environment(path)
@@ -2844,6 +2879,7 @@ def review(args):
             prompt.extend(["Recorded check (trusted if present, otherwise advisory):",
                            f"Verdict: {'PASS' if checked['result'] == 'passed' else 'FAIL'}; "
                            f"head: {checked['sha']}; trusted: {checked.get('trusted', False)}",
+                           f"Log: {checked.get('log', '(legacy check: no log path saved)')}",
                            "Summary tail:", checked['summary_tail']])
         else:
             prompt.append("Recorded check: missing for the reviewed head.")
@@ -3172,7 +3208,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
         else:
             passed = run_check(gate, base, record, task_state(task),
                                evidence_name="gate-check.json", display_log=archived_log)
-        shutil.copy2(gate / ".work/check.log", archived_log)
+        # run_check writes directly to archived_log in the trusted state directory.
         completed_step(task, "gate")
         return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
     finally:
@@ -3339,7 +3375,7 @@ def merge(args):
         shutil.copy2(report_path, archive / "report.md")
     check_log = path / ".work/check.log"
     if check_log.is_file():
-        shutil.copy2(check_log, archive / "check.log")
+        shutil.copy2(check_log, archive / "advisory-check.log")
     completed_step(task, "archived")
     if args.keep:
         return 0
@@ -3941,7 +3977,11 @@ def status(args):
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
                   f"report={'present' if report else 'missing'} idle={idle_label} branch={branch}")
+            if check.get("log"):
+                print(f"    trusted check log: {check['log']}")
             if lane_check.get("advisory"):
+                if lane_check.get("log"):
+                    print(f"    advisory check log: {lane_check['log']}")
                 lane_result = lane_check.get("result", "unknown")
                 current = (lane_check.get("sha") == head and record
                            and lane_check.get("record_revision") == record.get("revision"))
@@ -4070,8 +4110,8 @@ def cancel(args):
             print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
             return 0
         lane_run.update(state="cancelled", ended_at=utc_now())
-        cleanup_lane_temporary(lane_run.get("temporary"))
         atomic_json(lane_path, lane_run)
+        cleanup_lane_temporary(lane_run.get("temporary"))
         print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
         return 0
     run_path = task_state(task) / "run.json"
@@ -4297,10 +4337,13 @@ def repair_published(task, base):
     atomic_json(state / 'merge.json', {'head': head, 'commit': commit, 'time': merged_at})
     print(update_local_default(task.repo, default_branch(task.repo), base))
     if task.path.exists():
-        for name in ('report.md', 'check.log'):
+        for name in ('report.md',):
             source = task.path / '.work' / name
             if source.is_file():
                 shutil.copy2(source, state / name)
+        advisory = task.path / '.work/check.log'
+        if advisory.is_file():
+            shutil.copy2(advisory, state / 'advisory-check.log')
         if not (untracked(task.path) + ignored_leftovers(task.path)):
             preserve_work(task.repo, task.name, task.path, reuse_head=head)
             branch = git(task.path, 'branch', '--show-current')
@@ -4477,11 +4520,6 @@ def gate_drill(args):
             return {"result": "failed", "duration": round(time.monotonic() - started, 3),
                     "error": f"Cannot read drill inputs in {path}."}
         finally:
-            log = path / ".work/check.log"
-            if log.is_file():
-                destination = archive / f"{index}-{phase}"
-                destination.mkdir(exist_ok=True)
-                shutil.copy2(log, destination / "check.log")
             GATE_SLOT.reset(token)
 
     rows = []
