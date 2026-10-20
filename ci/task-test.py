@@ -177,6 +177,30 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_adaptive_check_timeout_uses_trusted_passes_only(self):
+        repo = self.home / 'dev_workspace/proj'
+        state = self.home / '.local/state/task/proj/t1'
+        state.mkdir(parents=True)
+        history = [
+            {'trusted': True, 'result': 'passed', 'time': str(i), 'steps': [
+                {'command': ['just', 'check'], 'duration': duration}]}
+            for i, duration in enumerate([1100, 1000, 900, 800, 700])]
+        history += [{'trusted': True, 'result': 'failed', 'time': '9', 'steps': [
+            {'command': ['just', 'check'], 'duration': 9999}]},
+            {'trusted': False, 'result': 'passed', 'time': '10', 'steps': [
+                {'command': ['just', 'check'], 'duration': 9999}]}]
+        (state / 'checks.jsonl').write_text('\n'.join(json.dumps(row) for row in history))
+        (repo / '.task.toml').write_text('check_timeout = 1200\n')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            configured, effective, used = TASK_MODULE.step_timeout(repo, ['just', 'check'])
+            self.assertEqual((configured, effective, used), (1200, 2200, [700, 800, 900, 1000, 1100]))
+            self.assertIn('median 900 s', TASK_MODULE.gate_warning(repo))
+            (repo / '.task.toml').write_text('check_timeout = 1300\n')
+            self.assertEqual(TASK_MODULE.gate_warning(repo), '')
+        (state / 'checks.jsonl').unlink()
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            self.assertEqual(TASK_MODULE.step_timeout(repo, ['just', 'check']), (1300, 1300, []))
+
     def test_cumulative_report_uses_only_final_criteria_block(self):
         criteria = [{"number": 1}, {"number": 2}]
         old = "## Criteria\n#1 not met: failing check\n#2 not met: missing work\n"

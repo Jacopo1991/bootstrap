@@ -891,6 +891,39 @@ def timeout_for(path: Path):
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
+def check_history(path, step):
+    root = HOME / ".local/state/task" / path.name
+    rows = []
+    for file in root.glob("*/checks.jsonl") if root.is_dir() else ():
+        try: rows.extend(json.loads(line) for line in file.read_text().splitlines())
+        except (OSError, json.JSONDecodeError): pass
+    return sorted((item for item in rows if item.get("trusted") is True
+                   and item.get("result") == "passed"
+                   and any(record.get("command") == step for record in item.get("steps", []))),
+                  key=lambda item: item.get("time", ""))[-5:]
+
+
+def step_timeout(path, step):
+    configured = timeout_for(path)
+    durations = [record["duration"] for item in check_history(path, step)
+                 for record in item["steps"] if record.get("command") == step
+                 and isinstance(record.get("duration"), (int, float))]
+    return configured, max(configured, 2 * max(durations, default=0)), durations
+
+
+def gate_warning(path):
+    configured = timeout_for(path)
+    rows = check_history(path, ["just", "check"])
+    durations = sorted(record["duration"] for item in rows for record in item["steps"]
+                       if record.get("command") == ["just", "check"])
+    mid = len(durations) // 2
+    median = (durations[mid] if len(durations) % 2 else sum(durations[mid - 1:mid + 1]) / 2) if durations else 0
+    if durations and median > configured * .75:
+        return (f"gate near timeout: median {median:g} s of "
+                f"{configured} s configured; speed up the suite or raise check_timeout")
+    return ""
+
+
 def configured_environment(path, repo=None):
     values = task_config(path).get("env", {})
     return expand_environment(values, path, repo)
@@ -2358,7 +2391,6 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         state = None
     log = check_log_path(path, state, evidence_name, advisory)
     passed = True
-    timeout = timeout_for(path)
     configured_env = configured_environment(path)
     run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
@@ -2376,6 +2408,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 raise Stop("Drill interrupted.")
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
+            configured, timeout, durations = step_timeout(path, step)
             started = time.monotonic()
             private_index_directory = None
             try:
@@ -2423,10 +2456,12 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     process.wait()
                     if state:
                         set_child_group(state, None)
-                    out.write(f"\nTIMEOUT after {timeout}s\n")
+                    out.write(f"\nTIMEOUT configured={configured}s effective={timeout}s "
+                              f"recent trusted passes={durations}\n")
                     out.flush()
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
-                                    "timeout": True})
+                                    "timeout": True, "configured_timeout": configured,
+                                    "effective_timeout": timeout, "history_durations": durations})
                     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
@@ -2440,7 +2475,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                         if evidence_name == "check.json":
                             try: task_event(Task(main_repo(path), path.name), "check")
                             except OSError: pass
-                    print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {display_log or log}")
+                    print(f"NOT FINISHED: `{' '.join(step)}` ran over configured {configured}s "
+                          f"(effective {timeout}s; recent trusted passes {durations}); see {display_log or log}")
                     print(f"FAIL (log: {display_log or log})")
                     return False
             except subprocess.TimeoutExpired:
@@ -3917,6 +3953,8 @@ def status(args):
                   f"started={service.get('ExecMainStartTimestamp') or data['started_at']} "
                   f"last={lines[-1] if lines else '(no .done line)'}")
         attention = []
+        warning = gate_warning(repo)
+        if warning: attention.append(warning)
         state_root = HOME / ".local/state/task" / repo.name
         for path in sorted((repo / ".worktrees").glob("*")) if (repo / ".worktrees").is_dir() else []:
             if path.name.startswith("."):
