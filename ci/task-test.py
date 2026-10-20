@@ -4488,20 +4488,21 @@ store.write_text(json.dumps(prs))
         run_path.write_text(__import__("json").dumps({"command": "merge", "state": "running", "completed": []}))
         run_env = dict(self.env, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(run_path))
         out = self.raw_task("merge", "proj", "5", env=run_env)
-        self.assertIn("main unchanged since the lane's check; reusing it", out)
+        self.assertIn("trusted passing check", out)
+        self.assertIn("reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1,
                          "unchanged default should not rerun just check in a gate worktree")
         self.assertIn("gate", __import__("json").loads(run_path.read_text())["completed"])
         self.assertFalse((self.home / "sync-probe").exists(), "no dependency change should not probe or run sync")
 
-    def test_merge_regates_when_default_moved_after_lane_check(self):
+    def test_merge_regates_when_default_moved_after_lane_check_and_is_not_in_lane(self):
         self.checked_lane_with_counter()
         other = self.home / "other"
         self.git(self.home, "clone", "-q", str(self.origin), str(other))
         self.commit_in(other, "c.txt")
         self.git(other, "push", "-q", "origin", "main")
         out = self.raw_task("merge", "proj", "5")
-        self.assertNotIn("main unchanged since the lane's check; reusing it", out)
+        self.assertNotIn("reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
                          "default movement requires checking the would-be merge result")
 
@@ -4515,21 +4516,62 @@ store.write_text(json.dumps(prs))
         if override:
             args.extend(["--override", "permit fresh gate after stale check evidence"])
         out = self.raw_task(*args)
-        self.assertNotIn("main unchanged since the lane's check; reusing it", out)
+        self.assertNotIn("reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
                          "stale or failed check records must rerun the merge gate")
 
     def test_merge_does_not_reuse_check_with_different_head(self):
         self.assert_check_record_regates(lambda check: check.update(sha="0" * 40), override=True)
 
-    def test_merge_does_not_reuse_check_with_different_base(self):
-        self.assert_check_record_regates(lambda check: check.update(base_sha="0" * 40))
+    def test_merge_reuses_check_when_newer_main_was_merged_before_check(self):
+        wt, _ = self.started()
+        other = self.home / "other"
+        self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.commit_in(other, "c.txt")
+        self.git(other, "push", "-q", "origin", "main")
+        self.git(wt, "fetch", "-q", "origin")
+        self.git(wt, "merge", "--no-edit", "origin/main")
+        self.commit_in(wt, "b.txt")
+        (self.home / "just-count").unlink(missing_ok=True)
+        self.raw_task("check", "proj", "5")
+        check = __import__("json").loads((self.state() / "check.json").read_text())
+        self.assertEqual(check["base_sha"], self.git(wt, "rev-parse", "origin/main"))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("trusted passing check", out)
+        self.assertIn("reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
+
+    def test_merge_does_not_reuse_check_with_different_record_revision(self):
+        self.assert_check_record_regates(lambda check: check.update(record_revision="wrong"))
+
+    def test_merge_does_not_reuse_check_missing_gate_variant_coverage(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text('[ [gate_variant] ]\nname = "extra"\n')
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "configure gate variant")
+        (self.home / "just-count").unlink(missing_ok=True)
+        self.raw_task("check", "proj", "5")
+        check_path = self.state() / "check.json"
+        check = __import__("json").loads(check_path.read_text())
+        self.assertEqual({row["name"] for row in check["variants"]}, {"extra"})
+        check["variants"] = []
+        check_path.write_text(__import__("json").dumps(check))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertNotIn("reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
 
     def test_merge_does_not_reuse_failed_check_record(self):
         self.assert_check_record_regates(lambda check: check.update(result="failed"), override=True)
 
-    def test_merge_does_not_reuse_legacy_check_without_base_sha(self):
-        self.assert_check_record_regates(lambda check: check.pop("base_sha"))
+    def test_merge_reuses_check_without_legacy_base_sha(self):
+        self.checked_lane_with_counter()
+        check_path = self.state() / "check.json"
+        check = __import__("json").loads(check_path.read_text())
+        check.pop("base_sha")
+        check_path.write_text(__import__("json").dumps(check))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
 
     def test_merge_does_not_reuse_advisory_check(self):
         self.assert_check_record_regates(lambda check: check.update(trusted=False, advisory=True))

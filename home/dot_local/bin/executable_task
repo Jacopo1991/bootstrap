@@ -3121,15 +3121,21 @@ def merge_gate(task, path, head):
 
 
 def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record) -> bool:
-    """Reuse check evidence only when it passed for this head and revision against this base."""
+    """Reuse evidence only for the same checked tree, record revision and gate matrix."""
     try:
         checked = json.loads((task_state(task) / "check.json").read_text())
     except (OSError, json.JSONDecodeError):
         return False
+    expected_variants = set(gate_variants(task.worktree()))
+    checked_variants = checked.get("variants", [])
+    if not isinstance(checked_variants, list):
+        return False
+    covered_variants = {item.get("name") for item in checked_variants if isinstance(item, dict)}
     return (checked.get("trusted") is True and checked.get("result") == "passed"
             and checked.get("sha") == lane_head
             and checked.get("record_revision") == record.get("revision")
-            and checked.get("base_sha") == base and is_ancestor(repo, base, lane_head))
+            and covered_variants == expected_variants
+            and is_ancestor(repo, base, lane_head))
 
 
 def overlap_files(repo: Path, lane_head: str, base: str):
@@ -3271,7 +3277,8 @@ def merge(args):
             if overlap:
                 raise Stop(overlap_message(overlap))
             if can_reuse_lane_check(task, repo, lane_head, base, record):
-                print("main unchanged since the lane's check; reusing it")
+                print("current main is an ancestor of the checked lane head; trusted passing check "
+                      "matches the head, record revision, and gate variants; reusing it")
                 completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
             else:
