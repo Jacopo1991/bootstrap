@@ -2,6 +2,7 @@
 """Exercise task-batch end to end with real Git and a serial task stand-in."""
 import importlib.machinery
 import importlib.util
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,6 @@ import sys
 import tempfile
 import unittest
 import threading
-import time
 from unittest import mock
 from policy_test_env import isolate_policy_environment
 
@@ -128,6 +128,67 @@ print(entry.get('output', 'OK'))
 
 
 class BatchTest(unittest.TestCase):
+    def test_tier_only_dispatch_and_missing_route(self):
+        self.source.write_text('1. one: builder codex, tier hard\n')
+        self.run_batch()
+        lane = self.calls('lane')[0]
+        self.assertNotIn('--model', lane)
+        self.assertEqual(lane[lane.index('--tier') + 1], 'hard')
+        self.source.write_text('1. one: builder codex\n')
+        with self.assertRaisesRegex(batch_module.Stop, 'model or tier'):
+            batch_module.parse(self.source)
+
+    def test_lane_output_is_prefixed(self):
+        result = subprocess.run([sys.executable, str(TOOL), 'proj', str(self.source)],
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('[one] Dispatch prompt:', result.stdout)
+        self.assertIn('[one] Context: .work/context/', result.stdout)
+        self.assertIn('[one] OK', result.stdout)
+
+    def test_stop_and_interrupt_report_before_inflight_worker_finishes(self):
+        for interruption in (False, True):
+            with self.subTest(interruption=interruption):
+                config = self.home / '.config/task'
+                config.mkdir(parents=True, exist_ok=True)
+                (config / 'gate.toml').write_text('slots = 2\n')
+                boost = self.home / '.local/state/task/boost.json'
+                boost.parent.mkdir(parents=True, exist_ok=True)
+                boost.write_text(json.dumps({'codex': '2099-01-01T00:00:00+00:00'}))
+                release, entered, exited = threading.Event(), threading.Event(), threading.Event()
+                launched = []
+                def execute(worker, task):
+                    launched.append(task['id'])
+                    if task['id'] == 'one':
+                        self.assertTrue(entered.wait(5))
+                        raise batch_module.Stop('test stop')
+                    entered.set()
+                    try:
+                        release.wait(5)
+                        return 'merged'
+                    finally:
+                        exited.set()
+                tasks = [dict(id=i, builder='codex', after=None) for i in ('one', 'two', 'three')]
+                runner = batch_module.Batch(self.repo, self.source)
+                def interrupt(*args, **kwargs):
+                    self.assertTrue(entered.wait(5))
+                    raise KeyboardInterrupt
+                patches = contextlib.ExitStack()
+                with patches, mock.patch.dict(os.environ, self.env, clear=True), \
+                        mock.patch.object(runner, 'require'), \
+                        mock.patch.object(batch_module, 'parse', return_value=tasks), \
+                        mock.patch.object(batch_module.Batch, 'task', execute):
+                    if interruption:
+                        patches.enter_context(mock.patch.object(batch_module, 'wait', side_effect=interrupt))
+                    try:
+                        self.assertEqual(runner.run(), 1)
+                        self.assertIn('batch: stopped:', runner.done.read_text())
+                        self.assertFalse(exited.is_set())
+                        self.assertEqual(set(launched), {'one', 'two'})
+                    finally:
+                        release.set()
+                        self.assertTrue(exited.wait(5))
+
     def test_tier_runner_field_dispatch(self):
         self.source.write_text('1. one: builder codex, model gpt-6-luna, tier design\n')
         self.assertEqual(batch_module.parse(self.source)[0]['tier'], 'design')
@@ -153,6 +214,7 @@ class BatchTest(unittest.TestCase):
                     tasks = [dict(id=str(i), builder=vendor, after='0' if i == 3 else None) for i in range(5)]
                     lock = threading.Lock()
                     active, maximum, completed = 0, 0, set()
+                    first_wave = threading.Barrier(expected)
                     def execute(worker, task):
                         nonlocal active, maximum
                         with lock:
@@ -160,7 +222,8 @@ class BatchTest(unittest.TestCase):
                                 self.assertIn(task['after'], completed)
                             active += 1
                             maximum = max(maximum, active)
-                        time.sleep(0.04)
+                        if int(task['id']) < expected:
+                            first_wave.wait(timeout=5)
                         with lock:
                             active -= 1
                             completed.add(task['id'])

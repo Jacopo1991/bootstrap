@@ -9,22 +9,29 @@ ROUTING = {
 }
 
 
+class RoutingParseError(ValueError):
+    """Invalid user supplied routing policy or tier."""
+
+
 def policy(home):
     path = home / ".config/task/routing.json"
-    overrides = json.loads(path.read_text()) if path.exists() else {}
+    try:
+        overrides = json.loads(path.read_text()) if path.exists() else {}
+    except json.JSONDecodeError as error:
+        raise RoutingParseError(f"{path}: invalid JSON") from error
     if not isinstance(overrides, dict) or not isinstance(overrides.get("models", {}), dict):
-        raise ValueError(f"{path}: expected an object with a models object")
+        raise RoutingParseError(f"{path}: expected an object with a models object")
     result = {vendor: dict(values) for vendor, values in ROUTING.items()}
     for vendor, values in overrides.get("models", {}).items():
         if vendor not in result or not isinstance(values, dict):
-            raise ValueError(f"{path}: invalid vendor policy")
+            raise RoutingParseError(f"{path}: invalid vendor policy")
         for key, value in values.items():
             if key not in result[vendor] or not isinstance(value, str) or not value:
-                raise ValueError(f"{path}: invalid model policy")
+                raise RoutingParseError(f"{path}: invalid model policy")
             result[vendor][key] = value
     extra = overrides.get("extra_lanes", 2)
     if type(extra) is not int or extra < 0:
-        raise ValueError(f"{path}: extra_lanes must be a nonnegative integer")
+        raise RoutingParseError(f"{path}: extra_lanes must be a nonnegative integer")
     return result, extra
 
 
@@ -49,7 +56,7 @@ def active(home):
 
 def route(home, vendor, tier, explicit=None, boosted=True):
     if tier not in TIERS:
-        raise ValueError(f"Invalid tier: {tier}")
+        raise RoutingParseError(f"Invalid tier: {tier}")
     models, _ = policy(home)
     values = models[vendor]
     return explicit or values[tier if boosted and vendor in active(home) and tier != "routine" else "default"]

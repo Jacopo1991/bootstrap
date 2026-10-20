@@ -426,9 +426,15 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 `task start` and `task lane` accept `--tier routine|hard|design`. Tasks may
 declare `Tier: hard` alongside their `Verify:` lines; the default is routine.
 The flag takes precedence and the tier is pinned in task state and shown by
-`task status`. Runner lines accept `, tier hard`, for example:
-`1. example: builder codex, model gpt-6-luna, tier hard, after: previous`.
-Runner model fields are explicit model choices and take precedence over routing.
+`task status`. Runner lines require a model or a tier. For example:
+
+```text
+1. prepare: builder codex, tier routine
+2. implement: builder codex, tier hard, after: prepare
+```
+
+Without a model, the batch passes `--tier` to `task lane` for routing.
+An explicit runner model takes precedence over tier routing.
 
 `task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
 temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.

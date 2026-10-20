@@ -61,7 +61,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_limits import cli_limit, lane_limit
-from task_routing import TIERS, route, lane_limits, active
+from task_routing import TIERS, route, lane_limits, active, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -1559,6 +1559,7 @@ def lane(args):
                 previous = {}
             if previous.get("state") == "running" and pid_alive(previous.get("pid")):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
+            print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
             archive_lane_final(work)
@@ -1575,7 +1576,10 @@ def lane(args):
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
             if builder != record["builder"] or tier != record.get("tier", "routine"):
-                print(f"Updating task builder from {record['builder']} to {builder}; tier={tier}.")
+                if builder != record["builder"]:
+                    print(f"Updating task builder from {record['builder']} to {builder}.")
+                if tier != record.get("tier", "routine"):
+                    print(f"Updating task tier to {tier}.")
                 record["builder"] = builder
                 record["tier"] = tier
                 record["revision"] = record_revision(record)
@@ -1897,8 +1901,8 @@ def runner_check(args):
     pending = []
     in_text_rules = False
     task_line = re.compile(
-        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
-        r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
+        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude)"
+        r"(?:,\s*model\s+([^,\s]+))?(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
         r"(?:\b.*)?$"
     )
     no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:)|$)")
@@ -1929,7 +1933,10 @@ def runner_check(args):
                     pending.append(task.id)
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")
-                resolve_model(builder.lower(), model)
+                if not model and not tier_field:
+                    raise Stop("runner task needs a model or tier")
+                if model:
+                    resolve_model(builder.lower(), model)
                 if no_verify is not None:
                     if not no_verify.strip():
                         raise Stop("no-verify needs a nonempty reason.")
@@ -1977,7 +1984,7 @@ def runner_check(args):
             except (Stop, ValueError, IndexError) as error:
                 problems.append(f"line {number}: {error}")
     if task_lines == 0:
-        problems.append("no task lines found (format: N. <id>: builder <b>, model <m>[, seed <s>][, after: <id>])")
+        problems.append("no task lines found (format: N. <id>: builder <b>, model <m> or tier <t>[, seed <s>][, after: <id>])")
     if (CORTEX / f"cortex-kb-{repo.name}").exists():
         info = plan_info(repo)
         remaining = info["limit"] - len(info["merged"])
@@ -2093,6 +2100,13 @@ def runner_start(args):
 
 def start(args):
     repo = resolve_repo(args.repo)
+    common = Path(run_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    with (common / "task-start.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return start_locked(args, repo)
+
+
+def start_locked(args, repo):
     ensure_origin_head(repo)
     task = Task(repo, args.id)
     if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
@@ -2980,12 +2994,13 @@ def review(args):
         prompt_file.write_text(prompt_text)
         reply_file.unlink(missing_ok=True)
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
-        if record["builder"] == "codex":
-            command = (f"claude -p {add_dir}--permission-mode dontAsk --model {reviewer_route[1]} --effort high "
-                       "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
-        else:
-            command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
-                       f"-m {reviewer_route[1]} -c model_reasoning_effort=high -")
+        def reviewer_command(vendor, model):
+            if vendor == "claude":
+                return (f"claude -p {add_dir}--permission-mode dontAsk --model {model} --effort high "
+                        "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
+            return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+                    f"-m {model} -c model_reasoning_effort=high -")
+        command = reviewer_command(*reviewer_route)
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
@@ -2997,14 +3012,18 @@ def review(args):
             try:
                 run_reviewer(command, path, prompt_file, reply_file)
             except UsageLimit:
-                if reviewer_route != ("claude", "opus"):
+                if used_fallback:
                     raise
-                print("Claude reviewer hit a usage limit; retrying once with claude haiku.")
+                previous_route = reviewer_route
+                reviewer_route = (("codex", "gpt-6-luna") if reviewer_route[0] == "claude"
+                                  else ("claude", "haiku"))
+                print(f"{previous_route[0]} reviewer hit a usage limit; retrying once with "
+                      f"{reviewer_route[0]} {reviewer_route[1]}.")
                 used_fallback = True
-                reviewer_route = ("claude", "haiku")
-                atomic_json(state / "review-routing.json", {"vendor": "claude", "model": "haiku",
-                                                            "fallback_from": "opus"})
-                command = command.replace("--model opus ", "--model haiku ", 1)
+                atomic_json(state / "review-routing.json", {
+                    "vendor": reviewer_route[0], "model": reviewer_route[1],
+                    "fallback_from": list(previous_route)})
+                command = reviewer_command(*reviewer_route)
                 run_reviewer(command, path, prompt_file, reply_file)
             head = sha(path, "HEAD")
             try:
@@ -3049,7 +3068,8 @@ def review(args):
             problems.append("--reviewer must be <claude|codex> <model>")
         else:
             routed_reviewer = (routed_reviewer[0].lower(), routed_reviewer[1])
-    if routed_reviewer and routed_reviewer[0].lower() == record["builder"]:
+    if (routed_reviewer and routed_reviewer[0].lower() == record["builder"]
+            and not (args.run and used_fallback)):
         problems.append("reviewer vendor must differ from builder")
     if reviewer and reviewer[0].lower() == record["builder"]:
         print(f"WARNING: reply Reviewer: line names builder vendor '{reviewer[0]}'; using routed reviewer identity.")
@@ -4764,7 +4784,7 @@ def main(argv=None):
     except SystemExit as stop:
         finish_detached(stop.code or 0)
         raise
-    except (Stop, ValueError) as stop:
+    except (Stop, RoutingParseError) as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1

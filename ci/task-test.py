@@ -187,6 +187,68 @@ class TaskTool(unittest.TestCase):
             with self.subTest(tail=tail), self.assertRaises(TASK_MODULE.Stop):
                 TASK_MODULE.report_criteria(final + tail if tail else "", criteria)
 
+    def test_main_only_catches_routing_parse_errors(self):
+        with mock.patch.object(TASK_MODULE, 'foreground_lock', return_value=None), \
+                mock.patch.object(TASK_MODULE, 'finish_detached'), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            with mock.patch.object(TASK_MODULE, 'status', side_effect=TASK_MODULE.RoutingParseError('bad policy')):
+                self.assertEqual(TASK_MODULE.main(['status', 'proj']), 1)
+                self.assertIn('bad policy', errors.getvalue())
+            with mock.patch.object(TASK_MODULE, 'status', side_effect=ValueError('internal bug')):
+                with self.assertRaisesRegex(ValueError, 'internal bug'):
+                    TASK_MODULE.main(['status', 'proj'])
+
+    def test_concurrent_starts_serialize_on_repository_lock(self):
+        lock_path = self.repo / '.git/task-start.lock'
+        children = []
+        with lock_path.open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                for ident in ('parallel-one', 'parallel-two'):
+                    children.append(subprocess.Popen(
+                        [sys.executable, str(TOOL), 'start', 'proj', ident, '--builder', 'codex'],
+                        env=self.env, cwd=self.home, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True))
+                # Both real commands must wait for this repository's start lock.
+                for child in children:
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        child.communicate(timeout=0.25)
+                self.assertFalse((self.repo / '.worktrees/parallel-one').exists())
+                self.assertFalse((self.repo / '.worktrees/parallel-two').exists())
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        try:
+            for child, ident in zip(children, ('parallel-one', 'parallel-two')):
+                output, _ = child.communicate(timeout=20)
+                self.assertEqual(child.returncode, 0, output)
+                wt = self.repo / '.worktrees' / ident
+                self.assertEqual(self.git(wt, 'branch', '--show-current'), ident)
+                self.assertEqual(self.git(wt, 'rev-parse', 'HEAD'), self.git(self.repo, 'rev-parse', ident))
+                self.assertTrue((wt / '.work/context').is_dir())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
+
+    def test_runner_tier_only_and_documented_dependency_example(self):
+        runner = self.home / 'runner.md'
+        runner.write_text('1. prepare: builder codex, tier routine\n'
+                          '2. implement: builder codex, tier hard, after: prepare\n')
+        self.assertIn('runner file OK (2 tasks)', self.raw_task('runner-check', 'proj', str(runner)))
+        runner.write_text('1. missing: builder codex\n')
+        self.assertIn('model or tier', self.raw_task('runner-check', 'proj', str(runner), code=1))
+
+    def test_unboosted_route_notice_and_tier_only_update_message(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('Implement task')
+        out = self.task('lane', 'proj', '5', '--tier', 'hard')
+        self.wait_for_lane(wt)
+        self.assertIn('route: hard -> codex gpt-6-luna', out)
+        self.assertIn('Updating task tier to hard.', out)
+        self.assertNotIn('Updating task builder', out)
+
     def test_quality_dispatch_brief_and_evidence_instruction(self):
         task = self.kb / "backlog/tasks/t-5 - Add-the-b-file.md"
         task.write_text(task.read_text() + "\n## Read first\n\na.txt and justfile\n\n"
@@ -963,10 +1025,10 @@ class TaskTool(unittest.TestCase):
             self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
             self.assertIn(model, json.loads((wt / '.work/reviewer-call.json').read_text())['args'])
 
-    def test_review_limit_without_boost_or_after_fallback_is_not_retried(self):
+    def test_review_limit_retries_once_without_boost_and_after_boost(self):
         self.stub_reviewers()
         wt, _ = self.started()
-        for boosted, expected in ((False, ['haiku']), (True, ['haiku'])):
+        for boosted in (False, True):
             with self.subTest(boosted=boosted):
                 (wt / '.work/reviewer-count').unlink(missing_ok=True)
                 (wt / '.work/reviewer-calls.jsonl').unlink(missing_ok=True)
@@ -975,10 +1037,13 @@ class TaskTool(unittest.TestCase):
                 self.raw_task("check", "proj", '5')
                 out = self.raw_task('review', 'proj', '5', '--run', code=1,
                                     env=dict(self.env, REVIEW_STUB_REPLY="You've hit your weekly limit",
+                                             REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
                                              REVIEW_STUB_EXIT='2'))
                 self.assertIn('ended by usage limit', out)
                 calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
-                self.assertEqual([call[call.index('--model') + 1] for call in calls], expected)
+                self.assertEqual(len(calls), 2)
+                self.assertIn('haiku', calls[0])
+                self.assertIn('gpt-6-luna', calls[1])
                 self.assertFalse((self.state() / 'review.json').exists())
 
     def test_boosted_reviewer_other_errors_do_not_fall_back(self):
@@ -993,7 +1058,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
         self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'haiku')
 
-    def test_boosted_codex_limit_is_reported_without_fallback(self):
+    def test_boosted_codex_limit_retries_once(self):
         self.stub_reviewers()
         self.raw_task('start', 'proj', '5', '--builder', 'claude')
         wt = self.repo / '.worktrees/t5'
@@ -1001,10 +1066,38 @@ class TaskTool(unittest.TestCase):
         self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', code=1,
                             env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
+                                     REVIEW_STUB_REPLY="You've hit your weekly limit",
                                      REVIEW_STUB_EXIT='1'))
         self.assertIn('ended by usage limit', out)
-        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
         self.assertFalse((self.state() / 'review.json').exists())
+
+    def test_reviewer_fallback_records_actual_route_and_stops_without_verdict(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        for builder, vendor, model in (('codex', 'codex', 'gpt-6-luna'), ('claude', 'claude', 'haiku')):
+            self.task('start', 'proj', '5', '--refresh', '--builder', builder)
+            self.raw_task('check', 'proj', '5')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            for reply in ('No verdict available', f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'):
+                with self.subTest(builder=builder, reply=reply):
+                    (wt / '.work/reviewer-count').unlink(missing_ok=True)
+                    (self.state() / 'review.json').unlink(missing_ok=True)
+                    first_limit = "You've hit your weekly limit"
+                    out = self.raw_task('review', 'proj', '5', '--run',
+                        code=1 if reply.startswith('No') else 0,
+                        env=dict(self.env, REVIEW_STUB_FIRST_REPLY=first_limit,
+                                 REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.", REVIEW_STUB_FIRST_EXIT='2',
+                                 REVIEW_STUB_REPLY=reply, REVIEW_STUB_EXIT='0'))
+                    self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
+                    route = json.loads((self.state() / 'review-routing.json').read_text())
+                    self.assertEqual((route['vendor'], route['model']), (vendor, model))
+                    if reply.startswith('No'):
+                        self.assertIn('review produced no verdict', out)
+                        self.assertFalse((self.state() / 'review.json').exists())
+                    else:
+                        meta = json.loads((self.state() / 'review.json').read_text())
+                        self.assertEqual((meta['reviewer'], meta['model']), (vendor, model))
 
     def test_plan_refusals_exceptions_and_resume(self):
         plan = self.kb / 'INTENT.md'
@@ -4762,7 +4855,9 @@ store.write_text(json.dumps(prs))
         self.assertIn(diagnostic, out)
         self.assertEqual((self.state() / 'review-stderr.log').read_text(), diagnostic)
         self.assertEqual(json.loads((self.state() / 'review-run.json').read_text()),
-                         dict(builder='codex', state='finished', exit_code=1))
+                         dict(builder='claude', state='finished', exit_code=1))
+        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text()),
+                         dict(vendor='claude', model='haiku', fallback_from=['codex', 'gpt-6-luna']))
 
     def test_review_run_cleans_inherited_environment_before_hook_and_diff(self):
         import json
