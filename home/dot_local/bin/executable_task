@@ -63,7 +63,6 @@ from task_limits import cli_limit, lane_limit
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
-CHECK_TIMEOUT = int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 GATE_SLOT = ContextVar("gate_slot", default=None)
 GATE_PORT_INDEXES = 227  # 20000 + 200 * 226 + 199 stays below 65536
 SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|error)|"
