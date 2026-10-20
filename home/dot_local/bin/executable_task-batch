@@ -350,11 +350,8 @@ class Batch:
                 return f"parked: fix rounds exhausted; last blocking findings: {findings}; {check_tail}"
             previous = signature
             rounds += 1
-            if rounds == 2:
-                if tier_only:
-                    if tier == "routine":
-                        tier = "hard"
-                elif model in {"gpt-6.1-sol", "gpt-6-astra", "opus", "claude-opus-5-5", "fable", "claude-fable-5-1"}:
+            if rounds == 2 and not tier_only:
+                if model in {"gpt-6.1-sol", "gpt-6-astra", "opus", "claude-opus-5-5", "fable", "claude-fable-5-1"}:
                     rounds = 3
                 else:
                     model = "gpt-6.1-sol" if builder == "codex" else "opus"

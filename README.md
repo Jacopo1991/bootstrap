@@ -435,9 +435,8 @@ The flag takes precedence and the tier is pinned in task state and shown by
 
 Without a model, the batch passes `--tier` to `task lane` for routing.
 An explicit runner model takes precedence over tier routing.
-After two failed rounds, tier-only routine tasks rise to hard; hard and design
-keep their tier. Tier-only fixes keep routing without a model pin, including
-the final vendor swap. Explicit-model tasks keep their model escalation rules.
+Tier-only tasks keep their tier on every fix round without a model pin; only
+the final vendor swap applies. Explicit-model tasks keep their model escalation rules.
 
 `task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
 temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.

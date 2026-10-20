@@ -505,9 +505,8 @@ class BatchTest(unittest.TestCase):
                         lanes = [c for c in self.calls('lane') if c[2] == ident]
                         self.assertEqual(len(lanes), 4)
                         self.assertTrue(all('--model' not in c for c in lanes))
-                        raised = 'hard' if tier == 'routine' else tier
                         self.assertEqual([c[c.index('--tier') + 1] for c in lanes],
-                                         [tier, tier, raised, raised])
+                                         [tier, tier, tier, tier])
                         other = 'codex' if vendor == 'claude' else 'claude'
                         self.assertEqual([c[c.index('--builder') + 1] for c in lanes],
                                          [vendor, vendor, vendor, other])
@@ -519,7 +518,7 @@ class BatchTest(unittest.TestCase):
                         prompts = [p for p in self.prompts() if Path(p['path']).parents[1].name == ident]
                         self.assertEqual([p['routed_model'] for p in prompts],
                                          [models[vendor][tier], models[vendor][tier],
-                                          models[vendor][raised], models[other][raised]])
+                                          models[vendor][tier], models[other][tier]])
 
     def test_strong_model_skips_round_two(self):
         self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6-astra'))
