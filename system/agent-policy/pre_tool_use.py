@@ -1776,7 +1776,8 @@ def trusted_script_changes(text: str, cwd: str, root: Path,
 def recipe_reason(tokens: list[str], cwd: str, root: Path,
                   approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
     runner = Path(tokens[0]).name.lower()
-    if runner in {"bunx"}:
+    runner = {"yarnpkg": "yarn"}.get(runner, runner)
+    if runner in {"bunx", "pnpx"}:
         return "Fetch-and-run package commands are blocked."
     if runner == "npx":
         if depth >= INDIRECTION_DEPTH:
@@ -1802,15 +1803,24 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         return None
     args = tokens[1:]
     package_runner = runner in {"npm", "pnpm", "yarn", "bun"}
+    script_name = None
     if package_runner:
         if args and args[0] in {"exec", "dlx", "x", "create"}:
             return "Fetch-and-run package commands are blocked."
+        if runner in {"yarn", "bun"} and (not args or args[0] not in {"run", "install"}):
+            return "Use explicit run or install; other runner forms cannot be judged reliably."
         if args and args[0] in {"outdated", "audit", "list", "ls", "view", "info",
                                "--version", "--help"}:
             return None
         if not args or args[0] not in {"run", "run-script", "test", "start", "stop", "restart",
                                       "install", "ci", "add", "remove", "uninstall", "update"}:
             return "Package runner shorthand and global options cannot be judged reliably."
+        if args[0] in {"run", "run-script"}:
+            if len(args) < 2:
+                return "Package run requires an explicitly defined script name."
+            script_name = args[1]
+        elif args[0] in {"test", "start", "stop", "restart"}:
+            script_name = args[0]
         # All script values are checked below, including install/prepare hooks.
         args = args[1:]
     if any(not re.fullmatch(r"[A-Za-z0-9_.:-]+", arg) or arg.startswith("-") for arg in args):
@@ -1853,13 +1863,16 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
             return "Just imports and modules cannot be judged reliably."
         if runner in {"make", "gmake"} and re.search(r"(?m)^\s*(?:-?include|sinclude)\b", text):
             return "Make includes cannot be judged reliably."
+        if package_runner:
+            package = json.loads(text)
+            scripts = package.get("scripts", {}) if isinstance(package, dict) else None
+            if not isinstance(scripts, dict) or not all(isinstance(b, str) for b in scripts.values()):
+                return "Package scripts cannot be judged safely."
+            if script_name is not None and script_name not in scripts:
+                return "Package run target must be explicitly defined; binary/file fallbacks are blocked."
         changed = recipe_changed(path, root)
         if not changed:
             if package_runner:
-                package = json.loads(text)
-                scripts = package.get("scripts", {})
-                if not isinstance(scripts, dict) or not all(isinstance(b, str) for b in scripts.values()):
-                    return "Package scripts cannot be judged safely."
                 text = "\n".join(scripts.values())
             return trusted_script_changes(text, str(directory), root, approved_roots, depth)
         if has_config:
@@ -1867,10 +1880,6 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         if runner in {"make", "gmake"}:
             return "Changed Make definitions cannot be judged reliably."
         if package_runner:
-            package = json.loads(text)
-            scripts = package.get("scripts", {}) if isinstance(package, dict) else None
-            if not isinstance(scripts, dict) or not all(isinstance(body, str) for body in scripts.values()):
-                return "Package scripts cannot be judged safely."
             bodies = list(scripts.values())  # Includes lifecycle hooks, not just the named script.
         else:
             bodies = []
@@ -2114,7 +2123,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
                 and git_subcommand(unwrapped, effective) in STATE_DEPENDENT_GIT and seen_changing):
             return STATE_CHAIN_MESSAGE
         indirect = head in SHELL_PROGRAMS | {"source", ".", "", "just", "make", "gmake", "npm", "pnpm",
-                                           "yarn", "bun", "bunx", "npx"}
+                                           "yarn", "yarnpkg", "bun", "bunx", "npx", "pnpx"}
         if unwrapped and "/" in unwrapped[0]:
             try:
                 indirect |= (Path(effective) / unwrapped[0]).resolve().parent not in {

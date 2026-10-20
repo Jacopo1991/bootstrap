@@ -394,12 +394,23 @@ with tempfile.TemporaryDirectory() as temp:
         fixture("package.json", '{"scripts":{"preinstall":"bash denied.sh"}}')
         for action in ("install", "ci", "run check"):
             assert judge(f"{runner} {action}"), (runner, action)
-        fixture("package.json", '{"scripts":{"prepare":"bash allowed.sh"}}')
-        for action in ("install", "ci", "run check"):
+        fixture("package.json", '{"scripts":{"check":"echo safe","prepare":"bash allowed.sh"}}')
+        actions = ("install", "ci", "run check") if runner in {"npm", "pnpm"} else (
+            "install", "run check")
+        for action in actions:
             assert judge(f"{runner} {action}") is None, (runner, action)
+        if runner in {"yarn", "bun"}:
+            for action in ("ci", "test", "list", "update", "check"):
+                assert judge(f"{runner} {action}"), (runner, action)
         for action in ("exec echo safe", "dlx anything", "x anything", "create anything"):
             assert judge(f"{runner} {action}"), (runner, action)
+        for action in ("run denied.sh", "run missing", "run"):
+            assert judge(f"{runner} {action}"), (runner, action)
+    assert judge("bun test")
     assert judge("bunx anything")
+    assert judge("pnpx anything")
+    assert judge("yarnpkg dlx anything")
+    assert judge("yarnpkg run check") is None
     (root / "node_modules/.bin").mkdir(parents=True)
     fixture("node_modules/.bin/local-tool", "#!/bin/sh\necho safe\n")
     assert judge("npx --no-install local-tool") is None

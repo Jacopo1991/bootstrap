@@ -317,8 +317,10 @@ not count as file changes. Shell assignments affecting resolution or startup
 (including `CDPATH`, `PATH`, `BASH_ENV` and `ENV`) are refused.
 
 Package scripts and install lifecycle scripts use the same checks for npm, pnpm,
-Yarn and Bun. Fetch-and-run forms (`exec`, `dlx`, `x`, `create`, and `bunx`) are
-refused. `npx` requires explicit `--no-install` or `--no`, an existing executable
+Yarn and Bun. Run targets must be explicitly defined in `package.json`; binary
+and file fallbacks are refused. Yarn (including `yarnpkg`) and Bun support explicit
+`run` and `install` forms. Fetch-and-run forms (`exec`, `dlx`, `x`, `create`,
+`bunx`, and `pnpx`) are refused. `npx` requires explicit `--no-install` or `--no`, an existing executable
 in local `node_modules/.bin`, and a script the policy can judge.
 
 The guardrails are root-owned, so an agent in any permission mode (including Claude
