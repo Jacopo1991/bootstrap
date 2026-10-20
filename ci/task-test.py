@@ -3742,7 +3742,12 @@ store.write_text(json.dumps(prs))
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
         self.assertEqual(call["args"][:3], ["-p", "--model", "opus"])
         self.assertEqual(call["args"][3:], ["--effort", "high", "--permission-mode", "acceptEdits",
-                                            "--allowedTools", "Bash Read Write Edit Glob Grep"])
+                                            "--allowedTools", "Bash Read Write Edit Glob Grep",
+                                            "--settings", str(wt / ".work/claude-settings.json")])
+        settings = json.loads((wt / ".work/claude-settings.json").read_text())
+        self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
+        self.assertEqual(settings["sandbox"]["filesystem"]["allowWrite"],
+                         [call["tmpdir"], str(self.gate_dir)])
         self.assertEqual(record["model"], "opus")
 
     def test_lane_rejects_model_from_other_builder(self):
