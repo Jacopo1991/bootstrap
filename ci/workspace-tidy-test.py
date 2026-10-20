@@ -302,6 +302,36 @@ class Safety(unittest.TestCase):
         self.assertEqual(self.archive_files(), [], "no .work archive when a secret blocks removal")
         self.assertTrue({"work-env", "claude-secret"} <= self.branches())
 
+    def test_secret_looking_files_inside_a_cache_are_not_scanned_or_archived(self):
+        self.ignore("data/")
+        path = self.worktree("cache-pem", "-b", "cache-pem")
+        (path / "node_modules/pkg").mkdir(parents=True)
+        (path / "node_modules/pkg/cert.pem").write_text("PEMDATA")
+        (path / "data/build").mkdir(parents=True)
+        (path / "data/build/id_rsa").write_text("KEYDATA")
+        (path / "data/notes.txt").write_text("kept")
+        age(path)
+        out = self.tidy()
+        self.assertFalse(path.exists(), out)
+        self.assertNotIn("cache-pem", self.branches())
+        files = self.archive_files()
+        self.assertEqual(len([name for name in files if name.endswith("data/notes.txt")]), 1, files)
+        self.assertFalse([name for name in files if "cert.pem" in name or "id_rsa" in name], files)
+
+    def test_secret_at_depth_three_in_an_ignored_non_cache_directory_keeps_the_worktree(self):
+        self.ignore("data/")
+        path = self.worktree("deep-env", "-b", "deep-env")
+        (path / "data/a/b").mkdir(parents=True)
+        (path / "data/a/b/.env").write_text("TOKEN=hunter2")
+        (path / "data/a/note.txt").write_text("fine")
+        age(path)
+        out = self.tidy()
+        self.assertEqual((path / "data/a/b/.env").read_text(), "TOKEN=hunter2", out)
+        self.assertIn("looks like a secret", out)
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(self.archive_files(), [], "nothing is copied when a secret blocks removal")
+        self.assertIn("deep-env", self.branches())
+
     def test_other_blockers_still_keep_a_worktree_with_ignored_files(self):
         self.ignore("logs/")
         dirty = self.worktree("dirty-logs", "-b", "dirty-logs")
