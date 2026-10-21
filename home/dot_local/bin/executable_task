@@ -83,14 +83,103 @@ DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", 
               "coverage", "target", ".parcel-cache"}
 # .work is removable only after preservation; its outputs are not disposable.
 WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
-               "node_modules", "hermes-home", "fakehome"}
+               "node_modules", "hermes-home", "fakehome", ".pycache", ".mypy_cache",
+               ".ruff_cache", ".cache"}
+
+
+def archive_exclusion(item, info, size=None):
+    """Shared no-follow copy/prune rule; hashes are streamed, never buffered whole."""
+    mode = info.st_mode
+    record = {"size": info.st_size if size is None else size}
+    if stat.S_ISLNK(mode):
+        return None
+    if archive_runtime(item, info) or (stat.S_ISREG(mode) and item.suffix == '.pyc'):
+        return dict(record, reason="cache/runtime")
+    if not stat.S_ISREG(mode):
+        return None
+    name = item.name.lower()
+    base = re.sub(r'-(wal|shm|journal)$', '', name)
+    reason = "database" if base.endswith(('.sqlite', '.sqlite3', '.db', '.duckdb')) else None
+    if reason is None and info.st_size > 50 * 1024 ** 2:
+        reason = "file over 50 MB"
+    try:
+        with os.fdopen(os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError("file type changed")
+            header = stream.read(16)
+            if header == b'SQLite format 3\0':
+                reason = "database"
+            if reason:
+                digest = hashlib.sha256(header)
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+                return dict(record, reason=reason, sha256=digest.hexdigest())
+    except OSError as error:
+        return dict(record, reason=reason or "unreadable file", sha256=None, error=str(error))
+    return None
+
+
+def prune_evidence_archive(root, apply, report):
+    """Prune archive snapshots, including legacy ones without manifests; never traverse links."""
+    if any(item.is_symlink() for item in (root, *root.parents)) or not root.is_dir():
+        return
+    entries, _, _ = archive_inventory(root)
+    total = 0
+    for snapshot, info in entries:
+        if not stat.S_ISDIR(info.st_mode) or len(snapshot.relative_to(root).parts) != 3:
+            continue
+        manifest = snapshot / 'manifest.json'
+        if manifest.is_symlink():
+            report.append(f"archive: cannot prune {snapshot}: symlink manifest")
+            continue
+        try:
+            record = json.loads(manifest.read_text()) if manifest.exists() else {}
+            contents, sizes, _ = archive_inventory(manifest.parent)
+            excluded = set()
+            for item, meta in contents:
+                if item == manifest or item == manifest.parent:
+                    continue
+                if item.parent in excluded:
+                    excluded.add(item)
+                    continue
+                removal = archive_exclusion(item, meta, sizes[item])
+                if removal is None:
+                    continue
+                excluded.add(item)
+                total += removal['size']
+                removal.update(path=str(item.relative_to(manifest.parent)), date=utc_now())
+                report.append(f"archive: {'remove' if apply else 'would remove'} {item} ({removal['size']} bytes)")
+                if apply:
+                    record.setdefault('pruned', []).append(removal)
+                    atomic_json(manifest, record)
+                    if stat.S_ISDIR(meta.st_mode):
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+            if apply:
+                for item, meta in reversed(contents):
+                    if stat.S_ISDIR(meta.st_mode) and item != manifest.parent:
+                        try:
+                            item.rmdir()
+                        except OSError:
+                            pass
+        except (OSError, ValueError, TypeError) as error:
+            report.append(f"archive: cannot prune {manifest.parent}: {error}")
+    report.append(f"archive: {'removed' if apply else 'would remove'} {total} bytes total")
 
 
 def archive_runtime(item, info, errors=None):
     try:
-        return (item.name in WORK_CACHES or item.name.endswith('.sock') or
-                stat.S_ISSOCK(info.st_mode) or
-                (stat.S_ISDIR(info.st_mode) and (item / 'pyvenv.cfg').is_file()))
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        if item.name in WORK_CACHES or item.name.endswith('.sock') or stat.S_ISSOCK(info.st_mode):
+            return True
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                return stat.S_ISREG((item / 'pyvenv.cfg').lstat().st_mode)
+            except FileNotFoundError:
+                pass
+        return False
     except OSError as error:
         if errors is not None:
             errors[item] = f"cannot inspect: {error}"
@@ -846,23 +935,21 @@ def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=
                 continue
             relative = str(item.relative_to(source))
             mode = info.st_mode
+            omission = archive_exclusion(item, info, sizes[item]) if item != source else None
             reason = None
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                 special.append(relative)
                 reason = "special file"
-            elif item != source and archive_runtime(item, info, errors):
-                reason = "cache/runtime"
+            elif omission:
+                reason = omission['reason']
             elif item in disposable:
                 reason = "directory over 200 MB"
-            elif (stat.S_ISREG(mode) and item.suffix == '.log' and
-                  sizes[item] >= 50 * 1024 ** 2 and not archive_evidence(item, info)):
-                reason = "log over 50 MB"
             if item in errors:
                 excluded.add(item)
                 continue
             if reason:
                 excluded.add(item)
-                skipped.append({"path": relative, "size": sizes[item], "reason": reason})
+                skipped.append(dict(omission or {"size": sizes[item], "reason": reason}, path=relative))
                 continue
             if item in oversized:
                 skipped.append({"path": relative, "size": sizes[item],

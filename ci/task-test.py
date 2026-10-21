@@ -3191,6 +3191,134 @@ store.write_text(json.dumps(prs))
     def work_archives(self):
         return self.home / ".local/state/task/archive/proj/t5"
 
+    def archive_fixture(self, root):
+        root.mkdir(parents=True, exist_ok=True)
+        payloads = {'house.sqlite': b'database', 'house.sqlite-wal': b'wal',
+                    'other.sqlite3': b'db', 'other.db': b'db', 'other.duckdb': b'db',
+                    'house.sqlite-shm': b'shm', 'house.sqlite-journal': b'journal',
+                    'innocent.txt': b'SQLite format 3\0payload', 'module.pyc': b'cache',
+                    'report.md': b'report', 'check.json': b'{}', 'review.txt': b'review'}
+        for name, content in payloads.items():
+            (root / name).write_bytes(content)
+        for name, size in [('check-report.json', '51M'), ('keep.log', '49M')]:
+            subprocess.run(['truncate', '-s', size, str(root / name)], check=True)
+        (root / '.pycache').mkdir()
+        (root / '.pycache/source.py').write_text('cache')
+        outside = self.home / 'outside.sqlite'
+        outside.write_bytes(b'SQLite format 3\0outside')
+        (root / 'linked.db').symlink_to(outside)
+        (root / 'linked-dir').symlink_to(self.home, target_is_directory=True)
+        return payloads, outside
+
+    def assert_archive_skips(self, skipped, payloads, prefix=''):
+        import hashlib
+        for name in ('house.sqlite', 'house.sqlite-wal', 'other.sqlite3', 'other.db',
+                     'other.duckdb', 'house.sqlite-shm', 'house.sqlite-journal', 'innocent.txt'):
+            entry = skipped[prefix + name]
+            self.assertEqual(entry['size'], len(payloads[name]))
+            self.assertEqual(entry['sha256'], hashlib.sha256(payloads[name]).hexdigest())
+            self.assertEqual(entry['reason'], 'database')
+        big = skipped[prefix + 'check-report.json']
+        self.assertEqual(big['size'], 51 * 1024 ** 2)
+        digest = hashlib.sha256()
+        for _ in range(51):
+            digest.update(bytes(1024 ** 2))
+        self.assertEqual(big['sha256'], digest.hexdigest())
+        self.assertEqual(big['reason'], 'file over 50 MB')
+        for name in ('.pycache', 'module.pyc'):
+            self.assertEqual(skipped[prefix + name]['reason'], 'cache/runtime')
+            self.assertNotIn('sha256', skipped[prefix + name])
+
+    def test_archive_exclusions_shared_with_ignored_files(self):
+        import runpy
+        wt, _ = self.started()
+        payloads, outside = self.archive_fixture(wt / '.work/fixture')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
+        manifest = next(self.work_archives().glob('*/manifest.json'))
+        skipped = {row['path']: row for row in json.loads(manifest.read_text())['skipped']}
+        self.assert_archive_skips(skipped, payloads, 'fixture/')
+        saved = manifest.parent / '.work/fixture'
+        for name in ('keep.log', 'report.md', 'check.json', 'review.txt'):
+            self.assertTrue((saved / name).is_file())
+        self.assertTrue((saved / 'linked.db').is_symlink())
+        self.assertTrue((saved / 'linked-dir').is_symlink())
+        self.assertTrue(outside.exists())
+        self.assertTrue((wt / '.work/fixture/house.sqlite').exists())
+        # Exercise tidy's real ignored-file entry point with the same payloads.
+        tool = ROOT / 'home/dot_local/bin/executable_workspace-tidy'
+        with mock.patch.dict(os.environ, HOME=str(self.home)):
+            tidy = runpy.run_path(str(tool), run_name='archive_test')
+            files = [item.relative_to(wt / '.work/fixture')
+                     for item in (wt / '.work/fixture').iterdir() if item.name != '.pycache']
+            files.append(Path('.pycache/source.py'))
+            destination = tidy['archive_ignored'](self.repo, wt / '.work/fixture', files, [])
+        record = json.loads((destination / 'manifest.json').read_text())
+        self.assert_archive_skips({row['path']: row for row in record['skipped']}, payloads)
+        self.assertTrue((destination / 'keep.log').exists())
+        self.assertFalse((destination / 'house.sqlite').exists())
+
+    def test_archive_prune_dry_run_apply_and_symlinks(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = root / 'proj/t5/snapshot'
+        payloads, outside = self.archive_fixture(snapshot / '.work')
+        (snapshot / '.work/empty-after').mkdir()
+        (snapshot / '.work/empty-after/copy.db').write_bytes(b'db')
+        manifest = snapshot / 'manifest.json'
+        manifest.write_text(json.dumps({'skipped': [{'path': 'old'}]}))
+        # Old ignored-file archives have no manifest yet.
+        old = root / 'proj/t5/old-ignored'
+        old.mkdir()
+        (old / 'copy.db').write_bytes(b'db')
+        (root / 'linked').symlink_to(self.home, target_is_directory=True)
+        before = manifest.read_bytes()
+        report = []
+        tidy = ROOT / 'home/dot_local/bin/executable_workspace-tidy'
+        dry_run = subprocess.run([sys.executable, str(tidy)], env=self.env,
+                                 capture_output=True, text=True, check=True)
+        report = dry_run.stdout.splitlines()
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertTrue((snapshot / '.work/house.sqlite').exists())
+        self.assertTrue((old / 'copy.db').exists())
+        self.assertFalse((old / 'manifest.json').exists())
+        listed = {line.split('would remove ', 1)[1].rsplit(' (', 1)[0]
+                  for line in report if 'would remove ' in line and ' bytes)' in line}
+        subprocess.run([sys.executable, str(tidy), '--apply'], env=self.env,
+                       capture_output=True, text=True, check=True)
+        record = json.loads(manifest.read_text())
+        pruned = {row['path']: row for row in record['pruned']}
+        self.assert_archive_skips(pruned, payloads, '.work/')
+        self.assertEqual(record['skipped'], [{'path': 'old'}])
+        self.assertEqual(listed, {str(snapshot / row['path']) for row in record['pruned']} |
+                         {str(old / 'copy.db')})
+        for row in record['pruned']:
+            self.assertFalse((snapshot / row['path']).exists())
+            self.assertIsNotNone(__import__('datetime').datetime.fromisoformat(row['date']))
+        for name in ('keep.log', 'report.md', 'check.json', 'review.txt'):
+            self.assertTrue((snapshot / '.work' / name).exists())
+        self.assertFalse((snapshot / '.work/empty-after').exists())
+        total = sum(row['size'] for row in record['pruned']) + 2
+        self.assertTrue(any(f'{total} bytes total' in line for line in report))
+        self.assertTrue((snapshot / '.work/linked.db').is_symlink())
+        self.assertTrue(outside.exists())
+        TASK_MODULE.prune_evidence_archive(root, True, [])
+        self.assertEqual(json.loads(manifest.read_text()), record)
+
+    def test_archive_unreadable_file_records_null_hash(self):
+        wt, _ = self.started()
+        for name in ('check.db', 'check.txt'):
+            file = wt / '.work' / name
+            file.write_bytes(b'db')
+            make_read_only(self, file, 0)
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
+        manifest = next(self.work_archives().glob('*/manifest.json'))
+        for name in ('check.db', 'check.txt'):
+            row = next(row for row in json.loads(manifest.read_text())['skipped'] if row['path'] == name)
+            self.assertIsNone(row['sha256'])
+            self.assertIn('error', row)
+            self.assertFalse((manifest.parent / '.work' / name).exists())
+
     def test_archive_runtime_failures_and_deep_tree(self):
         wt, _ = self.started()
         work = wt / '.work'
