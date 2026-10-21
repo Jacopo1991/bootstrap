@@ -6,7 +6,7 @@ Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
-  task runner-start <repo> <runner-file> [--llm]
+  task runner-start <repo> <runner-file>
   task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
@@ -45,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import secrets
 import selectors
 import shlex
@@ -2008,7 +2009,7 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, executable, offset, mode, repo = sys.argv[1:]
+source, done, log, executable, offset, repo = sys.argv[1:]
 child = None
 def stop(signum, frame):
     if child is not None:
@@ -2017,11 +2018,8 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
-    with open(source) as stream:
-        command = ([executable, 'exec', '--dangerously-bypass-approvals-and-sandbox',
-                    '-m', 'gpt-6-luna', '-'] if mode == 'llm' else [executable, repo, source])
-        child = subprocess.Popen(command, stdin=stream if mode == 'llm' else subprocess.DEVNULL)
-        code = child.wait()
+    child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL)
+    code = child.wait()
 finally:
     path = pathlib.Path(done)
     content = path.read_bytes() if path.exists() else b''
@@ -2073,17 +2071,16 @@ def runner_start(args):
         previous = json.loads(record.read_text())
         if previous.get('backend') == 'setsid' and pid_alive(previous.get('pid')):
             raise Stop(f'{unit} is already active (setsid).')
-    binary = 'codex' if args.llm else 'task-batch'
-    executable = shutil.which(binary)
+    executable = shutil.which('task-batch')
     if not executable:
-        raise Stop(f'{binary} is unavailable.')
+        raise Stop('task-batch is unavailable.')
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
     command = [sys.executable, str(wrapper), str(source), str(done),
-               str(log), executable, str(done_offset), 'llm' if args.llm else 'batch', str(repo)]
+               str(log), executable, str(done_offset), str(repo)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               '--property=KillMode=process',
@@ -3920,6 +3917,19 @@ def quality_summary(repo):
             f"reviews per merged task {average}")
 
 
+def stale_worktree_lines(repo):
+    """Unmerged worktrees idle past workspace-tidy's limit; reported only, never removed."""
+    tool = Path(__file__).with_name("workspace-tidy")
+    if not tool.is_file():
+        tool = Path(__file__).with_name("executable_workspace-tidy")
+    try:
+        found = runpy.run_path(str(tool), run_name="task_status_tidy")["stale_unmerged"](repo, time.time())
+    except Exception as error:
+        return [f"idle worktree check unavailable: {error}"]
+    return [f"idle worktree: {repo.name} {item['path']} (branch {item['branch']}, idle {item['days']} days, "
+            f"unmerged{item['locked']}): finish, adopt or delete" for item in found]
+
+
 def status(args):
     active = boost_line()
     if active:
@@ -4075,6 +4085,7 @@ def status(args):
         for request in open_setup_requests(setup_path, repo.name, setup_events):
             attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
                              f"{request.get('text', '')}")
+        attention += stale_worktree_lines(repo)
         improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
         open_count = 0
         if improvements.is_file():
@@ -4684,7 +4695,6 @@ def main(argv=None):
     sub = commands.add_parser("runner-start", help="launch a validated, detached batch runner")
     sub.add_argument("repo")
     sub.add_argument("file")
-    sub.add_argument("--llm", action="store_true", help="use the legacy Codex runner for this release")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
