@@ -2,6 +2,7 @@
 """Exercise task-batch end to end with real Git and a serial task stand-in."""
 import importlib.machinery
 import importlib.util
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import threading
 from unittest import mock
+from policy_test_env import isolate_policy_environment
+
+isolate_policy_environment()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,8 +77,15 @@ if cmd == 'start':
     print('Dispatch prompt:\nContext: .work/context/\nCommit and fill .work/report.md.')
 elif cmd == 'lane':
     prompt = (work / 'prompt.md').read_text()
+    sys.path.insert(0, os.environ['TASK_TEST_ROUTING_DIR'])
+    from task_routing import route
+    vendor = options[options.index('--builder') + 1]
+    tier = options[options.index('--tier') + 1] if '--tier' in options else 'routine'
+    explicit = options[options.index('--model') + 1] if '--model' in options else None
+    routed_model = route(home, vendor, tier, explicit)
     with (home / 'prompts.jsonl').open('a') as out:
-        out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options)) + '\n')
+        out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options,
+                                 routed_model=routed_model)) + '\n')
     record = json.loads((state / 'task.json').read_text())
     record['builder'] = options[options.index('--builder') + 1]
     save(state / 'task.json', record)
@@ -123,13 +135,144 @@ print(entry.get('output', 'OK'))
 
 
 class BatchTest(unittest.TestCase):
+    def test_same_builder_reviewer_fallback_stops_before_merge_or_fixes(self):
+        self.source.write_text('1. one: builder codex, tier hard\n')
+        self.scenario({})
+        original = batch_module.Batch.reviewer_outcome
+        def fallback(worker, state):
+            (state / 'review-routing.json').write_text(json.dumps(
+                dict(vendor='codex', model='gpt-6-luna', fallback_from=['claude', 'haiku'])))
+            return original(worker, state)
+        runner = batch_module.Batch(self.repo, self.source)
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(batch_module.Batch, 'reviewer_outcome', fallback):
+            self.assertEqual(runner.run(), 1)
+        self.assertIn('independent review required', runner.done.read_text())
+        self.assertEqual(len(self.calls('lane')), 1)
+        self.assertEqual(self.calls('merge'), [])
+
+    def test_tier_only_dispatch_and_missing_route(self):
+        self.source.write_text('1. one: builder codex, tier hard\n')
+        self.run_batch()
+        lane = self.calls('lane')[0]
+        self.assertNotIn('--model', lane)
+        self.assertEqual(lane[lane.index('--tier') + 1], 'hard')
+        self.source.write_text('1. one: builder codex\n')
+        with self.assertRaisesRegex(batch_module.Stop, 'model or tier'):
+            batch_module.parse(self.source)
+
+    def test_lane_output_is_prefixed(self):
+        result = subprocess.run([sys.executable, str(TOOL), 'proj', str(self.source)],
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('[one] Dispatch prompt:', result.stdout)
+        self.assertIn('[one] Context: .work/context/', result.stdout)
+        self.assertIn('[one] OK', result.stdout)
+
+    def test_stop_and_interrupt_report_before_inflight_worker_finishes(self):
+        for interruption in (False, True):
+            with self.subTest(interruption=interruption):
+                config = self.home / '.config/task'
+                config.mkdir(parents=True, exist_ok=True)
+                (config / 'gate.toml').write_text('slots = 2\n')
+                boost = self.home / '.local/state/task/boost.json'
+                boost.parent.mkdir(parents=True, exist_ok=True)
+                boost.write_text(json.dumps({'codex': '2099-01-01T00:00:00+00:00'}))
+                release, entered, exited = threading.Event(), threading.Event(), threading.Event()
+                launched = []
+                def execute(worker, task):
+                    launched.append(task['id'])
+                    if task['id'] == 'one':
+                        self.assertTrue(entered.wait(5))
+                        raise batch_module.Stop('test stop')
+                    entered.set()
+                    try:
+                        release.wait(5)
+                        return 'merged'
+                    finally:
+                        exited.set()
+                tasks = [dict(id=i, builder='codex', after=None) for i in ('one', 'two', 'three')]
+                runner = batch_module.Batch(self.repo, self.source)
+                def interrupt(*args, **kwargs):
+                    self.assertTrue(entered.wait(5))
+                    raise KeyboardInterrupt
+                patches = contextlib.ExitStack()
+                with patches, mock.patch.dict(os.environ, self.env, clear=True), \
+                        mock.patch.object(runner, 'require'), \
+                        mock.patch.object(batch_module, 'parse', return_value=tasks), \
+                        mock.patch.object(batch_module.Batch, 'task', execute):
+                    if interruption:
+                        patches.enter_context(mock.patch.object(batch_module, 'wait', side_effect=interrupt))
+                    try:
+                        self.assertEqual(runner.run(), 1)
+                        self.assertIn('batch: stopped:', runner.done.read_text())
+                        if interruption:
+                            self.assertIn('batch: stopped: interrupted', runner.done.read_text())
+                        self.assertFalse(exited.is_set())
+                        self.assertEqual(set(launched), {'one', 'two'})
+                    finally:
+                        release.set()
+                        self.assertTrue(exited.wait(5))
+
+    def test_tier_runner_field_dispatch(self):
+        self.source.write_text('1. one: builder codex, model gpt-6-luna, tier design\n')
+        self.assertEqual(batch_module.parse(self.source)[0]['tier'], 'design')
+        self.run_batch()
+        for command in ('start', 'lane'):
+            call = self.calls(command)[0]
+            self.assertEqual(call[call.index('--tier') + 1], 'design')
+        self.source.write_text('1. one: builder codex, model gpt-6-luna, tier unknown\n')
+        with self.assertRaises(batch_module.Stop):
+            batch_module.parse(self.source)
+
+    def test_boost_capacity_dependencies_and_gate_bound(self):
+        config = self.home / '.config/task'
+        config.mkdir(parents=True)
+        state = self.home / '.local/state/task'
+        state.mkdir(parents=True)
+        boost = state / 'boost.json'
+        for vendor in ('codex', 'claude'):
+            for boosted, slots, expected in ((False, 3, 1), (True, 3, 3), (True, 2, 2), (True, 1, 1)):
+                with self.subTest(vendor=vendor, boosted=boosted, slots=slots):
+                    (config / 'gate.toml').write_text(f'slots = {slots}\n')
+                    boost.write_text(json.dumps({vendor: '2099-01-01T00:00:00+00:00'} if boosted else {}))
+                    tasks = [dict(id=str(i), builder=vendor, after='0' if i == 3 else None) for i in range(5)]
+                    lock = threading.Lock()
+                    active, maximum, completed = 0, 0, set()
+                    first_wave = threading.Barrier(expected)
+                    def execute(worker, task):
+                        nonlocal active, maximum
+                        with lock:
+                            if task['after']:
+                                self.assertIn(task['after'], completed)
+                            active += 1
+                            maximum = max(maximum, active)
+                        if int(task['id']) < expected:
+                            first_wave.wait(timeout=5)
+                        with lock:
+                            active -= 1
+                            completed.add(task['id'])
+                        return 'merged'
+                    runner = batch_module.Batch(self.repo, self.source)
+                    with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module.Batch, 'task', execute):
+                        runner.schedule(tasks)
+                    self.assertEqual(maximum, expected)
+                    self.assertEqual(len(completed), 5)
+        boost.write_text(json.dumps({'codex': '2000-01-01T00:00:00+00:00'}))
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(runner.capacity()[0], 1)
+        boost.write_text(json.dumps({'codex': '2099-01-01T00:00:00+00:00'}))
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(runner.capacity()[1]['claude'], 1)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.repo = self.home / 'dev_workspace/proj'
         self.repo.mkdir(parents=True)
-        self.env = dict(os.environ, HOME=str(self.home),
+        self.env = dict(HOME=str(self.home), PATH=os.environ['PATH'],
+                        TASK_TEST_ROUTING_DIR=str(ROOT / 'home/dot_local/bin'),
                         GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
                         GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid',
                         GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid')
@@ -336,6 +479,25 @@ class BatchTest(unittest.TestCase):
         self.assertIn('criterion 1 missing', prompts[1]['prompt'])
         self.assertNotIn('optional', prompts[1]['prompt'])
 
+    def test_external_after_without_merge_record_parks_only_dependant(self):
+        self.source.write_text('1. dependent: builder codex, model gpt-6-luna, after: prepare\n'
+                               '2. independent: builder codex, model gpt-6-luna\n')
+        self.scenario({})
+        done = self.run_batch()
+        self.assertIn('dependent: not started: after prepare (no merge record)', done)
+        self.assertIn('independent: merged', done)
+        self.assertEqual([call[2] for call in self.calls('lane')], ['independent'])
+
+    def test_external_after_with_merge_record_is_satisfied(self):
+        self.source.write_text('1. dependent: builder codex, model gpt-6-luna, after: prepare\n')
+        merge = self.home / '.local/state/task/proj/prepare/merge.json'
+        merge.parent.mkdir(parents=True)
+        merge.write_text(json.dumps({'head': 'already-merged'}))
+        self.scenario({})
+        done = self.run_batch()
+        self.assertIn('dependent: merged', done)
+        self.assertEqual([call[2] for call in self.calls('lane')], ['dependent'])
+
     def test_escalation_and_round_three_park(self):
         self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}') for i in range(4)]})
         self.assertIn('parked: fix rounds exhausted', self.run_batch())
@@ -343,6 +505,39 @@ class BatchTest(unittest.TestCase):
         self.assertEqual([c[c.index('--model') + 1] for c in lanes],
                          ['gpt-6-luna', 'gpt-6-luna', 'gpt-6.1-sol', 'opus'])
         self.assertEqual(lanes[-1][lanes[-1].index('--builder') + 1], 'claude')
+
+    def test_tier_only_fix_rounds_preserve_routing(self):
+        state = self.home / '.local/state/task'
+        state.mkdir(parents=True)
+        for vendor in ('claude', 'codex'):
+            for boosted in (False, True):
+                for tier in ('routine', 'hard', 'design'):
+                    with self.subTest(vendor=vendor, boosted=boosted, tier=tier):
+                        ident = f'{vendor}-{boosted}-{tier}'
+                        self.source.write_text(f'1. {ident}: builder {vendor}, tier {tier}\n')
+                        (state / 'boost.json').write_text(json.dumps(
+                            {v: '2099-01-01T00:00:00+00:00' for v in ('claude', 'codex')}
+                            if boosted else {}))
+                        self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}')
+                                                  for i in range(4)]})
+                        self.assertIn('parked: fix rounds exhausted', self.run_batch())
+                        lanes = [c for c in self.calls('lane') if c[2] == ident]
+                        self.assertEqual(len(lanes), 4)
+                        self.assertTrue(all('--model' not in c for c in lanes))
+                        self.assertEqual([c[c.index('--tier') + 1] for c in lanes],
+                                         [tier, tier, tier, tier])
+                        other = 'codex' if vendor == 'claude' else 'claude'
+                        self.assertEqual([c[c.index('--builder') + 1] for c in lanes],
+                                         [vendor, vendor, vendor, other])
+                        models = {'claude': {'routine': 'sonnet', 'hard': 'fable' if boosted else 'opus',
+                                             'design': 'opus'},
+                                  'codex': {'routine': 'gpt-6-luna',
+                                            'hard': 'gpt-6.1-sol',
+                                            'design': 'gpt-6-astra' if boosted else 'gpt-6.1-sol'}}
+                        prompts = [p for p in self.prompts() if Path(p['path']).parents[1].name == ident]
+                        self.assertEqual([p['routed_model'] for p in prompts],
+                                         [models[vendor][tier], models[vendor][tier],
+                                          models[vendor][tier], models[other][tier]])
 
     def test_strong_model_skips_round_two(self):
         self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6-astra'))
