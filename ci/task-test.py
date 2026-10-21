@@ -182,9 +182,9 @@ class TaskTool(unittest.TestCase):
         state = self.home / '.local/state/task/proj/t1'
         state.mkdir(parents=True)
         history = [
-            {'trusted': True, 'result': 'passed', 'time': str(i), 'steps': [
+            {'trusted': True, 'result': 'passed', 'time': f'2026-10-21T00:0{i}:00+00:00', 'steps': [
                 {'command': ['just', 'check'], 'duration': duration}]}
-            for i, duration in enumerate([1100, 1000, 900, 800, 700])]
+            for i, duration in enumerate([1100, 1000, 950, 800, 700])]
         history += [{'trusted': True, 'result': 'failed', 'time': '9', 'steps': [
             {'command': ['just', 'check'], 'duration': 9999}]},
             {'trusted': False, 'result': 'passed', 'time': '10', 'steps': [
@@ -193,8 +193,8 @@ class TaskTool(unittest.TestCase):
         (repo / '.task.toml').write_text('check_timeout = 1200\n')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
             configured, effective, used = TASK_MODULE.step_timeout(repo, ['just', 'check'])
-            self.assertEqual((configured, effective, used), (1200, 2200, [700, 800, 900, 1000, 1100]))
-            self.assertIn('median 900 s', TASK_MODULE.gate_warning(repo))
+            self.assertEqual((configured, effective, used), (1200, 2200, [700, 800, 950, 1000, 1100]))
+            self.assertIn('median 950 s', TASK_MODULE.gate_warning(repo))
             (repo / '.task.toml').write_text('check_timeout = 1300\n')
             self.assertEqual(TASK_MODULE.gate_warning(repo), '')
         (state / 'checks.jsonl').unlink()

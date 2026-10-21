@@ -2475,8 +2475,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                         if evidence_name == "check.json":
                             try: task_event(Task(main_repo(path), path.name), "check")
                             except OSError: pass
-                    print(f"NOT FINISHED: `{' '.join(step)}` ran over configured {configured}s "
-                          f"(effective {timeout}s; recent trusted passes {durations}); see {display_log or log}")
+                    print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s "
+                          f"(configured {configured}s; effective {timeout}s; "
+                          f"recent trusted passes {durations}); see {display_log or log}")
                     print(f"FAIL (log: {display_log or log})")
                     return False
             except subprocess.TimeoutExpired:
@@ -3953,7 +3954,8 @@ def status(args):
                   f"started={service.get('ExecMainStartTimestamp') or data['started_at']} "
                   f"last={lines[-1] if lines else '(no .done line)'}")
         attention = []
-        warning = gate_warning(repo)
+        try: warning = gate_warning(repo)
+        except Stop: warning = ""
         if warning: attention.append(warning)
         state_root = HOME / ".local/state/task" / repo.name
         for path in sorted((repo / ".worktrees").glob("*")) if (repo / ".worktrees").is_dir() else []:
