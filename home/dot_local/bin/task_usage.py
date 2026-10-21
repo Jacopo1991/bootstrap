@@ -91,19 +91,22 @@ def _text(path):
         return ""
 
 
-def _unknown(vendor, reason):
-    return {"vendor": vendor, "reason": reason}
+def _unknown(vendor, reason, has_five=False):
+    return {"vendor": vendor, "reason": reason, "has_five": has_five}
 
 
-def _reading(vendor, at, weekly, resets, five_hour, five_resets, now):
-    """Reject a reading from before the last reset or older than the weekly window."""
+def _reading(vendor, at, weekly, resets, five_hour, five_resets, now, has_five=True):
+    """Reject a reading from before the last reset or older than the weekly window.
+
+    `has_five` says the vendor has a 5-hour window at all (Claude always; Codex when one was seen in 7 days).
+    """
     if resets <= now:
-        return _unknown(vendor, f"newest reading ({at:%Y-%m-%d %H:%M} UTC) is from before the last weekly reset")
+        return _unknown(vendor, f"newest reading ({at:%Y-%m-%d %H:%M} UTC) is from before the last weekly reset", has_five)
     if now - at > WEEK:
-        return _unknown(vendor, f"newest reading ({at:%Y-%m-%d %H:%M} UTC) is older than the 7-day window")
+        return _unknown(vendor, f"newest reading ({at:%Y-%m-%d %H:%M} UTC) is older than the 7-day window", has_five)
     if five_resets is not None and five_resets <= now:
         five_hour = None
-    return {"vendor": vendor, "reason": "", "at": at, "resets_at": resets, "weekly": float(weekly),
+    return {"vendor": vendor, "reason": "", "has_five": has_five, "at": at, "resets_at": resets, "weekly": float(weekly),
             "five_hour": None if five_hour is None else float(five_hour),
             "five_resets": five_resets if five_hour is not None else None}
 
@@ -119,6 +122,7 @@ def read_codex(home, now):
             pass
     if not files:
         return _unknown("codex", f"no rollout file under {root}")
+    found, seen_five = None, False  # the newest reading; whether any event of the last 7 days had a 5-hour window
     for _, path in sorted(files, reverse=True)[:5]:
         try:
             with path.open("rb") as stream:
@@ -137,11 +141,17 @@ def read_codex(home, now):
                 windows = {"weekly" if item["window_minutes"] >= 10080 else "five": item
                            for item in (limits.get("primary"), limits.get("secondary")) if item}
                 weekly, five = windows["weekly"], windows.get("five", {})
-                return _reading("codex", at, weekly["used_percent"], _epoch(weekly["resets_at"]),
-                                five.get("used_percent"),
-                                _epoch(five["resets_at"]) if five else None, now)
+                found = found or (at, weekly["used_percent"], _epoch(weekly["resets_at"]), five.get("used_percent"),
+                                  _epoch(five["resets_at"]) if five else None)
+                seen_five = seen_five or bool(five) and now - at <= WEEK
             except (KeyError, TypeError, ValueError):
                 continue
+            if seen_five:
+                break
+        if seen_five:
+            break
+    if found:
+        return _reading("codex", *found, now, seen_five)
     return _unknown("codex", "no weekly rate_limits in the newest Codex rollouts")
 
 
@@ -154,7 +164,7 @@ def read_claude(home, now):
                         five["utilization"] * 100 if five else None,
                         _epoch(five["resetsAt"]) if five else None, now)
     except (KeyError, TypeError, ValueError):
-        return _unknown("claude", "no rate_limit_event recorded yet (a recorded Claude lane or review writes one)")
+        return _unknown("claude", "no rate_limit_event recorded yet (a recorded Claude lane or review writes one)", True)
 
 
 def readings(home, now):
@@ -248,19 +258,23 @@ def running(home, vendor):
 
 
 def _five(reading, pol, now, ran):
-    """5-hour verdict: exhausted at 100 - reserve, warning 15 points lower or on a stale reading while lanes ran."""
-    reserve, used = pol["reserve"][reading["vendor"]], reading.get("five_hour")
-    stale = ran and reading["reason"] == "" and now - reading["at"] > STALE  # no reading at all stays "unknown"
+    """5-hour verdict: exhausted at 100 - reserve; warning 15 points lower, or on a missing or stale reading.
+
+    A vendor with no 5-hour window in its readings has none to pace: always ok. Otherwise unknown is never plenty.
+    """
+    reserve, used, has = pol["reserve"][reading["vendor"]], reading.get("five_hour"), reading["has_five"]
+    stale = has and ran and reading["reason"] == "" and now - reading["at"] > STALE
+    missing = has and used is None
     if used is not None and used >= 100 - reserve:
-        return {"five": FIVE_OUT, "stale": False}
-    return {"five": FIVE_WARN if stale or used is not None and used >= 100 - reserve - FIVE_BAND else "ok",
-            "stale": stale}
+        return {"five": FIVE_OUT, "stale": False, "missing": False}
+    return {"five": FIVE_WARN if stale or missing or used is not None and used >= 100 - reserve - FIVE_BAND else "ok",
+            "stale": stale, "missing": missing}
 
 
 def assess(reading, pol, now, ran=False):
     """Add spare/limit and the pace verdict to a reading (see `task usage` for the meanings).
 
-    `ran` says the vendor's lanes ran since the reading (or ever, with none): an old reading is then stale.
+    `ran` says the vendor's lanes ran since the reading: an old reading is then stale.
     The 5-hour verdict ignores spare resets, which only refill the weekly window.
     """
     vendor = reading["vendor"]
@@ -340,6 +354,9 @@ def assessments(home, now):
         if found["stale"]:
             notes.append(f"pace warning: {vendor} usage reading is {(now - since) / timedelta(minutes=1):.0f} min old "
                          "while its lanes ran; treated as the 5-hour warning band (one lane or review at a time)")
+        if found["missing"]:
+            notes.append(f"pace warning: {vendor} has no current 5-hour reading; "
+                         "treated as the 5-hour warning band (one lane or review at a time)")
         note(home, found, now)
     return pol, seen, notes
 
@@ -391,7 +408,7 @@ def gate(home, kind, vendor, tier, repo, key, now=None):
                            f"no new {kind}s there")
     if not out["hold"] and found["five"] == FIVE_WARN and running(home, out["vendor"]):
         out["hold"] = (f"{out['vendor']} 5-hour window in the warning band"
-                       f"{' (reading stale)' if found['stale'] else ''}: "
+                       f"{' (reading stale)' if found['stale'] else ' (no 5-hour reading)' if found['missing'] else ''}: "
                        f"{running(home, out['vendor'])} lane or review running; one at a time")
     if not out["hold"] and _ahead(found):
         out["cheaper"] = kind == "lane" and tier == "routine"
@@ -444,19 +461,23 @@ def report(home, now=None):
     pol, seen, lines = assessments(home, now)
     for vendor in VENDORS:
         item = seen[vendor]
-        if item["verdict"] == "unknown":
-            lines.append(f"{vendor}: unknown ({item['reason']})")
-            continue
-        five = "n/a" if item["five_hour"] is None else f"{item['five_hour']:.0f} %"
-        age = (now - item["at"]) / timedelta(minutes=1)
         reserve = pol["reserve"][vendor]
         effect = {FIVE_OUT: f"no new lanes or reviews on {vendor} until the reset; routine lanes move to the other vendor if it has room",
                   FIVE_WARN: f"at most one lane or review of {vendor} at a time, machine-wide, {running(home, vendor)} running now"
                   }.get(item["five"], "normal")
+        if item["verdict"] == "unknown":
+            lines.append(f"{vendor}: unknown ({item['reason']})")
+            if item["missing"]:
+                lines.append(f"  5-hour: {item['five']} (no 5-hour reading); {effect}")
+            continue
+        five = "n/a" if item["five_hour"] is None else f"{item['five_hour']:.0f} %"
+        age = (now - item["at"]) / timedelta(minutes=1)
         reset = f", resets at {_when(item['five_resets'])}" if item["five_resets"] else ""
+        state = " (reading stale)" if item["stale"] else " (no 5-hour reading)" if item["missing"] else ""
+        limits = (f"exhausted at {100 - reserve} %, warning at {100 - reserve - FIVE_BAND} %; {effect}" if item["has_five"]
+                  else "no 5-hour window in the readings of the last 7 days; only the weekly rules apply")
         lines += [f"{vendor}: weekly used {item['weekly']:.0f} %, 5-hour used {five}",
-                  f"  5-hour: {item['five']}{' (reading stale)' if item['stale'] else ''}{reset}; "
-                  f"exhausted at {100 - reserve} %, warning at {100 - reserve - FIVE_BAND} %; {effect}",
+                  f"  5-hour: {item['five'] if item['has_five'] else 'none'}{state}{reset}; {limits}",
                   f"  resets at {_when(item['resets_at'])}",
                   f"  reading {item['at']:%Y-%m-%d %H:%M} UTC, {age:.0f} min old; week elapsed {item['elapsed']:.0f} %",
                   f"  pace: {item['verdict']}",

@@ -258,6 +258,10 @@ class BatchTest(unittest.TestCase):
         state = self.home / '.local/state/task'
         state.mkdir(parents=True)
         boost = state / 'boost.json'
+        now = datetime.now(timezone.utc)  # claude has a 5-hour window, so boost needs a fresh reading below the warning band
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.2, 'resetsAt': int(now.timestamp() + 7200)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
         for vendor in ('codex', 'claude'):
             for boosted, slots, expected in ((False, 3, 1), (True, 3, 3), (True, 2, 2), (True, 1, 1)):
                 with self.subTest(vendor=vendor, boosted=boosted, slots=slots):
@@ -309,6 +313,11 @@ class BatchTest(unittest.TestCase):
                     total, limits = runner.capacity()
                 self.assertEqual(limits['claude'], expected)
                 self.assertEqual(total, max(expected, 1))  # codex is unreported and unboosted: one lane
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {  # that 5-hour window has reset: no reading
+            'five_hour': {'utilization': 0.1, 'resetsAt': int(now.timestamp() - 60)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(runner.capacity()[1]['claude'], 1)  # a missing 5-hour reading is the warning band
         tasks = [dict(id=str(i), builder='claude', after=None) for i in range(4)]
         task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
             'five_hour': {'utilization': 0.65, 'resetsAt': int(now.timestamp() + 7200)},

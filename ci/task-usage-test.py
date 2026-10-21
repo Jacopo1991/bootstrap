@@ -310,11 +310,54 @@ class Usage(unittest.TestCase):
         self.busy("codex")
         self.assertEqual(self.verdict("codex")["five"], "5h-warning")
 
-    def test_no_reading_at_all_stays_unknown_even_when_lanes_ran(self):
+    def test_no_reading_at_all_is_unknown_and_the_warning_band_for_a_vendor_with_a_5h_window(self):
+        found = self.verdict()  # claude always has a 5-hour window; with no reading the weekly pace stays unknown
+        self.assertEqual((found["verdict"], found["five"], found["missing"]), ("unknown", "5h-warning", True))
+        self.assertEqual(usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)["hold"], "")  # the first one starts
+        self.assertEqual(usage.five_caps(self.home, NOW)["claude"], 1)
         self.busy("claude")
+        held = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
+        self.assertIn("warning band (no 5-hour reading)", held["hold"])
+        self.assertIn("claude: unknown (no rate_limit_event", "\n".join(usage.report(self.home, NOW)))
+        self.assertIn("5-hour: 5h-warning (no 5-hour reading)", "\n".join(usage.report(self.home, NOW)))
+
+    def test_an_expired_5h_reading_is_missing_so_the_warning_band_even_when_no_lane_ran(self):
+        event = {"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": 0.1, "resetsAt": epoch(NOW - timedelta(hours=1))},  # that window has reset
+            "seven_day": {"utilization": 0.5, "resetsAt": epoch(NOW + timedelta(hours=84))}}}}
+        usage.record_claude(self.home, event, NOW - timedelta(hours=3))
         found = self.verdict()
-        self.assertEqual((found["verdict"], found["five"], found["stale"]), ("unknown", "ok", False))
-        self.assertEqual(usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)["hold"], "")
+        self.assertEqual((found["five"], found["missing"], found["stale"]), ("5h-warning", True, False))
+        self.assertTrue(any("claude has no current 5-hour reading" in note for note in usage.assessments(self.home, NOW)[2]))
+        self.assertEqual(usage.five_caps(self.home, NOW)["claude"], 1)
+        self.assertIn("(no 5-hour reading)", "\n".join(usage.report(self.home, NOW)))
+        self.busy("claude")
+        self.assertIn("one at a time", usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)["hold"])
+        self.five("claude", 10)  # a fresh reading lifts it
+        self.assertEqual(usage.five_caps(self.home, NOW)["claude"], None)
+
+    def test_a_vendor_without_a_5h_window_in_7_days_has_only_the_weekly_rules(self):
+        self.codex()  # the real Codex rollout: one weekly window, no 5-hour window
+        self.busy("codex")  # the 47-minute-old reading with a running lane is not stale: there is no 5-hour window
+        found = self.verdict("codex")
+        self.assertEqual((found["has_five"], found["five"], found["missing"], found["stale"]), (False, "ok", False, False))
+        self.assertEqual(usage.five_caps(self.home, NOW)["codex"], None)
+        text = "\n".join(usage.report(self.home, NOW))
+        self.assertIn("5-hour: none; no 5-hour window in the readings of the last 7 days; only the weekly rules apply", text)
+        self.assertEqual(usage.gate(self.home, "lane", "codex", "hard", "proj", "t1", NOW)["hold"], "")  # a second lane may start
+        line = json.loads((FIXTURES / "codex-rollout-sample.jsonl").read_text().splitlines()[0])
+        older = json.loads(json.dumps(line))  # a 5-hour window seen two days ago makes the newest reading's gap a miss
+        older["timestamp"] = (NOW - timedelta(days=2)).isoformat()
+        older["payload"]["rate_limits"] = {
+            "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": epoch(NOW - timedelta(days=2) + timedelta(hours=5))},
+            "secondary": {"used_percent": 75.0, "window_minutes": 10080, "resets_at": 1793082750}}
+        self.codex(json.dumps(older) + "\n" + json.dumps(line) + "\n")
+        found = self.verdict("codex")
+        self.assertEqual((found["has_five"], found["five"], found["missing"]), (True, "5h-warning", True))
+        self.assertEqual(usage.five_caps(self.home, NOW)["codex"], 1)
+        older["timestamp"] = (NOW - timedelta(days=8)).isoformat()  # outside the 7 days: no window again
+        self.codex(json.dumps(older) + "\n" + json.dumps(line) + "\n")
+        self.assertEqual((self.verdict("codex")["has_five"], self.verdict("codex")["five"]), (False, "ok"))
 
     def test_five_caps_under_the_bands(self):
         self.five("claude", 50)

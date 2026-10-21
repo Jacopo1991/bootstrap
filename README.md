@@ -540,7 +540,10 @@ and a routine lane moves to the other vendor when that has room on both windows.
 (15 points lower): at most one lane or review of that vendor runs machine-wide (`task` records each
 started process under `~/.local/state/task/usage/running/`); a new one is held until it ends. A
 reading older than 45 minutes while that vendor's lanes ran since counts as `5h-warning` and prints a
-warning; no reading at all after lanes ran counts the same. A runner's capacity, boosted or not, is
+warning. For a vendor that has a 5-hour window (Claude; Codex once one shows in its readings), a
+missing 5-hour reading (none yet, or its window has reset) is `5h-warning` too. A vendor with no
+5-hour window in its readings of the last 7 days (Codex today) has only the weekly rules, and
+`task usage` says so. A runner's capacity, boosted or not, is
 capped by this (0 when exhausted, 1 in the warning band), so boost adds parallel lanes only below
 the warning band. `task usage --weekly-line` appends `, 5-hour exhausted <day and time>` per window.
 
