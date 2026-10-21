@@ -542,7 +542,10 @@ with tempfile.TemporaryDirectory() as temp:
         assert judge(body), body
     # Round 6: escaped quotes outside quotes cannot hide an unquoted glob.
     # Inspect these payloads only; never run their redirects or expansions.
-    for body in (r"printf >\' ?v 'PATH' \'", r'printf >\" ?v "PATH" \"'):
+    for body in (r"printf >\' ?v 'PATH' \'", r'printf >\" ?v "PATH" \"',
+                 r"printf <$'\'' ?v PATH \'", r"printf safe\ word",
+                 "printf '%s' < input", "printf '%s' *",
+                 r"echo safe\ word", "echo safe < input"):
         assert judge(body), body
         fixture("probe.sh", body + "\n")
         assert judge("bash probe.sh"), body
@@ -562,8 +565,7 @@ with tempfile.TemporaryDirectory() as temp:
         fixture_git("commit", "-qm", "escaped quote echo negative")
         for runner in ("just check", "npm run check", "pnpm run check"):
             assert judge(runner), (runner, body)
-    # Later data operands retain their pre-existing typed-command treatment.
-    assert judge("printf '%s' *") is None
+    # Round 7 PM ruling: later unquoted globs also fail closed.
     fixture("justfile", "check:\n    printf '%s\\n' safe\n")
     fixture_git("add", "justfile")
     fixture_git("commit", "-qm", "modelled positive recipe")

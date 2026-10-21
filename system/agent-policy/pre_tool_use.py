@@ -1584,23 +1584,55 @@ def program_text(path: Path) -> str:
     return data.decode("utf-8")
 
 
-def mask_print_literals(text: str) -> str:
-    """Hide punctuation only inside real quotes; leave expansions visible."""
-    return "".join("x" if quoted and char in "~*?{}[]#" else char
-                   for char, (quoted, _) in zip(text, shell_quote_state(text)))
+def print_allowlist(text: str) -> bool:
+    """Allow only complete literal print words and modelled output redirects.
 
-
-def printf_format(tokens: list[str]) -> str:
-    """Find the option/format operand even when redirections precede it."""
-    args = tokens[1:]
-    redirects = {"<", ">", ">>", ">|", "&>", "&>>", ">&", "<>", "<&", "<<<"}
-    while args:
-        if args[0].isdigit() and len(args) > 1 and args[1] in redirects:
-            args = args[1:]
-        if args[0] not in redirects:
-            return args[0]
-        args = args[2:]
-    return ""
+    Keep the original spelling: shlex alone loses the distinction between
+    quoted data, unquoted expansions, and escapes outside quotes.
+    Output destinations still undergo the ordinary write-boundary checks.
+    """
+    word = r'''(?:[A-Za-z0-9%_.,:/=+@-]+|'[^'\n\r]*'|"(?:\\[^\n\r$`]|[^"\\$`\n\r])*")'''
+    token = re.compile(r"(?:&>>|&>|>>|>\||>&|>)|" + word)
+    spellings: list[str] = []
+    offset = 0
+    while offset < len(text):
+        if text[offset].isspace():
+            offset += 1
+            continue
+        match = token.match(text, offset)
+        if not match:
+            return False
+        spelling = match[0]
+        spellings.append(spelling)
+        offset = match.end()
+        if (spelling not in {">", ">>", ">|", "&>", "&>>", ">&"}
+                and offset < len(text) and not text[offset].isspace()
+                and text[offset] not in ">&"):
+            return False
+    values = [shlex.split(value)[0] if value else "" for value in spellings]
+    unwrapped = unwrap_command(values)
+    if isinstance(unwrapped, str) or not unwrapped:
+        return False
+    head = Path(unwrapped[0]).name.lower()
+    args = unwrapped[1:]
+    first = True
+    index = 0
+    while index < len(args):
+        value = args[index]
+        if value.isdigit() and index + 1 < len(args) and args[index + 1] in {
+                ">", ">>", ">|", "&>", "&>>", ">&"}:
+            index += 1
+            value = args[index]
+        if value in {">", ">>", ">|", "&>", "&>>", ">&"}:
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if head == "printf" and first and value.startswith("-v"):
+            return False
+        first = False
+        index += 1
+    return True
 
 
 def judge_program(text: str, cwd: str, root: Path,
@@ -1631,8 +1663,10 @@ def judge_program(text: str, cwd: str, root: Path,
             return "Script leading redirections cannot be judged safely."
         if tokens:
             head = Path(tokens[0]).name.lower()
-            syntax = mask_print_literals(segment) if head in {"printf", "echo"} else segment
-            if re.search(r"[$`*?{}\[\]#]", syntax) or "\\\n" in body:
+            if head in {"printf", "echo"}:
+                if not print_allowlist(segment):
+                    return "Script print syntax cannot be judged safely."
+            elif re.search(r"[$`*?{}\[\]#]", segment) or "\\\n" in body:
                 return "Script expansion or syntax cannot be judged safely."
             if (head in INTERPRETERS - SHELL_PROGRAMS
                     or re.fullmatch(r"python[0-9.]+", head)):
@@ -2000,15 +2034,11 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                     drop.update(range(index, index + len(expected)))
                     word_start = char.isspace()
                 tokens = [token for index, token in enumerate(tokens) if index not in drop]
-            print_lexer = shlex.shlex(mask_print_literals(text), posix=True,
-                                     punctuation_chars=";&|<>")
-            print_lexer.whitespace_split = True
-            print_lexer.commenters = ""
-            print_tokens = unwrap_command(list(print_lexer))
+            print_tokens = unwrap_command(tokens)
             if (isinstance(print_tokens, list) and print_tokens
-                    and Path(print_tokens[0]).name == "printf"
-                    and SHELL_EXPANSION.search(printf_format(print_tokens))):
-                return "Shell expansion in printf cannot be judged safely."
+                    and Path(print_tokens[0]).name.lower() in {"printf", "echo"}
+                    and not print_allowlist(text)):
+                return "Shell print syntax cannot be judged safely."
             all_tokens.append(tokens)
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
@@ -2158,10 +2188,6 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
             tokens[0].isdigit() and len(tokens) > 1 and re.match(r"[<>]", tokens[1])):
         if len(tokens) != 2 or tokens[0] not in {">", ">>", ">|"}:
             return "Leading shell redirections cannot be judged safely."
-    if executable == "printf":
-        format_word = printf_format(tokens)
-        if format_word.startswith("-v") or re.search(r"[$`]", format_word):
-            return "Shell builtin assignment via printf -v cannot be judged safely."
     if executable in SHELL_CONSTRUCTS - {"source", ".", "printf"} or tokens[0].startswith(("(", "{")) or any(
             tokens[i] in {"<", ">", ">>"} and tokens[i + 1].startswith("(")
             for i in range(len(tokens) - 1)):
