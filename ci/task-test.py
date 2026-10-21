@@ -6997,6 +6997,18 @@ Reviewer: codex gpt-6-luna
         self.assertEqual(judgments, {2: ("fail", ""), 5: ("pass", "colon evidence"),
                                      6: ("fail", "spaced dash evidence")})
 
+    def test_fenced_review_with_blocking_and_notes_inside_the_fence_parses(self):
+        text = (REVIEW_FIXTURES / "fence-with-sections.md").read_text()
+        self.assertEqual(TASK_MODULE.parse_review_reply(text, []),
+                         ("PASS", "097ee880fcd0a472d3aabdc03de70db78d6dd8c3", None, {}))
+        sha = "b" * 40
+        fail = (f"```review\nVerdict: FAIL\nCommit: {sha}\n#1 fail: broken\n\n"
+                "**Blocking**\n- #1: a.py:3 breaks\n\nNotes\n- none\n```\n")
+        self.assertEqual(TASK_MODULE.parse_review_reply(fail, [1]),
+                         ("FAIL", sha, None, {1: ("fail", "broken")}))
+        with self.assertRaises(TASK_MODULE.ReviewParseError):
+            TASK_MODULE.parse_review_reply(fail.replace("**Blocking**", "Findings"), [1])
+
     def test_haiku3_fenced_fixture_records_fail_without_criteria(self):
         fixture = REVIEW_FIXTURES / "haiku-3-fenced.md"
         text = fixture.read_text()
