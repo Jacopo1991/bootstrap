@@ -1572,6 +1572,15 @@ def resolve_model(builder, model):
 GATE_LOCK_WAIT = 45
 
 
+def lane_contract_source():
+    for root in (".agents", ".claude"):
+        source = HOME / root / "skills/slim-workflow/lane-contract.md"
+        if source.is_file() and os.access(source, os.R_OK):
+            return source
+    raise Stop("No lane contract: install the slim-workflow skill so ~/.agents/skills/slim-workflow/lane-contract.md "
+               "or ~/.claude/skills/slim-workflow/lane-contract.md exists.")
+
+
 def refresh_context(task):
     destination = task.path / ".work/context"
     # Never traverse lane-controlled links, including dangling links and links
@@ -1594,16 +1603,16 @@ def refresh_context(task):
         for decision in (task.kb / "backlog/decisions").glob("*.md"):
             if decision.name in text or re.search(r"\b" + re.escape(decision.stem.split(" - ")[0]) + r"\b", text, re.I):
                 sources.append(decision)
-    expected = {source.relative_to(task.kb) for source in sources if source.is_file()}
+    pairs = [(source, source.relative_to(task.kb)) for source in sources if source.is_file()]
+    pairs.append((lane_contract_source(), Path("lane-contract.md")))
+    expected = {relative for _, relative in pairs}
     for target in destination.rglob("*"):
         if target.is_file() and target.relative_to(destination) not in expected:
             target.chmod(0o644)
             target.unlink()
             print(f"Context source removed: {target.relative_to(destination)}")
-    for source in sources:
-        if not source.is_file():
-            continue
-        target = destination / source.relative_to(task.kb)
+    for source, relative in pairs:
+        target = destination / relative
         for parent in reversed(target.relative_to(destination).parents):
             directory = destination / parent
             if directory.is_symlink() or directory.is_file():
@@ -2263,6 +2272,7 @@ def start(args):
 
 
 def start_locked(args, repo):
+    lane_contract_source()
     ensure_origin_head(repo)
     task = Task(repo, args.id)
     if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
@@ -2399,25 +2409,20 @@ def start_locked(args, repo):
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     refresh_context(task)
-    dispatch = ["Context: .work/context/", f"{task.id}{title}",
-                f"Work only in {task.path} on branch {branch}.",
-                "Write and edit files with your edit or apply_patch tool, never shell heredocs or cat >; "
-                "avoid backticks in shell commands."]
+    dispatch = [f"{task.id}{title}", f"Work only in {task.path} on branch {branch}.",
+                "Mandatory read: .work/context/lane-contract.md"]
     if task.file:
         dispatch.append(f"Task: {task.file}")
+    dispatch.append("Acceptance criteria:\n" + ("\n".join(
+        f"- [{'x' if item.get('checked') else ' '}] #{item['number']} {item['text']}"
+        for item in record.get("criteria", [])) or "(PM: none given)"))
+    dispatch.append("Verify:\n" + ("\n".join(f"Verify: `{command}`" for command in record.get("verify", []))
+                                  or "(PM: none given)"))
     brief = task_text or ((work / "request.md").read_text() if (work / "request.md").is_file() else "")
     for heading in ("Read first", "Test against"):
         dispatch.append(f"{heading}:\n{brief_field(brief, heading) or '(PM: none given)'}")
-    dispatch.append("Commit on the branch, then run `task check` from that folder for advisory feedback, "
-          "before reporting. Paste its final summary line (PASS/FAIL plus the log path) under `## Check` "
-          "in `.work/report.md`; a claim like 'tests pass' without that line is not evidence. "
-          "Check the final commit; any later commit needs a new check. The PM's `task merge` "
-          "runs the trusted gate, unless a matching trusted check already passed. A PM may run "
-          "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
-          "`verified: ...`, and `not done: ...`, followed by `report written`. "
-          "For long gates, the PM can use `task merge --detach`.")
     dispatch.append(f"The PM writes the approved prompt to {work / 'prompt.md'} and launches the builder with "
-          f"`task lane {args.repo} {task.id}`. Always use `task lane` so builders stay sandboxed.")
+          f"`task lane {args.repo} {task.id}`.")
     dispatch_text = "\n".join(dispatch) + "\n"
     (work / 'dispatch.md').write_text(dispatch_text)
     print(dispatch_text, end="")
@@ -3166,25 +3171,10 @@ def review(args):
             prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
         else:
             prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
-        prompt.append("Return exactly this final fenced block, with plain text only inside it:")
-        prompt.append(
-            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
-            "or the change breaks something that worked. Everything else is a non-blocking "
-            "note: list it under 'Notes', never as a reason to FAIL."
-        )
-        prompt.append("Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.")
-        prompt.append("```review")
-        prompt.append("Verdict: PASS|FAIL")
-        prompt.append("Commit: <full sha>")
-        for item in record["criteria"]:
-            prompt.append(f"#{item['number']} pass|fail|unclear: <one line of evidence>")
-        prompt.append("```")
-        prompt.append(
-            "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
-            "Blocking finding must identify a named requested criterion or a concrete defect or regression, "
-            "with file:line. Put all other "
-            "observations under Notes."
-        )
+        contract = path / ".work/context/lane-contract.md"
+        prompt.append(f"Mandatory read: {contract if contract.is_file() else lane_contract_source()}. Reply in its review "
+                      "block with the full 40-character Commit sha" + (", then one line per criterion: "
+                      "`#N pass|fail|unclear: <one line of evidence>`." if record["criteria"] else "."))
         if args.append_prompt:
             prompt.append(args.append_prompt)
         prompt_text = "\n".join(prompt) + "\n"
