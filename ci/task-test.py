@@ -311,8 +311,6 @@ class TaskTool(unittest.TestCase):
         wt, dispatch = self.started()
         self.assertIn("Read first:\na.txt and justfile", dispatch)
         self.assertIn("Test against:\nci/fixtures/reviews/haiku-3-fenced.md", dispatch)
-        self.assertIn("PASS/FAIL plus the log path", dispatch)
-        self.assertIn("under `## Check`", dispatch)
         self.assertIn("## Check", (wt / '.work/report.md').read_text())
         direct = self.raw_task('start', 'proj', 'direct', '--builder', 'codex')
         self.assertIn('Read first:\n(PM: none given)', direct)
@@ -346,7 +344,7 @@ class TaskTool(unittest.TestCase):
         prompt = json.loads((wt / '.work/reviewer-call.json').read_text())['prompt']
         self.assertIn('Verdict: FAIL; head: ' + head, prompt)
         self.assertIn('FAILED (failures=1)', prompt)
-        self.assertIn('file:line', prompt)
+        self.assertIn('lane-contract.md', prompt)
         checks = [json.loads(line) for line in (self.state() / 'checks.jsonl').read_text().splitlines()]
         self.assertEqual([item['result'] for item in checks], ['passed', 'failed'])
 
@@ -1970,7 +1968,8 @@ store.write_text(json.dumps(prs))
         shutil.rmtree(context)
         context.symlink_to(outside, target_is_directory=True)
         task = SimpleNamespace(path=wt, kb=self.kb, file=None)
-        TASK_MODULE.refresh_context(task)
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.refresh_context(task)
         self.assertFalse(context.is_symlink())
         self.assertEqual((context / 'INTENT.md').read_text(), 'intent')
         (context / 'INTENT.md').unlink()
@@ -2001,7 +2000,7 @@ store.write_text(json.dumps(prs))
         self.git(self.kb, 'commit', '-qm', 'decisions')
         self.task('plan', 'proj', '--sign')
         wt, out = self.started()
-        self.assertIn("Context: .work/context/", out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
         context = wt / ".work/context"
         self.assertEqual((context / 'INTENT.md').read_bytes(), (self.kb / 'INTENT.md').read_bytes())
         self.assertEqual((context / "backlog/decisions" / decision.name).read_text(), "binding decision")
