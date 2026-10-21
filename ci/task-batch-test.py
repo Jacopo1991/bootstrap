@@ -77,7 +77,8 @@ if cmd == 'start':
         work.mkdir()
         state.mkdir(parents=True)
         save(state / 'task.json', dict(base_sha=git(wt, 'rev-parse', 'HEAD'), branch=name,
-             builder=options[options.index('--builder') + 1], revision='revision', criteria=[]))
+             builder=options[options.index('--builder') + 1], revision='revision', criteria=[],
+             tier=options[options.index('--tier') + 1] if '--tier' in options else 'routine'))
     if '--seed' in options:
         import shutil
         seed = options[options.index('--seed') + 1]
@@ -90,7 +91,9 @@ elif cmd == 'lane':
     vendor = options[options.index('--builder') + 1]
     tier = options[options.index('--tier') + 1] if '--tier' in options else 'routine'
     explicit = options[options.index('--model') + 1] if '--model' in options else None
-    routed_model = route(home, vendor, tier, explicit)
+    override = options[options.index('--override') + 1] if '--override' in options else ''
+    recorded = json.loads((state / 'task.json').read_text()).get('tier', 'routine')
+    routed_model = route(home, vendor, tier, explicit, override=override, recorded=recorded)
     with (home / 'prompts.jsonl').open('a') as out:
         out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options,
                                  routed_model=routed_model)) + '\n')
@@ -610,11 +613,80 @@ class BatchTest(unittest.TestCase):
                                           models[vendor][tier], models[other][tier]])
 
     def test_strong_model_skips_round_two(self):
-        self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6-astra'))
+        self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6.1-sol'))
         self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}') for i in range(4)]})
         self.run_batch()
         self.assertEqual(len(self.calls('lane')), 3)
         self.assertIn('opus', self.calls('lane')[-1])
+
+    def test_top_model_on_the_wrong_tier_is_parked_without_a_lane(self):
+        for number, line in enumerate(('model gpt-6-astra', 'model gpt-6-astra, tier hard',
+                                       'model gpt-6-astra, tier routine', 'model fable',
+                                       'model claude-fable-5-1, tier design')):
+            with self.subTest(line=line):
+                vendor = 'claude' if 'fable' in line else 'codex'
+                self.source.write_text(f'1. one{number}: builder {vendor}, {line}\nTime box: 60 min\n')
+                self.assertRegex(self.run_batch(), rf'one{number}: parked: (gpt-6-astra|fable|claude-fable-5-1) is for Tier: '
+                                 r'(design|hard) tasks only .*gpt-6-luna.*gpt-6.1-sol')
+                self.assertFalse((self.home / 'calls.jsonl').exists() and self.calls('lane'))
+                (self.repo / '.work/runner-test.done').unlink()
+
+    def test_top_model_on_its_own_tier_runs_and_never_returns_in_fix_rounds(self):
+        for builder, model, tier, final in (('codex', 'gpt-6-astra', 'design', 'opus'),
+                                            ('claude', 'fable', 'hard', 'gpt-6.1-sol')):
+            with self.subTest(model=model):
+                self.source.write_text(f'1. {tier}: builder {builder}, model {model}, tier {tier}\n'
+                                       'Time box: 60 min\n')
+                self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}') for i in range(4)]})
+                self.run_batch()
+                lanes = [c for c in self.calls('lane') if c[2] == tier]
+                self.assertEqual([c[c.index('--model') + 1] for c in lanes][:1], [model])
+                self.assertEqual(lanes[-1][lanes[-1].index('--model') + 1], final)
+                self.assertEqual([model in c for c in lanes], [True, True, False])
+
+    def test_runner_line_override_runs_a_top_model_outside_its_tier(self):
+        request = 'Jacopo 2026-10-21: design review, quick'
+        for number, (builder, model, tier) in enumerate((('codex', 'gpt-6-astra', 'routine'), ('claude', 'fable', 'design'))):
+            with self.subTest(model=model):
+                self.source.write_text(f'1. ov{number}: builder {builder}, model {model}, tier {tier}, '
+                                       f'override: {request}\nTime box: 60 min\n')
+                self.scenario({})
+                self.assertNotIn('parked', self.run_batch())
+                lanes = [c for c in self.calls('lane') if c[2] == f'ov{number}']
+                self.assertEqual(lanes[0][lanes[0].index('--override') + 1], request)
+                self.assertEqual(lanes[0][lanes[0].index('--model') + 1], model)
+                (self.repo / '.work/runner-test.done').unlink(missing_ok=True)
+
+    def test_runner_tier_does_not_raise_eligibility_over_the_recorded_tier(self):
+        # The task was started as routine; a runner line naming tier design or hard does not make astra or fable eligible.
+        request = 'Jacopo 2026-10-21: design review'
+        for number, (builder, model, tier) in enumerate((('codex', 'gpt-6-astra', 'design'), ('claude', 'fable', 'hard'))):
+            with self.subTest(model=model):
+                ident = f'rec{number}'
+                subprocess.run(['task', 'start', str(self.repo), ident, '--builder', builder],
+                               check=True, env=self.env, capture_output=True)
+                line = f'1. {ident}: builder {builder}, model {model}, tier {tier}'
+                self.source.write_text(f'{line}\nTime box: 60 min\n')
+                self.assertRegex(self.run_batch(), rf'{ident}: parked: {model} is for Tier: {tier} tasks only \(this one is routine\)')
+                self.assertEqual([c for c in self.calls('lane') if c[2] == ident], [])
+                (self.repo / '.work/runner-test.done').unlink()
+                self.source.write_text(f'{line}, override: {request}\nTime box: 60 min\n')
+                self.scenario({})
+                self.assertNotIn('parked', self.run_batch())
+                lanes = [c for c in self.calls('lane') if c[2] == ident]
+                self.assertEqual(lanes[0][lanes[0].index('--override') + 1], request)
+                (self.repo / '.work/runner-test.done').unlink(missing_ok=True)
+
+    def test_runner_line_override_must_not_be_empty(self):
+        self.source.write_text('1. one: builder codex, model gpt-6-astra, override: \nTime box: 60 min\n')
+        self.assertIn('Jacopo YYYY-MM-DD: <request>', self.run_batch(code=1))
+
+    def test_runner_line_override_must_name_jacopo_with_a_valid_date_and_request(self):
+        for text in ('x', 'Jacopo 2026-10-21', 'Jacopo 2026-10-21:', 'Jacopo 2026-13-40: look', 'Bob 2026-10-21: look'):
+            with self.subTest(text=text):
+                self.source.write_text(f'1. one: builder codex, model gpt-6-astra, override: {text}\nTime box: 60 min\n')
+                self.assertIn('Jacopo YYYY-MM-DD: <request>', self.run_batch(code=1))
+                self.assertEqual([c for c in self.calls('lane') if c[2] == 'one'], [])
 
     def test_two_parked_tasks_stop_batch(self):
         self.source.write_text(self.source.read_text().split('```')[0] +

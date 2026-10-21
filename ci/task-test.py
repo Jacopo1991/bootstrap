@@ -298,7 +298,8 @@ class TaskTool(unittest.TestCase):
         self.stub_models()
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('Implement task')
-        out = self.task('lane', 'proj', '5', '--tier', 'hard')
+        self.assertIn('cannot change this task', self.lane_refused('--tier', 'hard'))
+        out = self.task('lane', 'proj', '5', '--tier', 'hard', '--override', 'Jacopo 2026-10-21: tier')
         self.wait_for_lane(wt)
         self.assertIn('route: hard -> codex gpt-6.1-sol', out)
         self.assertIn('Updating task tier to hard.', out)
@@ -1028,6 +1029,8 @@ class TaskTool(unittest.TestCase):
                             'claude': {'routine': 'sonnet', 'hard': 'fable', 'design': 'opus'}}[builder][tier]
                 (wt / '.work/model-call.json').unlink(missing_ok=True)
                 (wt / '.work/final.md').unlink(missing_ok=True)
+                # Astra and fable follow the recorded tier, so the task is recorded at each tier first.
+                self.task('start', 'proj', '5', '--builder', builder, '--tier', tier, '--override', 'Jacopo 2026-10-21: tier')
                 out = self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier)
                 record = self.wait_for_lane(wt)
                 self.assertEqual(record['model'], expected)
@@ -1039,9 +1042,213 @@ class TaskTool(unittest.TestCase):
                 self.assertEqual(self.wait_for_lane(wt)['model'], explicit)
             (wt / '.work/model-call.json').unlink(missing_ok=True)
             (wt / '.work/final.md').unlink(missing_ok=True)
-            self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost')
+            self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost', '--override', 'Jacopo 2026-10-21: tier')
             no_boost_hard = 'gpt-6.1-sol' if builder == 'codex' else explicit
             self.assertEqual(self.wait_for_lane(wt)['model'], no_boost_hard)
+
+    def lane_refused(self, *options, env=None):
+        out = self.raw_task('lane', 'proj', '5', *options, code=1, env=env)
+        self.assertFalse((self.repo / '.worktrees/t5/.work/lane.json').exists())
+        return out
+
+    def test_astra_only_for_the_design_tier(self):
+        self.stub_models()
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: design\n')
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for tier in ('routine', 'hard'):
+            out = self.lane_refused('--tier', tier, '--model', 'gpt-6-astra')
+            self.assertIn(f'gpt-6-astra is for Tier: design tasks only (this one is {tier})', out)
+            self.assertIn('gpt-6-luna', out)
+            self.assertIn('gpt-6.1-sol', out)
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra')
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+
+    def test_fable_only_for_the_hard_tier(self):
+        self.stub_models()
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: hard\n')
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for tier in ('routine', 'design'):
+            for model in ('fable', 'claude-fable-5-1'):
+                out = self.lane_refused('--builder', 'claude', '--tier', tier, '--model', model)
+                self.assertIn(f'{model} is for Tier: hard tasks only (this one is {tier})', out)
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--tier', 'hard', '--model', 'fable')
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'fable')
+
+    def test_no_pace_and_pace_do_not_override_the_top_model_rule(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.readings(codex=(70, 84))
+        for options, env in (((), None), (('--no-pace',), None), ((), dict(self.env, TASK_NO_PACE='1'))):
+            out = self.lane_refused('--model', 'gpt-6-astra', *options, env=env)
+            self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
+            self.assertNotIn('route:', out)
+
+    def test_a_tier_flag_does_not_raise_eligibility_over_the_recorded_tier(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        cases = (('codex', 'design', 'gpt-6-astra'), ('claude', 'hard', 'fable'))
+        for builder, tier, model in cases:
+            out = self.lane_refused('--builder', builder, '--tier', tier, '--model', model)
+            self.assertIn(f'{model} is for Tier: {tier} tasks only (this one is routine)', out)
+            self.assertIn('--override', out)
+        # Tier routing that would pick astra is refused: the --tier cannot change the recorded tier.
+        self.assertIn("--tier design cannot change this task's recorded tier (routine)", self.lane_refused('--tier', 'design'))
+        self.assertEqual(self.overrides(), [])
+        request = 'Jacopo 2026-10-21: design look'
+        for builder, tier, model in cases:
+            (wt / '.work/final.md').unlink(missing_ok=True)
+            out = self.raw_task('lane', 'proj', '5', '--builder', builder, '--tier', tier, '--model', model, '--override', request)
+            self.assertEqual(self.wait_for_lane(wt)['model'], model)
+            self.assertIn(f'override recorded: {model} on a ', out)
+        # The ledger names the tier the task was recorded at; the first override moved it to design.
+        self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
+                         [('tier change', 'routine to design', request), ('gpt-6-astra', 'routine', request),
+                          ('tier change', 'design to hard', request), ('fable', 'design', request)])
+
+    def test_a_tier_flag_never_changes_the_recorded_tier_without_an_override(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        # The review's sequence: a tier change with a cheap model, then astra on the now-design task.
+        out = self.lane_refused('--tier', 'design', '--model', 'gpt-6-luna')
+        self.assertIn("--tier design cannot change this task's recorded tier (routine)", out)
+        self.assertIn('--override', out)
+        out = self.lane_refused('--tier', 'design', '--model', 'gpt-6-luna', '--override', 'Jacopo 2026-10-21')
+        self.assertIn('override must read', out)
+        self.assertIn('gpt-6-astra is for Tier: design tasks only (this one is routine)', self.lane_refused('--model', 'gpt-6-astra'))
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'routine')
+        # `task start` on the existing record is the same rule.
+        out = self.raw_task('start', 'proj', '5', '--builder', 'codex', '--tier', 'design', code=1)
+        self.assertIn("cannot change this task's recorded tier (routine)", out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'routine')
+        self.assertEqual(self.overrides(), [])
+        request = 'Jacopo 2026-10-21: design pass'
+        out = self.raw_task('lane', 'proj', '5', '--tier', 'design', '--model', 'gpt-6-luna', '--override', request)
+        self.wait_for_lane(wt)
+        self.assertIn('Updating task tier to design.', out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
+        self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
+                         [('tier change', 'routine to design', request)])
+
+    def overrides(self):
+        path = self.home / '.local/state/task/usage/overrides.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_override_allows_astra_on_a_routine_task_and_is_recorded(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        request = 'Jacopo 2026-10-21: use Astra on this one'
+        out = self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', request)
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+        self.assertIn('override recorded', out)
+        # The detached worker re-runs the lane with the override but does not record it a second time.
+        (entry,) = self.overrides()
+        self.assertEqual((entry['repo'], entry['task'], entry['model'], entry['tier'], entry['override']),
+                         ('proj', 'T-5', 'gpt-6-astra', 'routine', request))
+        self.assertRegex(entry['time'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d')
+        # An override on a model that is within its tier is not an override: nothing recorded.
+        (wt / '.work/final.md').unlink(missing_ok=True)
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-luna', '--override', request)
+        self.wait_for_lane(wt)
+        self.assertEqual(len(self.overrides()), 1)
+
+    def test_without_an_override_the_tier_rule_holds_and_nothing_is_recorded(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for options in ((), ('--override', ''), ('--override', '  ')):
+            out = self.lane_refused('--model', 'gpt-6-astra', *options)
+            self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
+            self.assertIn('--override', out)
+        self.assertEqual(self.overrides(), [])
+
+    def test_override_must_name_jacopo_with_a_valid_date_and_a_request(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        bad = ('x', 'Jacopo', 'Jacopo 2026-10-21', 'Jacopo 2026-10-21:', 'Jacopo 2026-10-21:   ', 'Jacopo 2026-13-40: look',
+               'Jacopo 2026-02-30: look', 'Bob 2026-10-21: look', 'Jacopo 21-10-2026: look', 'Jacopo: look 2026-10-21')
+        for text in bad:
+            for model in ('gpt-6-astra', 'gpt-6-luna'):
+                with self.subTest(text=text, model=model):
+                    out = self.lane_refused('--model', model, '--override', text)
+                    self.assertIn('Jacopo YYYY-MM-DD: <request>', out)
+        self.assertEqual(self.overrides(), [])
+        # Name case does not matter.
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'jacopo 2026-10-21: look')
+        self.wait_for_lane(wt)
+        self.assertEqual([entry['override'] for entry in self.overrides()], ['jacopo 2026-10-21: look'])
+
+    def test_runner_check_requires_the_dated_override_format(self):
+        runner = self.home / 'runner.md'
+        for text in ('x', 'Jacopo 2026-10-21', 'Jacopo 2026-13-01: look'):
+            runner.write_text(f'1. a: builder codex, model gpt-6-astra, override: {text}\n')
+            self.assertIn('Jacopo YYYY-MM-DD: <request>', self.raw_task('runner-check', 'proj', str(runner), code=1))
+        runner.write_text('1. a: builder codex, model gpt-6-astra, override: Jacopo 2026-10-21: look, with a comma\n')
+        self.assertIn('runner file OK', self.raw_task('runner-check', 'proj', str(runner)))
+
+    def test_reviews_refuse_astra_and_fable_even_with_an_override(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21: design look')
+        self.wait_for_lane(wt)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'review.md'
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n')
+        for vendor, model in (('codex', 'gpt-6-astra'), ('claude', 'fable'), ('claude', 'claude-fable-5-1')):
+            out = self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', vendor, model, code=1)
+            self.assertIn(f'reviews never use {model}; no override applies', out)
+        # `task review` takes no override at all, and the lane override leaves the routed reviewer cheap.
+        self.assertIn('unrecognized arguments: --override', self.raw_task(
+            'review', 'proj', '5', '--run', '--override', 'Jacopo 2026-10-21', code=2))
+        self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply.read_text()))
+        from task_routing import TOP_ONLY
+        route = json.loads((self.state() / 'review-routing.json').read_text())
+        self.assertNotIn(route['model'], TOP_ONLY)
+
+    def test_status_and_weekly_line_show_overrides(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.assertIn('model overrides, last 7 days: 0', self.raw_task('status', 'proj'))
+        self.assertEqual(self.raw_task('usage', '--weekly-line').splitlines()[-1], 'model overrides, last 7 days: 0')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21: design look')
+        self.wait_for_lane(wt)
+        for out in (self.raw_task('status', 'proj'), self.raw_task('usage', '--weekly-line')):
+            self.assertIn('model overrides, last 7 days: 1 (proj/T-5 gpt-6-astra on routine at ', out)
+            self.assertIn('Jacopo 2026-10-21: design look', out)
+
+    def test_reviews_never_pick_astra_or_fable(self):
+        from task_routing import TOP_ONLY
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        for builder in ('codex', 'claude'):
+            for tier in ('routine', 'hard', 'design'):
+                with self.subTest(builder=builder, tier=tier):
+                    self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier,
+                              '--override', 'Jacopo 2026-10-21: tier')
+                    self.raw_task('check', 'proj', '5')
+                    self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+                    route = json.loads((self.state() / 'review-routing.json').read_text())
+                    self.assertNotIn(route['model'], TOP_ONLY)
+                    call = json.loads((wt / '.work/reviewer-call.json').read_text())
+                    self.assertFalse(set(TOP_ONLY) & set(call['args']))
+        # The deeper review a pace spend picks is the other cap on review models.
+        self.assertFalse(set(TOP_ONLY) & set(TASK_MODULE.task_usage.DEEPER.values()))
 
     def test_tier_file_flag_state_and_status(self):
         task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
@@ -1049,7 +1256,7 @@ class TaskTool(unittest.TestCase):
         self.task('start', 'proj', '5', '--builder', 'codex')
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'hard')
         self.assertIn('tier=hard', self.task('status', 'proj'))
-        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex', '--tier', 'design')
+        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex', '--tier', 'design', '--override', 'Jacopo 2026-10-21: tier')
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
 
     def test_tier_defaults_and_override_policy(self):
@@ -4387,9 +4594,9 @@ store.write_text(json.dumps(prs))
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"timestamp": now.isoformat(), "payload": {"rate_limits": limits}}) + "\n")
 
-    def pace_lane(self, *options, code=0, builder="claude"):
+    def pace_lane(self, *options, code=0, builder="claude", recorded=()):
         self.stub_models()
-        self.raw_task("start", "proj", "5", "--builder", builder)
+        self.raw_task("start", "proj", "5", "--builder", builder, *recorded)
         wt = self.repo / ".worktrees/t5"
         (wt / ".work/prompt.md").write_text("Approved task.\n")
         out = self.raw_task("lane", "proj", "5", *options, code=code)
@@ -4482,7 +4689,7 @@ store.write_text(json.dumps(prs))
         self.assertIn("automated share used up; routine lane moves to codex", out)
         self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
         self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "codex")
-        self.raw_task("lane", "proj", "5", "--builder", "claude", "--tier", "hard", code=4)
+        self.raw_task("lane", "proj", "5", "--builder", "claude", "--tier", "hard", "--override", "Jacopo 2026-10-21: tier", code=4)
         self.readings(codex=(100, 84))
         out = self.raw_task("lane", "proj", "5", "--builder", "claude", code=4)
         self.assertIn("claude automated share used up (80 % of 75 %)", out)
@@ -4494,7 +4701,8 @@ store.write_text(json.dumps(prs))
 
     def test_pace_lane_under_used_near_reset_switches_the_boost_on_until_the_reset(self):
         self.readings(claude=(40, 30))
-        wt, out = self.pace_lane("--tier", "hard")
+        # Fable follows the recorded tier, so the task is started as hard.
+        wt, out = self.pace_lane("--tier", "hard", recorded=("--tier", "hard"))
         self.assertRegex(out, r"pace: claude under-used near its reset; boost on until ")
         self.assertEqual(self.wait_for_lane(wt)["model"], "fable")
         until = json.loads((self.home / ".local/state/task/boost.json").read_text())["claude"]
@@ -4552,7 +4760,7 @@ store.write_text(json.dumps(prs))
             publish(path, run)
 
         args = SimpleNamespace(repo=str(self.repo), id="5", builder="claude", tier=None,
-                               model="opus", no_boost=True, _worker=True, timeout=None)
+                               model="opus", no_boost=True, _worker=True, timeout=None, override="")
         with mock.patch.dict(os.environ, self.env), \
                 mock.patch.object(TASK_MODULE, "HOME", self.home), \
                 mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
@@ -4696,8 +4904,11 @@ store.write_text(json.dumps(prs))
         self.stub_models()
         wt, _ = self.started()
         (wt / ".work/prompt.md").write_text("task\n")
+        # Fable follows the recorded tier, so the task is recorded as hard first.
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--tier", "hard", "--override", "Jacopo 2026-10-21: tier")
         for model, cli in TASK_MODULE.MODELS["claude"].items():
-            out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model)
+            tier = ("--tier", "hard") if cli == "fable" else ()
+            out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model, *tier)
             record = self.wait_for_lane(wt)
             self.assertEqual((record["model"], record["cli_model"]), (model, cli))
             call = json.loads((wt / ".work/model-call.json").read_text())
