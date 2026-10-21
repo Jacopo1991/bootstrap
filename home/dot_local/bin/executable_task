@@ -26,7 +26,7 @@ Write capability there determines trust; vendor environment markers do not.
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
     Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
-    Explicit --model always wins. Configure ~/.config/task/routing.json to override the table.
+    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard (refused otherwise, no override). Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -66,7 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import cli_limit, lane_limit
-from task_routing import TIERS, route, lane_limits, active, RoutingParseError
+from task_routing import TIERS, route, guard, lane_limits, active, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -1650,6 +1650,7 @@ def lane(args):
     builder = args.builder or record["builder"]
     tier = args.tier or record.get("tier", "routine")
     explicit = args.model
+    guard(tier, explicit)
     decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
     if decision:
         if decision["hold"]:

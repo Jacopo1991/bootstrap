@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import cli_limit, lane_limit
-from task_routing import TIERS, lane_limits
+from task_routing import TIERS, guard, lane_limits
 
 
 TASK_LINE = re.compile(
@@ -328,6 +328,10 @@ class Batch:
             if over_cap():
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             if run_lane:
+                try:
+                    guard(tier or data(state / "task.json").get("tier", "routine"), model)
+                except ValueError as error:
+                    return f"parked: {error}"
                 round_start = time.monotonic()
                 reviewed = data(state / "review.json").get("commit")
                 prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch

@@ -1044,6 +1044,66 @@ class TaskTool(unittest.TestCase):
             no_boost_hard = 'gpt-6.1-sol' if builder == 'codex' else explicit
             self.assertEqual(self.wait_for_lane(wt)['model'], no_boost_hard)
 
+    def lane_refused(self, *options, env=None):
+        out = self.raw_task('lane', 'proj', '5', *options, code=1, env=env)
+        self.assertFalse((self.repo / '.worktrees/t5/.work/lane.json').exists())
+        return out
+
+    def test_astra_only_for_the_design_tier(self):
+        self.stub_models()
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: design\n')
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for tier in ('routine', 'hard'):
+            out = self.lane_refused('--tier', tier, '--model', 'gpt-6-astra')
+            self.assertIn(f'gpt-6-astra is for Tier: design tasks only (this one is {tier})', out)
+            self.assertIn('gpt-6-luna', out)
+            self.assertIn('gpt-6.1-sol', out)
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra')
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+
+    def test_fable_only_for_the_hard_tier(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for tier in ('routine', 'design'):
+            for model in ('fable', 'claude-fable-5-1'):
+                out = self.lane_refused('--builder', 'claude', '--tier', tier, '--model', model)
+                self.assertIn(f'{model} is for Tier: hard tasks only (this one is {tier})', out)
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--tier', 'hard', '--model', 'fable')
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'fable')
+
+    def test_no_pace_and_pace_do_not_override_the_top_model_rule(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.readings(codex=(70, 84))
+        for options, env in (((), None), (('--no-pace',), None), ((), dict(self.env, TASK_NO_PACE='1'))):
+            out = self.lane_refused('--model', 'gpt-6-astra', *options, env=env)
+            self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
+            self.assertNotIn('route:', out)
+
+    def test_reviews_never_pick_astra_or_fable(self):
+        from task_routing import TOP_ONLY
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        for builder in ('codex', 'claude'):
+            for tier in ('routine', 'hard', 'design'):
+                with self.subTest(builder=builder, tier=tier):
+                    self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier)
+                    self.raw_task('check', 'proj', '5')
+                    self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+                    route = json.loads((self.state() / 'review-routing.json').read_text())
+                    self.assertNotIn(route['model'], TOP_ONLY)
+                    call = json.loads((wt / '.work/reviewer-call.json').read_text())
+                    self.assertFalse(set(TOP_ONLY) & set(call['args']))
+        # The deeper review a pace spend picks is the other cap on review models.
+        self.assertFalse(set(TOP_ONLY) & set(TASK_MODULE.task_usage.DEEPER.values()))
+
     def test_tier_file_flag_state_and_status(self):
         task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
         task_file.write_text(task_file.read_text() + '\nTier: hard\n')

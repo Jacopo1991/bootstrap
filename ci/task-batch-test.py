@@ -560,11 +560,36 @@ class BatchTest(unittest.TestCase):
                                           models[vendor][tier], models[other][tier]])
 
     def test_strong_model_skips_round_two(self):
-        self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6-astra'))
+        self.source.write_text(self.source.read_text().replace('gpt-6-luna', 'gpt-6.1-sol'))
         self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}') for i in range(4)]})
         self.run_batch()
         self.assertEqual(len(self.calls('lane')), 3)
         self.assertIn('opus', self.calls('lane')[-1])
+
+    def test_top_model_on_the_wrong_tier_is_parked_without_a_lane(self):
+        for number, line in enumerate(('model gpt-6-astra', 'model gpt-6-astra, tier hard',
+                                       'model gpt-6-astra, tier routine', 'model fable',
+                                       'model claude-fable-5-1, tier design')):
+            with self.subTest(line=line):
+                vendor = 'claude' if 'fable' in line else 'codex'
+                self.source.write_text(f'1. one{number}: builder {vendor}, {line}\nTime box: 60 min\n')
+                self.assertRegex(self.run_batch(), rf'one{number}: parked: (gpt-6-astra|fable|claude-fable-5-1) is for Tier: '
+                                 r'(design|hard) tasks only .*gpt-6-luna.*gpt-6.1-sol')
+                self.assertFalse((self.home / 'calls.jsonl').exists() and self.calls('lane'))
+                (self.repo / '.work/runner-test.done').unlink()
+
+    def test_top_model_on_its_own_tier_runs_and_never_returns_in_fix_rounds(self):
+        for builder, model, tier, final in (('codex', 'gpt-6-astra', 'design', 'opus'),
+                                            ('claude', 'fable', 'hard', 'gpt-6.1-sol')):
+            with self.subTest(model=model):
+                self.source.write_text(f'1. {tier}: builder {builder}, model {model}, tier {tier}\n'
+                                       'Time box: 60 min\n')
+                self.scenario({'review': [dict(verdict='FAIL', findings=f'criterion {i}') for i in range(4)]})
+                self.run_batch()
+                lanes = [c for c in self.calls('lane') if c[2] == tier]
+                self.assertEqual([c[c.index('--model') + 1] for c in lanes][:1], [model])
+                self.assertEqual(lanes[-1][lanes[-1].index('--model') + 1], final)
+                self.assertEqual([model in c for c in lanes], [True, True, False])
 
     def test_two_parked_tasks_stop_batch(self):
         self.source.write_text(self.source.read_text().split('```')[0] +

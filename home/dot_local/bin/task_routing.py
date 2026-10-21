@@ -8,6 +8,8 @@ ROUTING = {
     "claude": {"default": "sonnet", "hard": "fable", "design": "opus"},
 }
 UNBOOSTED = {"codex": "gpt-6.1-sol", "claude": "opus"}
+# Top models run only for their specialty tier, whoever names them.
+TOP_ONLY = {"gpt-6-astra": "design", "fable": "hard", "claude-fable-5-1": "hard"}
 
 
 class RoutingParseError(ValueError):
@@ -55,7 +57,21 @@ def active(home):
     return result
 
 
+def guard(tier, model):
+    """Refuse a top model outside its tier; no flag overrides this."""
+    if TOP_ONLY.get(model, tier) != tier:
+        raise RoutingParseError(
+            f"{model} is for Tier: {TOP_ONLY[model]} tasks only (this one is {tier}); use gpt-6-luna "
+            "by default or gpt-6.1-sol for hard (Claude: sonnet, opus). --model and --no-pace do not override this.")
+
+
 def route(home, vendor, tier, explicit=None, boosted=True):
+    model = pick(home, vendor, tier, explicit, boosted)
+    guard(tier, model)
+    return model
+
+
+def pick(home, vendor, tier, explicit, boosted):
     if tier not in TIERS:
         raise RoutingParseError(f"Invalid tier: {tier}")
     models, _ = policy(home)

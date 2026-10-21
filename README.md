@@ -487,7 +487,12 @@ Without boost, routine uses the usual builder default (Codex gpt-6-luna,
 Claude sonnet); hard and design use Codex gpt-6.1-sol or Claude opus.
 While that vendor is boosted, hard uses Codex gpt-6.1-sol or
 Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
-default. An explicit `--model` always wins; `--no-boost` disables boosted tier
+default. An explicit `--model` wins, except that top models run only for their
+specialty: `gpt-6-astra` needs `Tier: design` and `fable` needs `Tier: hard`.
+`task lane` refuses them on any other tier, and the batch parks that task with the
+reason, whether the model came from `--model`, a runner line or a fix round.
+Neither `--no-pace` nor any other flag overrides this, and reviews never use them.
+`--no-boost` disables boosted tier
 routing, while Codex hard remains gpt-6.1-sol.
 The launch notice explains the decision. Reviews keep their usual cheap models
 and usage-limit handling regardless of boost.
