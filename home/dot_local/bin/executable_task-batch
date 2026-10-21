@@ -33,6 +33,8 @@ BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end you
 FIX_SCOPE_INSTRUCTION = ("Fix only inside this task's scope. If a finding needs changes to files "
                          "the task forbids, do not make them: end your final reply with `BLOCKED:` "
                          "and the finding.")
+MERGE_IN_INSTRUCTION = ("If the findings only ask for `git merge origin/main`, make no other change and skip "
+                        "`task check` this round; the trusted check runs at the new head.")
 OUTPUT_LOCK = threading.Lock()
 LAUNCH_LOCK = threading.Lock()
 HELD = 4  # `task lane` exit status: held back by usage pacing
@@ -131,6 +133,25 @@ def blocking(text):
     if judgments:
         return "\n".join(judgments)
     return re.sub(r"(?im)^Commit:.*$", "", text).strip()
+
+
+def merge_in_only(path, reviewed, head):
+    """True when every commit after the reviewed head cleanly merges the default branch."""
+    def run(*args):
+        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
+    default = next((ref for ref in ("origin/HEAD", "origin/main", "main")
+                    if not run("rev-parse", "-q", "--verify", ref).returncode), None)
+    if not default or not reviewed:
+        return False
+    commits = run("rev-list", "--parents", f"{reviewed}..{head}", "--not", default).stdout.splitlines()
+    for line in commits:
+        commit, *parents = line.split()
+        if len(parents) != 2 or run("merge-base", "--is-ancestor", parents[1], default).returncode:
+            return False
+        merged = run("merge-tree", "--write-tree", *parents)
+        if merged.returncode or merged.stdout.split()[:1] != [run("rev-parse", f"{commit}^{{tree}}").stdout.strip()]:
+            return False
+    return bool(commits)
 
 
 def failure_key(text):
@@ -297,14 +318,24 @@ class Batch:
                         if previous_limit else blocking(read(state / "review.md")) or
                         "Unfinished work: finish and commit.")
             check_tail = "\n".join(check_output(state, work).splitlines()[-80:])
+        # Merge-in rounds do not count toward the cap: their time is subtracted.
+        exempt, round_start, merge_in_since = 0.0, 0.0, None
+
+        def over_cap():
+            now = time.monotonic()
+            return now - started - exempt - (now - merge_in_since if merge_in_since is not None else 0) >= 3 * box * 60
         while True:
-            if time.monotonic() - started >= 3 * box * 60:
+            if over_cap():
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             if run_lane:
+                round_start = time.monotonic()
+                reviewed = data(state / "review.json").get("commit")
                 prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch
                 if rounds or findings:
                     prompt += ("\n\nFix round: re-measure, run the tests, finish and commit.\n"
                                f"Blocking findings:\n{findings}\nFailing check output tail:\n{check_tail}\n")
+                    if "git merge origin/main" in findings:
+                        prompt += MERGE_IN_INSTRUCTION + "\n"
                 prompt += "\n\n" + BLOCK_INSTRUCTION + "\n"
                 if rounds or findings:
                     prompt += FIX_SCOPE_INSTRUCTION + "\n"
@@ -315,7 +346,9 @@ class Batch:
                 self.require("lane", ident, "--builder", builder, "--timeout", box, *options)
                 self.require("wait", ident, "--max", box, retry=True)
                 self.lane_outcome(work)
-            if time.monotonic() - started >= 3 * box * 60:
+                if (rounds or findings) and merge_in_only(path, reviewed, git(path, "rev-parse", "HEAD")):
+                    merge_in_since = round_start
+            if over_cap():
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             record = data(state / "task.json")
             if not self.finished(path, record):
@@ -341,7 +374,7 @@ class Batch:
                                 and candidate.get("verdict") in {"PASS", "FAIL"}):
                             review = candidate
                             break
-                    if time.monotonic() - started >= 3 * box * 60:
+                    if over_cap():
                         return f"parked: total time cap; last blocking findings: {findings or 'time cap'}"
                     if (review.get("verdict") == "PASS"
                             and all(v == "pass" for v in review.get("judgments", {}).values())):
@@ -369,6 +402,9 @@ class Batch:
                 if not tier_only:
                     model = "opus" if builder == "claude" else "gpt-6.1-sol"
             run_lane = True
+            if merge_in_since is not None:
+                exempt += time.monotonic() - merge_in_since
+                merge_in_since = None
 
     def run_task(self, task):
         try:
