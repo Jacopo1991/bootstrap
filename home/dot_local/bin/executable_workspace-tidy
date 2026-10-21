@@ -361,13 +361,13 @@ def idle_note(repo: Path, entry: dict, refs: list[str], now: float) -> str:
 
 
 def stale_unmerged(repo: Path, now: float) -> list[dict]:
-    """Unmerged worktrees (managed folders and Codex app worktrees) idle for more than STALE_DAYS, locked ones included."""
+    """Every unmerged worktree git has registered, wherever it lives (Codex app ones included), idle for more than
+    STALE_DAYS, locked ones included."""
     refs = default_refs(repo)
     found = []
     for entry in worktree_list(repo)[1:]:
         path = Path(entry["worktree"])
-        if "prunable" in entry or not (inside(path, CODEX_WORKTREES)
-                                       or any(inside(path, repo / place) for place in TIDY_DIRS)):
+        if "prunable" in entry:
             continue
         _, merged, age = worktree_state(repo, entry, refs, now)
         if not merged and age > STALE_DAYS * 86400:
@@ -391,7 +391,7 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
             tidy_codex_worktree(repo, entry, path, refs, apply, now, in_use, report, done)
             continue
         if "locked" in entry:                # a running Claude Code session; never removed
-            if "prunable" not in entry and any(inside(path, repo / place) for place in TIDY_DIRS):
+            if "prunable" not in entry:
                 _, merged, age = worktree_state(repo, entry, refs, now)
                 if not merged and age > STALE_DAYS * 86400:
                     report.append(f"{repo.name}: open worktree {path} ({label}, unmerged work, "
@@ -402,7 +402,8 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
                           f"run `git -C {repo} worktree repair <new path>`; if deleted, check, then prune")
             continue
         if not any(inside(path, repo / place) for place in TIDY_DIRS):
-            report.append(f"{repo.name}: worktree outside the repository: {path} ({label}); when idle: "
+            note = idle_note(repo, entry, refs, now)
+            report.append(f"{repo.name}: worktree outside the repository: {path} ({label}){note}; when idle: "
                           f"git -C {repo} worktree move {path} {repo}/.worktrees/{path.name}")
             continue
         gitdir, merged, age = worktree_state(repo, entry, refs, now)

@@ -228,6 +228,41 @@ class Tidy(unittest.TestCase):
             self.assertTrue(path.is_dir(), path)
         self.assertLessEqual({"codex-open", "codex-locked", "codex-recent"}, self.branches())
 
+    def test_idle_unmerged_worktrees_outside_the_managed_folders_are_reported_and_kept(self):
+        stray = self.repo.parent / "proj-wt"
+        elsewhere = self.home / "elsewhere/lane"
+        run(self.repo, "worktree", "add", "-q", "-b", "elsewhere", str(elsewhere), old=True)
+        (elsewhere / "e.txt").write_text("e")
+        run(elsewhere, "add", "e.txt", old=True)
+        run(elsewhere, "commit", "-qm", "elsewhere work", old=True)
+        run(self.repo, "worktree", "lock", "--reason", "pinned by hand", str(elsewhere))
+        age(elsewhere)
+        recent = self.home / "elsewhere/recent"
+        run(self.repo, "worktree", "add", "-q", "-b", "elsewhere-recent", str(recent))
+        (recent / "r.txt").write_text("r")
+        run(recent, "add", "r.txt")
+        run(recent, "commit", "-qm", "recent work")
+        merged = self.home / "elsewhere/merged"
+        run(self.repo, "worktree", "add", "-q", "-b", "elsewhere-merged", str(merged), old=True)
+        age(merged)
+        found = {item["branch"]: item for item in TIDY_MODULE.stale_unmerged(self.repo, time.time())}
+        self.assertEqual(found["sibling"]["path"], stray)
+        self.assertEqual(found["sibling"]["days"], 10)
+        self.assertEqual(found["elsewhere"]["path"], elsewhere)
+        self.assertEqual(found["elsewhere"]["locked"], ", locked: pinned by hand")
+        for not_listed in ("elsewhere-recent", "elsewhere-merged"):
+            self.assertNotIn(not_listed, found)
+        for mode in ((), ("--apply",)):
+            out = self.tidy(*mode)
+            self.assertIn(f"worktree outside the repository: {stray} (sibling); idle 10 days; "
+                          "finish, adopt or delete; when idle:", out)
+            self.assertIn(f"open worktree {elsewhere} (elsewhere, unmerged work, idle 10 days, locked: "
+                          "pinned by hand); finish, adopt or delete", out)
+            self.assertNotIn("(elsewhere-recent); idle", out)
+        for path in (stray, elsewhere, recent, merged):
+            self.assertTrue(path.is_dir(), path)
+        self.assertLessEqual({"sibling", "elsewhere", "elsewhere-recent", "elsewhere-merged"}, self.branches())
+
     def test_strays_and_project_data_are_reported_never_removed(self):
         out = self.tidy("--apply")
         self.assertIn("worktree outside the repository", out)

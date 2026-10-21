@@ -3482,6 +3482,27 @@ store.write_text(json.dumps(prs))
             self.assertNotIn('codex-recent', attention)
         self.assertTrue(codex.is_dir() and recent.is_dir())
 
+    def test_status_lists_idle_unmerged_worktrees_outside_the_managed_folders(self):
+        old = int(time.time()) - 10 * 86400
+        stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
+        elsewhere = self.home / 'elsewhere/lane'
+        recent = self.home / 'elsewhere/recent'
+        for path, branch, idle in ((elsewhere, 'elsewhere-idle', True), (recent, 'elsewhere-recent', False)):
+            self.git(self.repo, 'worktree', 'add', '-q', '-b', branch, str(path))
+            (path / f'{branch}.txt').write_text(branch)
+            self.git(path, 'add', f'{branch}.txt')
+            subprocess.run(['git', '-C', str(path), 'commit', '-qm', branch], check=True,
+                           env=dict(self.env, **(stamp if idle else {})), capture_output=True)
+            if idle:
+                for marker in (path / '.git', Path(self.git(path, 'rev-parse', '--absolute-git-dir')) / 'logs/HEAD'):
+                    os.utime(marker, (old, old))
+        for args in ((), ('proj',)):
+            attention = self.raw_task('status', *args).split('Needs attention:', 1)[1]
+            self.assertIn(f"idle worktree: proj {elsewhere} (branch elsewhere-idle, idle 10 days, "
+                          "unmerged): finish, adopt or delete", attention)
+            self.assertNotIn('elsewhere-recent', attention)
+        self.assertTrue(elsewhere.is_dir() and recent.is_dir())
+
     def test_setup_requests_are_pm_intake_and_status_attention(self):
         out = self.raw_task("note", "proj", "5", "setup", "Please configure the new provider")
         self.assertIn("Recorded setup request #1", out)
