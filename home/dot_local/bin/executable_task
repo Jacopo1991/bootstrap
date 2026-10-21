@@ -7,7 +7,7 @@ Write capability there determines trust; vendor environment markers do not.
   task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
   task runner-start <repo> <runner-file> [--no-pace]
-  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace] [--override "<Jacopo's request and date>"]
+  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace] [--override "Jacopo YYYY-MM-DD: <request>"]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
@@ -26,7 +26,7 @@ Write capability there determines trust; vendor environment markers do not.
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
     Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
-    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; only task lane --override "<Jacopo's request and date>" (ledgered) permits otherwise. Configure ~/.config/task/routing.json to override the table.
+    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; only task lane --override "Jacopo YYYY-MM-DD: <request>" (ledgered) permits otherwise. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -66,7 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import cli_limit, lane_limit
-from task_routing import TIERS, TOP_ONLY, route, guard, lane_limits, active, RoutingParseError
+from task_routing import TIERS, TOP_ONLY, route, guard, lane_limits, active, override_problem, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -2091,8 +2091,8 @@ def runner_check(args):
         if parsed:
             task_lines += 1
             ident, builder, model, seed, after = parsed.groups()
-            if override_match and not override_match[1].strip():
-                problems.append(f"line {number}: override needs Jacopo's request and date")
+            if override_match and (problem := override_problem(override_match[1], required=True)):
+                problems.append(f"line {number}: {problem}")
             no_verify = no_verify_match[1].strip() if no_verify_match else None
             try:
                 task = Task(repo, ident)

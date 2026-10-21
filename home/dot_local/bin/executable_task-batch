@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import cli_limit, lane_limit
-from task_routing import TIERS, guard, lane_limits
+from task_routing import TIERS, guard, lane_limits, override_problem
 
 
 TASK_LINE = re.compile(
@@ -101,8 +101,8 @@ def parse(source):
             if no_verify is not None and not no_verify.strip():
                 raise Stop("no-verify needs a nonempty reason")
             override = override_field[1].strip() if override_field else ""
-            if override_field and not override:
-                raise Stop("override needs Jacopo's request and date")
+            if override_field and (problem := override_problem(override, required=True)):
+                raise Stop(problem)
             current = dict(id=ident, builder=builder.lower(), model=model, seed=seed, after=after,
                            tier=tier, no_verify=no_verify, override=override, lines=[line])
             tasks.append(current)

@@ -1116,11 +1116,36 @@ class TaskTool(unittest.TestCase):
             self.assertIn('--override', out)
         self.assertEqual(self.overrides(), [])
 
+    def test_override_must_name_jacopo_with_a_valid_date_and_a_request(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        bad = ('x', 'Jacopo', 'Jacopo 2026-10-21', 'Jacopo 2026-10-21:', 'Jacopo 2026-10-21:   ', 'Jacopo 2026-13-40: look',
+               'Jacopo 2026-02-30: look', 'Bob 2026-10-21: look', 'Jacopo 21-10-2026: look', 'Jacopo: look 2026-10-21')
+        for text in bad:
+            for model in ('gpt-6-astra', 'gpt-6-luna'):
+                with self.subTest(text=text, model=model):
+                    out = self.lane_refused('--model', model, '--override', text)
+                    self.assertIn('Jacopo YYYY-MM-DD: <request>', out)
+        self.assertEqual(self.overrides(), [])
+        # Name case does not matter.
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'jacopo 2026-10-21: look')
+        self.wait_for_lane(wt)
+        self.assertEqual([entry['override'] for entry in self.overrides()], ['jacopo 2026-10-21: look'])
+
+    def test_runner_check_requires_the_dated_override_format(self):
+        runner = self.home / 'runner.md'
+        for text in ('x', 'Jacopo 2026-10-21', 'Jacopo 2026-13-01: look'):
+            runner.write_text(f'1. a: builder codex, model gpt-6-astra, override: {text}\n')
+            self.assertIn('Jacopo YYYY-MM-DD: <request>', self.raw_task('runner-check', 'proj', str(runner), code=1))
+        runner.write_text('1. a: builder codex, model gpt-6-astra, override: Jacopo 2026-10-21: look, with a comma\n')
+        self.assertIn('runner file OK', self.raw_task('runner-check', 'proj', str(runner)))
+
     def test_reviews_refuse_astra_and_fable_even_with_an_override(self):
         self.stub_models()
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('task\n')
-        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21: design look')
         self.wait_for_lane(wt)
         self.stub_reviewers()
         self.raw_task('check', 'proj', '5')

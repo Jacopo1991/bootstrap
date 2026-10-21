@@ -593,7 +593,7 @@ class BatchTest(unittest.TestCase):
                 self.assertEqual([model in c for c in lanes], [True, True, False])
 
     def test_runner_line_override_runs_a_top_model_outside_its_tier(self):
-        request = 'Jacopo 2026-10-21, design review'
+        request = 'Jacopo 2026-10-21: design review, quick'
         for number, (builder, model, tier) in enumerate((('codex', 'gpt-6-astra', 'routine'), ('claude', 'fable', 'design'))):
             with self.subTest(model=model):
                 self.source.write_text(f'1. ov{number}: builder {builder}, model {model}, tier {tier}, '
@@ -607,7 +607,14 @@ class BatchTest(unittest.TestCase):
 
     def test_runner_line_override_must_not_be_empty(self):
         self.source.write_text('1. one: builder codex, model gpt-6-astra, override: \nTime box: 60 min\n')
-        self.assertIn('override needs', self.run_batch(code=1))
+        self.assertIn('Jacopo YYYY-MM-DD: <request>', self.run_batch(code=1))
+
+    def test_runner_line_override_must_name_jacopo_with_a_valid_date_and_request(self):
+        for text in ('x', 'Jacopo 2026-10-21', 'Jacopo 2026-10-21:', 'Jacopo 2026-13-40: look', 'Bob 2026-10-21: look'):
+            with self.subTest(text=text):
+                self.source.write_text(f'1. one: builder codex, model gpt-6-astra, override: {text}\nTime box: 60 min\n')
+                self.assertIn('Jacopo YYYY-MM-DD: <request>', self.run_batch(code=1))
+                self.assertEqual([c for c in self.calls('lane') if c[2] == 'one'], [])
 
     def test_two_parked_tasks_stop_batch(self):
         self.source.write_text(self.source.read_text().split('```')[0] +

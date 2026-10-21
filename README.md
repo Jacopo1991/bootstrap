@@ -491,8 +491,9 @@ default. An explicit `--model` wins, except that top models run only for their
 specialty: `gpt-6-astra` needs `Tier: design` and `fable` needs `Tier: hard`.
 `task lane` refuses them on any other tier, and the batch parks that task with the
 reason, whether the model came from `--model`, a runner line or a fix round.
-Only Jacopo can switch a model: `task lane --override "<Jacopo's request and date>"`
-(runner line field `, override: <request and date>`) permits it. Each use is appended to
+Only Jacopo can switch a model: `task lane --override "Jacopo YYYY-MM-DD: <request>"`
+(runner line field `, override: Jacopo YYYY-MM-DD: <request>`) permits it; any other
+text is refused. Each use is appended to
 `~/.local/state/task/usage/overrides.jsonl` and shown in `task status` and
 `task usage --weekly-line`. `--no-pace` does not override this, and reviews never use
 these models, override or not.

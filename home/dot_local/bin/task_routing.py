@@ -1,6 +1,7 @@
 """Shared builder routing and boost capacity policy (no runtime side effects)."""
 import json
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 
 TIERS = ("routine", "hard", "design")
 ROUTING = {
@@ -10,6 +11,24 @@ ROUTING = {
 UNBOOSTED = {"codex": "gpt-6.1-sol", "claude": "opus"}
 # Top models run only for their specialty tier, whoever names them.
 TOP_ONLY = {"gpt-6-astra": "design", "fable": "hard", "claude-fable-5-1": "hard"}
+
+
+OVERRIDE_FORMAT = "Jacopo YYYY-MM-DD: <request>"
+OVERRIDE_TEXT = re.compile(r"jacopo\s+(\d{4}-\d{2}-\d{2}):\s*\S", re.IGNORECASE)
+
+
+def override_problem(text, required=False):
+    """Why an override text is not `Jacopo YYYY-MM-DD: <request>`; "" when it is, or blank and not required."""
+    text = (text or "").strip()
+    match = OVERRIDE_TEXT.match(text)
+    try:
+        if match:
+            date.fromisoformat(match[1])
+    except ValueError:
+        match = None
+    if (text or required) and not match:
+        return f"override must read '{OVERRIDE_FORMAT}' (Jacopo's request, with a valid date); got: {text}"
+    return ""
 
 
 class RoutingParseError(ValueError):
@@ -59,13 +78,15 @@ def active(home):
 
 def guard(tier, model, override=""):
     """Refuse a top model outside its tier unless Jacopo's override text is given; True when it was needed."""
+    if problem := override_problem(override):
+        raise RoutingParseError(problem)
     if TOP_ONLY.get(model, tier) == tier:
         return False
     if not (override or "").strip():
         raise RoutingParseError(
             f"{model} is for Tier: {TOP_ONLY[model]} tasks only (this one is {tier}); use gpt-6-luna "
-            "by default or gpt-6.1-sol for hard (Claude: sonnet, opus). Only --override \"<Jacopo's request and "
-            "date>\" permits it; --model and --no-pace do not.")
+            f"by default or gpt-6.1-sol for hard (Claude: sonnet, opus). Only --override \"{OVERRIDE_FORMAT}\" "
+            "permits it; --model and --no-pace do not.")
     return True
 
 
