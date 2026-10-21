@@ -6338,6 +6338,49 @@ exit 1
         self.assertIn("main changed a.txt that this task also changed; ask the lane to run `git merge origin/main` on its branch, then `task check` and a new review", out)
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), lane_head)
 
+    def checked_lane_then_main_edits(self, name, lane_text, main_text):
+        """Check a lane that edits `name`, then move main with its own edit of the same file."""
+        (self.repo / name).write_text("one\nmiddle\nthree\n")
+        self.git(self.repo, "add", name)
+        self.git(self.repo, "commit", "-qm", f"add {name}")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        (wt / name).write_text(lane_text)
+        self.git(wt, "commit", "-qam", f"lane edits {name}")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        (self.repo / name).write_text(main_text)
+        self.git(self.repo, "commit", "-qam", f"main edits {name}")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        return wt
+
+    def test_markdown_only_overlap_that_merges_cleanly_runs_the_gate_on_the_merged_result(self):
+        self.checked_lane_then_main_edits("README.md", "lane\nmiddle\nthree\n", "one\nmiddle\nmain\n")
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("reuse decision: running full gate because main changed only Markdown files", out)
+        self.assertIn("Merged", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
+                         "the lane check is not reused; the gate runs on the merged result")
+        self.assertEqual(self.git(self.repo, "show", "origin/main:README.md"), "lane\nmiddle\nmain")
+
+    def test_non_markdown_overlap_that_merges_cleanly_still_blocks(self):
+        wt = self.checked_lane_then_main_edits("code.py", "lane\nmiddle\nthree\n", "one\nmiddle\nmain\n")
+        before = self.git(self.origin, "rev-parse", "main")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("main changed code.py that this task also changed; ask the lane to run `git merge origin/main`", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1, "no gate ran")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), before)
+
+    def test_markdown_overlap_with_a_conflict_still_blocks(self):
+        self.checked_lane_then_main_edits("README.md", "lane\nmiddle\nthree\n", "main\nmiddle\nthree\n")
+        before = self.git(self.origin, "rev-parse", "main")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("main changed README.md that this task also changed; ask the lane to run `git merge origin/main`", out)
+        self.assertNotIn("Merged", out)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), before)
+
     def test_round2_refused_push_is_resumable_without_override(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")

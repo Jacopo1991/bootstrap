@@ -97,7 +97,14 @@ elif cmd == 'lane':
     (work / 'lane.log').write_text(entry.get('log', ''))
     (work / 'final.md').write_text(entry.get('final', ''))
     (work / 'check.log').write_text(entry.get('check_log', ''))
-    if not entry.get('unfinished'):
+    if entry.get('merge_main'):
+        (repo / 'from-main').write_text(str(index))
+        git(repo, 'add', 'from-main')
+        git(repo, 'commit', '-m', 'main moves')
+        git(wt, 'merge', '--no-edit', 'main')
+    if entry.get('merge_main') and not entry.get('also_commit'):
+        pass
+    elif not entry.get('unfinished'):
         (wt / 'result').write_text(str(index))
         git(wt, 'add', 'result')
         git(wt, 'commit', '--allow-empty', '-m', entry.get('subject', 'Implement task'))
@@ -581,6 +588,32 @@ class BatchTest(unittest.TestCase):
             result = runner.task(batch_module.parse(self.source)[0])
         self.assertIn('parked: total time cap', result)
         self.assertFalse(self.calls('lane'))
+
+    def merge_in_batch(self, lane_entry):
+        """Run one task whose merge is refused for an overlap, then fixed by the given lane round.
+
+        The lane round takes 12000 s on a fake clock; the time cap is 10800 s."""
+        self.scenario({'merge': [{'code': 1, 'output': 'main changed a.txt that this task also changed; '
+                                  'ask the lane to run `git merge origin/main` on its branch'}, {}],
+                       'lane': [{}, lane_entry]})
+        def clock():
+            lanes = json.loads((self.home / 'counts.json').read_text()).get('lane:one', 0)
+            return [0, 100, 12100][min(lanes, 2)]
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(batch_module.time, 'monotonic', clock):
+            return batch_module.Batch(self.repo, self.source).task(batch_module.parse(self.source)[0])
+
+    def test_merge_in_round_is_exempt_from_the_time_cap_and_skips_the_advisory_check(self):
+        self.assertEqual(self.merge_in_batch({'merge_main': True}), 'merged after 1 fix rounds')
+        self.assertEqual(len(self.calls('review')), 2)
+        self.assertIn('skip `task check` this round', self.prompts()[1]['prompt'])
+        self.assertNotIn('skip `task check` this round', self.prompts()[0]['prompt'])
+
+    def test_round_with_other_changes_counts_toward_the_time_cap(self):
+        self.assertIn('parked: total time cap', self.merge_in_batch({}))
+        self.assertEqual(len(self.calls('review')), 1)
+
+    def test_merge_in_plus_another_commit_counts_toward_the_time_cap(self):
+        self.assertIn('parked: total time cap', self.merge_in_batch({'merge_main': True, 'also_commit': True}))
 
     def test_same_check_failure_ignores_head_and_duration(self):
         self.scenario({'check': [{'code': 1, 'output': 'head abc1234 failed in 1.2s'},
