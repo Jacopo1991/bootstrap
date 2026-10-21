@@ -251,6 +251,21 @@ class Usage(unittest.TestCase):
         self.claude(100, 30)  # outside the window the old wording stays
         self.assertIn("reserve 30 % used up", "\n".join(usage.report(self.home, NOW)))
 
+    def test_a_vendor_with_a_spare_reset_gets_the_release_wording_first(self):
+        self.release_policy()
+        policy = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
+        policy.write_text(policy.read_text() + "[spare_resets]\nclaude = 1\n")
+        until = f"reserve released until {usage._when(NOW + timedelta(hours=20))}"
+        for used, left, first in ((72, 20, f"100 % weekly limit, {until}; {usage.SPARE}"),
+                                  (100, 20, f"100 % limit used up, {until}; {usage.SPARE}"), (72, 30, usage.SPARE)):
+            with self.subTest(used=used, left=left):
+                self.claude(used, left)
+                self.assertTrue(self.verdict()["released"] == (left == 20))
+                self.assertIn(f"policy: {first}", "\n".join(usage.report(self.home, NOW)))
+        self.claude(72, 20)
+        decision = usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)
+        self.assertEqual((decision["hold"], decision["spend"]), ("", (NOW + timedelta(hours=20)).isoformat()))
+
     def test_five_hour_reserve_scales_with_the_time_left_in_the_window(self):
         self.release_policy()  # reserve 30: full window exhausted at 70, warning at 55
         for hours, five, expected, out, warn in ((1.5, 62, "ok", 91, 76), (1.5, 76, "5h-warning", 91, 76), (1.5, 91, "5h-exhausted", 91, 76),

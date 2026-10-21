@@ -286,7 +286,7 @@ def assess(reading, pol, now, ran=False):
     vendor = reading["vendor"]
     spare = pol["spare_resets"][vendor] > 0
     left = None if reading["reason"] else (reading["resets_at"] - now) / timedelta(hours=1)
-    released = not spare and left is not None and left <= pol["under_use_hours"]
+    released = left is not None and left <= pol["under_use_hours"]
     result = dict(reading, spare=spare, released=released,
                   limit=100 - (0 if spare or released else pol["reserve"][vendor]), **_five(reading, pol, now, ran))
     if reading["reason"]:
@@ -477,10 +477,11 @@ def _applied(vendor, item, pol, top):
     reserve = f"reserve {pol['reserve'][vendor]} %"
     used_up = f"{reserve} used up"
     if item["released"]:
-        reserve = f"reserve released until {_when(item['resets_at'])}"
-        used_up = f"100 % limit used up, {reserve}"
+        until = f"reserve released until {_when(item['resets_at'])}"
+        reserve, used_up = f"100 % weekly limit, {until}", f"100 % limit used up, {until}"
     if item["spare"]:
-        return f"{SPARE}; no reserve, lanes not held back for pace"
+        first = f"{used_up if item['verdict'] == EXHAUSTED else reserve}; " if item["released"] else ""
+        return f"{first}{SPARE}; no reserve, lanes not held back for pace"
     return {
         EXHAUSTED: f"{used_up}: no new lanes or reviews on {vendor}; routine lanes move to the other vendor if it has room",
         "ahead": f"{reserve}; routine lanes use {CHEAPER[vendor]}, no new batch starts on its own, "

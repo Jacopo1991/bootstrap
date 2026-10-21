@@ -566,7 +566,7 @@ the warning band. `task usage --weekly-line` appends `, 5-hour exhausted <day an
 
 While Jacopo holds a spare reset for a vendor (`spare_resets` > 0) there is no reserve: the window is
 spent at the normal pace, `ahead` never holds lanes back, the share ends at 100 % and `task usage`
-says "spare reset held; reset at 100 %".
+says "spare reset held; reset at 100 %", after the release wording in the final `under_use_hours`.
 
 A held lane exits 4 (`task lane`, `task review --run`); the batch runner waits a minute and asks again.
 `--no-pace` on `task lane`, `task review`, `task runner-start` and `task-batch` skips the check for that
