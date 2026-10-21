@@ -507,6 +507,50 @@ Dependencies wait for their predecessor to merge; parked predecessors skip
 their dependants. Expiry reduces new dispatches without interrupting live work.
 `task status` shows the effective vendor limits and gate slots.
 
+#### Usage pacing
+
+`task usage` shows, per vendor, weekly and 5-hour use, the weekly reset (UTC and Europe/Copenhagen),
+the reading's age, the share of the week elapsed, the pace verdict and the policy applied. It spends
+no tokens. Readings are the vendors' own numbers: the newest Codex `rate_limits` in
+`~/.codex/sessions/**/rollout-*.jsonl` and the newest Claude `rate_limit_event`. Claude lanes and
+`task review --run` run `claude -p --output-format stream-json --verbose`: the events go to
+`.work/lane.jsonl` (reviews: `review-response.jsonl` in the task state) and the newest reading per
+window to `~/.local/state/task/usage/claude.json`; `lane.log`, `final.md` and the review reply keep
+the plain text. A reading with no `rate_limit_event` yet, from before the last weekly reset, or older
+than 7 days is `unknown` with the reason, and `task` then behaves as before and prints a warning.
+The interactive status-line `rate_limits` is not read. ccusage is for per-project attribution only.
+
+Verdicts, with weekly used % against the share of the week elapsed: `exhausted-automated-share`
+(used ≥ 100 − reserve), `under-used-near-reset` (used below `under_use_percent` with at most
+`under_use_hours` left), `ahead` (more than `ahead_margin` points above the elapsed share), `under`
+(more than that below it) and `on`. `task lane`, `task review --run` and each batch start (`task-batch`,
+so `task runner-start` too) apply the verdict:
+
+| Verdict | Effect |
+| --- | --- |
+| `on`, `under`, unknown | unchanged (unknown prints a warning) |
+| `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
+| `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
+| `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+
+While Jacopo holds a spare reset for a vendor (`spare_resets` > 0) there is no reserve: the window is
+spent at the normal pace, `ahead` never holds lanes back, the share ends at 100 % and `task usage`
+says "spare reset held; reset at 100 %".
+
+A held lane exits 4 (`task lane`, `task review --run`); the batch runner waits a minute and asks again.
+`--no-pace` on `task lane`, `task review`, `task runner-start` and `task-batch` skips the check for that
+one command. Overrides, boosts and held-back lanes are logged to `~/.local/state/task/usage/pace.log`.
+`~/.local/state/task/usage/weeks.json` keeps, per vendor and weekly window, the last used %, the day
+the automated share was first seen used up and the lanes held back; `task usage --weekly-line` prints
+`<vendor> week ending <date>: used N %, exhausted <day or no>, lanes held back N` for the company STATUS.
+
+The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
+`~/cortex/cortex-kb-company/policy/usage-pacing.toml`; `task` only reads it and the company PM writes it.
+A missing file or key means the built-in defaults; an invalid file is reported and the defaults apply.
+[`docs/usage-pacing.example.toml`](docs/usage-pacing.example.toml) shows every key at its default:
+`[reserve]` (claude 25, codex 10), `[spare_resets]` (claude 0, codex 1), `priority`, `ahead_margin` (10),
+`under_use_percent` (60), `under_use_hours` (36) and `research_backlog`.
+
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
 `--dangerously-bypass-approvals-and-sandbox`; the managed policy hook stays active.

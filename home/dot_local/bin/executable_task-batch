@@ -2,6 +2,7 @@
 """Sequence an approved batch using the installed task command, without a model."""
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -15,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import task_usage
 from task_limits import cli_limit, lane_limit
 from task_routing import TIERS, lane_limits
 
@@ -33,6 +35,8 @@ FIX_SCOPE_INSTRUCTION = ("Fix only inside this task's scope. If a finding needs 
                          "and the finding.")
 OUTPUT_LOCK = threading.Lock()
 LAUNCH_LOCK = threading.Lock()
+HELD = 4  # `task lane` exit status: held back by usage pacing
+HOLD_SECONDS = 60
 
 
 def terminal_block(output):
@@ -137,7 +141,8 @@ def failure_key(text):
 
 
 class Batch:
-    def __init__(self, repo, source, stopping=None, ident=None):
+    def __init__(self, repo, source, stopping=None, ident=None, no_pace=False):
+        self.no_pace = no_pace
         self.repo = repo
         self.source = source
         self.done = repo / ".work" / source.with_suffix(".done").name
@@ -182,6 +187,10 @@ class Batch:
                             raise Stop("batch is stopping")
                 result = subprocess.CompletedProcess(argv, child.returncode, output)
             self.output(result.stdout)
+            if command == "lane" and result.returncode == HELD:
+                if self.stopping.wait(HOLD_SECONDS):
+                    raise Stop("batch is stopping")
+                continue
             if not (retry and result.returncode == 3):
                 return result
 
@@ -371,7 +380,17 @@ class Batch:
     def run(self):
         try:
             self.require("runner-check", self.source)
-            self.schedule(parse(self.source))
+            tasks = parse(self.source)
+            home = Path.home()
+            if self.no_pace or os.environ.get("TASK_NO_PACE"):
+                task_usage.log(home, f"--no-pace: batch {self.repo.name}/{self.source.name} not paced")
+            else:
+                reason, notes = task_usage.batch_gate(home, [task["builder"] for task in tasks])
+                for note in notes:
+                    self.output(note)
+                if reason:
+                    raise Stop(f"usage pacing: {reason} (--no-pace overrides)")
+            self.schedule(tasks)
             self.append("batch: finished")
             return 0
         except (Exception, KeyboardInterrupt) as error:
@@ -468,11 +487,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo")
     parser.add_argument("runner_file", type=Path)
+    parser.add_argument("--no-pace", action="store_true", help="start without the usage-pacing check (logged)")
     args = parser.parse_args()
     repo = Path(args.repo).expanduser()
     if not repo.is_absolute():
         repo = Path.home() / "dev_workspace" / repo
-    batch = Batch(repo.resolve(), args.runner_file.resolve())
+    batch = Batch(repo.resolve(), args.runner_file.resolve(), no_pace=args.no_pace)
     try:
         batch.repo = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
         batch.done = batch.repo / ".work" / batch.source.with_suffix(".done").name

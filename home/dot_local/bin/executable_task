@@ -6,14 +6,17 @@ Write capability there determines trust; vendor environment markers do not.
 
   task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
-  task runner-start <repo> <runner-file>
-  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
+  task runner-start <repo> <runner-file> [--no-pace]
+  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
-  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>]
+  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>] [--no-pace]
+  task usage [--weekly-line]
+    Vendor usage, pace verdict and the usage-pacing policy applied; lane, review and batch starts obey it
+    (exit 4 = held back). --no-pace skips the check for one command and is logged. See README.
   task merge <repo> <id> [--keep] [--override <reason>] [--detach] [--lock-wait <minutes>]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
@@ -61,6 +64,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import task_usage
 from task_limits import cli_limit, lane_limit
 from task_routing import TIERS, route, lane_limits, active, RoutingParseError
 
@@ -414,6 +418,30 @@ def boost_line():
     active = active_boosts()
     return ("boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items()))
             + " (tier routing + batch capacity; routine and reviews unchanged)" if active else "")
+
+
+def usage(args):
+    lines = task_usage.weekly_lines(HOME) if args.weekly_line else task_usage.report(HOME)
+    print("\n".join(lines))
+    return 0
+
+
+def pace_check(args, kind, vendor, tier, task):
+    """Usage-pacing gate for a PM lane or review: the decision, or None under --no-pace."""
+    if args.no_pace or os.environ.get("TASK_NO_PACE"):
+        task_usage.log(HOME, f"--no-pace: {kind} {task.repo.name}/{task.id} not paced")
+        return None
+    decision = task_usage.gate(HOME, kind, vendor, tier, task.repo.name, task.id)
+    print("\n".join(decision["notes"]), end="\n" if decision["notes"] else "")
+    until, vendor = decision["spend"], decision["vendor"]
+    if until and vendor not in active_boosts():
+        path = HOME / ".local/state/task/boost.json"
+        atomic_json(path, {**read_json_object(path), vendor: until})
+        task_usage.log(HOME, f"boost on for {vendor} until {until}: under-used near reset")
+        print(f"pace: {vendor} under-used near its reset; boost on until {until}")
+    if decision["hold"]:
+        print(f"task {kind}: held back by usage pacing: {decision['hold']} (retry later; --no-pace overrides)")
+    return decision
 
 
 def plan_time(value):
@@ -1510,7 +1538,7 @@ def lane_environment(task, builder="codex"):
 
 
 MODELS = {"codex": {"gpt-6-luna": "gpt-6-luna", "gpt-6.1-sol": "gpt-6.1-sol", "gpt-6-astra": "gpt-6-astra"},
-          "claude": {"sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
+          "claude": {"haiku": "haiku", "sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
                      "opus": "opus", "claude-opus-5-5": "opus",
                      "fable": "fable", "claude-fable-5-1": "fable"}}
 
@@ -1602,7 +1630,15 @@ def lane(args):
     refresh_context(task)
     builder = args.builder or record["builder"]
     tier = args.tier or record.get("tier", "routine")
-    model = route(HOME, builder, tier, args.model, not args.no_boost and not args._worker)
+    explicit = args.model
+    decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
+    if decision:
+        if decision["hold"]:
+            return 4
+        explicit = None if decision["vendor"] != builder else explicit
+        builder = decision["vendor"]
+        explicit = explicit or (task_usage.CHEAPER[builder] if decision["cheaper"] else None)
+    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
@@ -1623,7 +1659,7 @@ def lane(args):
     final = work / "final.md"
     command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
                 "--output-last-message", str(final), "-"] if builder == "codex" else
-               ["claude", "-p", "--model", cli_model, "--effort", "high",
+               ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", "high",
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
@@ -1686,7 +1722,10 @@ def lane(args):
         with tempfile.TemporaryFile() as source:
             source.write(b"Read the pinned task context in .work/context/ before working.\n\n" + prompt.read_bytes())
             source.seek(0)
-            with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output:
+            with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output, \
+                    (work / "lane.jsonl").open("wb") if builder == "claude" else contextlib.nullcontext() as raw:
+                # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
+                stream = task_usage.ClaudeStream(HOME) if raw else None
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          stdout=subprocess.PIPE if output else None)
                 try:
@@ -1703,10 +1742,19 @@ def lane(args):
                                 if not chunk:
                                     reader.unregister(key.fileobj)
                                     continue
+                                if stream:
+                                    raw.write(chunk)
+                                    raw.flush()
+                                    chunk = stream.feed(chunk).encode()
                                 output.write(chunk)
                                 output.flush()
                                 sys.stdout.buffer.write(chunk)
                                 sys.stdout.buffer.flush()
+                    if stream:
+                        rest = stream.finish().encode()
+                        output.write(rest)
+                        sys.stdout.buffer.write(rest)
+                        sys.stdout.buffer.flush()
                     code = child.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
@@ -2152,7 +2200,8 @@ def runner_start(args):
               '--working-directory', str(repo), '--property=StandardInput=null',
               '--property=KillMode=process',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
-              '--setenv=PATH=' + os.environ.get('PATH', ''), *command]
+              '--setenv=PATH=' + os.environ.get('PATH', ''),
+              *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
         result = subprocess.run(launch, capture_output=True, text=True)
     except FileNotFoundError:
@@ -2163,8 +2212,8 @@ def runner_start(args):
         if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
             raise Stop(f'{unit} is already active.')
         with log.open('a') as output:
-            process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL,
-                                       stdout=output, stderr=output, start_new_session=True)
+            process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                       start_new_session=True, env={**os.environ, "TASK_NO_PACE": "1"} if args.no_pace else None)
         data.update(backend='setsid', pid=process.pid)
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
@@ -2920,8 +2969,10 @@ def run_reviewer(command, path, prompt_file, reply_file):
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
     atomic_json(run_file, run)
+    # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
+    raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
-        with prompt_file.open() as prompt, reply_file.open("w") as reply, stderr_file.open("w") as errors:
+        with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
                                        stderr=errors, start_new_session=True)
             try:
@@ -2939,6 +2990,9 @@ def run_reviewer(command, path, prompt_file, reply_file):
         run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
     finally:
+        if raw != reply_file and raw.is_file():
+            stream = task_usage.ClaudeStream(HOME)
+            reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
@@ -2985,6 +3039,12 @@ def review(args):
                           else ("codex", "gpt-6-luna"))
         if reviewer_route[0] == record["builder"]:
             raise Stop("reviewer vendor must differ from builder")
+        if args.run:
+            decision = pace_check(args, "review", reviewer_route[0], "routine", task)
+            if decision and decision["hold"]:
+                return 4
+            if decision and decision["spend"]:
+                reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
@@ -3079,7 +3139,8 @@ def review(args):
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         def reviewer_command(vendor, model):
             if vendor == "claude":
-                return (f"claude -p {add_dir}--permission-mode dontAsk --model {model} --effort high "
+                events = "--output-format stream-json --verbose " if args.run else ""
+                return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {model} --effort high "
                         "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
             return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
                     f"-m {model} -c model_reasoning_effort=high -")
@@ -4751,9 +4812,10 @@ def main(argv=None):
             sub.add_argument("--off-plan", metavar="REASON")
         if name == "lane":
             sub.add_argument("--no-boost", action="store_true")
+            sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
             sub.add_argument("--builder", choices=("codex", "claude"))
-            sub.add_argument("--model", help="Claude aliases sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
+            sub.add_argument("--model", help="Claude aliases haiku|sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
             sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
@@ -4771,6 +4833,7 @@ def main(argv=None):
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
+            sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--no-check", metavar="REASON", help="record an override of the passing-check prerequisite")
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
@@ -4792,6 +4855,9 @@ def main(argv=None):
     sub = commands.add_parser("runner-start", help="launch a validated, detached batch runner")
     sub.add_argument("repo")
     sub.add_argument("file")
+    sub.add_argument("--no-pace", action="store_true", help="run the batch without usage pacing (logged)")
+    sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
+    sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
@@ -4879,7 +4945,7 @@ def main(argv=None):
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost,
+                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
                       "gate-drill": gate_drill}[args.command](args) or 0
         finally:
             if lock:

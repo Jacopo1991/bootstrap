@@ -24,6 +24,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
@@ -40,6 +41,7 @@ os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
 REVIEW_FIXTURES = ROOT / "ci/fixtures/reviews"
+SPARE_HELD = "spare reset held; reset at 100 %"
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
@@ -132,6 +134,13 @@ if pathlib.Path(sys.argv[0]).name == 'codex':
     final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
     final.write_text('codex-final: ' + prompt)
     print('codex-log')
+elif '--output-format' in sys.argv:
+    reset = int(time.time()) + 3 * 86400
+    window = {'utilization': 0.4, 'resetsAt': reset}
+    print(json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {
+        'rateLimitType': 'seven_day', **window, 'unifiedWindows': {'five_hour': {**window, 'utilization': 0.1}, 'seven_day': window}}}))
+    print(json.dumps({'type': 'result', 'result': 'claude-final: ' + prompt}))
+    print('claude-log', file=sys.stderr)
 else:
     print('claude-final: ' + prompt, end='')
     print('claude-log', file=sys.stderr)
@@ -4207,7 +4216,8 @@ store.write_text(json.dumps(prs))
         self.raw_task("lane", "proj", "5", "--builder", "claude")
         record = self.wait_for_lane(wt)
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
-        self.assertEqual(call["args"], ["-p", "--model", "sonnet", "--effort", "high",
+        self.assertEqual(call["args"], ["-p", "--output-format", "stream-json", "--verbose",
+                                       "--model", "sonnet", "--effort", "high",
                                        "--permission-mode", "acceptEdits", "--allowedTools",
                                        "Bash Read Write Edit Glob Grep",
                                        "--settings", str(wt / ".work/claude-settings.json")])
@@ -4257,11 +4267,146 @@ store.write_text(json.dumps(prs))
         self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
         self.assertEqual(record["exit_code"], 3)
         self.assertEqual(record["model"], "sonnet")
-        self.assertEqual((wt / ".work/final.md").read_text(), "claude-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt)
+        self.assertEqual((wt / ".work/final.md").read_text(), "claude-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt + "\n")
+        events = [json.loads(line) for line in (wt / ".work/lane.jsonl").read_text().splitlines()]
+        self.assertEqual([event["type"] for event in events], ["rate_limit_event", "result"])
+        self.assertEqual(json.loads((self.home / ".local/state/task/usage/claude.json").read_text())["seven_day"]["utilization"], 0.4)
         log = (wt / ".work/lane.log").read_text()
         self.assertIn("claude-log", log)
         self.assertIn("claude-final", log)
         self.assertIn("lane: finished (exit 3)", self.raw_task("status", "proj"))
+
+    def readings(self, claude=None, codex=None):
+        """Fixture usage readings in the temporary HOME: (weekly used %, hours until the weekly reset)."""
+        now = datetime.now(timezone.utc)
+        if claude:
+            event = {"rate_limit_info": {"unifiedWindows": {"seven_day": {
+                "utilization": claude[0] / 100, "resetsAt": int(now.timestamp() + claude[1] * 3600)}}}}
+            TASK_MODULE.task_usage.record_claude(self.home, event, now)
+        if codex:
+            limits = {"primary": {"used_percent": codex[0], "window_minutes": 10080,
+                                  "resets_at": int(now.timestamp() + codex[1] * 3600)}}
+            path = self.home / ".codex/sessions/2026/10/20/rollout-fixture.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"timestamp": now.isoformat(), "payload": {"rate_limits": limits}}) + "\n")
+
+    def pace_lane(self, *options, code=0, builder="claude"):
+        self.stub_models()
+        self.raw_task("start", "proj", "5", "--builder", builder)
+        wt = self.repo / ".worktrees/t5"
+        (wt / ".work/prompt.md").write_text("Approved task.\n")
+        out = self.raw_task("lane", "proj", "5", *options, code=code)
+        return wt, out
+
+    def pace_log(self):
+        path = self.home / ".local/state/task/usage/pace.log"
+        return path.read_text() if path.exists() else ""
+
+    def test_usage_command_prints_both_vendors_and_the_weekly_line(self):
+        out = self.raw_task("usage")
+        self.assertIn("claude: unknown (no rate_limit_event recorded yet", out)
+        self.assertIn("codex: unknown (no rollout file under", out)
+        self.readings(claude=(50, 84), codex=(40, 84))
+        out = self.raw_task("usage")
+        for expected in ("claude: weekly used 50 %, 5-hour used n/a", "Europe/Copenhagen", "week elapsed 50 %",
+                         "pace: on", "codex: weekly used 40 %", SPARE_HELD):
+            self.assertIn(expected, out)
+        lines = self.raw_task("usage", "--weekly-line").splitlines()
+        self.assertRegex(lines[0], r"^claude week ending \d{4}-\d\d-\d\d: used 50 %, exhausted no, lanes held back 0$")
+        self.assertRegex(lines[1], r"^codex week ending \d{4}-\d\d-\d\d: used 40 %, exhausted no, lanes held back 0$")
+
+    def test_usage_policy_file_override_changes_the_verdict(self):
+        self.readings(claude=(60, 84))
+        self.assertIn("pace: on", self.raw_task("usage"))  # 60 % used, 50 % of the week gone, margin 10
+        policy = self.home / "policy.toml"
+        policy.write_text("ahead_margin = 5\n[reserve]\nclaude = 50\n")
+        (self.home / ".config/task").mkdir(parents=True)
+        (self.home / ".config/task/usage-policy-path").write_text(str(policy))
+        out = self.raw_task("usage")
+        self.assertIn("pace: exhausted-automated-share", out)
+        self.assertIn("reserve 50 %", out)
+
+    def test_pace_lane_with_an_unknown_reading_warns_and_changes_nothing(self):
+        wt, out = self.pace_lane()  # nothing recorded: unchanged behaviour plus a warning
+        self.assertIn("pace warning: claude usage unknown", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+
+    def test_pace_lane_ahead_uses_the_cheaper_model_and_holds_non_priority_repos(self):
+        self.readings(claude=(70, 84))
+        wt, out = self.pace_lane()
+        self.assertIn("route: routine -> claude haiku", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "haiku")
+        self.readings(claude=(70, 84))  # the Claude stub's own event replaced the reading
+        priority = self.home / ".local/state/task/madplanner-v2/t1"
+        priority.mkdir(parents=True)
+        (priority / "task.json").write_text("{}")
+        (wt / ".work/lane.json").unlink()
+        out = self.raw_task("lane", "proj", "5", code=4)
+        self.assertIn("held back by usage pacing: claude is ahead of pace; only madplanner-v2 gets new lanes", out)
+        self.assertFalse((wt / ".work/lane.json").exists())
+        self.assertIn("held lane proj/T-5", self.pace_log())
+        self.assertIn("lanes held back 1", self.raw_task("usage", "--weekly-line"))
+        self.raw_task("lane", "proj", "5", "--no-pace")
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+        self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
+
+    def test_pace_lane_exhausted_moves_routine_to_the_other_vendor_and_holds_hard(self):
+        self.readings(claude=(80, 84), codex=(20, 84))
+        wt, out = self.pace_lane()
+        self.assertIn("automated share used up; routine lane moves to codex", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
+        self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "codex")
+        self.raw_task("lane", "proj", "5", "--builder", "claude", "--tier", "hard", code=4)
+        self.readings(codex=(100, 84))
+        out = self.raw_task("lane", "proj", "5", "--builder", "claude", code=4)
+        self.assertIn("claude automated share used up (80 % of 75 %)", out)
+
+    def test_pace_lane_exhausted_with_spare_reset_asks_jacopo(self):
+        self.readings(claude=(80, 84), codex=(100, 84))
+        wt, out = self.pace_lane(builder="codex", code=4)
+        self.assertIn("Jacopo: codex is at 100 %; use your spare reset", out)
+
+    def test_pace_lane_under_used_near_reset_switches_the_boost_on_until_the_reset(self):
+        self.readings(claude=(40, 30))
+        wt, out = self.pace_lane("--tier", "hard")
+        self.assertRegex(out, r"pace: claude under-used near its reset; boost on until ")
+        self.assertEqual(self.wait_for_lane(wt)["model"], "fable")
+        until = json.loads((self.home / ".local/state/task/boost.json").read_text())["claude"]
+        self.assertIn(f"boost on for claude until {until}", self.pace_log())
+        self.assertIn(f"boost: claude until {until}", self.raw_task("status", "proj"))
+
+    def test_pace_review_holds_exhausted_reviewer_and_goes_deeper_when_under_used(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
+        self.readings(claude=(80, 84))
+        out = self.raw_task("review", "proj", "5", "--run", code=4)
+        self.assertIn("held back by usage pacing: claude automated share used up", out)
+        self.assertFalse((wt / ".work/reviewer-call.json").exists())
+        self.readings(claude=(40, 30))
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```\n"
+        self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        call = json.loads((wt / ".work/reviewer-call.json").read_text())
+        self.assertEqual(call["args"][call["args"].index("--model") + 1], "opus")
+        self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "opus")
+
+    def test_review_run_records_claude_stream_events_and_plain_reply(self):
+        self.stub_reviewers()
+        self.raw_task("start", "proj", "5", "--builder", "codex")
+        wt = self.repo / ".worktrees/t5"
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```"
+        stub = self.home / "bin/claude"
+        stub.write_text("#!/usr/bin/env python3\nimport json, os, sys, time\nsys.stdin.read()\n"
+                        "print(json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {'unifiedWindows': {'seven_day': "
+                        "{'utilization': 0.3, 'resetsAt': int(time.time()) + 86400}}}}))\n"
+                        "print(json.dumps({'type': 'result', 'result': os.environ['REVIEW_STUB_REPLY']}))\n")
+        self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((self.state() / "review-response.md").read_text(), reply + "\n")
+        self.assertIn('"rate_limit_event"', (self.state() / "review-response.jsonl").read_text())
+        self.assertEqual(json.loads((self.home / ".local/state/task/usage/claude.json").read_text())["seven_day"]["utilization"], 0.3)
 
     def test_claude_worker_cleans_temp_before_publishing_finished(self):
         self.stub_models()
@@ -4332,8 +4477,8 @@ store.write_text(json.dumps(prs))
         self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", "opus")
         record = self.wait_for_lane(wt)
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
-        self.assertEqual(call["args"][:3], ["-p", "--model", "opus"])
-        self.assertEqual(call["args"][3:], ["--effort", "high", "--permission-mode", "acceptEdits",
+        self.assertEqual(call["args"][:6], ["-p", "--output-format", "stream-json", "--verbose", "--model", "opus"])
+        self.assertEqual(call["args"][6:], ["--effort", "high", "--permission-mode", "acceptEdits",
                                             "--allowedTools", "Bash Read Write Edit Glob Grep",
                                             "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
@@ -4430,7 +4575,7 @@ store.write_text(json.dumps(prs))
             record = self.wait_for_lane(wt)
             self.assertEqual((record["model"], record["cli_model"]), (model, cli))
             call = json.loads((wt / ".work/model-call.json").read_text())
-            self.assertEqual(call["args"][:3], ["-p", "--model", cli])
+            self.assertEqual(call["args"][4:6], ["--model", cli])
         self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "claude")
         self.stub_reviewers()
         head = self.git(wt, "rev-parse", "HEAD")
@@ -5069,6 +5214,8 @@ store.write_text(json.dumps(prs))
         expected_args = shlex.split(expected_command.split(" < ")[0])
         if expected_args[0] == "GIT_OPTIONAL_LOCKS=0":
             expected_args.pop(0)
+        if expected_args[0] == "claude":  # --run records stream-json; the printed manual command stays plain
+            expected_args[2:2] = ["--output-format", "stream-json", "--verbose"]
         reply = (f"```review\nVerdict: {verdict}\nCommit: {head}\n"
                  f"Reviewer: {builder} wrong-model\n"
                  f"#1 {'pass' if verdict == 'PASS' else 'fail'}: inspected b\n"

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import threading
+from datetime import datetime, timezone
 from unittest import mock
 from policy_test_env import isolate_policy_environment
 
@@ -24,6 +25,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 batch_module = importlib.util.module_from_spec(spec)
 sys.dont_write_bytecode = True
 loader.exec_module(batch_module)
+task_usage = sys.modules['task_usage']
 STUB = r'''#!/usr/bin/env python3
 import fcntl, json, os, pathlib, subprocess, sys
 from datetime import datetime, timezone
@@ -298,9 +300,9 @@ class BatchTest(unittest.TestCase):
     def scenario(self, value):
         (self.home / 'scenario.json').write_text(json.dumps(value))
 
-    def run_batch(self, code=0):
+    def run_batch(self, code=0, options=()):
         prior_prompts = len(self.prompts()) if (self.home / 'prompts.jsonl').exists() else 0
-        result = subprocess.run([sys.executable, str(TOOL), 'proj', str(self.source)],
+        result = subprocess.run([sys.executable, str(TOOL), 'proj', str(self.source), *options],
                                 env=self.env, capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         self.assertFalse((self.home / 'overlap').exists())
@@ -779,6 +781,40 @@ class BatchTest(unittest.TestCase):
         self.run_batch()
         self.assertEqual(self.calls('start')[-1][-2:], ['--seed', 'pinned'])
         self.assertEqual((self.repo / '.worktrees/one/.work/pinned').read_text(), 'resumed input')
+
+    def ahead_claude_batch(self):
+        """Claude 70 % used with half the week gone is ahead of pace (reserve 25, margin 10)."""
+        now = datetime.now(timezone.utc)
+        event = {'rate_limit_info': {'unifiedWindows': {'seven_day': {
+            'utilization': 0.7, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}
+        task_usage.record_claude(self.home, event, now)
+        self.source.write_text('1. one: builder claude, model sonnet\nRequest\n')
+
+    def test_batch_start_is_refused_when_a_vendor_is_ahead_of_pace_unless_no_pace(self):
+        self.ahead_claude_batch()
+        done = self.run_batch(1)
+        self.assertIn('batch: stopped: usage pacing: claude is ahead of pace; no new batch starts on its own', done)
+        self.assertEqual([c[0] for c in self.calls()], ['runner-check'])
+        self.assertIn('batch not started: claude ahead of pace', (self.home / '.local/state/task/usage/pace.log').read_text())
+        (self.repo / '.work/runner-test.done').unlink()
+        self.assertIn('one: merged', self.run_batch(options=['--no-pace']))
+        self.assertIn('--no-pace: batch proj/runner-test.md not paced', (self.home / '.local/state/task/usage/pace.log').read_text())
+
+    def test_batch_start_with_unknown_usage_warns_and_runs(self):
+        self.source.write_text('1. one: builder claude, model sonnet\nRequest\n')
+        result = subprocess.run([sys.executable, str(TOOL), 'proj', str(self.source)],
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('pace warning: claude usage unknown', result.stdout)
+
+    def test_held_lane_is_retried_until_the_pace_check_allows_it(self):
+        self.scenario({'lane': [{'code': batch_module.HELD, 'output': 'held back by usage pacing'}, {}]})
+        runner = batch_module.Batch(self.repo, self.source)
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module, 'HOLD_SECONDS', 0.01):
+            runner.require('start', 'one', '--builder', 'codex')
+            (self.repo / '.worktrees/one/.work/prompt.md').write_text('prompt')
+            runner.require('lane', 'one', '--builder', 'codex', '--model', 'gpt-6-luna')
+        self.assertEqual(len(self.calls('lane')), 2)
 
 
 if __name__ == '__main__':
