@@ -492,7 +492,8 @@ specialty: `gpt-6-astra` needs `Tier: design` and `fable` needs `Tier: hard`.
 `task lane` refuses them on any other tier, and the batch parks that task with the
 reason, whether the model came from `--model`, a runner line or a fix round. The tier
 is the one recorded for the task; a `--tier` flag or runner `tier` that differs from it
-does not make the model eligible.
+is refused on `task lane` and `task start`, so it never changes the recorded tier or
+makes the model eligible, unless a valid `--override` is given (the change is ledgered).
 Only Jacopo can switch a model: `task lane --override "Jacopo YYYY-MM-DD: <request>"`
 (runner line field `, override: Jacopo YYYY-MM-DD: <request>`) permits it; any other
 text is refused. Each use is appended to

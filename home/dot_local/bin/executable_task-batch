@@ -298,6 +298,8 @@ class Batch:
             options = ["--builder", task["builder"]]
             if task.get("tier"):
                 options += ["--tier", task["tier"]]
+            if task["override"]:
+                options += ["--override", task["override"]]
             if task["seed"]:
                 options += ["--seed", task["seed"]]
             if task.get("no_verify"):

@@ -90,6 +90,16 @@ def guard(tier, model, override=""):
     return True
 
 
+def tier_guard(recorded, tier, override=""):
+    """Refuse a --tier that differs from the recorded tier unless Jacopo's override text is given; True when it was needed."""
+    if not tier or tier == recorded:
+        return False
+    if problem := override_problem(override, required=True):
+        raise RoutingParseError(f"--tier {tier} cannot change this task's recorded tier ({recorded}) without "
+                                f"--override \"{OVERRIDE_FORMAT}\"; {problem}")
+    return True
+
+
 def route(home, vendor, tier, explicit=None, boosted=True, override="", recorded=None):
     """Pick the model for `tier`; the guard needs both it and the task's recorded tier to allow the model."""
     model = pick(home, vendor, tier, explicit, boosted)

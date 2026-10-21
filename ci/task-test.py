@@ -298,7 +298,8 @@ class TaskTool(unittest.TestCase):
         self.stub_models()
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('Implement task')
-        out = self.task('lane', 'proj', '5', '--tier', 'hard')
+        self.assertIn('cannot change this task', self.lane_refused('--tier', 'hard'))
+        out = self.task('lane', 'proj', '5', '--tier', 'hard', '--override', 'Jacopo 2026-10-21: tier')
         self.wait_for_lane(wt)
         self.assertIn('route: hard -> codex gpt-6.1-sol', out)
         self.assertIn('Updating task tier to hard.', out)
@@ -1029,7 +1030,7 @@ class TaskTool(unittest.TestCase):
                 (wt / '.work/model-call.json').unlink(missing_ok=True)
                 (wt / '.work/final.md').unlink(missing_ok=True)
                 # Astra and fable follow the recorded tier, so the task is recorded at each tier first.
-                self.task('start', 'proj', '5', '--builder', builder, '--tier', tier)
+                self.task('start', 'proj', '5', '--builder', builder, '--tier', tier, '--override', 'Jacopo 2026-10-21: tier')
                 out = self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier)
                 record = self.wait_for_lane(wt)
                 self.assertEqual(record['model'], expected)
@@ -1041,7 +1042,7 @@ class TaskTool(unittest.TestCase):
                 self.assertEqual(self.wait_for_lane(wt)['model'], explicit)
             (wt / '.work/model-call.json').unlink(missing_ok=True)
             (wt / '.work/final.md').unlink(missing_ok=True)
-            self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost')
+            self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost', '--override', 'Jacopo 2026-10-21: tier')
             no_boost_hard = 'gpt-6.1-sol' if builder == 'codex' else explicit
             self.assertEqual(self.wait_for_lane(wt)['model'], no_boost_hard)
 
@@ -1097,8 +1098,8 @@ class TaskTool(unittest.TestCase):
             out = self.lane_refused('--builder', builder, '--tier', tier, '--model', model)
             self.assertIn(f'{model} is for Tier: {tier} tasks only (this one is routine)', out)
             self.assertIn('--override', out)
-        # Tier routing that would pick astra is judged the same way.
-        self.assertIn('gpt-6-astra is for Tier: design tasks only (this one is routine)', self.lane_refused('--tier', 'design'))
+        # Tier routing that would pick astra is refused: the --tier cannot change the recorded tier.
+        self.assertIn("--tier design cannot change this task's recorded tier (routine)", self.lane_refused('--tier', 'design'))
         self.assertEqual(self.overrides(), [])
         request = 'Jacopo 2026-10-21: design look'
         for builder, tier, model in cases:
@@ -1108,7 +1109,33 @@ class TaskTool(unittest.TestCase):
             self.assertIn(f'override recorded: {model} on a ', out)
         # The ledger names the tier the task was recorded at; the first override moved it to design.
         self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
-                         [('gpt-6-astra', 'routine', request), ('fable', 'design', request)])
+                         [('tier change', 'routine to design', request), ('gpt-6-astra', 'routine', request),
+                          ('tier change', 'design to hard', request), ('fable', 'design', request)])
+
+    def test_a_tier_flag_never_changes_the_recorded_tier_without_an_override(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        # The review's sequence: a tier change with a cheap model, then astra on the now-design task.
+        out = self.lane_refused('--tier', 'design', '--model', 'gpt-6-luna')
+        self.assertIn("--tier design cannot change this task's recorded tier (routine)", out)
+        self.assertIn('--override', out)
+        out = self.lane_refused('--tier', 'design', '--model', 'gpt-6-luna', '--override', 'Jacopo 2026-10-21')
+        self.assertIn('override must read', out)
+        self.assertIn('gpt-6-astra is for Tier: design tasks only (this one is routine)', self.lane_refused('--model', 'gpt-6-astra'))
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'routine')
+        # `task start` on the existing record is the same rule.
+        out = self.raw_task('start', 'proj', '5', '--builder', 'codex', '--tier', 'design', code=1)
+        self.assertIn("cannot change this task's recorded tier (routine)", out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'routine')
+        self.assertEqual(self.overrides(), [])
+        request = 'Jacopo 2026-10-21: design pass'
+        out = self.raw_task('lane', 'proj', '5', '--tier', 'design', '--model', 'gpt-6-luna', '--override', request)
+        self.wait_for_lane(wt)
+        self.assertIn('Updating task tier to design.', out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
+        self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
+                         [('tier change', 'routine to design', request)])
 
     def overrides(self):
         path = self.home / '.local/state/task/usage/overrides.jsonl'
@@ -1212,7 +1239,8 @@ class TaskTool(unittest.TestCase):
         for builder in ('codex', 'claude'):
             for tier in ('routine', 'hard', 'design'):
                 with self.subTest(builder=builder, tier=tier):
-                    self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier)
+                    self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier,
+                              '--override', 'Jacopo 2026-10-21: tier')
                     self.raw_task('check', 'proj', '5')
                     self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
                     route = json.loads((self.state() / 'review-routing.json').read_text())
@@ -1228,7 +1256,7 @@ class TaskTool(unittest.TestCase):
         self.task('start', 'proj', '5', '--builder', 'codex')
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'hard')
         self.assertIn('tier=hard', self.task('status', 'proj'))
-        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex', '--tier', 'design')
+        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex', '--tier', 'design', '--override', 'Jacopo 2026-10-21: tier')
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
 
     def test_tier_defaults_and_override_policy(self):
@@ -4661,7 +4689,7 @@ store.write_text(json.dumps(prs))
         self.assertIn("automated share used up; routine lane moves to codex", out)
         self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
         self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "codex")
-        self.raw_task("lane", "proj", "5", "--builder", "claude", "--tier", "hard", code=4)
+        self.raw_task("lane", "proj", "5", "--builder", "claude", "--tier", "hard", "--override", "Jacopo 2026-10-21: tier", code=4)
         self.readings(codex=(100, 84))
         out = self.raw_task("lane", "proj", "5", "--builder", "claude", code=4)
         self.assertIn("claude automated share used up (80 % of 75 %)", out)
@@ -4877,7 +4905,7 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         (wt / ".work/prompt.md").write_text("task\n")
         # Fable follows the recorded tier, so the task is recorded as hard first.
-        self.raw_task("start", "proj", "5", "--builder", "codex", "--tier", "hard")
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--tier", "hard", "--override", "Jacopo 2026-10-21: tier")
         for model, cli in TASK_MODULE.MODELS["claude"].items():
             tier = ("--tier", "hard") if cli == "fable" else ()
             out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model, *tier)

@@ -4,7 +4,7 @@
 The sandbox protects private task state from lanes running as the same Unix user.
 Write capability there determines trust; vendor environment markers do not.
 
-  task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
+  task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]... [--override "Jacopo YYYY-MM-DD: <request>"]
   task runner-check <repo> <file>
   task runner-start <repo> <runner-file> [--no-pace]
   task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace] [--override "Jacopo YYYY-MM-DD: <request>"]
@@ -26,7 +26,7 @@ Write capability there determines trust; vendor environment markers do not.
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
     Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
-    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; only task lane --override "Jacopo YYYY-MM-DD: <request>" (ledgered) permits otherwise. Configure ~/.config/task/routing.json to override the table.
+    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; --tier never changes the recorded tier; only --override "Jacopo YYYY-MM-DD: <request>" on task lane or task start (ledgered) permits either. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -66,7 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import bwrap_denial, cli_limit, lane_limit
-from task_routing import TIERS, TOP_ONLY, route, guards, lane_limits, active, override_problem, RoutingParseError
+from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -1661,6 +1661,7 @@ def lane(args):
     tier = args.tier or recorded
     explicit = args.model
     guards(tier, recorded, explicit, args.override)
+    tier_changed = tier_guard(recorded, args.tier, args.override)
     decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
     if decision:
         if decision["hold"]:
@@ -1712,6 +1713,9 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            if tier_changed:
+                task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
+                print(f"override recorded: tier {recorded} to {tier} ({args.override})")
             if guards(tier, recorded, model, args.override):
                 task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
@@ -2285,6 +2289,10 @@ def start_locked(args, repo):
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
     task_text = task.file.read_text() if task.file else ""
+    pinned = read_json_object(task_state(task) / "task.json").get("tier")
+    if pinned and tier_guard(pinned, args.tier, args.override):
+        task_usage.record_override(HOME, repo.name, task.id, "tier change", f"{pinned} to {args.tier}", args.override)
+        print(f"override recorded: tier {pinned} to {args.tier} ({args.override})")
     criteria = criteria_from(task_text)
     verify = verification_from(task_text)
     if task.file and not criteria:
@@ -4873,6 +4881,8 @@ def main(argv=None):
         if name in {"start", "lane"}:
             sub.add_argument("--tier", choices=TIERS, help="task Tier line or routine by default")
         if name == "start":
+            sub.add_argument("--override", metavar="REQUEST", default="",
+                             help="Jacopo's request and date; permits --tier to change the recorded tier (ledgered)")
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
             sub.add_argument("--seed", action="append", default=[], metavar="NAME")
