@@ -146,9 +146,10 @@ def merge_in_only(path, reviewed, head):
     commits = run("rev-list", "--parents", f"{reviewed}..{head}", "--not", default).stdout.splitlines()
     for line in commits:
         commit, *parents = line.split()
-        merged = run("merge-tree", "--write-tree", *parents).stdout.split()
-        if (len(parents) != 2 or run("merge-base", "--is-ancestor", parents[1], default).returncode
-                or not merged or merged[0] != run("rev-parse", f"{commit}^{{tree}}").stdout.strip()):
+        if len(parents) != 2 or run("merge-base", "--is-ancestor", parents[1], default).returncode:
+            return False
+        merged = run("merge-tree", "--write-tree", *parents)
+        if merged.returncode or merged.stdout.split()[:1] != [run("rev-parse", f"{commit}^{{tree}}").stdout.strip()]:
             return False
     return bool(commits)
 

@@ -102,7 +102,18 @@ elif cmd == 'lane':
         git(repo, 'add', 'from-main')
         git(repo, 'commit', '-m', 'main moves')
         git(wt, 'merge', '--no-edit', 'main')
-    if entry.get('merge_main') and not entry.get('also_commit'):
+    if entry.get('conflict_main'):
+        # Commit the conflicted merge-tree result (markers included) as a two-parent merge.
+        (repo / 'result').write_text('main')
+        git(repo, 'add', 'result')
+        git(repo, 'commit', '-m', 'main conflicts')
+        ours, theirs = git(wt, 'rev-parse', 'HEAD'), git(wt, 'rev-parse', 'main')
+        tree = subprocess.run(['git', '-C', str(wt), 'merge-tree', '--write-tree', ours, theirs],
+                              capture_output=True, text=True)
+        assert tree.returncode == 1
+        git(wt, 'reset', '--hard', git(wt, 'commit-tree', tree.stdout.split()[0], '-p', ours, '-p', theirs,
+                                       '-m', 'Merge main with conflict markers'))
+    if (entry.get('merge_main') and not entry.get('also_commit')) or entry.get('conflict_main'):
         pass
     elif not entry.get('unfinished'):
         (wt / 'result').write_text(str(index))
@@ -614,6 +625,9 @@ class BatchTest(unittest.TestCase):
 
     def test_merge_in_plus_another_commit_counts_toward_the_time_cap(self):
         self.assertIn('parked: total time cap', self.merge_in_batch({'merge_main': True, 'also_commit': True}))
+
+    def test_conflicted_merge_is_not_a_merge_in_round(self):
+        self.assertIn('parked: total time cap', self.merge_in_batch({'conflict_main': True}))
 
     def test_same_check_failure_ignores_head_and_duration(self):
         self.scenario({'check': [{'code': 1, 'output': 'head abc1234 failed in 1.2s'},
