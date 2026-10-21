@@ -3467,9 +3467,13 @@ def merge(args):
             fetch(repo)
             base, label = base_commit(repo, default)
             overlap = overlap_files(repo, lane_head, base)
-            if overlap:
+            if overlap and not all(name.endswith(".md") for name in overlap):
                 raise Stop(overlap_message(overlap))
-            reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
+            if overlap:
+                # A conflict in these files still stops in gate_merge_result.
+                reusable, reuse_reason = False, "main changed only Markdown files this task also changed, so the merge result differs from the checked tree"
+            else:
+                reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
             if reusable:
                 print(f"reuse decision: reusing trusted lane check: {reuse_reason}")
                 completed_step(task, "gate")
