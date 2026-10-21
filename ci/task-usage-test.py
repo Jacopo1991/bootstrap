@@ -198,6 +198,44 @@ class Usage(unittest.TestCase):
         self.assertIn("pace: under-used-near-reset", text)
         self.assertIn("spend before the reset", text)
 
+    def release_policy(self):
+        policy = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
+        policy.parent.mkdir(parents=True)
+        policy.write_text("under_use_percent = 95\nunder_use_hours = 24\n[reserve]\nclaude = 30\n")
+
+    def test_weekly_reserve_is_released_in_the_final_window_only(self):
+        self.release_policy()
+        for used, left, limit, expected in ((69, 30, 70, "under"),(72, 30, 70, usage.EXHAUSTED),
+                                            (72, 20, 100, "under-used-near-reset"), (72, 24, 100, "under-used-near-reset")):
+            with self.subTest(used=used, left=left):
+                self.claude(used, left)
+                found = self.verdict()
+                self.assertEqual((found["limit"], found["verdict"], found["released"]), (limit, expected, limit == 100))
+        self.claude(72, 30)
+        self.assertIn("automated share used up (72 % of 70 %)", usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"])
+        self.claude(72, 20)
+        decision = usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)
+        self.assertEqual((decision["hold"], decision["spend"]), ("", (NOW + timedelta(hours=20)).isoformat()))
+
+    def test_five_hour_bands_keep_their_reserve_in_the_final_window(self):
+        self.release_policy()
+        for five, expected in ((54, "ok"), (55, "5h-warning"), (70, "5h-exhausted")):  # reserve 30: warning 55, exhausted 70
+            with self.subTest(five=five):
+                self.claude(72, 20, five=five / 100)
+                found = self.verdict()
+                self.assertEqual((found["limit"], found["five"]), (100, expected))
+        self.claude(72, 20, five=0.7)
+        self.assertIn("5-hour window used up (70 % of 70 %)", usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"])
+
+    def test_usage_says_when_the_reserve_is_released(self):
+        self.release_policy()
+        self.claude(72, 30)
+        self.assertNotIn("reserve released", "\n".join(usage.report(self.home, NOW)))
+        self.claude(72, 20)
+        text = "\n".join(usage.report(self.home, NOW))
+        self.assertIn(f"reserve released until {usage._when(NOW + timedelta(hours=20))}", text)
+        self.assertIn("exhausted at 70 %", text)  # the 5-hour bands still show the reserve
+
     def test_batch_gate_refuses_ahead_vendors_only(self):
         self.claude(70, 84)
         reason, _ = usage.batch_gate(self.home, ["claude"], NOW)

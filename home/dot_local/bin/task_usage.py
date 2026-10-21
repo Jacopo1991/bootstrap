@@ -275,15 +275,17 @@ def assess(reading, pol, now, ran=False):
     """Add spare/limit and the pace verdict to a reading (see `task usage` for the meanings).
 
     `ran` says the vendor's lanes ran since the reading: an old reading is then stale.
-    The 5-hour verdict ignores spare resets, which only refill the weekly window.
+    The 5-hour verdict ignores spare resets and the release below, which only touch the weekly window.
+    In the final `under_use_hours` before the weekly reset the weekly reserve is released (limit 100 %).
     """
     vendor = reading["vendor"]
     spare = pol["spare_resets"][vendor] > 0
-    result = dict(reading, spare=spare, limit=100 - (0 if spare else pol["reserve"][vendor]),
-                  **_five(reading, pol, now, ran))
+    left = None if reading["reason"] else (reading["resets_at"] - now) / timedelta(hours=1)
+    released = not spare and left is not None and left <= pol["under_use_hours"]
+    result = dict(reading, spare=spare, released=released,
+                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), **_five(reading, pol, now, ran))
     if reading["reason"]:
         return dict(result, verdict="unknown")
-    left = (reading["resets_at"] - now) / timedelta(hours=1)
     elapsed = min(100.0, max(0.0, 100 * (1 - left / (WEEK / timedelta(hours=1)))))
     used, margin = reading["weekly"], pol["ahead_margin"]
     if used >= result["limit"]:
@@ -468,6 +470,8 @@ def _when(value):
 
 def _applied(vendor, item, pol, top):
     reserve = f"reserve {pol['reserve'][vendor]} %"
+    if item["released"] and item["verdict"] != EXHAUSTED:
+        reserve = f"reserve released until {_when(item['resets_at'])}"
     if item["spare"]:
         return f"{SPARE}; no reserve, lanes not held back for pace"
     return {

@@ -536,7 +536,9 @@ The interactive status-line `rate_limits` is not read. ccusage is for per-projec
 Verdicts, with weekly used % against the share of the week elapsed: `exhausted-automated-share`
 (used ≥ 100 − reserve), `under-used-near-reset` (used below `under_use_percent` with at most
 `under_use_hours` left), `ahead` (more than `ahead_margin` points above the elapsed share), `under`
-(more than that below it) and `on`. `task lane`, `task review --run` and each batch start (`task-batch`,
+(more than that below it) and `on`. In the final `under_use_hours` before a vendor's weekly reset the
+weekly reserve is released (limit 100 %; `task usage` says "reserve released until <reset>"); the 5-hour
+bands keep their reserve. `task lane`, `task review --run` and each batch start (`task-batch`,
 so `task runner-start` too) apply the verdict:
 
 | Verdict | Effect |
