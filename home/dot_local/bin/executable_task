@@ -1510,6 +1510,18 @@ def private_claude_lane(path, root):
             and stat.S_IMODE(info.st_mode) == 0o700)
 
 
+def new_lane_temporary():
+    root = claude_temporary_root()
+    # Nest only in a verified outer lane grant, keeping bridge sockets short.
+    inherited = os.environ.get("TMPDIR")
+    parent = Path(inherited).resolve() if inherited else root
+    parent = next((candidate for candidate in (parent, *parent.parents)
+                   if private_claude_lane(candidate, root)), root)
+    temporary = parent / f"lane-{secrets.token_hex(4)}"
+    temporary.mkdir(mode=0o700)
+    return temporary
+
+
 def lane_environment(task, builder="codex"):
     env = agent_environment()
     env.update(configured_environment(task.path, task.repo))
@@ -1517,14 +1529,7 @@ def lane_environment(task, builder="codex"):
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
     if builder == "claude":
-        root = claude_temporary_root()
-        # Nest only in a verified outer lane grant, keeping bridge sockets short.
-        inherited = os.environ.get("TMPDIR")
-        parent = Path(inherited).resolve() if inherited else root
-        parent = next((candidate for candidate in (parent, *parent.parents)
-                       if private_claude_lane(candidate, root)), root)
-        temporary = parent / f"lane-{secrets.token_hex(4)}"
-        temporary.mkdir(mode=0o700)
+        temporary = new_lane_temporary()
     else:
         temporary = task.path / ".work/tmp"
         if not temporary.resolve().is_relative_to(task.path.resolve()):
@@ -1713,10 +1718,7 @@ def lane(args):
     try:
         environment = lane_environment(task, builder)
         # Advisory checks use the recorded directory, outside the checkout; Codex lanes get a private one.
-        temporary = environment["TMPDIR"]
-        if builder != "claude":
-            temporary = str(claude_temporary_root() / f"lane-{secrets.token_hex(4)}")
-            os.mkdir(temporary, 0o700)
+        temporary = environment["TMPDIR"] if builder == "claude" else str(new_lane_temporary())
         run["temporary"] = temporary
         atomic_json(lane_record, run)
         if builder == "claude":
@@ -2436,8 +2438,10 @@ def advisory_temporary_parent(path):
         recorded = json.loads((path / ".work/lane.json").read_text()).get("temporary")
     except (OSError, ValueError, AttributeError):
         recorded = None
-    if recorded and Path(recorded).is_dir() and not Path(recorded).resolve().is_relative_to(path.resolve()):
-        return recorded
+    # Without a usable record (a lane that predates it), the lane's own TMPDIR, else the per-user root.
+    for candidate in (recorded, os.environ.get("TMPDIR")):
+        if candidate and Path(candidate).is_dir() and not Path(candidate).resolve().is_relative_to(path.resolve()):
+            return candidate
     return claude_temporary_root()
 
 

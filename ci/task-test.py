@@ -3875,7 +3875,8 @@ store.write_text(json.dumps(prs))
                     (wt / ".work/lane.json").unlink()
                 else:
                     (wt / ".work/lane.json").write_text(json.dumps(record))
-                with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=fallback):
+                with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=fallback), \
+                        mock.patch.dict(os.environ, TMPDIR=str(wt / ".work/tmp")):
                     self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), fallback)
 
     def test_check_steps_append_localhost_proxy_bypasses(self):
