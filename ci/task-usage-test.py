@@ -310,11 +310,11 @@ class Usage(unittest.TestCase):
         self.busy("codex")
         self.assertEqual(self.verdict("codex")["five"], "5h-warning")
 
-    def test_unknown_reading_is_not_plenty_once_lanes_ran(self):
-        self.assertEqual(self.verdict()["five"], "ok")
+    def test_no_reading_at_all_stays_unknown_even_when_lanes_ran(self):
         self.busy("claude")
-        self.assertEqual((self.verdict()["five"], self.verdict()["stale"]), ("5h-warning", True))
-        self.assertTrue(any("claude usage reading is missing" in note for note in usage.assessments(self.home, NOW)[2]))
+        found = self.verdict()
+        self.assertEqual((found["verdict"], found["five"], found["stale"]), ("unknown", "ok", False))
+        self.assertEqual(usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)["hold"], "")
 
     def test_five_caps_under_the_bands(self):
         self.five("claude", 50)

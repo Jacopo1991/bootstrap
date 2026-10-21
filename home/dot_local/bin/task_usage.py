@@ -250,7 +250,7 @@ def running(home, vendor):
 def _five(reading, pol, now, ran):
     """5-hour verdict: exhausted at 100 - reserve, warning 15 points lower or on a stale reading while lanes ran."""
     reserve, used = pol["reserve"][reading["vendor"]], reading.get("five_hour")
-    stale = ran and (reading["reason"] != "" or now - reading["at"] > STALE)
+    stale = ran and reading["reason"] == "" and now - reading["at"] > STALE  # no reading at all stays "unknown"
     if used is not None and used >= 100 - reserve:
         return {"five": FIVE_OUT, "stale": False}
     return {"five": FIVE_WARN if stale or used is not None and used >= 100 - reserve - FIVE_BAND else "ok",
@@ -335,12 +335,11 @@ def assessments(home, now):
     seen = {}
     for vendor, item in readings(home, now).items():
         since = item.get("at")
-        ran = running(home, vendor) > 0 or any(not since or at > since for at, _ in _claims(home, vendor))
+        ran = bool(since) and (running(home, vendor) > 0 or any(at > since for at, _ in _claims(home, vendor)))
         seen[vendor] = found = assess(item, pol, now, ran)
         if found["stale"]:
-            age = f"{(now - since) / timedelta(minutes=1):.0f} min old" if since else "missing"
-            notes.append(f"pace warning: {vendor} usage reading is {age} while its lanes ran; "
-                         "treated as the 5-hour warning band (one lane or review at a time)")
+            notes.append(f"pace warning: {vendor} usage reading is {(now - since) / timedelta(minutes=1):.0f} min old "
+                         "while its lanes ran; treated as the 5-hour warning band (one lane or review at a time)")
         note(home, found, now)
     return pol, seen, notes
 
