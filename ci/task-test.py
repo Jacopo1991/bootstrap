@@ -2766,7 +2766,9 @@ store.write_text(json.dumps(prs))
         self.gate_dir = self.home / "shared-gate"
         self.gate_dir.mkdir()
         self.env["TASK_GATE_DIR"] = str(self.gate_dir)
-        self.origin = self.home / "origin.git"
+        self.lane_root = self.home / "task-lane"
+        self.env["TASK_LANE_TEMP_ROOT"] = str(self.lane_root)
+        self.origin =self.home / "origin.git"
         self.git(self.home, "init", "-q", "--bare", "-b", "main", str(self.origin))
         self.repo = self.home / "dev_workspace/proj"
         self.repo.mkdir(parents=True)
@@ -3860,25 +3862,50 @@ store.write_text(json.dumps(prs))
         record["revision"] = TASK_MODULE.record_revision(record)
         task_record_path.write_text(json.dumps(record))
         self.sandbox_state()
-        (wt / ".work/lane.json").write_text(json.dumps({"state": "running", "temporary": str(outside)}))
-        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1", TMPDIR=str(wt / ".work/tmp")))
-        self.assertIn("PASS", out)
-        for name in ("gate", "verify"):
-            seen = Path((self.home / f"{name}-tmp").read_text().splitlines()[-1])
-            self.assertEqual(seen.parent, outside, "the lane's recorded temporary directory is the parent")
-            self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
         shared = self.home / f"task-gate-{os.getuid()}"
         shared.mkdir()
-        for record in (None, {"temporary": str(self.home / "gone")}, {"temporary": str(wt / ".work/tmp")}):
-            for inherited in (wt / ".work/tmp", shared):
-                with self.subTest(record=record, inherited=inherited):
-                    if record is None:
-                        (wt / ".work/lane.json").unlink(missing_ok=True)
-                    else:
-                        (wt / ".work/lane.json").write_text(json.dumps(record))
-                    with mock.patch.dict(os.environ, TMPDIR=str(inherited)):
-                        self.assertIsNone(TASK_MODULE.advisory_temporary_parent(wt),
-                                          "no inherited TMPDIR is ever adopted as the parent")
+        lane_dir = self.lane_root / "proj-t5"
+        lane_json = wt / ".work/lane.json"
+        # Per case: the lane record, the inherited TMPDIR, the expected parent, whether the record gains the path.
+        cases = {
+            "recorded directory": ({"state": "running", "temporary": str(outside)}, wt / ".work/tmp", outside, False),
+            "no record, shared gate TMPDIR": (None, shared, lane_dir, False),
+            "record inside the checkout, TMPDIR inside the checkout": (
+                {"state": "running", "temporary": str(wt / ".work/tmp")}, wt / ".work/tmp", lane_dir, True),
+            "record names a vanished directory": (
+                {"state": "running", "temporary": str(self.home / "gone")}, shared, lane_dir, True),
+        }
+        for matrix in (False, True):
+            if matrix:
+                (wt / ".task.toml").write_text('[[gate_variant]]\nname = "one"\n[[gate_variant]]\nname = "two"\n')
+                self.git(wt, "add", ".task.toml")
+                self.git(wt, "commit", "-qm", "gate variants")
+            for label, (lane_record, inherited, expected, recorded) in cases.items():
+                with self.subTest(matrix=matrix, case=label):
+                    for name in ("gate", "verify"):
+                        (self.home / f"{name}-tmp").unlink(missing_ok=True)
+                    shutil.rmtree(lane_dir, ignore_errors=True)
+                    lane_json.unlink(missing_ok=True)
+                    if lane_record:
+                        lane_json.write_text(json.dumps(lane_record))
+                    out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1", TMPDIR=str(inherited)))
+                    self.assertIn("PASS", out)
+                    for name in ("gate", "verify"):
+                        lines = (self.home / f"{name}-tmp").read_text().splitlines()
+                        self.assertEqual(len(lines), 2 if matrix else 1)
+                        for line in lines:
+                            seen = Path(line)
+                            self.assertEqual(seen.parent, expected)
+                            self.assertNotEqual(seen.parent, inherited, "the inherited TMPDIR is never the parent")
+                            self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
+                    if recorded:
+                        self.assertEqual(json.loads(lane_json.read_text())["temporary"], str(lane_dir))
+                        self.assertEqual(stat.S_IMODE(lane_dir.stat().st_mode), 0o700)
+                    self.assertEqual(lane_dir.exists(), expected == lane_dir)
+        with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
+            lane_json.unlink(missing_ok=True)
+            self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(lane_dir))
+            self.assertFalse(lane_json.exists(), "no lane record is invented for a check outside a lane")
 
     def test_check_steps_append_localhost_proxy_bypasses(self):
         wt, _ = self.started()
@@ -4047,10 +4074,10 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call["task_worktree"], str(wt))
             self.assertTrue(Path(call["tmpdir"]).is_dir())
             recorded = Path(json.loads((wt / ".work/lane.json").read_text())["temporary"])
-            self.assertRegex(recorded.name, r"^lane-[0-9a-f]{8}$")
-            self.assertTrue(recorded.is_relative_to(Path("/tmp") / f"claude-{os.getuid()}"))
+            self.assertEqual(recorded, self.lane_root / "proj-t5")
             self.assertTrue(recorded.is_dir())
-            self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
+            with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
+                self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
             self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
                                             "--output-last-message", str(wt / ".work/final.md"), "-"])
