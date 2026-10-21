@@ -2402,6 +2402,11 @@ def start_locked(args, repo):
                 "Mandatory read: .work/context/lane-contract.md"]
     if task.file:
         dispatch.append(f"Task: {task.file}")
+    dispatch.append("Acceptance criteria:\n" + ("\n".join(
+        f"- [{'x' if item.get('checked') else ' '}] #{item['number']} {item['text']}"
+        for item in record.get("criteria", [])) or "(PM: none given)"))
+    dispatch.append("Verify:\n" + ("\n".join(f"Verify: `{command}`" for command in record.get("verify", []))
+                                  or "(PM: none given)"))
     brief = task_text or ((work / "request.md").read_text() if (work / "request.md").is_file() else "")
     for heading in ("Read first", "Test against"):
         dispatch.append(f"{heading}:\n{brief_field(brief, heading) or '(PM: none given)'}")

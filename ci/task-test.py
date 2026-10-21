@@ -313,6 +313,7 @@ class TaskTool(unittest.TestCase):
         self.assertIn("Test against:\nci/fixtures/reviews/haiku-3-fenced.md", dispatch)
         self.assertIn("## Check", (wt / '.work/report.md').read_text())
         direct = self.raw_task('start', 'proj', 'direct', '--builder', 'codex')
+        self.assertIn('Acceptance criteria:\n(PM: none given)\nVerify:\n(PM: none given)', direct)
         self.assertIn('Read first:\n(PM: none given)', direct)
         self.assertIn('Test against:\n(PM: none given)', direct)
         request = self.repo / '.worktrees/direct/.work/request.md'
@@ -3478,6 +3479,9 @@ store.write_text(json.dumps(prs))
         self.assertIn(str(wt / ".work/prompt.md"), out)
         self.assertIn("t-5 - Add-the-b-file.md", out)
         self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
+        self.assertIn("Acceptance criteria:\n- [ ] #1 b exists\n- [ ] #2 checks pass\n", out)
+        self.assertIn("Verify:\nVerify: `true`\n", out)
+        self.assertEqual((wt / ".work/dispatch.md").read_text(), out.split("Dispatch prompt:\n\n", 1)[1])
         for rule in ("Commit on the branch", "advisory feedback", "three lines", "task merge --detach",
                      "apply_patch", "heredocs"):
             self.assertNotIn(rule, out)
