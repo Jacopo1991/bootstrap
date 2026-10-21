@@ -2510,7 +2510,6 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
                                 "trusted": state is not None, "advisory": state is None}
-                    if state is not None and evidence_name == "check.json":
                     if evidence_sink is not None:
                         evidence_sink.append(evidence)
                     elif evidence_name == "check.json" and state is None:
