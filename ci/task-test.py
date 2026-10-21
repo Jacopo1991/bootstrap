@@ -45,6 +45,7 @@ SPARE_HELD = "spare reset held; reset at 100 %"
 # "Idle 10 days" with an hour of margin: the host wall clock steps back by seconds, so a
 # worktree aged exactly 10 days when the test reads the clock can read 9 days in `task status`.
 IDLE_TEN_DAYS = 10 * 86400 + 3600
+PAST = '2000-01-01T00:00:00+00:00'  # for commits and merges that must precede a later sign-off
 
 
 def restore_access(path):
@@ -863,7 +864,7 @@ class TaskTool(unittest.TestCase):
         name = 'backlog/decisions/d-status.md'
         (self.kb / 'backlog/decisions').mkdir()
         original = '---\nstatus: accepted\n---\n## Decision\nKeep the data.\n'
-        self.commit_in(self.kb, name, original)
+        self.commit_in(self.kb, name, original, when=PAST)
         self.task('plan', 'proj', '--sign')
         for revised, counted in (
                 (original.replace('accepted', 'replaced'), False),
@@ -874,7 +875,10 @@ class TaskTool(unittest.TestCase):
                 (original.replace('Keep the data.', 'Delete the data.'), True)):
             (self.kb / name).write_text(revised)
             self.assertEqual('decisions changed:' in self.task('plan', 'proj'), counted)
-        (self.kb / name).write_text(original.replace('accepted', 'replaced'))
+        # A status word of another length: git then sees the edit by size. With "replaced" (same
+        # length as "accepted") only timestamps differ, and after a backward step of the host
+        # clock `git add` can find the file unchanged and stage nothing.
+        (self.kb / name).write_text(original.replace('accepted', 'superseded'))
         self.git(self.kb, 'add', name)
         subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'status'],
                        env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
@@ -890,8 +894,8 @@ class TaskTool(unittest.TestCase):
         status_name = 'backlog/decisions/d-status.md'
         binary_name = 'backlog/decisions/d-bytes.md'
         original = '---\nstatus: accepted\n---\nKeep the data.\n'
-        self.commit_in(self.kb, status_name, original)
-        self.commit_in(self.kb, binary_name, original)
+        self.commit_in(self.kb, status_name, original, when=PAST)
+        self.commit_in(self.kb, binary_name, original, when=PAST)
         self.task('plan', 'proj', '--sign')
         (self.kb / status_name).write_text(original.replace('accepted', 'replaced'))
         (self.kb / binary_name).write_bytes(b'\xff')
@@ -936,14 +940,7 @@ class TaskTool(unittest.TestCase):
         )
         name = 'backlog/decisions/decision-22.md'
         (self.kb / 'backlog/decisions').mkdir()
-        # Committed before the sign-off at a fixed past time, not the wall clock: the host clock
-        # steps back by seconds, which can put a "now" commit after the sign-off that follows it.
-        (self.kb / name).write_text(old)
-        self.git(self.kb, 'add', name)
-        past = dict(self.env, GIT_AUTHOR_DATE='2000-01-01T00:00:00+00:00',
-                    GIT_COMMITTER_DATE='2000-01-01T00:00:00+00:00')
-        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', f'add {name}'], env=past,
-                       check=True, capture_output=True)
+        self.commit_in(self.kb, name, old, when=PAST)
         self.task('plan', 'proj', '--sign')
         (self.kb / name).write_text(new)
         self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
@@ -1330,9 +1327,8 @@ class TaskTool(unittest.TestCase):
         self.assertIn('1/1', self.task('plan', 'proj'))
         self.task('status', 'proj')
         self.assertIn('realignment due', self.task('start', 'proj', '5', code=1))
-        # A merge before the new sign-off. Fixed past time: the host wall clock steps back by
-        # seconds, so "now" taken here can come out later than the sign-off taken a moment after.
-        (state / 'merge.json').write_text(json.dumps({'time': '2000-01-01T00:00:00+00:00'}))
+        # A merge before the new sign-off, at a fixed past time (see PAST).
+        (state / 'merge.json').write_text(json.dumps({'time': PAST}))
         self.assertIn('0/1', self.task('plan', 'proj', '--sign'))
         decisions = self.kb / 'backlog/decisions'
         decisions.mkdir()
@@ -2948,10 +2944,14 @@ store.write_text(json.dumps(prs))
         self.raw_task("check", "proj", "5")
         return wt
 
-    def commit_in(self, wt, name, text="x\n"):
+    def commit_in(self, wt, name, text="x\n", when=None):
+        """Commit a file. Pass `when` for a commit that must precede a later sign-off: the host
+        wall clock steps back by seconds, so a commit made "now" can end up dated after it."""
         (wt / name).write_text(text)
         self.git(wt, "add", name)
-        self.git(wt, "commit", "-qm", f"add {name}")
+        stamp = {} if when is None else {"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+        subprocess.run(["git", "-C", str(wt), "commit", "-qm", f"add {name}"],
+                       env=dict(self.env, **stamp), check=True, capture_output=True)
 
     def start_slow_detached_gate(self):
         wt, _ = self.started()
