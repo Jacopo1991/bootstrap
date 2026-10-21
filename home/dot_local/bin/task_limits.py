@@ -30,6 +30,14 @@ def cli_limit(record, output):
     return last if match else ""
 
 
+# Setup #11: Codex lane sandboxes cannot open the NETLINK_ROUTE socket bwrap needs.
+BWRAP_DENIAL = re.compile(r"BLOCKED:.*\b(?:bwrap|bubblewrap)\b.*NETLINK_ROUTE", re.I)
+
+
+def bwrap_denial(line):
+    return bool(BWRAP_DENIAL.match(line))
+
+
 def lane_limit(record, work):
     for name in ("final.md", "lane.log"):
         try:
