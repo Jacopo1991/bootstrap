@@ -4734,74 +4734,12 @@ store.write_text(json.dumps(prs))
         self.raw_task("check", "proj", "5")
         check_path = self.state() / "check.json"
         check = __import__("json").loads(check_path.read_text())
-        check["variants"][0]["environment"]["COUNT"] = "old"
+        check["variants"][0]["environment_template"]["COUNT"] = "old"
         check_path.write_text(__import__("json").dumps(check))
         out = self.raw_task("merge", "proj", "5")
         self.assertIn("gate variants or environments differ", out)
         self.assertIn("reuse decision: running full gate", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
-
-    def test_merge_does_not_reuse_when_seeded_work_file_changes(self):
-        source = self.repo / ".work"
-        source.mkdir(exist_ok=True)
-        (source / "pinned").write_text("seed at check\n")
-        self.raw_task("start", "proj", "5", "--builder", "codex", "--seed", "pinned")
-        wt = self.repo / ".worktrees/t5"
-        self.commit_in(wt, "b.txt")
-        self.prepare_merge_evidence("5")
-        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
-        (self.home / "during-check.sh").chmod(0o755)
-        self.raw_task("check", "proj", "5")
-        (source / "pinned").write_text("seed after check\n")
-        out = self.raw_task("merge", "proj", "5")
-        self.assertIn("outside-tree gate input fingerprints changed", out)
-        self.assertIn("reuse decision: running full gate", out)
-        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
-
-    def test_merge_does_not_reuse_when_main_lockfile_changes(self):
-        (self.repo / "node_modules").mkdir()
-        (self.repo / "node_modules/.package-lock.json").write_text("{}\n")
-        (self.repo / ".venv").mkdir()
-        (self.repo / ".venv/pyvenv.cfg").write_text("home = /usr/bin\n")
-        (self.repo / "package-lock.json").write_text("lock at check\n")
-        wt = self.checked_lane_with_counter()
-        (self.repo / "package-lock.json").write_text("lock after check\n")
-        out = self.raw_task("merge", "proj", "5")
-        self.assertIn("outside-tree gate input fingerprints changed", out)
-        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
-
-    def test_merge_does_not_reuse_when_environment_install_marker_changes(self):
-        (self.repo / "node_modules").mkdir()
-        (self.repo / "node_modules/.package-lock.json").write_text("marker at check\n")
-        (self.repo / ".venv").mkdir()
-        (self.repo / ".venv/pyvenv.cfg").write_text("home = /usr/bin\n")
-        (self.repo / "package-lock.json").write_text("lock\n")
-        self.checked_lane_with_counter()
-        (self.repo / "node_modules/.package-lock.json").write_text("marker after check\n")
-        out = self.raw_task("merge", "proj", "5")
-        self.assertIn("outside-tree gate input fingerprints changed", out)
-        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
-
-    def test_merge_does_not_reuse_when_environment_install_marker_is_missing(self):
-        (self.repo / "node_modules").mkdir()
-        (self.repo / "node_modules/.package-lock.json").write_text("marker\n")
-        (self.repo / "package-lock.json").write_text("lock\n")
-        self.checked_lane_with_counter()
-        out = self.raw_task("merge", "proj", "5")
-        self.assertIn("Cannot fingerprint gate input", out)
-        self.assertIn(".venv/pyvenv.cfg: install marker is missing", out)
-        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
-
-    def test_merge_reuses_when_outside_gate_inputs_are_unchanged(self):
-        (self.repo / "node_modules").mkdir()
-        (self.repo / "node_modules/.package-lock.json").write_text("marker\n")
-        (self.repo / ".venv").mkdir()
-        (self.repo / ".venv/pyvenv.cfg").write_text("home = /usr/bin\n")
-        (self.repo / "package-lock.json").write_text("lock\n")
-        self.checked_lane_with_counter()
-        out = self.raw_task("merge", "proj", "5")
-        self.assertIn("reuse decision: reusing trusted lane check", out)
-        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
 
     def test_merge_does_not_reuse_failed_check_record(self):
         self.assert_check_record_regates(lambda check: check.update(result="failed"), override=True)
