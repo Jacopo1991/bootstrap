@@ -941,6 +941,40 @@ def gate_variants(path):
     return variants
 
 
+def task_config_at_commit(repo: Path, commit: str):
+    """Read task configuration from the committed tree that would be merged."""
+    try:
+        raw = git(repo, "show", f"{commit}:.task.toml")
+        config = tomllib.loads(raw)
+    except Stop as error:
+        if "does not exist" in str(error) or "Path '" in str(error):
+            config = {}
+        else:
+            raise
+    return config
+
+
+def gate_variants_at_commit(repo: Path, commit: str, worktree: Path):
+    """Read unexpanded gate environment values from the committed result."""
+    config = task_config_at_commit(repo, commit)
+    entries = config.get("gate_variant", [])
+    if not isinstance(entries, list):
+        raise Stop(".task.toml gate_variant must be an array of tables.")
+    variants = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Stop(".task.toml gate_variant must contain tables.")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise Stop(".task.toml gate_variant requires a simple nonempty name.")
+        if name in variants:
+            raise Stop(".task.toml gate_variant names must be unique.")
+        raw_environment = entry.get("env", {})
+        expand_environment(raw_environment, worktree)  # Validate names and values.
+        variants[name] = raw_environment
+    return variants
+
+
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     values = task_config(path)
     if advisory:
@@ -2344,6 +2378,8 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     destination.mkdir(parents=True, exist_ok=True)
     results = []
     logs = []
+    templates = {entry["name"]: entry.get("env", {})
+                 for entry in task_config(path).get("gate_variant", [])}
     # Reserve the port range once, including for drills without an exclusive slot.
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
@@ -2357,7 +2393,8 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                     path, base, record, state, evidence_name, display_log, advisory=advisory,
                     gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
                     cancelled=cancelled, evidence_sink=evidence)
-                results.append(dict(evidence[0], name=name))
+                results.append(dict(evidence[0], name=name, environment=environment,
+                                    environment_template=templates.get(name, {})))
                 logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
                 print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
     log = check_log_path(path, state, evidence_name, advisory)
@@ -3163,16 +3200,32 @@ def merge_gate(task, path, head):
     return record
 
 
-def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record) -> bool:
-    """Reuse check evidence only when it passed for this head and revision against this base."""
+def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record):
+    """Return whether trusted evidence covers the committed merge result."""
     try:
         checked = json.loads((task_state(task) / "check.json").read_text())
     except (OSError, json.JSONDecodeError):
-        return False
-    return (checked.get("trusted") is True and checked.get("result") == "passed"
-            and checked.get("sha") == lane_head
-            and checked.get("record_revision") == record.get("revision")
-            and checked.get("base_sha") == base and is_ancestor(repo, base, lane_head))
+        return False, "trusted lane check record is missing or unreadable"
+    if checked.get("trusted") is not True or checked.get("result") != "passed":
+        return False, "lane check is not trusted and passing"
+    if checked.get("sha") != lane_head:
+        return False, "lane check is for a different head"
+    if checked.get("record_revision") != record.get("revision"):
+        return False, "lane check record revision differs"
+    if not is_ancestor(repo, base, lane_head):
+        return False, "current main is not an ancestor of the checked lane head"
+    try:
+        expected_variants = gate_variants_at_commit(repo, lane_head, task.worktree())
+    except (Stop, OSError, ValueError) as error:
+        return False, f"cannot read committed gate variants: {error}"
+    checked_variants = checked.get("variants", [])
+    if not isinstance(checked_variants, list):
+        return False, "lane check variant evidence is malformed"
+    covered_variants = {item.get("name"): item.get("environment_template", {})
+                        for item in checked_variants if isinstance(item, dict)}
+    if covered_variants != expected_variants:
+        return False, "lane check gate variants or environments differ from committed merge result"
+    return True, "trusted passing check matches committed result, record revision, and variants"
 
 
 def overlap_files(repo: Path, lane_head: str, base: str):
@@ -3313,11 +3366,13 @@ def merge(args):
             overlap = overlap_files(repo, lane_head, base)
             if overlap:
                 raise Stop(overlap_message(overlap))
-            if can_reuse_lane_check(task, repo, lane_head, base, record):
-                print("main unchanged since the lane's check; reusing it")
+            reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
+            if reusable:
+                print(f"reuse decision: reusing trusted lane check: {reuse_reason}")
                 completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
             else:
+                print(f"reuse decision: running full gate because {reuse_reason}")
                 tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
                 if not gate_passed:
                     if not args.override:
