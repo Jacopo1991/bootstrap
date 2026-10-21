@@ -1461,10 +1461,24 @@ def claude_temporary_root():
     return root
 
 
+def lane_temporary_root():
+    override = os.environ.get("TASK_LANE_TEMP_ROOT")
+    return Path(override) if override else Path("/tmp") / f"task-lane-{os.getuid()}"
+
+
 def cleanup_lane_temporary(temporary):
     if not temporary:
         return
     path = Path(temporary)
+    if path.parent == lane_temporary_root():  # The directory advisory_temporary_parent created.
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise Stop("Lane temporary directory must be owned by the user.")
+        shutil.rmtree(path, ignore_errors=True)
+        return
     # Cancellation reads a lane-controlled record; never remove arbitrary paths.
     root = claude_temporary_root()
     if not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
@@ -1510,6 +1524,18 @@ def private_claude_lane(path, root):
             and stat.S_IMODE(info.st_mode) == 0o700)
 
 
+def new_lane_temporary():
+    root = claude_temporary_root()
+    # Nest only in a verified outer lane grant, keeping bridge sockets short.
+    inherited = os.environ.get("TMPDIR")
+    parent = Path(inherited).resolve() if inherited else root
+    parent = next((candidate for candidate in (parent, *parent.parents)
+                   if private_claude_lane(candidate, root)), root)
+    temporary = parent / f"lane-{secrets.token_hex(4)}"
+    temporary.mkdir(mode=0o700)
+    return temporary
+
+
 def lane_environment(task, builder="codex"):
     env = agent_environment()
     env.update(configured_environment(task.path, task.repo))
@@ -1517,14 +1543,7 @@ def lane_environment(task, builder="codex"):
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
     if builder == "claude":
-        root = claude_temporary_root()
-        # Nest only in a verified outer lane grant, keeping bridge sockets short.
-        inherited = os.environ.get("TMPDIR")
-        parent = Path(inherited).resolve() if inherited else root
-        parent = next((candidate for candidate in (parent, *parent.parents)
-                       if private_claude_lane(candidate, root)), root)
-        temporary = parent / f"lane-{secrets.token_hex(4)}"
-        temporary.mkdir(mode=0o700)
+        temporary = new_lane_temporary()
     else:
         temporary = task.path / ".work/tmp"
         if not temporary.resolve().is_relative_to(task.path.resolve()):
@@ -1712,10 +1731,10 @@ def lane(args):
     temporary = None
     try:
         environment = lane_environment(task, builder)
+        # Advisory checks use the recorded directory, outside the checkout; Codex lanes get theirs from the same function.
+        run["temporary"] = environment["TMPDIR"] if builder == "claude" else advisory_temporary_parent(path)
+        atomic_json(lane_record, run)
         if builder == "claude":
-            temporary = environment["TMPDIR"]
-            run["temporary"] = temporary
-            atomic_json(lane_record, run)
             settings = work / "claude-settings.json"
             atomic_json(settings, {"sandbox": {"filesystem": {"allowWrite": [
                 environment["TMPDIR"], str(gate_directory().resolve()),
@@ -2426,6 +2445,30 @@ def check_log_path(path, state, evidence_name, advisory):
     return destination / Path(evidence_name).with_suffix(".log")
 
 
+def advisory_temporary_parent(path):
+    """The one TMPDIR parent for advisory checks: the lane record's `temporary`, else a per-lane directory
+    under /tmp that is created and recorded. An inherited TMPDIR and `.work` are never used."""
+    record = path / ".work/lane.json"
+    try:
+        run = json.loads(record.read_text())
+    except (OSError, ValueError):
+        run = None
+    recorded = run.get("temporary") if isinstance(run, dict) else None
+    if recorded and Path(recorded).is_dir() and not Path(recorded).resolve().is_relative_to(path.resolve()):
+        return recorded
+    root = lane_temporary_root()
+    root.mkdir(mode=0o700, exist_ok=True)
+    temporary = root / f"{main_repo(path).name}-{path.name}"
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    for owned in (root, temporary):
+        info = owned.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise Stop(f"Lane temporary directory must be an owned directory that others cannot write: {owned}")
+    if isinstance(run, dict):
+        atomic_json(record, dict(run, temporary=str(temporary)))
+    return str(temporary)
+
+
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
     variants = gate_variants(path)
@@ -2440,8 +2483,9 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         return run_check_matrix(path, base, record, state, evidence_name, display_log,
                                 advisory, pre_commit_all_files, cancelled, variants)
     if advisory:
-        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
-                               cancelled=cancelled)
+        with tempfile.TemporaryDirectory(prefix="check-", dir=advisory_temporary_parent(path)) as temporary:
+            return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
+                                   gate_environment={"TMPDIR": temporary}, cancelled=cancelled)
     # Do not inherit TMPDIR: callers may point it inside a checkout.
     temporary_root = gate_temporary_root()
     sweep_gate_temporary(temporary_root)
@@ -2468,9 +2512,10 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     # Reserve the port range once, including for drills without an exclusive slot.
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
-            # Advisory checks need a writable parent inside their lane.
+            # Advisory checks need a writable parent outside the checkout, like the lane's TMPDIR.
             with tempfile.TemporaryDirectory(
-                    prefix="variant-", dir=work if advisory else gate_temporary_root()) as temporary:
+                    prefix="variant-",
+                    dir=advisory_temporary_parent(path) if advisory else gate_temporary_root()) as temporary:
                 gate_environment = dict(environment, TMPDIR=temporary, TASK_GATE_SLOT=str(slot),
                                         TASK_GATE_PORT_BASE=str(20000 + 200 * slot))
                 evidence = []
