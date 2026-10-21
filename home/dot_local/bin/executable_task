@@ -2433,15 +2433,14 @@ def check_log_path(path, state, evidence_name, advisory):
 
 
 def advisory_temporary_parent(path):
-    """The lane's recorded temporary directory when usable outside the checkout; never the shared gate root."""
+    """The lane's recorded temporary directory when usable outside the checkout, else None; never an inherited TMPDIR."""
     try:
         recorded = json.loads((path / ".work/lane.json").read_text()).get("temporary")
     except (OSError, ValueError, AttributeError):
         recorded = None
     if recorded and Path(recorded).is_dir() and not Path(recorded).resolve().is_relative_to(path.resolve()):
         return recorded
-    # No usable record (a lane that predates it): the per-user root, never an inherited TMPDIR.
-    return claude_temporary_root()
+    return None  # No usable record (a lane that predates it): the check keeps its earlier behaviour.
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
@@ -2457,8 +2456,12 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
     if variants:
         return run_check_matrix(path, base, record, state, evidence_name, display_log,
                                 advisory, pre_commit_all_files, cancelled, variants)
+    parent = advisory_temporary_parent(path) if advisory else None
+    if advisory and parent is None:
+        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
+                               cancelled=cancelled)
     if advisory:
-        with tempfile.TemporaryDirectory(prefix="check-", dir=advisory_temporary_parent(path)) as temporary:
+        with tempfile.TemporaryDirectory(prefix="check-", dir=parent) as temporary:
             return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
                                    gate_environment={"TMPDIR": temporary}, cancelled=cancelled)
     # Do not inherit TMPDIR: callers may point it inside a checkout.
@@ -2490,7 +2493,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
             # Advisory checks need a writable parent outside the checkout, like the lane's TMPDIR.
             with tempfile.TemporaryDirectory(
                     prefix="variant-",
-                    dir=advisory_temporary_parent(path) if advisory else gate_temporary_root()) as temporary:
+                    dir=(advisory_temporary_parent(path) or work) if advisory else gate_temporary_root()) as temporary:
                 gate_environment = dict(environment, TMPDIR=temporary, TASK_GATE_SLOT=str(slot),
                                         TASK_GATE_PORT_BASE=str(20000 + 200 * slot))
                 evidence = []

@@ -3867,8 +3867,6 @@ store.write_text(json.dumps(prs))
             seen = Path((self.home / f"{name}-tmp").read_text().splitlines()[-1])
             self.assertEqual(seen.parent, outside, "the lane's recorded temporary directory is the parent")
             self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
-        fallback = self.home / "fallback-root"
-        fallback.mkdir()
         shared = self.home / f"task-gate-{os.getuid()}"
         shared.mkdir()
         for record in (None, {"temporary": str(self.home / "gone")}, {"temporary": str(wt / ".work/tmp")}):
@@ -3878,9 +3876,9 @@ store.write_text(json.dumps(prs))
                         (wt / ".work/lane.json").unlink(missing_ok=True)
                     else:
                         (wt / ".work/lane.json").write_text(json.dumps(record))
-                    with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=fallback), \
-                            mock.patch.dict(os.environ, TMPDIR=str(inherited)):
-                        self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), fallback)
+                    with mock.patch.dict(os.environ, TMPDIR=str(inherited)):
+                        self.assertIsNone(TASK_MODULE.advisory_temporary_parent(wt),
+                                          "no inherited TMPDIR is ever adopted as the parent")
 
     def test_check_steps_append_localhost_proxy_bypasses(self):
         wt, _ = self.started()
