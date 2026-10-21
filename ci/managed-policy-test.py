@@ -424,6 +424,129 @@ with tempfile.TemporaryDirectory() as temp:
     assert judge("npx --no-install local-tool")
     print("PASS: recursive scripts and changed recipes denied; allowed scripts and base recipes pass")
 
+# A venv interpreter is an executable, not a script: a regular ELF binary outside every
+# lane-writable root is judged as the command its resolved name says, like the bare form.
+with tempfile.TemporaryDirectory() as temp:
+    import shutil
+    import sys
+    base = Path(temp).resolve()
+    root = base / "worktree"
+    (root / ".work").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    real_elf = Path(os.path.realpath(sys.executable))
+    assert real_elf.read_bytes()[:4] == b"\x7fELF", real_elf
+
+    def venv_judge(command):
+        return policy.evaluate({"tool_name": "Bash", "cwd": str(root),
+                                "tool_input": {"command": command}}, (root,))
+
+    def make_elf(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(real_elf, path)
+        path.chmod(0o755)
+        return path
+
+    def make_script(path, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def make_venv(venv):
+        make_elf(venv / "bin/python3.12")
+        (venv / "bin/python").symlink_to("python3.12")
+        return venv
+
+    # The fake lane sits under a temp dir, so lift the temp roots (and the per-run TMPDIR
+    # and scratch anchors) while the venv lives beside the worktree; they are put back for
+    # the temp-root negative controls.
+    def outside_temp():
+        stack = [patch.object(policy, "LANE_TEMP_ROOTS", ()),
+                 patch.object(policy, "scratch_root", return_value=None),
+                 patch.dict(os.environ)]
+        os.environ.pop("TMPDIR", None)
+        return stack
+
+    outside = make_venv(base / "outside-venv")
+    (root / ".venv").symlink_to(outside)
+    make_script(outside / "bin/pytest", "#!/bin/sh\necho safe\n")
+    make_script(outside / "bin/shellcheck", "#!/bin/sh\ngit clone https://example.invalid/r s\n")
+    make_script(outside / "bin/entry", "#!/usr/bin/python3\nprint('safe')\n")
+    fixture_commands = (
+        ".venv/bin/python -m pytest -q",
+        ".venv/bin/python --version",
+        ".venv/bin/python -m catalogue.admission_report x",
+        f"{root}/.venv/bin/python -m x",
+        ".venv/bin/python -m catalogue.admission_report .work/t109/records --decision-packet"
+        " .work/t109/packet-probe/records > .work/t109/log.txt 2>&1; echo done",
+        "TMPDIR=/tmp .venv/bin/python -m pytest -q tests/test_a.py tests/test_b.py",
+        ".venv/bin/python .work/t112/probe_summary.py -v",
+        '.venv/bin/python -m unittest discover -s catalogue -p "test_*.py" 2>&1 | tail -30',
+        "touch marker; .venv/bin/python -m pytest -q",
+    )
+    # Verdicts must equal the bare python3 form, including its denials.
+    denied_forms = (
+        ".venv/bin/python -c 'print(1)'", ".venv/bin/python -m pytest -c conf",
+        "cat x | .venv/bin/python", ".venv/bin/python <<< 'print(1)'",
+        ".venv/bin/python -m pytest > /etc/outside.log",
+    )
+    for command in fixture_commands + denied_forms:
+        bare = command.replace(f"{root}/.venv/bin/python", "python3").replace(".venv/bin/python", "python3")
+        stack = outside_temp()
+        for item in stack:
+            item.start()
+        try:
+            venv_verdict, bare_verdict = venv_judge(command), venv_judge(bare)
+        finally:
+            for item in reversed(stack):
+                item.stop()
+        assert bool(venv_verdict) == bool(bare_verdict), (command, venv_verdict, bare_verdict)
+        assert (command in fixture_commands) == (venv_verdict is None), (command, venv_verdict)
+        if command in denied_forms:
+            assert str(venv_verdict) == str(bare_verdict), (command, venv_verdict, bare_verdict)
+    # Judged by the resolved name, not the link name.
+    (outside / "bin/harmless").symlink_to("python3.12")
+    make_elf(outside / "bin/bash")
+    with patch.object(policy, "LANE_TEMP_ROOTS", ()), patch.object(policy, "scratch_root", return_value=None), \
+            patch.dict(os.environ):
+        os.environ.pop("TMPDIR", None)
+        assert venv_judge(".venv/bin/harmless -m pytest") is None
+        assert venv_judge(".venv/bin/harmless -c 'print(1)'")
+        assert venv_judge(".venv/bin/bash -c true")
+        assert venv_judge("bash -c true")
+        # Text scripts keep being read and judged, exactly as before.
+        assert venv_judge(".venv/bin/pytest -q") is None
+        assert venv_judge(".venv/bin/shellcheck x")
+        assert venv_judge(".venv/bin/entry")
+        # Negative controls: the same interpreter, but where a lane could have put it.
+        make_elf(root / "tool")
+        make_elf(root / ".work/tool")
+        make_elf(root / "bin/tool")
+        for command in ("./tool --version", "bin/tool --version", ".work/tool --version",
+                        f"{root}/tool --version", f"{root}/.work/tool --version"):
+            assert venv_judge(command), command
+        shutil.move(root / "tool", base / "moved-tool")
+        assert venv_judge(f"{base}/moved-tool --version") is None
+        # A venv inside the worktree whose interpreter is inside the worktree stays denied.
+        make_venv(root / "inner-venv")
+        for command in ("inner-venv/bin/python -m x", f"{root}/inner-venv/bin/python --version",
+                        "inner-venv/bin/python3.12 --version"):
+            assert venv_judge(command), command
+        # Writable by others, or not a regular ELF file, is not an executable either.
+        loose = make_elf(base / "loose/python3.12")
+        loose.chmod(0o775)
+        assert venv_judge(f"{loose} --version")
+        make_script(base / "plain/python3.12", "#!/bin/sh\necho safe\n")
+        assert venv_judge(f"{base}/plain/python3.12 --version") is None  # a script, as before
+        make_script(base / "plain/python3.12", "#!/bin/sh\ngit clone x y\n")
+        assert venv_judge(f"{base}/plain/python3.12 --version")
+        (base / "dir-elf").mkdir()
+        assert venv_judge(f"{base}/dir-elf --version")
+    # Under the real temp roots the outside venv is lane-writable, so it is denied again.
+    assert venv_judge(".venv/bin/python --version")
+    assert venv_judge(f"{root}/.venv/bin/python -m x")
+    print("PASS: venv interpreters follow the bare python3 verdict; lane-writable binaries and scripts stay denied")
+
 # Local-only bases, trusted recipes and transitive gate inputs.
 with tempfile.TemporaryDirectory() as temp:
     root = Path(temp)

@@ -1720,11 +1720,57 @@ def judge_program(text: str, cwd: str, root: Path,
     return evaluate_command(body, cwd, root, approved_roots, depth)
 
 
+LANE_TEMP_ROOTS = (Path("/tmp"), Path("/var/tmp"))
+
+
+def lane_writable_roots(root: Path) -> list[Path]:
+    """Places a lane can put files: its worktree and .work, temp dirs, scratch and caches."""
+    roots = [root, *LANE_TEMP_ROOTS, Path.home() / ".cache", Path.home() / ".npm"]
+    if os.environ.get("TMPDIR"):
+        roots.append(Path(os.environ["TMPDIR"]))
+    scratch = scratch_root()
+    if scratch is not None:
+        roots.append(scratch)
+    resolved = []
+    for item in roots:
+        try:
+            resolved.append(item.resolve())
+        except (OSError, RuntimeError):
+            resolved.append(item)
+    return resolved
+
+
+def external_binary(token: str, cwd: str, root: Path) -> Path | None:
+    """The resolved path when a command path is a regular ELF binary outside every
+    lane-writable root that the lane cannot have replaced; otherwise None."""
+    if "/" not in token:
+        return None
+    try:
+        resolved = (Path(cwd) / token).resolve(strict=True)
+        if resolved.parent in {Path("/usr/bin"), Path("/usr/local/bin")}:
+            return None                  # Installed commands have their own trust rule.
+        if any(resolved.is_relative_to(base) for base in lane_writable_roots(root)):
+            return None
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+            return None
+        with resolved.open("rb") as handle:
+            if handle.read(4) != b"\x7fELF":
+                return None
+    except (OSError, ValueError, RuntimeError):
+        return None
+    return resolved
+
+
 def script_reason(tokens: list[str], cwd: str, root: Path,
                   approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
     head = Path(tokens[0]).name.lower()
     path = None
-    if "/" in tokens[0]:
+    external = external_binary(tokens[0], cwd, root)
+    if external is not None:
+        # Judged as the command its resolved name says, like the bare form.
+        head = external.name.lower()
+    elif "/" in tokens[0]:
         path = Path(cwd) / tokens[0]
         try:
             resolved = path.resolve()
@@ -2162,6 +2208,9 @@ def evaluate_command(command: str, cwd: str, root: Path,
         if isinstance(unwrapped, str):
             return unwrapped
         head = Path(unwrapped[0]).name.lower() if unwrapped else ""
+        external = external_binary(unwrapped[0], effective, root) if unwrapped else None
+        if external is not None:
+            head = external.name.lower()
         if head == "cd":
             if not plain_chain or len(unwrapped) != 2 or unwrapped[1].startswith("-") \
                     or SHELL_EXPANSION.search(unwrapped[1]) or unwrapped != tokens:
@@ -2180,7 +2229,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
             return STATE_CHAIN_MESSAGE
         indirect = head in SHELL_PROGRAMS | {"source", ".", "", "just", "make", "gmake", "npm", "pnpm",
                                            "yarn", "yarnpkg", "bun", "bunx", "npx", "pnpx"}
-        if unwrapped and "/" in unwrapped[0]:
+        if unwrapped and "/" in unwrapped[0] and external is None:
             try:
                 indirect |= (Path(effective) / unwrapped[0]).resolve().parent not in {
                     Path("/usr/bin"), Path("/usr/local/bin")}
@@ -2216,6 +2265,9 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if not tokens:
         return None
     executable = Path(tokens[0]).name.lower()
+    external = external_binary(tokens[0], cwd, root)
+    if external is not None:
+        executable = external.name.lower()
     if executable in {"printf", "echo"} and not print_allowlist(tokens):
         return "Shell print syntax cannot be judged safely."
     if re.match(r"(?:\d*[<>]|&[<>])", tokens[0]) or (
