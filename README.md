@@ -301,6 +301,49 @@ Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
 
 #### Managed guardrails
 
+Literal shell scripts and all directly invoked recipe bodies are judged by the
+command policy, fail-closed: syntax or execution inputs it cannot model are denied.
+`task check` is the single explicit trusted gate entry for lanes. Direct `just`,
+`make`, `npm run` and `pnpm run` calls do not inherit gate trust.
+Recipe comparisons use the merge base with `origin/HEAD`, falling back to local
+`main`, `master`, then the worktree's source branch recorded in Git's reflogs.
+Without a usable base, recipe execution is denied with an explanatory message.
+Unchanged recipes use the same strict judge as changed recipes, including nested
+shell files. Simple literal Just and package scripts are supported; Make syntax,
+runner configuration, non-shell programs and dynamic script paths in judged bodies
+are denied. Recipe cwd changes are denied because lines may run in separate shells.
+
+Run scripts and recipes in separate calls after commands that may change files.
+A script or recipe run itself counts as changing for later scripts in the same
+chain: `bash a.sh && bash b.sh` and `just check && just lint` are refused because
+the first run could rewrite the second definition. Redirects to `/dev/null` do
+not count as file changes. Shell assignments affecting resolution or startup
+(including `CDPATH`, `PATH`, `BASH_ENV` and `ENV`) are refused. Builtin assignment
+forms (`printf -v`, `read`, `mapfile`, `readarray`, `getopts`, declarations), shell
+resolution changes (`hash`, `enable`, aliases, `shopt`, `set -o`) and wrappers
+around them are denied. Plain prints and read-only commands remain allowed.
+Quoted print literals may contain brackets, braces, stars, question marks and
+tildes; these characters do not make a print an assignment or shell expansion.
+Only literal `cd <path>` is modelled in typed commands and ordinary shell files;
+cwd options, variable operands and directory-stack operations are denied.
+
+Package scripts and install lifecycle scripts use the same checks for npm, pnpm,
+Yarn and Bun. Run targets must be explicitly defined in `package.json`; binary
+and file fallbacks are refused. Yarn (including `yarnpkg`) and Bun support explicit
+`run` and `install` forms. Fetch-and-run forms (`exec`, `dlx`, `x`, `create`,
+`bunx`, and `pnpx`) are refused. `npx` requires explicit `--no-install` or `--no`,
+an existing executable in local `node_modules/.bin`, and a script the policy can
+judge. Node-shebang binaries are denied.
+
+This inspection is not a process sandbox: inherited environment, mutable installed
+commands, dependency lifecycle code, executable tool configuration and concurrent
+file replacement remain execution boundaries for the OS sandbox. The trusted
+`task check` gate runs arbitrary project verification through its existing controls.
+The lane check is advisory: its worktree recipes and scripts are mutable. The PM's
+merge gate provides trusted verification. The task executable, rather than the
+command hook, enforces PM/lane authority for other task routes; `task status`
+remains available for inspection.
+
 The guardrails are root-owned, so an agent in any permission mode (including Claude
 `--dangerously-skip-permissions` and Codex `--dangerously-bypass-approvals-and-sandbox`)
 cannot edit or switch them off. Nothing in them limits bypass or auto mode, the approval
