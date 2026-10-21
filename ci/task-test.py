@@ -3860,14 +3860,23 @@ store.write_text(json.dumps(prs))
         record["revision"] = TASK_MODULE.record_revision(record)
         task_record_path.write_text(json.dumps(record))
         self.sandbox_state()
-        for lane_tmp, parent in ((wt / ".work/tmp", f"/tmp/task-gate-{os.getuid()}"), (outside, str(outside))):
-            with self.subTest(lane_tmp=str(lane_tmp)):
-                out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1", TMPDIR=str(lane_tmp)))
-                self.assertIn("PASS", out)
-                for name in ("gate", "verify"):
-                    seen = Path((self.home / f"{name}-tmp").read_text().splitlines()[-1])
-                    self.assertEqual(str(seen.parent), parent)
-                    self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
+        (wt / ".work/lane.json").write_text(json.dumps({"state": "running", "temporary": str(outside)}))
+        out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1", TMPDIR=str(wt / ".work/tmp")))
+        self.assertIn("PASS", out)
+        for name in ("gate", "verify"):
+            seen = Path((self.home / f"{name}-tmp").read_text().splitlines()[-1])
+            self.assertEqual(seen.parent, outside, "the lane's recorded temporary directory is the parent")
+            self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
+        fallback = self.home / "fallback-root"
+        fallback.mkdir()
+        for record in (None, {"temporary": str(self.home / "gone")}, {"temporary": str(wt / ".work/tmp")}):
+            with self.subTest(record=record):
+                if record is None:
+                    (wt / ".work/lane.json").unlink()
+                else:
+                    (wt / ".work/lane.json").write_text(json.dumps(record))
+                with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=fallback):
+                    self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), fallback)
 
     def test_check_steps_append_localhost_proxy_bypasses(self):
         wt, _ = self.started()
@@ -4035,6 +4044,10 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
             self.assertEqual(call["task_worktree"], str(wt))
             self.assertTrue(Path(call["tmpdir"]).is_dir())
+            recorded = Path(json.loads((wt / ".work/lane.json").read_text())["temporary"])
+            self.assertEqual(recorded.parent, Path("/tmp") / f"claude-{os.getuid()}")
+            self.assertTrue(recorded.is_dir())
+            self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
             self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
                                             "--output-last-message", str(wt / ".work/final.md"), "-"])
@@ -4051,6 +4064,7 @@ store.write_text(json.dumps(prs))
             release.touch()
             record = self.wait_for_lane(wt)
         self.assertEqual(record["exit_code"], 0)
+        self.assertFalse(recorded.exists(), "the Codex lane's recorded temporary directory is removed")
         self.assertEqual((wt / ".work/final.md").read_text(), "codex-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt)
         self.assertIn("codex-log", (wt / ".work/lane.log").read_text())
         self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))

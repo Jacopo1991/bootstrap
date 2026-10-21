@@ -1712,10 +1712,14 @@ def lane(args):
     temporary = None
     try:
         environment = lane_environment(task, builder)
+        # Advisory checks use the recorded directory, outside the checkout; Codex lanes get a private one.
+        temporary = environment["TMPDIR"]
+        if builder != "claude":
+            temporary = str(claude_temporary_root() / f"lane-{secrets.token_hex(4)}")
+            os.mkdir(temporary, 0o700)
+        run["temporary"] = temporary
+        atomic_json(lane_record, run)
         if builder == "claude":
-            temporary = environment["TMPDIR"]
-            run["temporary"] = temporary
-            atomic_json(lane_record, run)
             settings = work / "claude-settings.json"
             atomic_json(settings, {"sandbox": {"filesystem": {"allowWrite": [
                 environment["TMPDIR"], str(gate_directory().resolve()),
@@ -2427,11 +2431,14 @@ def check_log_path(path, state, evidence_name, advisory):
 
 
 def advisory_temporary_parent(path):
-    """The lane's own TMPDIR when it is outside the checkout, else the trusted gate's parent."""
-    inherited = os.environ.get("TMPDIR")
-    if inherited and Path(inherited).is_dir() and not Path(inherited).resolve().is_relative_to(path.resolve()):
-        return inherited
-    return gate_temporary_root()
+    """The lane's recorded temporary directory when usable outside the checkout; never the shared gate root."""
+    try:
+        recorded = json.loads((path / ".work/lane.json").read_text()).get("temporary")
+    except (OSError, ValueError, AttributeError):
+        recorded = None
+    if recorded and Path(recorded).is_dir() and not Path(recorded).resolve().is_relative_to(path.resolve()):
+        return recorded
+    return claude_temporary_root()
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
