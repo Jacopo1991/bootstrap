@@ -66,7 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import bwrap_denial, cli_limit, lane_limit
-from task_routing import TIERS, TOP_ONLY, route, guard, lane_limits, active, override_problem, RoutingParseError
+from task_routing import TIERS, TOP_ONLY, route, guards, lane_limits, active, override_problem, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -1657,9 +1657,10 @@ def lane(args):
     record = load_record(task)
     refresh_context(task)
     builder = args.builder or record["builder"]
-    tier = args.tier or record.get("tier", "routine")
+    recorded = record.get("tier", "routine")
+    tier = args.tier or recorded
     explicit = args.model
-    guard(tier, explicit, args.override)
+    guards(tier, recorded, explicit, args.override)
     decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
     if decision:
         if decision["hold"]:
@@ -1670,7 +1671,7 @@ def lane(args):
             if explicit and explicit != task_usage.CHEAPER[builder]:
                 print(f"pace: {builder} ahead of pace; routine lane uses {task_usage.CHEAPER[builder]}, not {explicit} (--no-pace keeps it)")
             explicit = task_usage.CHEAPER[builder]
-    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker, args.override)
+    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker, args.override, recorded)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
@@ -1711,9 +1712,9 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
-            if guard(tier, model, args.override):
-                task_usage.record_override(HOME, task.repo.name, task.id, model, tier, args.override)
-                print(f"override recorded: {model} on a {tier} lane ({args.override})")
+            if guards(tier, recorded, model, args.override):
+                task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
+                print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]

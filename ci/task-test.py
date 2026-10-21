@@ -1028,6 +1028,8 @@ class TaskTool(unittest.TestCase):
                             'claude': {'routine': 'sonnet', 'hard': 'fable', 'design': 'opus'}}[builder][tier]
                 (wt / '.work/model-call.json').unlink(missing_ok=True)
                 (wt / '.work/final.md').unlink(missing_ok=True)
+                # Astra and fable follow the recorded tier, so the task is recorded at each tier first.
+                self.task('start', 'proj', '5', '--builder', builder, '--tier', tier)
                 out = self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier)
                 record = self.wait_for_lane(wt)
                 self.assertEqual(record['model'], expected)
@@ -1064,6 +1066,8 @@ class TaskTool(unittest.TestCase):
 
     def test_fable_only_for_the_hard_tier(self):
         self.stub_models()
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: hard\n')
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('task\n')
         for tier in ('routine', 'design'):
@@ -1082,6 +1086,29 @@ class TaskTool(unittest.TestCase):
             out = self.lane_refused('--model', 'gpt-6-astra', *options, env=env)
             self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
             self.assertNotIn('route:', out)
+
+    def test_a_tier_flag_does_not_raise_eligibility_over_the_recorded_tier(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        cases = (('codex', 'design', 'gpt-6-astra'), ('claude', 'hard', 'fable'))
+        for builder, tier, model in cases:
+            out = self.lane_refused('--builder', builder, '--tier', tier, '--model', model)
+            self.assertIn(f'{model} is for Tier: {tier} tasks only (this one is routine)', out)
+            self.assertIn('--override', out)
+        # Tier routing that would pick astra is judged the same way.
+        self.assertIn('gpt-6-astra is for Tier: design tasks only (this one is routine)', self.lane_refused('--tier', 'design'))
+        self.assertEqual(self.overrides(), [])
+        request = 'Jacopo 2026-10-21: design look'
+        for builder, tier, model in cases:
+            (wt / '.work/final.md').unlink(missing_ok=True)
+            out = self.raw_task('lane', 'proj', '5', '--builder', builder, '--tier', tier, '--model', model, '--override', request)
+            self.assertEqual(self.wait_for_lane(wt)['model'], model)
+            self.assertIn(f'override recorded: {model} on a ', out)
+        # The ledger names the tier the task was recorded at; the first override moved it to design.
+        self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
+                         [('gpt-6-astra', 'routine', request), ('fable', 'design', request)])
 
     def overrides(self):
         path = self.home / '.local/state/task/usage/overrides.jsonl'
@@ -4539,9 +4566,9 @@ store.write_text(json.dumps(prs))
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"timestamp": now.isoformat(), "payload": {"rate_limits": limits}}) + "\n")
 
-    def pace_lane(self, *options, code=0, builder="claude"):
+    def pace_lane(self, *options, code=0, builder="claude", recorded=()):
         self.stub_models()
-        self.raw_task("start", "proj", "5", "--builder", builder)
+        self.raw_task("start", "proj", "5", "--builder", builder, *recorded)
         wt = self.repo / ".worktrees/t5"
         (wt / ".work/prompt.md").write_text("Approved task.\n")
         out = self.raw_task("lane", "proj", "5", *options, code=code)
@@ -4646,7 +4673,8 @@ store.write_text(json.dumps(prs))
 
     def test_pace_lane_under_used_near_reset_switches_the_boost_on_until_the_reset(self):
         self.readings(claude=(40, 30))
-        wt, out = self.pace_lane("--tier", "hard")
+        # Fable follows the recorded tier, so the task is started as hard.
+        wt, out = self.pace_lane("--tier", "hard", recorded=("--tier", "hard"))
         self.assertRegex(out, r"pace: claude under-used near its reset; boost on until ")
         self.assertEqual(self.wait_for_lane(wt)["model"], "fable")
         until = json.loads((self.home / ".local/state/task/boost.json").read_text())["claude"]
@@ -4848,6 +4876,8 @@ store.write_text(json.dumps(prs))
         self.stub_models()
         wt, _ = self.started()
         (wt / ".work/prompt.md").write_text("task\n")
+        # Fable follows the recorded tier, so the task is recorded as hard first.
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--tier", "hard")
         for model, cli in TASK_MODULE.MODELS["claude"].items():
             tier = ("--tier", "hard") if cli == "fable" else ()
             out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model, *tier)

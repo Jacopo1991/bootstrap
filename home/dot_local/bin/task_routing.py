@@ -86,14 +86,20 @@ def guard(tier, model, override=""):
         raise RoutingParseError(
             f"{model} is for Tier: {TOP_ONLY[model]} tasks only (this one is {tier}); use gpt-6-luna "
             f"by default or gpt-6.1-sol for hard (Claude: sonnet, opus). Only --override \"{OVERRIDE_FORMAT}\" "
-            "permits it; --model and --no-pace do not.")
+            "permits it; --model, --tier and --no-pace do not.")
     return True
 
 
-def route(home, vendor, tier, explicit=None, boosted=True, override=""):
+def route(home, vendor, tier, explicit=None, boosted=True, override="", recorded=None):
+    """Pick the model for `tier`; the guard needs both it and the task's recorded tier to allow the model."""
     model = pick(home, vendor, tier, explicit, boosted)
-    guard(tier, model, override)
+    guards(tier, recorded, model, override)
     return model
+
+
+def guards(tier, recorded, model, override=""):
+    """guard() for the lane's tier and the task's recorded tier: a --tier flag cannot raise eligibility."""
+    return any([guard(each, model, override) for each in dict.fromkeys((recorded or tier, tier))])
 
 
 def pick(home, vendor, tier, explicit, boosted):
