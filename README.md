@@ -529,7 +529,7 @@ so `task runner-start` too) apply the verdict:
 | Verdict | Effect |
 | --- | --- |
 | `on`, `under`, unknown | unchanged (unknown prints a warning) |
-| `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
+| `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna) even when `--model` names another one (only `--no-pace`, logged, keeps it); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
 | `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
 | `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
 

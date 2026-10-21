@@ -4350,6 +4350,35 @@ store.write_text(json.dumps(prs))
         self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
         self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
 
+    def test_pace_lane_ahead_overrides_an_explicit_model_unless_no_pace(self):
+        self.readings(claude=(70, 84))
+        wt, out = self.pace_lane("--model", "opus")
+        self.assertIn("route: routine -> claude haiku", out)
+        self.assertIn("routine lane uses haiku, not opus", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "haiku")
+        self.readings(claude=(70, 84))
+        (wt / ".work/lane.json").unlink()
+        out = self.raw_task("lane", "proj", "5", "--model", "opus", "--no-pace")
+        self.assertIn("route: routine -> claude opus", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "opus")
+        self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
+
+    def test_pace_lane_ahead_overrides_an_explicit_codex_model_unless_no_pace(self):
+        policy = self.home / "policy.toml"
+        policy.write_text("[spare_resets]\ncodex = 0\n")  # by default Codex holds a spare reset and is never ahead
+        (self.home / ".config/task").mkdir(parents=True)
+        (self.home / ".config/task/usage-policy-path").write_text(str(policy))
+        self.readings(codex=(80, 84))
+        wt, out = self.pace_lane("--model", "gpt-6.1-sol", builder="codex")
+        self.assertIn("route: routine -> codex gpt-6-luna", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
+        self.readings(codex=(80, 84))
+        (wt / ".work/lane.json").unlink()
+        out = self.raw_task("lane", "proj", "5", "--model", "gpt-6.1-sol", "--no-pace")
+        self.assertIn("route: routine -> codex gpt-6.1-sol", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6.1-sol")
+        self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
+
     def test_pace_lane_exhausted_moves_routine_to_the_other_vendor_and_holds_hard(self):
         self.readings(claude=(80, 84), codex=(20, 84))
         wt, out = self.pace_lane()

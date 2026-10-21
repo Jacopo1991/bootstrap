@@ -1637,7 +1637,10 @@ def lane(args):
             return 4
         explicit = None if decision["vendor"] != builder else explicit
         builder = decision["vendor"]
-        explicit = explicit or (task_usage.CHEAPER[builder] if decision["cheaper"] else None)
+        if decision["cheaper"]:
+            if explicit and explicit != task_usage.CHEAPER[builder]:
+                print(f"pace: {builder} ahead of pace; routine lane uses {task_usage.CHEAPER[builder]}, not {explicit} (--no-pace keeps it)")
+            explicit = task_usage.CHEAPER[builder]
     model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
