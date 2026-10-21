@@ -2459,7 +2459,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                     path, base, record, state, evidence_name, display_log, advisory=advisory,
                     gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
                     cancelled=cancelled, evidence_sink=evidence)
-            results.append(dict(evidence[0], name=name, environment=environment))
+                results.append(dict(evidence[0], name=name, environment=environment))
                 logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
                 print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
     log = check_log_path(path, state, evidence_name, advisory)
