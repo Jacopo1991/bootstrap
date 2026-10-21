@@ -381,9 +381,10 @@ with tempfile.TemporaryDirectory() as temp:
     for command in (f"CDPATH={root}/evil; cd sub && bash run.sh",
                     "source ./assignment.sh && cd sub && bash run.sh"):
         assert judge(command), command
-    assert judge(">out.txt") is None
+    # Round 9 PM ruling includes redirect-only segments.
+    assert judge(">out.txt")
+    assert judge(">/dev/null && bash allowed.sh")
     for command in ("echo hi >/dev/null && bash allowed.sh",
-                    ">/dev/null && bash allowed.sh",
                     "echo hi 2>/dev/null && bash allowed.sh"):
         assert judge(command) is None, (command, judge(command))
     for command in ("bash allowed.sh && bash allowed.sh",
@@ -541,6 +542,26 @@ with tempfile.TemporaryDirectory() as temp:
         fixture_git("commit", "-qm", "normalized print negative")
         for runner in ("just check", "npm run check", "pnpm run check"):
             assert judge(runner), (runner, body)
+    # Round 9: inspect inert leading redirects; never execute the payloads.
+    for body in (
+            "&>/dev/null printf -v X y", "&>> f printf -v X y",
+            "2>/dev/null printf -v X y", ">f echo hi", "<f cat", "<<<x cat",
+            "2>&1 echo hi", "2>>f echo hi", ">&1 echo hi", "2<&1 cat",
+            "<>f cat", ">|f echo hi", "<<x cat",
+            "X=1 2>/dev/null echo hi", "if true; then 2>/dev/null echo hi; fi",
+            "if true; then &>/dev/null printf -v X y; fi"):
+        reason = judge(body)
+        assert reason, body
+        if body != "<<x cat":
+            assert "Leading shell redirections" in reason, (body, reason)
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+    for body in ("echo hi 2>/dev/null", "echo hi 2>&1", "echo hi >f",
+                 "printf '%s' hi &>/dev/null", "printf '%s' hi &>>f"):
+        assert judge(body) is None, (body, judge(body))
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh") is None, body
     for body in ("run bash sub/run.sh", "python3 check.py", "node build.js"):
         assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
     for body in ("echo safe", "printf '%s' safe", "printf '%s' -value", "printf -- -v",

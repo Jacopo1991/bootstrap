@@ -2061,7 +2061,13 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                 prefix.whitespace_split = True
                                 prefix.commenters = ""
                                 index = len(list(prefix))
-                                if tokens[index:index + len(expected)] == expected:
+                                # Normalize only stderr redirects following a
+                                # command word; never discard leading redirects.
+                                preceding = unwrap_command(tokens[:index])
+                                if (isinstance(preceding, list) and preceding
+                                        and preceding[0] not in {"if", "then", "else", "elif", "do"}
+                                        and not re.match(r"(?:\d*[<>]|&[<>])", preceding[0])
+                                        and tokens[index:index + len(expected)] == expected):
                                     drop.update(range(index, index + len(expected)))
                     word_start = char.isspace()
                 tokens = [token for index, token in enumerate(tokens) if index not in drop]
@@ -2212,10 +2218,9 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     executable = Path(tokens[0]).name.lower()
     if executable in {"printf", "echo"} and not print_allowlist(tokens):
         return "Shell print syntax cannot be judged safely."
-    if re.match(r"\d*[<>]", tokens[0]) or (
+    if re.match(r"(?:\d*[<>]|&[<>])", tokens[0]) or (
             tokens[0].isdigit() and len(tokens) > 1 and re.match(r"[<>]", tokens[1])):
-        if len(tokens) != 2 or tokens[0] not in {">", ">>", ">|"}:
-            return "Leading shell redirections cannot be judged safely."
+        return "Leading shell redirections cannot be judged safely."
     if executable in SHELL_CONSTRUCTS - {"source", ".", "printf"} or tokens[0].startswith(("(", "{")) or any(
             tokens[i] in {"<", ">", ">>"} and tokens[i + 1].startswith("(")
             for i in range(len(tokens) - 1)):
