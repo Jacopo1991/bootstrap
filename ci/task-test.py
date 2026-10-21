@@ -3845,6 +3845,30 @@ store.write_text(json.dumps(prs))
                 self.assertNotIn(expansion, source,
                                  f"{path.relative_to(ROOT)} must not expand unset {expansion}")
 
+    def test_advisory_check_tmpdir_is_outside_the_checkout(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".work/tmp").mkdir(parents=True, exist_ok=True)
+        outside = self.home / "lane-tmp"
+        outside.mkdir()
+        guard = f'case "$(realpath "$TMPDIR")" in "{wt.resolve()}"*) exit 1;; esac; test -d "$TMPDIR"'
+        (self.home / "during-check.sh").write_text(f'{guard} || exit 7\necho "$TMPDIR" >> "$HOME/gate-tmp"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        task_record_path = self.state() / "task.json"
+        record = json.loads(task_record_path.read_text())
+        record["verify"] = [f'{guard} && echo "$TMPDIR" >> "$HOME/verify-tmp"']
+        record["revision"] = TASK_MODULE.record_revision(record)
+        task_record_path.write_text(json.dumps(record))
+        self.sandbox_state()
+        for lane_tmp, parent in ((wt / ".work/tmp", f"/tmp/task-gate-{os.getuid()}"), (outside, str(outside))):
+            with self.subTest(lane_tmp=str(lane_tmp)):
+                out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1", TMPDIR=str(lane_tmp)))
+                self.assertIn("PASS", out)
+                for name in ("gate", "verify"):
+                    seen = Path((self.home / f"{name}-tmp").read_text().splitlines()[-1])
+                    self.assertEqual(str(seen.parent), parent)
+                    self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
+
     def test_check_steps_append_localhost_proxy_bypasses(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")

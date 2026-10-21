@@ -2426,6 +2426,14 @@ def check_log_path(path, state, evidence_name, advisory):
     return destination / Path(evidence_name).with_suffix(".log")
 
 
+def advisory_temporary_parent(path):
+    """The lane's own TMPDIR when it is outside the checkout, else the trusted gate's parent."""
+    inherited = os.environ.get("TMPDIR")
+    if inherited and Path(inherited).is_dir() and not Path(inherited).resolve().is_relative_to(path.resolve()):
+        return inherited
+    return gate_temporary_root()
+
+
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
     variants = gate_variants(path)
@@ -2440,8 +2448,9 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         return run_check_matrix(path, base, record, state, evidence_name, display_log,
                                 advisory, pre_commit_all_files, cancelled, variants)
     if advisory:
-        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
-                               cancelled=cancelled)
+        with tempfile.TemporaryDirectory(prefix="check-", dir=advisory_temporary_parent(path)) as temporary:
+            return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
+                                   gate_environment={"TMPDIR": temporary}, cancelled=cancelled)
     # Do not inherit TMPDIR: callers may point it inside a checkout.
     temporary_root = gate_temporary_root()
     sweep_gate_temporary(temporary_root)
@@ -2468,9 +2477,10 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     # Reserve the port range once, including for drills without an exclusive slot.
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
-            # Advisory checks need a writable parent inside their lane.
+            # Advisory checks need a writable parent outside the checkout, like the lane's TMPDIR.
             with tempfile.TemporaryDirectory(
-                    prefix="variant-", dir=work if advisory else gate_temporary_root()) as temporary:
+                    prefix="variant-",
+                    dir=advisory_temporary_parent(path) if advisory else gate_temporary_root()) as temporary:
                 gate_environment = dict(environment, TMPDIR=temporary, TASK_GATE_SLOT=str(slot),
                                         TASK_GATE_PORT_BASE=str(20000 + 200 * slot))
                 evidence = []
