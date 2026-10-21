@@ -2939,6 +2939,10 @@ def parse_review_block(block, criteria):
         raise ReviewParseError("review block must contain a full 40-character Commit SHA")
     reviewer = None
     judgment_lines = lines[2:]
+    section = next((i for i, line in enumerate(judgment_lines)
+                    if re.fullmatch(r"(?:#{1,6}\s+)?\**(?:Blocking|Notes)\**:?", line)), None)
+    if section is not None:
+        judgment_lines = judgment_lines[:section]
     reviewer_match = (re.fullmatch(r"Reviewer:\s*(.*)", judgment_lines[0], re.I)
                       if judgment_lines else None)
     if reviewer_match:
