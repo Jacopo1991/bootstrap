@@ -310,7 +310,7 @@ class BatchTest(unittest.TestCase):
         for five, expected in ((0.5, 3), (0.65, 1), (0.8, 0)):  # claude reserve 25: warning from 60 %, exhausted from 75 %
             with self.subTest(five=five):
                 task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
-                    'five_hour': {'utilization': five, 'resetsAt': int(now.timestamp() + 7200)},
+                    'five_hour': {'utilization': five, 'resetsAt': int(now.timestamp() + 5 * 3600)},
                     'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
                 with mock.patch.dict(os.environ, self.env, clear=True):
                     total, limits = runner.capacity()
@@ -323,7 +323,7 @@ class BatchTest(unittest.TestCase):
             self.assertEqual(runner.capacity()[1]['claude'], 1)  # a missing 5-hour reading is the warning band
         tasks = [dict(id=str(i), builder='claude', after=None) for i in range(4)]
         task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
-            'five_hour': {'utilization': 0.65, 'resetsAt': int(now.timestamp() + 7200)},
+            'five_hour': {'utilization': 0.65, 'resetsAt': int(now.timestamp() + 5 * 3600)},
             'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
         lock, state = threading.Lock(), {'active': 0, 'maximum': 0}
         def execute(worker, task):
