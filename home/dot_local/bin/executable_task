@@ -892,7 +892,7 @@ def timeout_for(path: Path):
 
 
 def check_history(path, step):
-    root = HOME / ".local/state/task" / path.name
+    root = HOME / ".local/state/task" / main_repo(path).name
     rows = []
     for file in root.glob("*/checks.jsonl") if root.is_dir() else ():
         try: rows.extend(json.loads(line) for line in file.read_text().splitlines())
