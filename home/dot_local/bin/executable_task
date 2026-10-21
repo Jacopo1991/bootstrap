@@ -940,8 +940,8 @@ def gate_variants(path):
     return variants
 
 
-def gate_variants_at_commit(repo: Path, commit: str, worktree: Path):
-    """Read the gate matrix from the committed tree that would be merged."""
+def task_config_at_commit(repo: Path, commit: str):
+    """Read task configuration from the committed tree that would be merged."""
     try:
         raw = git(repo, "show", f"{commit}:.task.toml")
         config = tomllib.loads(raw)
@@ -950,6 +950,12 @@ def gate_variants_at_commit(repo: Path, commit: str, worktree: Path):
             config = {}
         else:
             raise
+    return config
+
+
+def gate_variants_at_commit(repo: Path, commit: str, worktree: Path):
+    """Read the gate matrix from the committed tree that would be merged."""
+    config = task_config_at_commit(repo, commit)
     entries = config.get("gate_variant", [])
     if not isinstance(entries, list):
         raise Stop(".task.toml gate_variant must be an array of tables.")
@@ -3291,7 +3297,7 @@ def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, reco
     if "outside_inputs_error" in checked or not isinstance(checked.get("outside_inputs"), dict):
         return False, checked.get("outside_inputs_error", "lane check has no outside-input fingerprints")
     try:
-        configured_seeds = task_config(task.worktree()).get("drill_seeds", [])
+        configured_seeds = task_config_at_commit(repo, lane_head).get("drill_seeds", [])
         if not isinstance(configured_seeds, list) or not all(isinstance(name, str) for name in configured_seeds):
             return False, ".task.toml drill_seeds cannot be fingerprinted"
         current_inputs = outside_gate_inputs(
