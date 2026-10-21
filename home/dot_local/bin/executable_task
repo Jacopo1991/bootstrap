@@ -2438,10 +2438,9 @@ def advisory_temporary_parent(path):
         recorded = json.loads((path / ".work/lane.json").read_text()).get("temporary")
     except (OSError, ValueError, AttributeError):
         recorded = None
-    # Without a usable record (a lane that predates it), the lane's own TMPDIR, else the per-user root.
-    for candidate in (recorded, os.environ.get("TMPDIR")):
-        if candidate and Path(candidate).is_dir() and not Path(candidate).resolve().is_relative_to(path.resolve()):
-            return candidate
+    if recorded and Path(recorded).is_dir() and not Path(recorded).resolve().is_relative_to(path.resolve()):
+        return recorded
+    # No usable record (a lane that predates it): the per-user root, never an inherited TMPDIR.
     return claude_temporary_root()
 
 
