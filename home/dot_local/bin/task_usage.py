@@ -260,15 +260,20 @@ def running(home, vendor):
 def _five(reading, pol, now, ran):
     """5-hour verdict: exhausted at 100 - reserve; warning 15 points lower, or on a missing or stale reading.
 
-    A vendor with no 5-hour window in its readings has none to pace: always ok. Otherwise unknown is never plenty.
+    The reserve shrinks with the time left in the 5-hour window: reserve x (hours left / 5). A missing or stale
+    reading keeps the full reserve. A vendor with no 5-hour window in its readings has none to pace: always ok.
+    Otherwise unknown is never plenty.
     """
     reserve, used, has = pol["reserve"][reading["vendor"]], reading.get("five_hour"), reading["has_five"]
     stale = has and ran and reading["reason"] == "" and now - reading["at"] > STALE
     missing = has and used is None
+    hours = (reading["five_resets"] - now) / timedelta(hours=1) if reading.get("five_resets") else 0
+    if used is not None and not stale and 0 < hours < 5:
+        reserve = reserve * hours / 5
     if used is not None and used >= 100 - reserve:
-        return {"five": FIVE_OUT, "stale": False, "missing": False}
+        return {"five": FIVE_OUT, "stale": False, "missing": False, "five_reserve": reserve}
     return {"five": FIVE_WARN if stale or missing or used is not None and used >= 100 - reserve - FIVE_BAND else "ok",
-            "stale": stale, "missing": missing}
+            "stale": stale, "missing": missing, "five_reserve": reserve}
 
 
 def assess(reading, pol, now, ran=False):
@@ -428,7 +433,7 @@ def gate(home, kind, vendor, tier, repo, key, now=None):
             if alternative["verdict"] == "unknown":
                 notes.append(f"pace warning: {other} usage unknown ({alternative['reason']}); unchanged")
         elif found["five"] == FIVE_OUT:
-            out["hold"] = (f"{vendor} 5-hour window used up ({found['five_hour']:.0f} % of {100 - pol['reserve'][vendor]} %); "
+            out["hold"] = (f"{vendor} 5-hour window used up ({found['five_hour']:.0f} % of {100 - found['five_reserve']:g} %); "
                            f"no new {kind}s there until the reset at {_when(found['five_resets'])}")
         else:
             out["hold"] = (f"{vendor} automated share used up ({found['weekly']:.0f} % of {found['limit']:.0f} %); "
@@ -470,12 +475,14 @@ def _when(value):
 
 def _applied(vendor, item, pol, top):
     reserve = f"reserve {pol['reserve'][vendor]} %"
-    if item["released"] and item["verdict"] != EXHAUSTED:
+    used_up = f"{reserve} used up"
+    if item["released"]:
         reserve = f"reserve released until {_when(item['resets_at'])}"
+        used_up = f"100 % limit used up, {reserve}"
     if item["spare"]:
         return f"{SPARE}; no reserve, lanes not held back for pace"
     return {
-        EXHAUSTED: f"{reserve} used up: no new lanes or reviews on {vendor}; routine lanes move to the other vendor if it has room",
+        EXHAUSTED: f"{used_up}: no new lanes or reviews on {vendor}; routine lanes move to the other vendor if it has room",
         "ahead": f"{reserve}; routine lanes use {CHEAPER[vendor]}, no new batch starts on its own, "
                  f"new lanes only for {top or 'the top-priority repo with work'}",
         "under-used-near-reset": f"{reserve}; spend before the reset: boost on until it ends (stronger models on queued work), "
@@ -490,7 +497,6 @@ def report(home, now=None):
     pol, seen, lines = assessments(home, now)
     for vendor in VENDORS:
         item = seen[vendor]
-        reserve = pol["reserve"][vendor]
         effect = {FIVE_OUT: f"no new lanes or reviews on {vendor} until the reset; routine lanes move to the other vendor if it has room",
                   FIVE_WARN: f"at most one lane or review of {vendor} at a time, machine-wide, {running(home, vendor)} running now"
                   }.get(item["five"], "normal")
@@ -503,7 +509,9 @@ def report(home, now=None):
         age = (now - item["at"]) / timedelta(minutes=1)
         reset = f", resets at {_when(item['five_resets'])}" if item["five_resets"] else ""
         state = " (reading stale)" if item["stale"] else " (no 5-hour reading)" if item["missing"] else ""
-        limits = (f"exhausted at {100 - reserve} %, warning at {100 - reserve - FIVE_BAND} %; {effect}" if item["has_five"]
+        reserve, full = item["five_reserve"], pol["reserve"][vendor]
+        scaled = f" (reserve {reserve:g} % of {full} %, scaled by the time left)" if reserve != full else ""
+        limits = (f"exhausted at {100 - reserve:g} %, warning at {100 - reserve - FIVE_BAND:g} %{scaled}; {effect}" if item["has_five"]
                   else "no 5-hour window in the readings of the last 7 days; only the weekly rules apply")
         lines += [f"{vendor}: weekly used {item['weekly']:.0f} %, 5-hour used {five}",
                   f"  5-hour: {item['five'] if item['has_five'] else 'none'}{state}{reset}; {limits}",

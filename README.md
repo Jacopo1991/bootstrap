@@ -537,8 +537,8 @@ Verdicts, with weekly used % against the share of the week elapsed: `exhausted-a
 (used ≥ 100 − reserve), `under-used-near-reset` (used below `under_use_percent` with at most
 `under_use_hours` left), `ahead` (more than `ahead_margin` points above the elapsed share), `under`
 (more than that below it) and `on`. In the final `under_use_hours` before a vendor's weekly reset the
-weekly reserve is released (limit 100 %; `task usage` says "reserve released until <reset>"); the 5-hour
-bands keep their reserve. `task lane`, `task review --run` and each batch start (`task-batch`,
+weekly reserve is released (limit 100 %; every `task usage` verdict, exhausted included, says "reserve
+released until <reset>"); the 5-hour bands keep their reserve. `task lane`, `task review --run` and each batch start (`task-batch`,
 so `task runner-start` too) apply the verdict:
 
 | Verdict | Effect |
@@ -549,7 +549,9 @@ so `task runner-start` too) apply the verdict:
 | `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
 
 The 5-hour window is a second pace input per vendor with the same reserves (it ignores spare resets,
-which only refill the weekly window). `5h-exhausted` (used ≥ 100 − reserve): no new lane or review on
+which only refill the weekly window). The reserve shrinks with the time left in the window: reserve ×
+hours left ÷ 5 (30 with 1.5 h left is 9: exhausted at 91 %, warning at 76 %); a missing or stale reading
+keeps the full reserve, and `task usage` shows the effective values. `5h-exhausted` (used ≥ 100 − reserve): no new lane or review on
 that vendor until the 5-hour reset, which `task usage` and the hold message show; running ones finish,
 and a routine lane moves to the other vendor when that has room on both windows. `5h-warning`
 (15 points lower): at most one lane or review of that vendor runs machine-wide (`task` records each
