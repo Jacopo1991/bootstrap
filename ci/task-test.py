@@ -5917,6 +5917,8 @@ exit 1
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "false"])
         self.assertEqual(check["steps"][-1]["exit"], 1)
+        for step in check["steps"]:
+            self.assertEqual((step["configured_timeout"], step["effective_timeout"]), (900, 900))
 
     def test_acceptance_2_no_verify_requires_recorded_reason(self):
         task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
@@ -5978,6 +5980,8 @@ exit 1
         self.git(wt, "commit", "-qm", "set task timeout")
         out = self.task("check", "proj", "5", code=1)
         self.assertIn("ran over 1s", out)
+        step = json.loads((self.state() / "check.json").read_text())["steps"][0]
+        self.assertEqual((step["configured_timeout"], step["effective_timeout"]), (1, 1))
         pid = int(sleeper.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)

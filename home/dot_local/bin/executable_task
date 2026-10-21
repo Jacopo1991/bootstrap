@@ -2448,6 +2448,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
             configured, timeout, durations = step_timeout(path, step)
+            timeout_details = {"configured_timeout": configured, "effective_timeout": timeout,
+                               "history_durations": durations, "history_duration_order": "oldest_to_newest"}
             started = time.monotonic()
             private_index_directory = None
             try:
@@ -2499,9 +2501,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                               f"recent trusted passes (oldest to newest)={durations}\n")
                     out.flush()
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
-                                    "timeout": True, "configured_timeout": configured,
-                                    "effective_timeout": timeout, "history_durations": durations,
-                                    "history_duration_order": "oldest_to_newest"})
+                                    "timeout": True, **timeout_details})
                     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
@@ -2530,7 +2530,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             if state:
                 set_child_group(state, None)
             out.write(f"exit {code}\n")
-            results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3)})
+            results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3),
+                            **timeout_details})
             if code:
                 passed = False
                 break
