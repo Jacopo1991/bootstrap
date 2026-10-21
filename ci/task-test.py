@@ -1940,6 +1940,16 @@ store.write_text(json.dumps(prs))
                             else:
                                 self.assertNotIn('ended by usage limit', out)
 
+    def test_status_shows_bwrap_denial_once_as_known_warning(self):
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'lane.json').write_text(json.dumps(dict(builder='codex', state='finished', exit_code=0)))
+        for final, shown in (('BLOCKED: `task check` — bwrap NETLINK_ROUTE denied', 1),
+                             ('BLOCKED: git commit', 0)):
+            (work / 'final.md').write_text('Done.\n' + final + '\n')
+            out = self.raw_task('status', 'proj')
+            self.assertEqual(out.count('Known warning (setup #11)'), shown)
+
     def test_reliability_status_does_not_write_and_repair_does(self):
         import json
         self.started()
@@ -4253,7 +4263,7 @@ store.write_text(json.dumps(prs))
         self.assertIn(str(log), status)
         self.assertIn(evidence["log"], status)
 
-    def test_batch_tail_uses_actual_check_log(self):
+    def test_batch_tail_uses_trusted_check_log_only(self):
         loader = importlib.machinery.SourceFileLoader(
             "batch_log_test", str(ROOT / "home/dot_local/bin/executable_task-batch"))
         spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -4267,13 +4277,13 @@ store.write_text(json.dumps(prs))
             self.assertFalse(TASK_MODULE.run_check(wt, "", state=self.state()))
             evidence = json.loads((self.state() / "check.json").read_text())
             self.assertTrue(evidence["trusted"])
-            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
+            self.assertEqual(batch.check_output(self.state()),
                              Path(evidence["log"]).read_text())
-            self.assertNotEqual(batch.check_output(self.state(), wt / ".work"), advisory)
+            self.assertNotEqual(batch.check_output(self.state()), advisory)
             (wt / "FAIL").unlink()
             self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
-            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
-                             (wt / ".work/check.log").read_text())
+            # A newer advisory run never replaces the trusted result in a fix prompt (PM 2026-10-21).
+            self.assertEqual(batch.check_output(self.state()), Path(evidence["log"]).read_text())
 
     def test_repair_published_preserves_trusted_check_log(self):
         wt, _ = self.started()

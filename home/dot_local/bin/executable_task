@@ -65,7 +65,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
-from task_limits import cli_limit, lane_limit
+from task_limits import bwrap_denial, cli_limit, lane_limit
 from task_routing import TIERS, route, lane_limits, active, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
@@ -4139,6 +4139,7 @@ def status(args):
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
     setup_events = read_setup_events(setup_path, setup_warnings)
+    bwrap_lanes = []
     for repo in repos:
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
@@ -4260,6 +4261,13 @@ def status(args):
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
                 if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
                     attention.append(f"{path.name}: lane {lane_state}{result}")
+                try:
+                    final = [line for line in (path / ".work/final.md").read_text(errors="replace").splitlines()
+                             if line.strip()]
+                except OSError:
+                    final = []
+                if final and bwrap_denial(final[-1]):
+                    bwrap_lanes.append(f"{repo.name}/{path.name}")
             if (state / "exception.json").is_file():
                 attention.append(f"{path.name}: exception")
             if check.get("result") == "failed":
@@ -4295,6 +4303,9 @@ def status(args):
         for item in attention:
             print(f"    {item}")
         print(f"    open improvements: {open_count}")
+    if bwrap_lanes:
+        print("Known warning (setup #11): lane sandbox denies bwrap NETLINK_ROUTE; the trusted check runs "
+              "it, not a blocker: " + ", ".join(bwrap_lanes))
     if args.repo is None:
         visible_repos = {repo.name for repo in repos}
         unlisted = [item for item in open_setup_requests(setup_path, events=setup_events)
