@@ -42,6 +42,25 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
 REVIEW_FIXTURES = ROOT / "ci/fixtures/reviews"
 SPARE_HELD = "spare reset held; reset at 100 %"
+# "Idle 10 days" with an hour of margin: the host wall clock steps back by seconds, so a
+# worktree aged exactly 10 days when the test reads the clock can read 9 days in `task status`.
+IDLE_TEN_DAYS = 10 * 86400 + 3600
+
+
+def restore_access(path):
+    """Give the owner full access back so the tree can be removed; a path already gone is fine."""
+    path = Path(path)
+    try:
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    except FileNotFoundError:
+        pass
+
+
+def make_read_only(case, path, mode):
+    """chmod a fixture path and register the restore first, so a failing or erroring test cannot
+    leave a locked directory behind in the lane's .work/tmp."""
+    case.addCleanup(restore_access, path)
+    Path(path).chmod(mode)
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
@@ -917,7 +936,14 @@ class TaskTool(unittest.TestCase):
         )
         name = 'backlog/decisions/decision-22.md'
         (self.kb / 'backlog/decisions').mkdir()
-        self.commit_in(self.kb, name, old)
+        # Committed before the sign-off at a fixed past time, not the wall clock: the host clock
+        # steps back by seconds, which can put a "now" commit after the sign-off that follows it.
+        (self.kb / name).write_text(old)
+        self.git(self.kb, 'add', name)
+        past = dict(self.env, GIT_AUTHOR_DATE='2000-01-01T00:00:00+00:00',
+                    GIT_COMMITTER_DATE='2000-01-01T00:00:00+00:00')
+        subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', f'add {name}'], env=past,
+                       check=True, capture_output=True)
         self.task('plan', 'proj', '--sign')
         (self.kb / name).write_text(new)
         self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
@@ -1304,8 +1330,9 @@ class TaskTool(unittest.TestCase):
         self.assertIn('1/1', self.task('plan', 'proj'))
         self.task('status', 'proj')
         self.assertIn('realignment due', self.task('start', 'proj', '5', code=1))
-        from datetime import datetime, timezone
-        (state / 'merge.json').write_text(json.dumps({'time': datetime.now(timezone.utc).isoformat()}))
+        # A merge before the new sign-off. Fixed past time: the host wall clock steps back by
+        # seconds, so "now" taken here can come out later than the sign-off taken a moment after.
+        (state / 'merge.json').write_text(json.dumps({'time': '2000-01-01T00:00:00+00:00'}))
         self.assertIn('0/1', self.task('plan', 'proj', '--sign'))
         decisions = self.kb / 'backlog/decisions'
         decisions.mkdir()
@@ -2860,8 +2887,7 @@ store.write_text(json.dumps(prs))
         """Simulate the sandbox's private-state mount, independently of vendor markers."""
         state = self.home / ".local/state/task"
         state.mkdir(parents=True, exist_ok=True)
-        state.chmod(0o555)
-        self.addCleanup(state.chmod, 0o755)
+        make_read_only(self, state, 0o555)
         return state
 
     def stub_models(self):
@@ -2956,11 +2982,9 @@ store.write_text(json.dumps(prs))
             (work / name / 'state').write_text('runtime')
         (work / 'outside').symlink_to(self.home)
         (work / 'unreadable').write_text('private')
-        (work / 'unreadable').chmod(0)
-        self.addCleanup(lambda: (work / 'unreadable').chmod(0o600) if work.exists() else None)
+        make_read_only(self, work / 'unreadable', 0)
         (work / 'locked').mkdir()
-        (work / 'locked').chmod(0)
-        self.addCleanup(lambda: (work / 'locked').chmod(0o700) if work.exists() else None)
+        make_read_only(self, work / 'locked', 0)
         os.mkfifo(work / 'pipe')
         deep = work / 'deep'
         for _ in range(400):
@@ -3088,8 +3112,7 @@ store.write_text(json.dumps(prs))
         gate = self.repo / '.worktrees/.task-gate-t5-99999999'
         (gate / 'locked').mkdir(parents=True)
         (gate / 'locked/file').write_text('held')
-        (gate / 'locked').chmod(0o500)
-        self.addCleanup(lambda: (gate / 'locked').chmod(0o700))
+        make_read_only(self, gate / 'locked', 0o500)
         failed = subprocess.CompletedProcess([], 1)
         warning = io.StringIO()
         with mock.patch.object(TASK_MODULE, 'run_git', return_value=failed), \
@@ -3114,8 +3137,7 @@ store.write_text(json.dumps(prs))
         locked = saved / '.work/large/locked'
         locked.mkdir()
         (locked / 'evidence.txt').write_text('keep inaccessible evidence')
-        locked.chmod(0)
-        self.addCleanup(lambda: locked.chmod(0o700))
+        make_read_only(self, locked, 0)
         pending = root / '.pending-old'
         pending.mkdir()
         (pending / 'partial').write_text('partial')
@@ -3492,7 +3514,7 @@ store.write_text(json.dumps(prs))
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
 
     def test_status_lists_idle_unmerged_worktrees_and_never_removes_them(self):
-        old = int(time.time()) - 10 * 86400
+        old = int(time.time()) - IDLE_TEN_DAYS
         stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
         for name, idle in (('stale', True), ('recent', False)):
             path = self.repo / '.worktrees' / name
@@ -3519,7 +3541,7 @@ store.write_text(json.dumps(prs))
             self.assertTrue((self.repo / '.worktrees' / name).is_dir())
 
     def test_status_lists_locked_idle_unmerged_worktrees_with_the_lock_reason(self):
-        old = int(time.time()) - 10 * 86400
+        old = int(time.time()) - IDLE_TEN_DAYS
         stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
         for name, reason in (('held', ['--reason', 'session 42 running']), ('bare', [])):
             path = self.repo / '.worktrees' / name
@@ -3541,7 +3563,7 @@ store.write_text(json.dumps(prs))
             self.assertTrue((self.repo / '.worktrees' / name).is_dir())
 
     def test_status_lists_idle_unmerged_codex_worktrees(self):
-        old = int(time.time()) - 10 * 86400
+        old = int(time.time()) - IDLE_TEN_DAYS
         stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
         codex = self.home / '.codex/worktrees/ab12/proj'
         recent = self.home / '.codex/worktrees/cd34/proj'
@@ -3562,7 +3584,7 @@ store.write_text(json.dumps(prs))
         self.assertTrue(codex.is_dir() and recent.is_dir())
 
     def test_status_lists_idle_unmerged_worktrees_outside_the_managed_folders(self):
-        old = int(time.time()) - 10 * 86400
+        old = int(time.time()) - IDLE_TEN_DAYS
         stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
         elsewhere = self.home / 'elsewhere/lane'
         recent = self.home / 'elsewhere/recent'
@@ -3724,19 +3746,62 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         state = self.state()
-        state.chmod(0o555)
-        try:
-            out = self.raw_task("check", "proj", "5")
-            self.assertIn("advisory lane check (not evidence for merge)", out)
-            self.assertIn("PASS", out)
-            evidence = __import__("json").loads((wt / ".work/check.json").read_text())
-            self.assertEqual(evidence["result"], "passed")
-            self.assertTrue(evidence["advisory"])
-            self.assertFalse(evidence["trusted"])
-            self.assertTrue((wt / ".work/check.log").is_file())
-            self.assertFalse((state / "check.json").exists())
-        finally:
-            state.chmod(0o755)
+        make_read_only(self, state, 0o555)
+        out = self.raw_task("check", "proj", "5")
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertIn("PASS", out)
+        evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(evidence["result"], "passed")
+        self.assertTrue(evidence["advisory"])
+        self.assertFalse(evidence["trusted"])
+        self.assertTrue((wt / ".work/check.log").is_file())
+        self.assertFalse((state / "check.json").exists())
+
+    def test_read_only_fixtures_leave_the_lane_tmp_removable(self):
+        lane_tmp = self.home / 'lane/.work/tmp'
+
+        def lock_tree(case, *, restore):
+            fixture = lane_tmp / case.id().rsplit('.', 1)[-1]
+            (fixture / 'inner').mkdir(parents=True)
+            (fixture / 'inner/file').write_text('held')
+            (fixture / 'private').write_text('private')
+            for path, mode in ((fixture / 'private', 0), (fixture / 'inner', 0), (fixture, 0o555)):
+                if restore:
+                    make_read_only(case, path, mode)
+                else:
+                    path.chmod(mode)
+
+        class Restored(unittest.TestCase):
+            def test_failing(self):
+                lock_tree(self, restore=True)
+                self.fail('leaves every path locked')
+
+            def test_erroring(self):
+                lock_tree(self, restore=True)
+                raise RuntimeError('leaves every path locked')
+
+        class Unrestored(unittest.TestCase):
+            def test_failing(self):
+                lock_tree(self, restore=False)
+                self.fail('leaves every path locked')
+
+        def run(case):
+            suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
+            return unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+
+        result = run(Restored)
+        self.assertEqual((len(result.failures), len(result.errors)), (1, 1))
+        shutil.rmtree(lane_tmp)  # no chmod first: the fixtures must have restored access
+        self.assertFalse(lane_tmp.exists())
+        if os.geteuid():  # control: without the restore the same tree blocks removal
+            lane_tmp.mkdir(parents=True)
+            run(Unrestored)
+            with self.assertRaises(PermissionError):
+                shutil.rmtree(lane_tmp)
+            locked = lane_tmp / 'test_failing'
+            for path in (locked, locked / 'inner', locked / 'private'):
+                restore_access(path)
+            shutil.rmtree(lane_tmp)
 
     def test_agent_advisory_check_returns_real_failure_code(self):
         wt, _ = self.started()
@@ -4968,7 +5033,7 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         exclude_path = self.repo / ".git/info/exclude"
-        exclude_path.chmod(0o444)
+        make_read_only(self, exclude_path, 0o444)
         self.sandbox_state()
         out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
         self.assertIn("advisory lane check (not evidence for merge)", out)

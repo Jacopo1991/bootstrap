@@ -3,6 +3,7 @@
 import ast
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -54,4 +55,11 @@ with tempfile.TemporaryDirectory(prefix="hook-state-guard-") as temp:
         assert result.returncode == 0, (suite, result.stdout, result.stderr)
         escaped = [p for p in base.rglob("denials.jsonl") if not p.is_relative_to(state)]
         assert not escaped, (suite, escaped)
+        # A lane's TMPDIR is its .work/tmp: whatever a suite leaves behind there must be
+        # removable as it is, with no permission repair, or it blocks removing the worktree.
+        for leftover in state.iterdir():
+            if leftover.is_dir() and not leftover.is_symlink():
+                shutil.rmtree(leftover)
+            else:
+                leftover.unlink()
         print(f"PASS: {suite} leaves no denial log outside temporary state", flush=True)
