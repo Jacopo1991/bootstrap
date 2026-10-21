@@ -456,6 +456,9 @@ class Batch:
     def capacity(self):
         slots = self.gate_slots()
         limits = lane_limits(Path.home(), slots)
+        if not (self.no_pace or os.environ.get("TASK_NO_PACE")):  # boost never lifts the 5-hour limits
+            for vendor, cap in task_usage.five_caps(Path.home()).items():
+                limits[vendor] = limits[vendor] if cap is None else min(limits[vendor], cap)
         return min(slots, max(limits.values())), limits
 
     def schedule(self, tasks):
@@ -494,7 +497,10 @@ class Batch:
                                  name(running_task["id"]) / "task.json")
                         return data(state).get("builder", running_task["builder"])
                     count = sum(current_builder(t) == task["builder"] for t in running.values())
-                    if len(running) >= total or count >= limits[task["builder"]]:
+                    limit = limits[task["builder"]]
+                    if not limit and task.get("tier") in (None, "routine") and any(limits.values()):
+                        limit = 1  # 5-hour exhausted: the lane gate moves a routine task to the vendor with room, or holds it
+                    if len(running) >= total or count >= limit:
                         continue
                     pending.remove(task)
                     if self.stopping.is_set():
@@ -502,6 +508,10 @@ class Batch:
                     worker = Batch(self.repo, self.source, self.stopping, task["id"])
                     running[pool.submit(worker.run_task, task)] = task
                 if not running:
+                    if any(not limits[task["builder"]] for task in pending):  # waiting for a 5-hour reset
+                        if self.stopping.wait(HOLD_SECONDS):
+                            raise Stop("batch is stopping")
+                        continue
                     if pending:
                         raise Stop("unresolved after dependencies")
                     break
