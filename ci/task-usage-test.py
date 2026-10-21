@@ -4,6 +4,7 @@
 Never reads the real ~/.codex, ~/.claude or ~/.local/state: every path comes from the temporary HOME.
 """
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import task_usage as usage  # noqa: E402
 
 FIXTURES = ROOT / "ci/fixtures/usage"
 NOW = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)  # a minute-level hour after the Codex fixture
+DEAD = 2 ** 22 + 7  # above the largest pid, so never alive
 
 
 def epoch(when):
@@ -43,8 +45,7 @@ class Usage(unittest.TestCase):
         path.write_text(text if text is not None else (FIXTURES / "codex-rollout-sample.jsonl").read_text())
 
     def verdict(self, vendor="claude", now=NOW):
-        pol = usage.policy(self.home)
-        return usage.assess(usage.readings(self.home, now)[vendor], pol, now)
+        return usage.assessments(self.home, now)[1][vendor]  # as the gate sees it, lanes that ran included
 
     def test_codex_reader_takes_the_newest_rate_limits_of_the_fixture(self):
         self.codex()
@@ -223,6 +224,121 @@ class Usage(unittest.TestCase):
         self.claude(30, 20)  # the next reading, in a later week: its own counters
         later = usage.weekly_lines(self.home, NOW)[0]
         self.assertEqual(later, "claude week ending 2026-10-21: used 30 %, exhausted no, lanes held back 0")
+
+    def five(self, vendor, five, age=timedelta(minutes=5), week=50):
+        """Fixture reading with the 5-hour window at `five` percent: claude through its state file, codex through a rollout."""
+        if vendor == "claude":
+            return self.claude(week, 84, five=five / 100, age=age)
+        line = json.loads((FIXTURES / "codex-rollout-sample.jsonl").read_text().splitlines()[0])
+        line["timestamp"] = (NOW - age).isoformat()
+        line["payload"]["rate_limits"] = {
+            "primary": {"used_percent": five, "window_minutes": 300, "resets_at": epoch(NOW + timedelta(hours=2))},
+            "secondary": {"used_percent": week, "window_minutes": 10080, "resets_at": epoch(NOW + timedelta(hours=84))}}
+        self.codex(json.dumps(line) + "\n")
+
+    def busy(self, vendor, at=NOW, pid=None):
+        usage.claim(self.home, vendor, "lane", os.getpid() if pid is None else pid, at)
+
+    def test_five_hour_bands_per_vendor(self):
+        # Reserve claude 25 -> exhausted at 75, warning at 60; codex 10 -> 90 and 75.
+        for vendor, cases in (("claude", ((59, "ok"), (60, "5h-warning"), (74, "5h-warning"), (75, "5h-exhausted"), (100, "5h-exhausted"))),
+                              ("codex", ((74, "ok"), (75, "5h-warning"), (89, "5h-warning"), (90, "5h-exhausted")))):
+            for used, expected in cases:
+                with self.subTest(vendor=vendor, used=used):
+                    self.five(vendor, used)
+                    found = self.verdict(vendor)
+                    self.assertEqual((found["five"], found["stale"]), (expected, False))
+        self.codex()  # the real Codex rollout reports no 5-hour window: ok, never a limit
+        self.assertEqual(self.verdict("codex")["five"], "ok")
+
+    def test_five_hour_exhausted_holds_until_the_reset_and_moves_routine_work_to_room(self):
+        self.five("claude", 80)
+        self.five("codex", 20)
+        moved = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
+        self.assertEqual((moved["vendor"], moved["hold"]), ("codex", ""))
+        self.assertTrue(any("5-hour window used up; routine lane moves to codex" in note for note in moved["notes"]))
+        for kind, tier in (("lane", "hard"), ("review", "routine")):
+            held = usage.gate(self.home, kind, "claude", tier, "proj", "t1", NOW)
+            self.assertEqual(held["vendor"], "claude")
+            self.assertIn("5-hour window used up (80 % of 75 %)", held["hold"])
+            self.assertIn(f"until the reset at {NOW + timedelta(hours=2):%Y-%m-%d %H:%M} UTC", held["hold"])
+        self.busy("codex")
+        self.five("codex", 80)  # codex in its warning band with a lane running: no room there either
+        held = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
+        self.assertEqual((held["vendor"], "5-hour window used up" in held["hold"]), ("claude", True))
+        self.five("codex", 95)  # codex exhausted as well
+        self.assertIn("5-hour window used up", usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)["hold"])
+        self.five("claude", 20, week=80)  # weekly exhausted alone still reads as before
+        self.assertIn("automated share used up", usage.gate(self.home, "lane", "claude", "hard", "proj", "t1", NOW)["hold"])
+
+    def test_five_hour_warning_allows_one_lane_or_review_machine_wide(self):
+        self.five("claude", 65)
+        self.five("codex", 30)
+        for kind in ("lane", "review"):
+            self.assertEqual(usage.gate(self.home, kind, "claude", "routine", "proj", "t1", NOW)["hold"], "")
+        self.busy("claude", pid=DEAD)  # a dead pid does not count
+        self.assertEqual(usage.running(self.home, "claude"), 0)
+        self.busy("claude")
+        self.assertEqual(usage.running(self.home, "claude"), 1)
+        for kind in ("lane", "review"):
+            held = usage.gate(self.home, kind, "claude", "routine", "proj", "t2", NOW)
+            self.assertIn("warning band", held["hold"])
+            self.assertIn("one at a time", held["hold"])
+        self.assertEqual(usage.gate(self.home, "lane", "codex", "routine", "proj", "t3", NOW)["hold"], "")  # other vendor
+        self.five("claude", 30)  # below the band, a running lane does not hold the next one
+        self.assertEqual(usage.gate(self.home, "lane", "claude", "routine", "proj", "t2", NOW)["hold"], "")
+
+    def test_stale_reading_while_lanes_ran_is_the_warning_band_with_a_warning(self):
+        old, fresh = timedelta(minutes=46), timedelta(minutes=44)
+        self.five("claude", 10, age=old)
+        self.assertEqual(self.verdict()["five"], "ok")  # old, but no lane of this vendor ran
+        self.busy("claude", at=NOW - timedelta(hours=1), pid=DEAD)  # ended before the reading: still not stale
+        self.assertEqual(self.verdict()["five"], "ok")
+        self.busy("claude", at=NOW - timedelta(minutes=30), pid=DEAD)  # ran since the reading, ended
+        found = self.verdict()
+        self.assertEqual((found["five"], found["stale"]), ("5h-warning", True))
+        self.assertTrue(any("claude usage reading is 46 min old while its lanes ran" in note
+                            for note in usage.assessments(self.home, NOW)[2]))
+        self.assertIn("(reading stale)", "\n".join(usage.report(self.home, NOW)))
+        self.busy("claude")  # one running lane: a second one waits on the stale reading
+        self.assertIn("(reading stale)", usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)["hold"])
+        self.five("claude", 10, age=fresh)
+        self.assertEqual(self.verdict()["five"], "ok")  # 44 minutes is fresh enough
+        self.assertFalse(any("while its lanes ran" in note for note in usage.assessments(self.home, NOW)[2]))
+        self.five("codex", 10, age=old)  # the other vendor has its own lanes
+        self.assertEqual(self.verdict("codex")["five"], "ok")
+        self.busy("codex")
+        self.assertEqual(self.verdict("codex")["five"], "5h-warning")
+
+    def test_unknown_reading_is_not_plenty_once_lanes_ran(self):
+        self.assertEqual(self.verdict()["five"], "ok")
+        self.busy("claude")
+        self.assertEqual((self.verdict()["five"], self.verdict()["stale"]), ("5h-warning", True))
+        self.assertTrue(any("claude usage reading is missing" in note for note in usage.assessments(self.home, NOW)[2]))
+
+    def test_five_caps_under_the_bands(self):
+        self.five("claude", 50)
+        self.five("codex", 80)
+        self.assertEqual(usage.five_caps(self.home, NOW), {"claude": None, "codex": 1})
+        self.five("claude", 80)
+        self.five("codex", 95)
+        self.assertEqual(usage.five_caps(self.home, NOW), {"claude": 0, "codex": 0})
+
+    def test_usage_shows_the_five_hour_verdict_reset_and_the_weekly_line_the_exhaustion(self):
+        event = json.loads((FIXTURES / "claude-5h-event.json").read_text())  # the real 2026-10-21 event: 100 % at 20:10 reset
+        at = datetime.fromtimestamp(1792606200, timezone.utc) - timedelta(hours=1)
+        usage.record_claude(self.home, event, at)
+        text = "\n".join(usage.report(self.home, at))
+        self.assertIn("claude: weekly used 38 %, 5-hour used 100 %", text)
+        self.assertIn("5-hour: 5h-exhausted, resets at 2026-10-21 18:10 UTC / 2026-10-21 20:10 Europe/Copenhagen", text)
+        self.assertIn("no new lanes or reviews on claude until the reset", text)
+        self.assertEqual(usage.weekly_lines(self.home, at)[0],
+                         "claude week ending 2026-10-24: used 38 %, exhausted no, lanes held back 0, "
+                         "5-hour exhausted Wed 2026-10-21 19:10")
+        usage.weekly_lines(self.home, at + timedelta(minutes=20))  # same window again: recorded once
+        self.assertEqual(usage.weekly_lines(self.home, at)[0].count("5-hour exhausted"), 1)
+        self.five("claude", 30, week=38)
+        self.assertIn("5-hour: ok", "\n".join(usage.report(self.home, NOW)))
 
     def test_stream_splits_text_from_events_and_records_the_reading(self):
         stream = usage.ClaudeStream(self.home)

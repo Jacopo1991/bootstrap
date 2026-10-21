@@ -1720,6 +1720,7 @@ def lane(args):
                                          stdin=subprocess.DEVNULL, stdout=log,
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
+            task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
@@ -3028,6 +3029,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
                                        stderr=errors, start_new_session=True)
+            task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
                 code = process.wait(timeout=timeout)
                 run.update(state="finished", exit_code=code)

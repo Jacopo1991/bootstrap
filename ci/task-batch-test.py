@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import threading
+import time
 from datetime import datetime, timezone
 from unittest import mock
 from policy_test_env import isolate_policy_environment
@@ -290,6 +291,40 @@ class BatchTest(unittest.TestCase):
         boost.write_text(json.dumps({'codex': '2099-01-01T00:00:00+00:00'}))
         with mock.patch.dict(os.environ, self.env, clear=True):
             self.assertEqual(runner.capacity()[1]['claude'], 1)
+
+    def test_boost_never_lifts_the_five_hour_limits(self):
+        (self.home / '.config/task').mkdir(parents=True)
+        (self.home / '.config/task/gate.toml').write_text('slots = 3\n')
+        boost = self.home / '.local/state/task/boost.json'
+        boost.parent.mkdir(parents=True, exist_ok=True)
+        boost.write_text(json.dumps({'claude': '2099-01-01T00:00:00+00:00'}))
+        now = datetime.now(timezone.utc)
+        runner = batch_module.Batch(self.repo, self.source)
+        for five, expected in ((0.5, 3), (0.65, 1), (0.8, 0)):  # claude reserve 25: warning from 60 %, exhausted from 75 %
+            with self.subTest(five=five):
+                task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+                    'five_hour': {'utilization': five, 'resetsAt': int(now.timestamp() + 7200)},
+                    'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+                with mock.patch.dict(os.environ, self.env, clear=True):
+                    total, limits = runner.capacity()
+                self.assertEqual(limits['claude'], expected)
+                self.assertEqual(total, max(expected, 1))  # codex is unreported and unboosted: one lane
+        tasks = [dict(id=str(i), builder='claude', after=None) for i in range(4)]
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.65, 'resetsAt': int(now.timestamp() + 7200)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        lock, state = threading.Lock(), {'active': 0, 'maximum': 0}
+        def execute(worker, task):
+            with lock:
+                state['active'] += 1
+                state['maximum'] = max(state['maximum'], state['active'])
+            time.sleep(0.05)
+            with lock:
+                state['active'] -= 1
+            return 'merged'
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module.Batch, 'task', execute):
+            runner.schedule(tasks)
+        self.assertEqual(state['maximum'], 1)  # boosted for three, held to one by the warning band
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
