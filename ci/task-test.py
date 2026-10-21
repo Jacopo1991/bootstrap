@@ -193,7 +193,7 @@ class TaskTool(unittest.TestCase):
         (repo / '.task.toml').write_text('check_timeout = 1200\n')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
             configured, effective, used = TASK_MODULE.step_timeout(repo, ['just', 'check'])
-            self.assertEqual((configured, effective, used), (1200, 2200, [700, 800, 950, 1000, 1100]))
+            self.assertEqual((configured, effective, used), (1200, 2200, [1100, 1000, 950, 800, 700]))
             self.assertIn('median 950 s', TASK_MODULE.gate_warning(repo))
             (repo / '.task.toml').write_text('check_timeout = 1300\n')
             self.assertEqual(TASK_MODULE.gate_warning(repo), '')

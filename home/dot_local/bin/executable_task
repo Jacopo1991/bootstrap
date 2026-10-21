@@ -2457,11 +2457,12 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     if state:
                         set_child_group(state, None)
                     out.write(f"\nTIMEOUT configured={configured}s effective={timeout}s "
-                              f"recent trusted passes={durations}\n")
+                              f"recent trusted passes (oldest to newest)={durations}\n")
                     out.flush()
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
                                     "timeout": True, "configured_timeout": configured,
-                                    "effective_timeout": timeout, "history_durations": durations})
+                                    "effective_timeout": timeout, "history_durations": durations,
+                                    "history_duration_order": "oldest_to_newest"})
                     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
@@ -2477,7 +2478,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                             except OSError: pass
                     print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s "
                           f"(configured {configured}s; effective {timeout}s; "
-                          f"recent trusted passes {durations}); see {display_log or log}")
+                          f"recent trusted passes (oldest to newest) {durations}); see {display_log or log}")
                     print(f"FAIL (log: {display_log or log})")
                     return False
             except subprocess.TimeoutExpired:
