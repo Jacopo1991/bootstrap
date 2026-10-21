@@ -1584,13 +1584,49 @@ def program_text(path: Path) -> str:
     return data.decode("utf-8")
 
 
-def print_allowlist(text: str) -> bool:
+class ShellWord(str):
+    """A decoded shell token retaining its spelling through prefix removal."""
+
+    def __new__(cls, value: str, spelling: str):
+        word = super().__new__(cls, value)
+        word.spelling = spelling
+        return word
+
+
+def shell_words(text: str) -> list[str]:
+    """Tokenize like shlex, retaining quotes and escapes for literal checks."""
+    states = shell_quote_state(text)
+    spellings: list[str] = []
+    start = 0
+    kind = None
+    for index, char in enumerate(text):
+        quoted, escaped = states[index]
+        current = ("word" if quoted or escaped else
+                   "space" if char.isspace() else
+                   "punctuation" if char in ";&|<>" else "word")
+        if current != kind:
+            if kind and kind != "space":
+                spellings.append(text[start:index])
+            start, kind = index, current
+    if kind and kind != "space":
+        spellings.append(text[start:])
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    values = list(lexer)
+    if len(values) != len(spellings):
+        raise ValueError("Shell token spelling cannot be modelled safely.")
+    return [ShellWord(value, spelling) for value, spelling in zip(values, spellings)]
+
+
+def print_allowlist(tokens: list[str]) -> bool:
     """Allow only complete literal print words and modelled output redirects.
 
     Keep the original spelling: shlex alone loses the distinction between
     quoted data, unquoted expansions, and escapes outside quotes.
     Output destinations still undergo the ordinary write-boundary checks.
     """
+    text = " ".join(getattr(token, "spelling", token) for token in tokens)
     word = r'''(?:[A-Za-z0-9%_.,:/=+@-]+|'[^'\n\r]*'|"(?:\\[^\n\r$`]|[^"\\$`\n\r])*")'''
     token = re.compile(r"(?:&>>|&>|>>|>\||>&|>)|" + word)
     spellings: list[str] = []
@@ -1663,10 +1699,8 @@ def judge_program(text: str, cwd: str, root: Path,
             return "Script leading redirections cannot be judged safely."
         if tokens:
             head = Path(tokens[0]).name.lower()
-            if head in {"printf", "echo"}:
-                if not print_allowlist(segment):
-                    return "Script print syntax cannot be judged safely."
-            elif re.search(r"[$`*?{}\[\]#]", segment) or "\\\n" in body:
+            if head not in {"printf", "echo"} and (
+                    re.search(r"[$`*?{}\[\]#]", segment) or "\\\n" in body):
                 return "Script expansion or syntax cannot be judged safely."
             if (head in INTERPRETERS - SHELL_PROGRAMS
                     or re.fullmatch(r"python[0-9.]+", head)):
@@ -1986,10 +2020,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
                 reason = host_command_reason(raw_tokens, Path(raw_tokens[0]).name.lower())
                 if reason:
                     return Denial("host.command_boundary", reason)
-            lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|<>")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
+            tokens = shell_words(text)
             if tokens and Path(tokens[0]).name not in {"git", "gh"}:
                 # Keep the original text intact. Only discard shlex tokens
                 # proven to start at an unquoted, unescaped new word.
@@ -2034,11 +2065,6 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                     drop.update(range(index, index + len(expected)))
                     word_start = char.isspace()
                 tokens = [token for index, token in enumerate(tokens) if index not in drop]
-            print_tokens = unwrap_command(tokens)
-            if (isinstance(print_tokens, list) and print_tokens
-                    and Path(print_tokens[0]).name.lower() in {"printf", "echo"}
-                    and not print_allowlist(text)):
-                return "Shell print syntax cannot be judged safely."
             all_tokens.append(tokens)
         except ValueError:
             return "Shell syntax is unrecognized; blocked by policy."
@@ -2184,6 +2210,8 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if not tokens:
         return None
     executable = Path(tokens[0]).name.lower()
+    if executable in {"printf", "echo"} and not print_allowlist(tokens):
+        return "Shell print syntax cannot be judged safely."
     if re.match(r"\d*[<>]", tokens[0]) or (
             tokens[0].isdigit() and len(tokens) > 1 and re.match(r"[<>]", tokens[1])):
         if len(tokens) != 2 or tokens[0] not in {">", ">>", ">|"}:

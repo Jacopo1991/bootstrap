@@ -522,6 +522,25 @@ with tempfile.TemporaryDirectory() as temp:
         for runner in ("just check", "npm run check", "pnpm run check"):
             assert judge(runner), (runner, body)
         assert judge("task check") is None
+    # Round 8: prefixes and branches must not hide printf's assignment option.
+    # Judge inert text only; never execute these state-changing payloads.
+    for body in (
+            "2>/dev/null printf -v X y", "2>&1 printf -v X y",
+            "X=1 2>/dev/null printf -v X y",
+            "if true; then printf -v X y; fi",
+            "if true; then echo safe; else printf -v X y; fi",
+            "if true; then echo safe; elif true; then printf -v X y; fi",
+            "! printf -v X y", "(printf -v X y)", "true && printf -v X y"):
+        assert judge(body), body
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "normalized print negative")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
     for body in ("run bash sub/run.sh", "python3 check.py", "node build.js"):
         assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
     for body in ("echo safe", "printf '%s' safe", "printf '%s' -value", "printf -- -v",
