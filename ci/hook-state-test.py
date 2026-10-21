@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SUITES = {
     "agent-config-test.py", "managed-policy-test.py", "claude-managed-mods-test.py",
     "git-default-merge-test.py", "task-test.py", "claude-managed-install-test.py",
+    "rootless-docker-test.py",
 }
 # Fail when a new caller is added without coverage. Includes imports and the
 # review subprocess stub, not just direct subprocess invocations of the hook.
