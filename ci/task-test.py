@@ -311,10 +311,9 @@ class TaskTool(unittest.TestCase):
         wt, dispatch = self.started()
         self.assertIn("Read first:\na.txt and justfile", dispatch)
         self.assertIn("Test against:\nci/fixtures/reviews/haiku-3-fenced.md", dispatch)
-        self.assertIn("PASS/FAIL plus the log path", dispatch)
-        self.assertIn("under `## Check`", dispatch)
         self.assertIn("## Check", (wt / '.work/report.md').read_text())
         direct = self.raw_task('start', 'proj', 'direct', '--builder', 'codex')
+        self.assertIn('Acceptance criteria:\n(PM: none given)\nVerify:\n(PM: none given)', direct)
         self.assertIn('Read first:\n(PM: none given)', direct)
         self.assertIn('Test against:\n(PM: none given)', direct)
         request = self.repo / '.worktrees/direct/.work/request.md'
@@ -346,7 +345,7 @@ class TaskTool(unittest.TestCase):
         prompt = json.loads((wt / '.work/reviewer-call.json').read_text())['prompt']
         self.assertIn('Verdict: FAIL; head: ' + head, prompt)
         self.assertIn('FAILED (failures=1)', prompt)
-        self.assertIn('file:line', prompt)
+        self.assertIn('lane-contract.md', prompt)
         checks = [json.loads(line) for line in (self.state() / 'checks.jsonl').read_text().splitlines()]
         self.assertEqual([item['result'] for item in checks], ['passed', 'failed'])
 
@@ -1970,6 +1969,7 @@ store.write_text(json.dumps(prs))
         shutil.rmtree(context)
         context.symlink_to(outside, target_is_directory=True)
         task = SimpleNamespace(path=wt, kb=self.kb, file=None)
+        self.enterContext(mock.patch.object(TASK_MODULE, 'HOME', self.home))
         TASK_MODULE.refresh_context(task)
         self.assertFalse(context.is_symlink())
         self.assertEqual((context / 'INTENT.md').read_text(), 'intent')
@@ -2001,7 +2001,7 @@ store.write_text(json.dumps(prs))
         self.git(self.kb, 'commit', '-qm', 'decisions')
         self.task('plan', 'proj', '--sign')
         wt, out = self.started()
-        self.assertIn("Context: .work/context/", out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
         context = wt / ".work/context"
         self.assertEqual((context / 'INTENT.md').read_bytes(), (self.kb / 'INTENT.md').read_bytes())
         self.assertEqual((context / "backlog/decisions" / decision.name).read_text(), "binding decision")
@@ -2761,6 +2761,8 @@ store.write_text(json.dumps(prs))
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY)
+        self.contract_text = "# Fake lane contract\n"
+        self.install_contract(".agents")
         for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"):
             self.env.pop(marker, None)
         self.gate_dir = self.home / "shared-gate"
@@ -2820,6 +2822,30 @@ store.write_text(json.dumps(prs))
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result.stdout + result.stderr
+
+    def install_contract(self, root, text=None):
+        path = self.home / root / "skills/slim-workflow/lane-contract.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.contract_text if text is None else text)
+
+    def test_start_copies_contract_by_source_order_and_lane_refreshes_it(self):
+        copy = self.repo / ".worktrees/t5/.work/context/lane-contract.md"
+        self.install_contract(".claude", "claude copy\n")
+        self.started()
+        self.assertEqual(copy.read_text(), self.contract_text, ".agents wins over .claude")
+        (self.home / ".agents/skills/slim-workflow/lane-contract.md").unlink()
+        self.install_contract(".claude", "claude copy\n")
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            TASK_MODULE.refresh_context(TASK_MODULE.Task(self.repo, "T-5"))
+        self.assertEqual(copy.read_text(), "claude copy\n", "refresh falls back to .claude and replaces the copy")
+        self.assertFalse(copy.stat().st_mode & 0o222)
+
+    def test_start_stops_without_an_installed_contract(self):
+        for root in (".agents", ".claude"):
+            (self.home / root / "skills/slim-workflow/lane-contract.md").unlink(missing_ok=True)
+        out = self.task("start", "proj", "T-5", "--builder", "codex", code=1)
+        self.assertIn("No lane contract", out)
+        self.assertFalse((self.repo / ".worktrees/t5").exists(), "stops before creating the worktree")
 
     def started(self):
         out = self.task("start", "proj", "T-5", "--builder", "codex")
@@ -3452,18 +3478,14 @@ store.write_text(json.dumps(prs))
         self.assertIn("`task lane proj T-5`", out)
         self.assertIn(str(wt / ".work/prompt.md"), out)
         self.assertIn("t-5 - Add-the-b-file.md", out)
-        commit_at = out.index("Commit on the branch")
-        check_at = out.index("then run `task check`", commit_at)
-        report_at = out.index("in `.work/report.md`", check_at)
-        later_commit_at = out.index("any later commit needs a new check", report_at)
-        self.assertLess(commit_at, check_at)
-        self.assertLess(check_at, report_at)
-        self.assertLess(report_at, later_commit_at)
-        for line in ("three lines: `changed: ...`, `verified: ...`, and `not done: ...`",
-                     "followed by `report written`", "for advisory feedback",
-                     "runs the trusted gate", "A PM may run `task check --detach`",
-                     "PM can use `task merge --detach`"):
-            self.assertIn(line, out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
+        self.assertIn("Acceptance criteria:\n- [ ] #1 b exists\n- [ ] #2 checks pass\n", out)
+        self.assertIn("Verify:\nVerify: `true`\n", out)
+        self.assertEqual((wt / ".work/dispatch.md").read_text(), out.split("Dispatch prompt:\n\n", 1)[1])
+        for rule in ("Commit on the branch", "advisory feedback", "three lines", "task merge --detach",
+                     "apply_patch", "heredocs"):
+            self.assertNotIn(rule, out)
+        self.assertEqual((wt / ".work/context/lane-contract.md").read_text(), self.contract_text)
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "", "worktrees stay out of status")
         again = self.task("start", "proj", "5", "--builder", "codex")
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
@@ -3616,10 +3638,7 @@ store.write_text(json.dumps(prs))
         out = self.raw_task("review", "proj", "5")
         prompt = (self.state() / "review-prompt.md").read_text()
         self.assertIn(f"Outcome: {expected}", prompt)
-        self.assertIn(
-            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
-            "or the change breaks something that worked.", prompt)
-        self.assertIn("Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.", prompt)
+        self.assertIn(f"Mandatory read: {self.repo / '.worktrees/t5/.work/context/lane-contract.md'}.", prompt)
         self.assertNotIn(">-", prompt)
 
     def test_frontmatter_title_reads_quoted_folded_and_literal_scalars(self):
@@ -4845,8 +4864,8 @@ store.write_text(json.dumps(prs))
         self.assertIn("nonempty reason", self.raw_task("runner-check", "proj", str(runner), code=1))
         out = self.raw_task("start", "proj", "docs", "--builder", "codex",
                             "--no-verify", "gate is its verification")
-        self.assertIn("edit or apply_patch tool, never shell heredocs or cat >", out)
-        self.assertIn("avoid backticks in shell commands", out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
+        self.assertNotIn("heredocs", out)
 
     def test_setup_68_runner_preserves_trailing_text_and_optional_field_positions(self):
         runner = self.home / "runner.md"
@@ -5262,7 +5281,7 @@ store.write_text(json.dumps(prs))
         self.raw_task("review", "proj", "5", "--append-prompt", instruction)
         prompt = (self.state() / "review-prompt.md").read_text()
         self.assertTrue(prompt.endswith(instruction + "\n"))
-        self.assertIn("Verdict: PASS|FAIL", prompt)
+        self.assertIn("Mandatory read:", prompt)
 
     def test_review_prints_claude_headless_command_and_persisted_prompt(self):
         wt, _ = self.started()
@@ -5277,18 +5296,10 @@ store.write_text(json.dumps(prs))
         self.assertEqual(__import__("json").loads((self.state() / "review-routing.json").read_text()),
                          {"vendor": "claude", "model": "haiku"})
         self.assertTrue(prompt.read_text().endswith(
-            "Return exactly this final fenced block, with plain text only inside it:\n"
-            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
-            "or the change breaks something that worked. Everything else is a non-blocking "
-            "note: list it under 'Notes', never as a reason to FAIL.\n"
-            "Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.\n"
-            "```review\nVerdict: PASS|FAIL\nCommit: <full sha>\n"
-            "#1 pass|fail|unclear: <one line of evidence>\n"
-            "#2 pass|fail|unclear: <one line of evidence>\n```\n"
-            "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
-            "Blocking finding must identify a named requested criterion or a concrete defect or regression, "
-            "with file:line. Put all other "
-            "observations under Notes.\n"))
+            f"Mandatory read: {wt / '.work/context/lane-contract.md'}. Reply in its review block with the "
+            "full 40-character Commit sha, then one line per criterion: "
+            "`#N pass|fail|unclear: <one line of evidence>`.\n"))
+        self.assertNotIn("Split findings", prompt.read_text())
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
