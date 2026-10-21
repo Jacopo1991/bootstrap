@@ -533,6 +533,20 @@ so `task runner-start` too) apply the verdict:
 | `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
 | `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
 
+The 5-hour window is a second pace input per vendor with the same reserves (it ignores spare resets,
+which only refill the weekly window). `5h-exhausted` (used ≥ 100 − reserve): no new lane or review on
+that vendor until the 5-hour reset, which `task usage` and the hold message show; running ones finish,
+and a routine lane moves to the other vendor when that has room on both windows. `5h-warning`
+(15 points lower): at most one lane or review of that vendor runs machine-wide (`task` records each
+started process under `~/.local/state/task/usage/running/`); a new one is held until it ends. A
+reading older than 45 minutes while that vendor's lanes ran since counts as `5h-warning` and prints a
+warning. For a vendor that has a 5-hour window (Claude; Codex once one shows in its readings), a
+missing 5-hour reading (none yet, or its window has reset) is `5h-warning` too. A vendor with no
+5-hour window in its readings of the last 7 days (Codex today) has only the weekly rules, and
+`task usage` says so. A runner's capacity, boosted or not, is
+capped by this (0 when exhausted, 1 in the warning band), so boost adds parallel lanes only below
+the warning band. `task usage --weekly-line` appends `, 5-hour exhausted <day and time>` per window.
+
 While Jacopo holds a spare reset for a vendor (`spare_resets` > 0) there is no reserve: the window is
 spent at the normal pace, `ahead` never holds lanes back, the share ends at 100 % and `task usage`
 says "spare reset held; reset at 100 %".

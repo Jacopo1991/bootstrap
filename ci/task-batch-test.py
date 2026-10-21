@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 import threading
+import time
 from datetime import datetime, timezone
 from unittest import mock
 from policy_test_env import isolate_policy_environment
@@ -49,6 +50,11 @@ with (home / 'calls.jsonl').open('a') as out:
     out.write(json.dumps(sys.argv[1:]) + '\n')
 entries = config.get(key, config.get(cmd, [{}]))
 entry = entries[min(index, len(entries) - 1)]
+if cmd == 'check' and 'trusted_log' in entry:
+    done = home / '.local/state/task' / repo.name / ident
+    (done / 'check.log').write_text(entry['trusted_log'])
+    (done / 'check.json').write_text(json.dumps(dict(trusted=True, log=str(done / 'check.log'),
+         time=datetime.now(timezone.utc).isoformat())))
 if entry.get('code'):
     print(entry.get('output', 'failed'))
     sys.exit(entry['code'])
@@ -114,7 +120,8 @@ elif cmd == 'lane':
         git(wt, 'reset', '--hard', git(wt, 'commit-tree', tree.stdout.split()[0], '-p', ours, '-p', theirs,
                                        '-m', 'Merge main with conflict markers'))
     if (entry.get('merge_main') and not entry.get('also_commit')) or entry.get('conflict_main'):
-        pass
+        if entry.get('report'):
+            (work / 'report.md').write_text('## What changed\nMerged main\n\n## How I verified\nTests\n')
     elif not entry.get('unfinished'):
         (wt / 'result').write_text(str(index))
         git(wt, 'add', 'result')
@@ -251,6 +258,10 @@ class BatchTest(unittest.TestCase):
         state = self.home / '.local/state/task'
         state.mkdir(parents=True)
         boost = state / 'boost.json'
+        now = datetime.now(timezone.utc)  # claude has a 5-hour window, so boost needs a fresh reading below the warning band
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.2, 'resetsAt': int(now.timestamp() + 7200)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
         for vendor in ('codex', 'claude'):
             for boosted, slots, expected in ((False, 3, 1), (True, 3, 3), (True, 2, 2), (True, 1, 1)):
                 with self.subTest(vendor=vendor, boosted=boosted, slots=slots):
@@ -284,6 +295,45 @@ class BatchTest(unittest.TestCase):
         boost.write_text(json.dumps({'codex': '2099-01-01T00:00:00+00:00'}))
         with mock.patch.dict(os.environ, self.env, clear=True):
             self.assertEqual(runner.capacity()[1]['claude'], 1)
+
+    def test_boost_never_lifts_the_five_hour_limits(self):
+        (self.home / '.config/task').mkdir(parents=True)
+        (self.home / '.config/task/gate.toml').write_text('slots = 3\n')
+        boost = self.home / '.local/state/task/boost.json'
+        boost.parent.mkdir(parents=True, exist_ok=True)
+        boost.write_text(json.dumps({'claude': '2099-01-01T00:00:00+00:00'}))
+        now = datetime.now(timezone.utc)
+        runner = batch_module.Batch(self.repo, self.source)
+        for five, expected in ((0.5, 3), (0.65, 1), (0.8, 0)):  # claude reserve 25: warning from 60 %, exhausted from 75 %
+            with self.subTest(five=five):
+                task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+                    'five_hour': {'utilization': five, 'resetsAt': int(now.timestamp() + 7200)},
+                    'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+                with mock.patch.dict(os.environ, self.env, clear=True):
+                    total, limits = runner.capacity()
+                self.assertEqual(limits['claude'], expected)
+                self.assertEqual(total, max(expected, 1))  # codex is unreported and unboosted: one lane
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {  # that 5-hour window has reset: no reading
+            'five_hour': {'utilization': 0.1, 'resetsAt': int(now.timestamp() - 60)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            self.assertEqual(runner.capacity()[1]['claude'], 1)  # a missing 5-hour reading is the warning band
+        tasks = [dict(id=str(i), builder='claude', after=None) for i in range(4)]
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.65, 'resetsAt': int(now.timestamp() + 7200)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        lock, state = threading.Lock(), {'active': 0, 'maximum': 0}
+        def execute(worker, task):
+            with lock:
+                state['active'] += 1
+                state['maximum'] = max(state['maximum'], state['active'])
+            time.sleep(0.05)
+            with lock:
+                state['active'] -= 1
+            return 'merged'
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module.Batch, 'task', execute):
+            runner.schedule(tasks)
+        self.assertEqual(state['maximum'], 1)  # boosted for three, held to one by the warning band
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
@@ -637,9 +687,10 @@ class BatchTest(unittest.TestCase):
         self.assertFalse(self.calls('review'))
 
     def test_failed_check_fixes_before_spending_review(self):
-        self.scenario({'lane': [{'check_log': 'FAILED real fixture assertion'}, {}],
-                       'check': [{'code': 1}, {}]})
+        self.scenario({'lane': [{'check_log': 'ADVISORY bwrap NETLINK_ROUTE noise'}, {}],
+                       'check': [{'code': 1, 'trusted_log': 'FAILED real fixture assertion'}, {}]})
         self.assertIn('merged after 1 fix rounds', self.run_batch())
+        self.assertNotIn('ADVISORY', self.prompts()[1]['prompt'])
         commands = [call[0] for call in self.calls()]
         self.assertEqual(commands.count('check'), 2)
         self.assertEqual(commands.count('review'), 1)
@@ -718,8 +769,8 @@ class BatchTest(unittest.TestCase):
         self.assertIn('batch: finished', self.run_batch())
 
     def test_check_permission_denied_enters_fix_round(self):
-        self.scenario({'lane': [{'check_log': 'Permission denied: test fixture'}, {}],
-                       'check': [{'code': 1, 'output': 'check failed; see check.log'}, {}]})
+        self.scenario({'check': [{'code': 1, 'output': 'check failed; see check.log',
+                                  'trusted_log': 'Permission denied: test fixture'}, {}]})
         self.assertIn('merged after 1 fix rounds', self.run_batch())
         self.assertIn('Permission denied', self.prompts()[1]['prompt'])
 
@@ -736,6 +787,87 @@ class BatchTest(unittest.TestCase):
         self.scenario({'lane': [{'final': 'Could not finish.\nBLOCKED: git commit\n\n  \n'}]})
         self.assertIn('batch: stopped: lane: BLOCKED: git commit', self.run_batch(1))
         self.assertFalse(self.calls('check'))
+
+    def test_bwrap_netlink_denial_in_lane_final_is_a_warning(self):
+        denial = 'BLOCKED: `python3 -I onboard/check.py` — Bubblewrap’s `NETLINK_ROUTE` socket creation denied.'
+        self.scenario({'lane': [{'final': 'Done.\n' + denial + '\n'}], 'review': [{'reply': denial}]})
+        self.assertEqual(self.run_batch(), 'one: merged\nbatch: finished\n')
+
+    def test_other_blocked_lines_still_stop_even_when_they_mention_bwrap(self):
+        self.scenario({'lane': [{'final': 'BLOCKED: git push — bwrap failed\n'}]})
+        self.assertIn('batch: stopped: lane: BLOCKED: git push', self.run_batch(1))
+
+    def test_bwrap_warning_matches_only_the_sole_denial_line(self):
+        denial = 'BLOCKED: `task check` — bwrap NETLINK_ROUTE denied'
+        for line in (denial + ' and git push is refused', denial + '; also BLOCKED: git commit',
+                     'BLOCKED: `task check` && `git push` — bwrap NETLINK_ROUTE denied',
+                     'BLOCKED: git push — bwrap NETLINK_ROUTE denied, and the remote rejected it',
+                     'BLOCKED: bwrap NETLINK_ROUTE denied, then merge conflict in task.py'):
+            self.assertFalse(batch_module.bwrap_denial(line), line)
+            self.assertEqual(batch_module.terminal_block(line), line)
+        self.assertTrue(batch_module.bwrap_denial(denial + '.'))
+        self.assertEqual(batch_module.terminal_block('Done.\n' + denial + '\n'), '')
+
+    def test_fix_prompt_after_passed_check_states_the_pass_next_to_review_findings(self):
+        self.scenario({'check': [{'output': 'PASS (log: /fixture/check.log)',
+                                  'trusted_log': 'noise\nGate suites finished (failed=0, skipped=2)\nexit 0'}],
+                       'review': [{'verdict': 'FAIL', 'findings': 'REVIEW finding fixture'}, {}]})
+        self.assertIn('merged after 1 fix rounds', self.run_batch())
+        prompt = self.prompts()[1]['prompt']
+        self.assertIn('REVIEW finding fixture', prompt)
+        self.assertIn('PASS (log: /fixture/check.log)', prompt)
+        self.assertIn('Gate suites finished (failed=0, skipped=2)', prompt)
+
+    def test_resumed_fix_prompt_carries_trusted_check_and_review_not_advisory_log(self):
+        subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
+                       env=self.env, check=True, capture_output=True)
+        state = self.home / '.local/state/task/proj/one'
+        (state / 'check.log').write_text('TRUSTED failing assertion')
+        (state / 'check.json').write_text(json.dumps(dict(
+            trusted=True, log=str(state / 'check.log'), time='2026-10-21T00:00:00+00:00')))
+        (state / 'review.md').write_text('## Blocking\nREVIEW finding\n## Notes\nx')
+        work = self.repo / '.worktrees/one/.work'
+        (work / 'check.log').write_text('ADVISORY bwrap NETLINK_ROUTE denied')
+        (work / 'check.json').write_text(json.dumps(dict(advisory=True, time='2026-10-21T01:00:00+00:00')))
+        (self.repo / '.worktrees/one/dirty').write_text('unfinished')
+        self.run_batch()
+        prompt = self.prompts()[0]['prompt']
+        self.assertIn('TRUSTED failing assertion', prompt)
+        self.assertIn('REVIEW finding', prompt)
+        self.assertNotIn('ADVISORY', prompt)
+
+    def test_merge_only_head_is_unfinished_and_starts_no_trusted_check(self):
+        self.scenario({'lane': [{'merge_main': True, 'report': True}, {}]})
+        self.assertIn('one: merged', self.run_batch())
+        commands = [call[0] for call in self.calls() if call[0] in {'lane', 'check'}]
+        self.assertEqual(commands, ['lane', 'lane', 'check'])
+        self.assertIn('Unfinished work', self.prompts()[1]['prompt'])
+
+    def test_finished_needs_changes_beyond_the_default_branch(self):
+        report = '## What changed\nDone\n\n## How I verified\nTests\n'
+        runner = batch_module.Batch(self.repo, self.source)
+        for branch, real in (('merge-only', False), ('real-work', True)):
+            wt = self.repo / '.worktrees' / branch
+            self.git('worktree', 'add', '-b', branch, str(wt))
+            base = self.git('-C', str(wt), 'rev-parse', 'HEAD')
+            if real:
+                (wt / 'result').write_text('work')
+                self.git('-C', str(wt), 'add', 'result')
+            self.git('-C', str(wt), 'commit', '--allow-empty', '-m', 'Own commit')
+            (wt / '.work').mkdir()
+            (wt / '.work/report.md').write_text(report)
+            for number in (1, 2):
+                (self.repo / f'main-{branch}-{number}').write_text('main')
+                self.git('add', '.')
+                self.git('commit', '-m', 'main moves')
+                self.git('-C', str(wt), 'merge', '--no-edit', 'main')
+                self.assertEqual(runner.finished(wt, dict(base_sha=base)), real, (branch, number))
+        # Main moving on after the merge changes nothing.
+        (self.repo / 'later').write_text('main')
+        self.git('add', '.')
+        self.git('commit', '-m', 'main moves again')
+        self.assertFalse(runner.finished(self.repo / '.worktrees/merge-only', dict(base_sha='x')))
+        self.assertTrue(runner.finished(self.repo / '.worktrees/real-work', dict(base_sha='x')))
 
     def test_reviewer_final_blocked_stops(self):
         self.scenario({'review': [{'reply': 'Could not review.\nBLOCKED: git show\n\n  \n'}]})
