@@ -1,6 +1,7 @@
 """Shared builder routing and boost capacity policy (no runtime side effects)."""
 import json
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 
 TIERS = ("routine", "hard", "design")
 ROUTING = {
@@ -8,6 +9,26 @@ ROUTING = {
     "claude": {"default": "sonnet", "hard": "fable", "design": "opus"},
 }
 UNBOOSTED = {"codex": "gpt-6.1-sol", "claude": "opus"}
+# Top models run only for their specialty tier, whoever names them.
+TOP_ONLY = {"gpt-6-astra": "design", "fable": "hard", "claude-fable-5-1": "hard"}
+
+
+OVERRIDE_FORMAT = "Jacopo YYYY-MM-DD: <request>"
+OVERRIDE_TEXT = re.compile(r"jacopo\s+(\d{4}-\d{2}-\d{2}):\s*\S", re.IGNORECASE)
+
+
+def override_problem(text, required=False):
+    """Why an override text is not `Jacopo YYYY-MM-DD: <request>`; "" when it is, or blank and not required."""
+    text = (text or "").strip()
+    match = OVERRIDE_TEXT.match(text)
+    try:
+        if match:
+            date.fromisoformat(match[1])
+    except ValueError:
+        match = None
+    if (text or required) and not match:
+        return f"override must read '{OVERRIDE_FORMAT}' (Jacopo's request, with a valid date); got: {text}"
+    return ""
 
 
 class RoutingParseError(ValueError):
@@ -55,7 +76,43 @@ def active(home):
     return result
 
 
-def route(home, vendor, tier, explicit=None, boosted=True):
+def guard(tier, model, override=""):
+    """Refuse a top model outside its tier unless Jacopo's override text is given; True when it was needed."""
+    if problem := override_problem(override):
+        raise RoutingParseError(problem)
+    if TOP_ONLY.get(model, tier) == tier:
+        return False
+    if not (override or "").strip():
+        raise RoutingParseError(
+            f"{model} is for Tier: {TOP_ONLY[model]} tasks only (this one is {tier}); use gpt-6-luna "
+            f"by default or gpt-6.1-sol for hard (Claude: sonnet, opus). Only --override \"{OVERRIDE_FORMAT}\" "
+            "permits it; --model, --tier and --no-pace do not.")
+    return True
+
+
+def tier_guard(recorded, tier, override=""):
+    """Refuse a --tier that differs from the recorded tier unless Jacopo's override text is given; True when it was needed."""
+    if not tier or tier == recorded:
+        return False
+    if problem := override_problem(override, required=True):
+        raise RoutingParseError(f"--tier {tier} cannot change this task's recorded tier ({recorded}) without "
+                                f"--override \"{OVERRIDE_FORMAT}\"; {problem}")
+    return True
+
+
+def route(home, vendor, tier, explicit=None, boosted=True, override="", recorded=None):
+    """Pick the model for `tier`; the guard needs both it and the task's recorded tier to allow the model."""
+    model = pick(home, vendor, tier, explicit, boosted)
+    guards(tier, recorded, model, override)
+    return model
+
+
+def guards(tier, recorded, model, override=""):
+    """guard() for the lane's tier and the task's recorded tier: a --tier flag cannot raise eligibility."""
+    return any([guard(each, model, override) for each in dict.fromkeys((recorded or tier, tier))])
+
+
+def pick(home, vendor, tier, explicit, boosted):
     if tier not in TIERS:
         raise RoutingParseError(f"Invalid tier: {tier}")
     models, _ = policy(home)

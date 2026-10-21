@@ -314,6 +314,31 @@ def log(home, text, now=None):
         pass
 
 
+def record_override(home, repo, task, model, tier, text, now=None):
+    """Append one model-rule override (a top model outside its tier) to the overrides ledger."""
+    entry = dict(time=(now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
+                 repo=repo, task=task, model=model, tier=tier, override=text)
+    directory = _dir(home)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "overrides.jsonl").open("a") as stream:
+        stream.write(json.dumps(entry) + "\n")
+
+
+def override_summary(home, now=None):
+    """One line naming the model-rule overrides of the last 7 days."""
+    since = (now or datetime.now(timezone.utc)) - WEEK
+    found = []
+    try:
+        for line in (_dir(home) / "overrides.jsonl").read_text().splitlines():
+            entry = json.loads(line)
+            if _stamp(entry["time"]) >= since:
+                found.append(f"{entry['repo']}/{entry['task']} {entry['model']} on {entry['tier']} "
+                             f"at {entry['time']}: {entry['override']}")
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return f"model overrides, last 7 days: {len(found)}" + (" (" + "; ".join(found) + ")" if found else "")
+
+
 def note(home, found, now, held=None):
     """Remember this week's used %, first exhaustion day and held-back lanes for the weekly line."""
     if found["reason"]:
@@ -501,4 +526,4 @@ def weekly_lines(home, now=None):
         five = "".join(f", 5-hour exhausted {when}" for when in week.get("five_exhausted", {}).values())
         lines.append(f"{vendor} week ending {ends}: used {used}, exhausted {week.get('exhausted') or 'no'}, "
                      f"lanes held back {len(week.get('held', []))}{five}")
-    return lines
+    return lines + [override_summary(home, now)]

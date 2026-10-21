@@ -18,14 +18,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import bwrap_denial, cli_limit, lane_limit
-from task_routing import TIERS, lane_limits
+from task_routing import TIERS, guards, lane_limits, override_problem
 
 
 TASK_LINE = re.compile(
     r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude)"
     r"(?:,\s*model\s+([^,\s]+))?(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
     r"(?:\b.*)?$")
-NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:)|$)")
+NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
+OVERRIDE = re.compile(r"(?i),\s*override:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
 HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
                "Execution stopped by PreToolUse hook")
 BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end your final reply "
@@ -81,9 +82,11 @@ def parse(source):
             if re.fullmatch(r"\s*```\s*", line):
                 in_rules = False
             continue
-        no_verify_field = NO_VERIFY.search(line)
-        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line)
-        match = TASK_LINE.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", NO_VERIFY.sub("", line)))
+        override_field = OVERRIDE.search(line)
+        line_rest = OVERRIDE.sub("", line)
+        no_verify_field = NO_VERIFY.search(line_rest)
+        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line_rest)
+        match = TASK_LINE.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", NO_VERIFY.sub("", line_rest)))
         if match:
             ident, builder, model, seed, after = match.groups()
             tier = tier_field[1].lower() if tier_field else None
@@ -94,8 +97,11 @@ def parse(source):
             no_verify = no_verify_field[1].strip() if no_verify_field else None
             if no_verify is not None and not no_verify.strip():
                 raise Stop("no-verify needs a nonempty reason")
-            current = dict(id=ident, builder=builder.lower(), model=model,
-                           seed=seed, after=after, tier=tier, no_verify=no_verify, lines=[line])
+            override = override_field[1].strip() if override_field else ""
+            if override_field and (problem := override_problem(override, required=True)):
+                raise Stop(problem)
+            current = dict(id=ident, builder=builder.lower(), model=model, seed=seed, after=after,
+                           tier=tier, no_verify=no_verify, override=override, lines=[line])
             tasks.append(current)
         elif re.match(r"(?i)^\s*(?:\d+\.|[-*])\s+[^:\s]+:\s*builder\b", line):
             raise Stop("Invalid runner task line: " + line)
@@ -292,6 +298,8 @@ class Batch:
             options = ["--builder", task["builder"]]
             if task.get("tier"):
                 options += ["--tier", task["tier"]]
+            if task["override"]:
+                options += ["--override", task["override"]]
             if task["seed"]:
                 options += ["--seed", task["seed"]]
             if task.get("no_verify"):
@@ -337,6 +345,11 @@ class Batch:
             if over_cap():
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             if run_lane:
+                try:
+                    recorded = data(state / "task.json").get("tier", "routine")
+                    guards(tier or recorded, recorded, model, task["override"])
+                except ValueError as error:
+                    return f"parked: {error}"
                 round_start = time.monotonic()
                 reviewed = data(state / "review.json").get("commit")
                 prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch
@@ -352,6 +365,8 @@ class Batch:
                 options = ["--tier", tier] if tier else []
                 if model:
                     options += ["--model", model]
+                if task["override"]:
+                    options += ["--override", task["override"]]
                 self.require("lane", ident, "--builder", builder, "--timeout", box, *options)
                 self.require("wait", ident, "--max", box, retry=True)
                 self.lane_outcome(work)

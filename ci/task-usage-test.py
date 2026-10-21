@@ -225,6 +225,14 @@ class Usage(unittest.TestCase):
         later = usage.weekly_lines(self.home, NOW)[0]
         self.assertEqual(later, "claude week ending 2026-10-21: used 30 %, exhausted no, lanes held back 0")
 
+    def test_weekly_line_lists_this_weeks_model_overrides_only(self):
+        self.assertEqual(usage.weekly_lines(self.home, NOW)[-1], "model overrides, last 7 days: 0")
+        usage.record_override(self.home, "proj", "T-1", "fable", "routine", "Jacopo 2026-10-01", NOW - timedelta(days=9))
+        usage.record_override(self.home, "proj", "T-2", "gpt-6-astra", "hard", "Jacopo 2026-10-20", NOW - timedelta(days=1))
+        self.assertEqual(usage.weekly_lines(self.home, NOW)[-1],
+                         "model overrides, last 7 days: 1 (proj/T-2 gpt-6-astra on hard at "
+                         f"{(NOW - timedelta(days=1)).isoformat(timespec='seconds')}: Jacopo 2026-10-20)")
+
     def five(self, vendor, five, age=timedelta(minutes=5), week=50):
         """Fixture reading with the 5-hour window at `five` percent: claude through its state file, codex through a rollout."""
         if vendor == "claude":
