@@ -7,7 +7,7 @@ Write capability there determines trust; vendor environment markers do not.
   task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
   task runner-start <repo> <runner-file> [--no-pace]
-  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace]
+  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace] [--override "<Jacopo's request and date>"]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
@@ -26,7 +26,7 @@ Write capability there determines trust; vendor environment markers do not.
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
     Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
-    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard (refused otherwise, no override). Configure ~/.config/task/routing.json to override the table.
+    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; only task lane --override "<Jacopo's request and date>" (ledgered) permits otherwise. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -66,7 +66,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 from task_limits import cli_limit, lane_limit
-from task_routing import TIERS, route, guard, lane_limits, active, RoutingParseError
+from task_routing import TIERS, TOP_ONLY, route, guard, lane_limits, active, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -1650,7 +1650,7 @@ def lane(args):
     builder = args.builder or record["builder"]
     tier = args.tier or record.get("tier", "routine")
     explicit = args.model
-    guard(tier, explicit)
+    guard(tier, explicit, args.override)
     decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
     if decision:
         if decision["hold"]:
@@ -1661,7 +1661,7 @@ def lane(args):
             if explicit and explicit != task_usage.CHEAPER[builder]:
                 print(f"pace: {builder} ahead of pace; routine lane uses {task_usage.CHEAPER[builder]}, not {explicit} (--no-pace keeps it)")
             explicit = task_usage.CHEAPER[builder]
-    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker)
+    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker, args.override)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
@@ -1702,9 +1702,14 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            if guard(tier, model, args.override):
+                task_usage.record_override(HOME, task.repo.name, task.id, model, tier, args.override)
+                print(f"override recorded: {model} on a {tier} lane ({args.override})")
             archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]
+            if args.override:
+                worker.extend(["--override", args.override])
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
@@ -2054,7 +2059,8 @@ def runner_check(args):
         r"(?:,\s*model\s+([^,\s]+))?(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
         r"(?:\b.*)?$"
     )
-    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:)|$)")
+    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
+    override_field = re.compile(r"(?i),\s*override:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
         if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
             in_text_rules = True
@@ -2066,6 +2072,8 @@ def runner_check(args):
         # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
+        override_match = override_field.search(line)
+        line = override_field.sub("", line)
         no_verify_match = no_verify_field.search(line)
         tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line)
         if tier_field and tier_field[1].lower() not in TIERS:
@@ -2074,6 +2082,8 @@ def runner_check(args):
         if parsed:
             task_lines += 1
             ident, builder, model, seed, after = parsed.groups()
+            if override_match and not override_match[1].strip():
+                problems.append(f"line {number}: override needs Jacopo's request and date")
             no_verify = no_verify_match[1].strip() if no_verify_match else None
             try:
                 task = Task(repo, ident)
@@ -3259,6 +3269,8 @@ def review(args):
             problems.append("no stored reviewer routing; provide --reviewer <vendor> <model>")
         elif routed_reviewer[0].lower() not in {"claude", "codex"} or not routed_reviewer[1].strip():
             problems.append("--reviewer must be <claude|codex> <model>")
+        elif routed_reviewer[1] in TOP_ONLY:
+            problems.append(f"reviews never use {routed_reviewer[1]}; no override applies")
         else:
             routed_reviewer = (routed_reviewer[0].lower(), routed_reviewer[1])
     if (routed_reviewer and routed_reviewer[0].lower() == record["builder"]
@@ -4144,6 +4156,7 @@ def status(args):
         print(active)
     print(f"Gate slots: {gate_slots()}")
     print(f"Batch lane limits: {lane_limits(HOME, gate_slots())}; total bounded by gate slots")
+    print(task_usage.override_summary(HOME))
     for row in gate_holders():
         print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
@@ -4868,6 +4881,8 @@ def main(argv=None):
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
             sub.add_argument("--builder", choices=("codex", "claude"))
+            sub.add_argument("--override", metavar="REQUEST", default="",
+                             help="Jacopo's request and date; permits gpt-6-astra or fable outside its tier (ledgered)")
             sub.add_argument("--model", help="Claude aliases haiku|sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":

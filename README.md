@@ -491,7 +491,11 @@ default. An explicit `--model` wins, except that top models run only for their
 specialty: `gpt-6-astra` needs `Tier: design` and `fable` needs `Tier: hard`.
 `task lane` refuses them on any other tier, and the batch parks that task with the
 reason, whether the model came from `--model`, a runner line or a fix round.
-Neither `--no-pace` nor any other flag overrides this, and reviews never use them.
+Only Jacopo can switch a model: `task lane --override "<Jacopo's request and date>"`
+(runner line field `, override: <request and date>`) permits it. Each use is appended to
+`~/.local/state/task/usage/overrides.jsonl` and shown in `task status` and
+`task usage --weekly-line`. `--no-pace` does not override this, and reviews never use
+these models, override or not.
 `--no-boost` disables boosted tier
 routing, while Codex hard remains gpt-6.1-sol.
 The launch notice explains the decision. Reviews keep their usual cheap models

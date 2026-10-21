@@ -57,17 +57,21 @@ def active(home):
     return result
 
 
-def guard(tier, model):
-    """Refuse a top model outside its tier; no flag overrides this."""
-    if TOP_ONLY.get(model, tier) != tier:
+def guard(tier, model, override=""):
+    """Refuse a top model outside its tier unless Jacopo's override text is given; True when it was needed."""
+    if TOP_ONLY.get(model, tier) == tier:
+        return False
+    if not (override or "").strip():
         raise RoutingParseError(
             f"{model} is for Tier: {TOP_ONLY[model]} tasks only (this one is {tier}); use gpt-6-luna "
-            "by default or gpt-6.1-sol for hard (Claude: sonnet, opus). --model and --no-pace do not override this.")
+            "by default or gpt-6.1-sol for hard (Claude: sonnet, opus). Only --override \"<Jacopo's request and "
+            "date>\" permits it; --model and --no-pace do not.")
+    return True
 
 
-def route(home, vendor, tier, explicit=None, boosted=True):
+def route(home, vendor, tier, explicit=None, boosted=True, override=""):
     model = pick(home, vendor, tier, explicit, boosted)
-    guard(tier, model)
+    guard(tier, model, override)
     return model
 
 

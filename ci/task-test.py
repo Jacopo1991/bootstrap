@@ -1084,6 +1084,73 @@ class TaskTool(unittest.TestCase):
             self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
             self.assertNotIn('route:', out)
 
+    def overrides(self):
+        path = self.home / '.local/state/task/usage/overrides.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_override_allows_astra_on_a_routine_task_and_is_recorded(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        request = 'Jacopo 2026-10-21: use Astra on this one'
+        out = self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', request)
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+        self.assertIn('override recorded', out)
+        # The detached worker re-runs the lane with the override but does not record it a second time.
+        (entry,) = self.overrides()
+        self.assertEqual((entry['repo'], entry['task'], entry['model'], entry['tier'], entry['override']),
+                         ('proj', 'T-5', 'gpt-6-astra', 'routine', request))
+        self.assertRegex(entry['time'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d')
+        # An override on a model that is within its tier is not an override: nothing recorded.
+        (wt / '.work/final.md').unlink(missing_ok=True)
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-luna', '--override', request)
+        self.wait_for_lane(wt)
+        self.assertEqual(len(self.overrides()), 1)
+
+    def test_without_an_override_the_tier_rule_holds_and_nothing_is_recorded(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for options in ((), ('--override', ''), ('--override', '  ')):
+            out = self.lane_refused('--model', 'gpt-6-astra', *options)
+            self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
+            self.assertIn('--override', out)
+        self.assertEqual(self.overrides(), [])
+
+    def test_reviews_refuse_astra_and_fable_even_with_an_override(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21')
+        self.wait_for_lane(wt)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'review.md'
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n')
+        for vendor, model in (('codex', 'gpt-6-astra'), ('claude', 'fable'), ('claude', 'claude-fable-5-1')):
+            out = self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', vendor, model, code=1)
+            self.assertIn(f'reviews never use {model}; no override applies', out)
+        # `task review` takes no override at all, and the lane override leaves the routed reviewer cheap.
+        self.assertIn('unrecognized arguments: --override', self.raw_task(
+            'review', 'proj', '5', '--run', '--override', 'Jacopo 2026-10-21', code=2))
+        self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply.read_text()))
+        from task_routing import TOP_ONLY
+        route = json.loads((self.state() / 'review-routing.json').read_text())
+        self.assertNotIn(route['model'], TOP_ONLY)
+
+    def test_status_and_weekly_line_show_overrides(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.assertIn('model overrides, last 7 days: 0', self.raw_task('status', 'proj'))
+        self.assertEqual(self.raw_task('usage', '--weekly-line').splitlines()[-1], 'model overrides, last 7 days: 0')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21: design look')
+        self.wait_for_lane(wt)
+        for out in (self.raw_task('status', 'proj'), self.raw_task('usage', '--weekly-line')):
+            self.assertIn('model overrides, last 7 days: 1 (proj/T-5 gpt-6-astra on routine at ', out)
+            self.assertIn('Jacopo 2026-10-21: design look', out)
+
     def test_reviews_never_pick_astra_or_fable(self):
         from task_routing import TOP_ONLY
         self.stub_reviewers()

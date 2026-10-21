@@ -84,7 +84,8 @@ elif cmd == 'lane':
     vendor = options[options.index('--builder') + 1]
     tier = options[options.index('--tier') + 1] if '--tier' in options else 'routine'
     explicit = options[options.index('--model') + 1] if '--model' in options else None
-    routed_model = route(home, vendor, tier, explicit)
+    override = options[options.index('--override') + 1] if '--override' in options else ''
+    routed_model = route(home, vendor, tier, explicit, override=override)
     with (home / 'prompts.jsonl').open('a') as out:
         out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options,
                                  routed_model=routed_model)) + '\n')
@@ -590,6 +591,23 @@ class BatchTest(unittest.TestCase):
                 self.assertEqual([c[c.index('--model') + 1] for c in lanes][:1], [model])
                 self.assertEqual(lanes[-1][lanes[-1].index('--model') + 1], final)
                 self.assertEqual([model in c for c in lanes], [True, True, False])
+
+    def test_runner_line_override_runs_a_top_model_outside_its_tier(self):
+        request = 'Jacopo 2026-10-21, design review'
+        for number, (builder, model, tier) in enumerate((('codex', 'gpt-6-astra', 'routine'), ('claude', 'fable', 'design'))):
+            with self.subTest(model=model):
+                self.source.write_text(f'1. ov{number}: builder {builder}, model {model}, tier {tier}, '
+                                       f'override: {request}\nTime box: 60 min\n')
+                self.scenario({})
+                self.assertNotIn('parked', self.run_batch())
+                lanes = [c for c in self.calls('lane') if c[2] == f'ov{number}']
+                self.assertEqual(lanes[0][lanes[0].index('--override') + 1], request)
+                self.assertEqual(lanes[0][lanes[0].index('--model') + 1], model)
+                (self.repo / '.work/runner-test.done').unlink(missing_ok=True)
+
+    def test_runner_line_override_must_not_be_empty(self):
+        self.source.write_text('1. one: builder codex, model gpt-6-astra, override: \nTime box: 60 min\n')
+        self.assertIn('override needs', self.run_batch(code=1))
 
     def test_two_parked_tasks_stop_batch(self):
         self.source.write_text(self.source.read_text().split('```')[0] +
