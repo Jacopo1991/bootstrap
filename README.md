@@ -423,6 +423,47 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 ### Task batches and lanes
 
+`task start` and `task lane` accept `--tier routine|hard|design`. Tasks may
+declare `Tier: hard` alongside their `Verify:` lines; the default is routine.
+The flag takes precedence and the tier is pinned in task state and shown by
+`task status`. Runner lines require a model or a tier. For example:
+
+```text
+1. prepare: builder codex, tier routine
+2. implement: builder codex, tier hard, after: prepare
+```
+
+Without a model, the batch passes `--tier` to `task lane` for routing.
+An explicit runner model takes precedence over tier routing.
+Tier-only tasks keep their tier on every fix round without a model pin; only
+the final vendor swap applies. Explicit-model tasks keep their model escalation rules.
+
+`task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
+temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.
+Without boost, routine uses the usual builder default (Codex gpt-6-luna,
+Claude sonnet); hard and design use Codex gpt-6.1-sol or Claude opus.
+While that vendor is boosted, hard uses Codex gpt-6.1-sol or
+Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
+default. An explicit `--model` always wins; `--no-boost` disables boosted tier
+routing, while Codex hard remains gpt-6.1-sol.
+The launch notice explains the decision. Reviews keep their usual cheap models
+and usage-limit handling regardless of boost.
+Usage limits retry once on the other reviewer vendor and record its actual
+identity. If that fallback uses the builder's vendor, the batch stops for an
+independent review; the merge gate still requires the other vendor.
+
+The shared routing constant is in `home/dot_local/bin/task_routing.py`.
+Optional `~/.config/task/routing.json` overrides defaults and hard/design models,
+for example `{"models":{"claude":{"hard":"fable"}},"extra_lanes":2}`.
+Model keys are `default`, `hard`, `design` under `codex` or `claude`.
+`extra_lanes` is a nonnegative integer, default 2. The batch runner normally
+runs one task at a time; an active vendor boost permits 1 + extra_lanes tasks
+for that vendor. Total concurrency is capped by the largest current vendor
+limit and the slots in `~/.config/task/gate.toml` (default 3).
+Dependencies wait for their predecessor to merge; parked predecessors skip
+their dependants. Expiry reduces new dispatches without interrupting live work.
+`task status` shows the effective vendor limits and gate slots.
+
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
 `--dangerously-bypass-approvals-and-sandbox`; the managed policy hook stays active.

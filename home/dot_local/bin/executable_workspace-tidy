@@ -18,7 +18,8 @@ plain folders, second checkouts. Finished, clean Codex app worktrees in $CODEX_H
 reported and removed only with --apply; unfinished or dirty Codex worktrees are retained, and
 ignored non-cache files still block them.
 Unmerged worktrees idle for more than 7 days are reported and listed by `task status` under
-"Needs attention" (finish, adopt or delete); they are never removed.
+"Needs attention" (finish, adopt or delete), locked ones too with their lock reason; they are
+never removed.
 
 Usage: workspace-tidy            report only
        workspace-tidy --apply    also remove finished worktrees and merged branches
@@ -340,20 +341,28 @@ def worktree_state(repo: Path, entry: dict, refs: list[str], now: float) -> tupl
     return gitdir, merged, age
 
 
+def lock_note(entry: dict) -> str:
+    """Empty when the worktree is not locked, else ", locked: <reason>" (", locked" without one)."""
+    if "locked" not in entry:
+        return ""
+    reason = entry["locked"] if isinstance(entry["locked"], str) else ""
+    return f", locked: {reason}" if reason else ", locked"
+
+
 def stale_unmerged(repo: Path, now: float) -> list[dict]:
-    """Unmerged worktrees under the managed folders idle for more than STALE_DAYS."""
+    """Unmerged worktrees under the managed folders idle for more than STALE_DAYS, locked ones included."""
     refs = default_refs(repo)
     found = []
     for entry in worktree_list(repo)[1:]:
         path = Path(entry["worktree"])
-        if ("locked" in entry or "prunable" in entry or inside(path, CODEX_WORKTREES)
+        if ("prunable" in entry or inside(path, CODEX_WORKTREES)
                 or not any(inside(path, repo / place) for place in TIDY_DIRS)):
             continue
         _, merged, age = worktree_state(repo, entry, refs, now)
         if not merged and age > STALE_DAYS * 86400:
             branch = entry.get("branch") if isinstance(entry.get("branch"), str) else None
             found.append({"path": path, "branch": branch[len("refs/heads/"):] if branch else "detached",
-                          "days": int(age // 86400)})
+                          "days": int(age // 86400), "locked": lock_note(entry)})
     return found
 
 
@@ -370,8 +379,13 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
             seen_codex.add(path.resolve())
             tidy_codex_worktree(repo, entry, path, refs, apply, now, in_use, report, done)
             continue
-        if "locked" in entry:
-            continue                         # a running Claude Code session
+        if "locked" in entry:                # a running Claude Code session; never removed
+            if "prunable" not in entry and any(inside(path, repo / place) for place in TIDY_DIRS):
+                _, merged, age = worktree_state(repo, entry, refs, now)
+                if not merged and age > STALE_DAYS * 86400:
+                    report.append(f"{repo.name}: open worktree {path} ({label}, unmerged work, "
+                                  f"idle {int(age // 86400)} days{lock_note(entry)}); finish, adopt or delete")
+            continue
         if "prunable" in entry:
             report.append(f"{repo.name}: worktree folder missing: {path} ({label}); if it was moved, "
                           f"run `git -C {repo} worktree repair <new path>`; if deleted, check, then prune")

@@ -157,6 +157,38 @@ class Tidy(unittest.TestCase):
             self.assertIn(kept, branches, f"{kept} must survive:\n{out}")
         self.assertEqual((wt / "dirty/a.txt").read_text(), "changed\n")
 
+    def test_locked_idle_unmerged_worktrees_are_reported_with_the_lock_reason_and_kept(self):
+        wt = self.repo / ".worktrees"
+        for name, reason in (("held", ["--reason", "session 42 running"]), ("bare", [])):
+            run(self.repo, "worktree", "add", "-q", "-b", name, str(wt / name), old=True)
+            (wt / name / f"{name}.txt").write_text(name)
+            run(wt / name, "add", f"{name}.txt", old=True)
+            run(wt / name, "commit", "-qm", name, old=True)
+            run(self.repo, "worktree", "lock", *reason, str(wt / name))
+            age(wt / name)
+        run(self.repo, "worktree", "add", "-q", "-b", "held-new", str(wt / "held-new"))
+        (wt / "held-new/n.txt").write_text("n")
+        run(wt / "held-new", "add", "n.txt")
+        run(wt / "held-new", "commit", "-qm", "new")
+        run(self.repo, "worktree", "lock", str(wt / "held-new"))
+        stale = TIDY_MODULE.stale_unmerged(self.repo, time.time())
+        found = {item["branch"]: item for item in stale}
+        self.assertEqual(found["held"]["locked"], ", locked: session 42 running")
+        self.assertEqual(found["bare"]["locked"], ", locked")
+        self.assertEqual(found["open"]["locked"], "")
+        self.assertNotIn("held-new", found)
+        self.assertNotIn("locked", found, "a merged locked worktree is not unmerged")
+        for mode in ((), ("--apply",)):
+            out = self.tidy(*mode)
+            self.assertIn(f"open worktree {wt / 'held'} (held, unmerged work, idle 10 days, locked: "
+                          "session 42 running); finish, adopt or delete", out)
+            self.assertIn(f"open worktree {wt / 'bare'} (bare, unmerged work, idle 10 days, locked); "
+                          "finish, adopt or delete", out)
+            self.assertNotIn("held-new, unmerged", out)
+        for name in ("held", "bare", "held-new", "locked"):
+            self.assertTrue((wt / name).is_dir(), name)
+        self.assertLessEqual({"held", "bare", "held-new", "locked"}, self.branches())
+
     def test_strays_and_project_data_are_reported_never_removed(self):
         out = self.tidy("--apply")
         self.assertIn("worktree outside the repository", out)
