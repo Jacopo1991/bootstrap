@@ -3266,6 +3266,8 @@ store.write_text(json.dumps(prs))
         (snapshot / '.work/empty-after/copy.db').write_bytes(b'db')
         manifest = snapshot / 'manifest.json'
         manifest.write_text(json.dumps({'skipped': [{'path': 'old'}]}))
+        (snapshot / 'manifest.json.tmp').symlink_to(outside)
+        outside_content = outside.read_bytes()
         # Old ignored-file archives have no manifest yet.
         old = root / 'proj/t5/old-ignored'
         old.mkdir()
@@ -3301,6 +3303,7 @@ store.write_text(json.dumps(prs))
         self.assertTrue(any(f'{total} bytes total' in line for line in report))
         self.assertTrue((snapshot / '.work/linked.db').is_symlink())
         self.assertTrue(outside.exists())
+        self.assertEqual(outside.read_bytes(), outside_content)
         TASK_MODULE.prune_evidence_archive(root, True, [])
         self.assertEqual(json.loads(manifest.read_text()), record)
 

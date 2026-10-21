@@ -151,7 +151,11 @@ def prune_evidence_archive(root, apply, report):
                 report.append(f"archive: {'remove' if apply else 'would remove'} {item} ({removal['size']} bytes)")
                 if apply:
                     record.setdefault('pruned', []).append(removal)
-                    atomic_json(manifest, record)
+                    # A pre-existing manifest.json.tmp may be a link outside the archive.
+                    with tempfile.NamedTemporaryFile(mode='w', dir=snapshot, delete=False) as stream:
+                        json.dump(record, stream, indent=2, sort_keys=True)
+                        stream.write('\n')
+                    Path(stream.name).replace(manifest)
                     if stat.S_ISDIR(meta.st_mode):
                         shutil.rmtree(item)
                     else:
