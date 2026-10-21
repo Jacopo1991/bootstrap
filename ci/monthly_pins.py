@@ -159,6 +159,18 @@ def render_lock(entries: list[tuple[str, str]], candidates: dict[str, str]) -> s
     return "\n".join(lines) + "\n"
 
 
+ENGINE_PACKAGES = ("docker-ce", "docker-ce-cli", "docker-ce-rootless-extras")
+
+
+def require_engine_match(lock_text: str) -> None:
+    """The rootless extras must stay on the engine's exact version, or the cohort is kept as is."""
+    versions = dict(lock_entries(lock_text))
+    if not all(name in versions for name in ENGINE_PACKAGES):
+        return
+    if len({versions[name] for name in ENGINE_PACKAGES}) != 1:
+        raise ResolveError("Docker engine, CLI and rootless extras resolved to different versions")
+
+
 def gate_run_matches(
     run: dict[str, Any], workflow_id: int, branch: str, head_sha: str, dispatched_at: dt.datetime,
     prior_run_ids: set[int] | None = None,
@@ -313,7 +325,9 @@ def resolve_apt(root: Path, pins_text: str, pins: dict[str, str], staged: dict[s
             packages = [name for name, _ in entries]
             material, armored = apt_key(pins, key_prefix)
             candidates = isolated_apt_candidates(source_text, packages, material, armored)
-            staged[str(path)] = render_lock(entries, candidates)
+            rendered = render_lock(entries, candidates)
+            require_engine_match(rendered)
+            staged[str(path)] = rendered
             notes.append(f"Resolved {label} package cohort ({len(packages)} exact packages).")
         except ResolveError as exc:
             notes.append(f"Retained {label} cohort: {exc}.")
