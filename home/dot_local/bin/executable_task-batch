@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
-from task_limits import cli_limit, lane_limit
+from task_limits import bwrap_denial, cli_limit, lane_limit
 from task_routing import TIERS, guard, lane_limits, override_problem
 
 
@@ -45,7 +45,8 @@ HOLD_SECONDS = 60
 def terminal_block(output):
     lines = [line for line in output.splitlines() if line.strip()]
     last = lines[-1] if lines else ""
-    return last if last.startswith(("BLOCKED:", *HOOK_DENIAL)) else ""
+    # The known bwrap sandbox denial (setup #11) is an environment warning, not a stop.
+    return last if last.startswith(("BLOCKED:", *HOOK_DENIAL)) and not bwrap_denial(last) else ""
 
 
 class Stop(Exception):
@@ -60,14 +61,10 @@ def data(path):
     return json.loads(read(path) or "{}")
 
 
-def check_output(state, work):
-    """Use the log belonging to the latest check, including trusted PM runs."""
+def check_output(state):
+    """The latest trusted check log; a lane's advisory check.log never goes into a prompt."""
     trusted = data(state / "check.json")
-    advisory = data(work / "check.json")
-    evidence = max((trusted, advisory), key=lambda item: item.get("time", ""))
-    if evidence is trusted and trusted.get("trusted") and trusted.get("log"):
-        return read(Path(trusted["log"]))
-    return read(work / "check.log")
+    return read(Path(trusted["log"])) if trusted.get("trusted") and trusted.get("log") else ""
 
 
 def name(ident):
@@ -141,12 +138,20 @@ def blocking(text):
     return re.sub(r"(?im)^Commit:.*$", "", text).strip()
 
 
+def default_branch(path):
+    return next((ref for ref in ("origin/HEAD", "origin/main", "main")
+                 if not run_git(path, "rev-parse", "-q", "--verify", ref).returncode), None)
+
+
+def run_git(path, *args):
+    return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
+
+
 def merge_in_only(path, reviewed, head):
     """True when every commit after the reviewed head cleanly merges the default branch."""
     def run(*args):
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
-    default = next((ref for ref in ("origin/HEAD", "origin/main", "main")
-                    if not run("rev-parse", "-q", "--verify", ref).returncode), None)
+        return run_git(path, *args)
+    default = default_branch(path)
     if not default or not reviewed:
         return False
     commits = run("rev-list", "--parents", f"{reviewed}..{head}", "--not", default).stdout.splitlines()
@@ -233,6 +238,10 @@ class Batch:
         if git(path, "rev-parse", "HEAD") == record["base_sha"]:
             return False
         if re.match(r"(?i)WIP\b", git(path, "log", "-1", "--format=%s")):
+            return False
+        # `default...HEAD` is the diff from the merge-base: a merge-only head adds nothing of its own.
+        default = default_branch(path)
+        if default and not run_git(path, "diff", "--quiet", f"{default}...HEAD").returncode:
             return False
         report = read(path / ".work/report.md")
         headings = ["What changed", "How I verified"]
@@ -323,7 +332,7 @@ class Batch:
             findings = (f"Previous lane ended by usage limit: {previous_limit}. Resume, finish and commit."
                         if previous_limit else blocking(read(state / "review.md")) or
                         "Unfinished work: finish and commit.")
-            check_tail = "\n".join(check_output(state, work).splitlines()[-80:])
+            check_tail = "\n".join(check_output(state).splitlines()[-80:])
         # Merge-in rounds do not count toward the cap: their time is subtracted.
         exempt, round_start, merge_in_since = 0.0, 0.0, None
 
@@ -343,7 +352,7 @@ class Batch:
                 prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch
                 if rounds or findings:
                     prompt += ("\n\nFix round: re-measure, run the tests, finish and commit.\n"
-                               f"Blocking findings:\n{findings}\nFailing check output tail:\n{check_tail}\n")
+                               f"Blocking findings:\n{findings}\nLatest trusted check result:\n{check_tail}\n")
                     if "git merge origin/main" in findings:
                         prompt += MERGE_IN_INSTRUCTION + "\n"
                 prompt += "\n\n" + BLOCK_INSTRUCTION + "\n"
@@ -371,11 +380,14 @@ class Batch:
                 # Only lane final.md and the reviewer's own reply are inspected.
                 checked = self.call("check", ident, retry=True)
                 if checked.returncode:
-                    check_tail = "\n".join((check_output(state, work) or checked.stdout).splitlines()[-80:])
+                    check_tail = "\n".join((check_output(state) or checked.stdout).splitlines()[-80:])
                     findings = "Failed task check"
                     signature = ("check", failure_key(check_tail))
                 else:
-                    check_tail = ""
+                    # A passed check is still the latest trusted result the next fix prompt states.
+                    check_tail = "\n".join((checked.stdout.strip().splitlines()[-1:]
+                                            + [line for line in check_output(state).splitlines()
+                                               if line.startswith("Gate suites finished")][-1:]))
                     review = {}
                     for _ in range(2):
                         result = self.call("review", ident, "--run", "--append-prompt", BLOCK_INSTRUCTION)
