@@ -189,6 +189,45 @@ class Tidy(unittest.TestCase):
             self.assertTrue((wt / name).is_dir(), name)
         self.assertLessEqual({"held", "bare", "held-new", "locked"}, self.branches())
 
+    def test_idle_unmerged_codex_worktrees_are_reported_and_kept(self):
+        age(self.codex_open)
+        locked = self.home / ".codex/worktrees/lk01/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-locked", str(locked), old=True)
+        (locked / "l.txt").write_text("l")
+        run(locked, "add", "l.txt", old=True)
+        run(locked, "commit", "-qm", "locked Codex work", old=True)
+        run(self.repo, "worktree", "lock", "--reason", "codex session", str(locked))
+        age(locked)
+        recent = self.home / ".codex/worktrees/rc02/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-recent", str(recent))
+        (recent / "r.txt").write_text("r")
+        run(recent, "add", "r.txt")
+        run(recent, "commit", "-qm", "recent Codex work")
+        before = TIDY_MODULE.CODEX_WORKTREES
+        TIDY_MODULE.CODEX_WORKTREES = self.home / ".codex/worktrees"
+        try:
+            found = {item["branch"]: item for item in TIDY_MODULE.stale_unmerged(self.repo, time.time())}
+        finally:
+            TIDY_MODULE.CODEX_WORKTREES = before
+        self.assertEqual(found["codex-open"]["path"], self.codex_open)
+        self.assertEqual(found["codex-open"]["days"], 10)
+        self.assertEqual(found["codex-open"]["locked"], "")
+        self.assertEqual(found["codex-locked"]["locked"], ", locked: codex session")
+        for merged_or_recent in ("codex-recent", "codex-done", "codex-dirty"):
+            self.assertNotIn(merged_or_recent, found)
+        for mode in ((), ("--apply",)):
+            out = self.tidy(*mode)
+            self.assertIn(f"Codex worktree {self.codex_open} (codex-open) kept: branch is not merged or "
+                          "detached commit is outside the default branch; idle 10 days; "
+                          "finish, adopt or delete", out)
+            self.assertIn(f"Codex worktree {locked} (codex-locked) kept: worktree is locked; idle 10 days; "
+                          "finish, adopt or delete", out)
+            self.assertNotIn("(codex-recent) kept: branch is not merged or detached commit is outside the "
+                             "default branch; idle", out)
+        for path in (self.codex_open, locked, recent):
+            self.assertTrue(path.is_dir(), path)
+        self.assertLessEqual({"codex-open", "codex-locked", "codex-recent"}, self.branches())
+
     def test_strays_and_project_data_are_reported_never_removed(self):
         out = self.tidy("--apply")
         self.assertIn("worktree outside the repository", out)

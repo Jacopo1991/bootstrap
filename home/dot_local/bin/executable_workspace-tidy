@@ -17,7 +17,7 @@ Everything else is reported for the PM, never changed: worktrees elsewhere, ~/pr
 plain folders, second checkouts. Finished, clean Codex app worktrees in $CODEX_HOME/worktrees are
 reported and removed only with --apply; unfinished or dirty Codex worktrees are retained, and
 ignored non-cache files still block them.
-Unmerged worktrees idle for more than 7 days are reported and listed by `task status` under
+Unmerged worktrees idle for more than 7 days, Codex app worktrees included, are reported and listed by `task status` under
 "Needs attention" (finish, adopt or delete), locked ones too with their lock reason; they are
 never removed.
 
@@ -286,7 +286,7 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
         report.append(f"{prefix} kept: worktree folder missing or prunable")
         return
     if "locked" in entry:
-        report.append(f"{prefix} kept: worktree is locked")
+        report.append(f"{prefix} kept: worktree is locked{idle_note(repo, entry, refs, now)}")
         return
     head = entry.get("HEAD") if isinstance(entry.get("HEAD"), str) else ""
     if not head:
@@ -306,7 +306,8 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
     else:
         finished = all_contained(repo, {head}, refs)
     if not finished:
-        report.append(f"{prefix} kept: branch is not merged or detached commit is outside the default branch")
+        report.append(f"{prefix} kept: branch is not merged or detached commit is outside the default branch"
+                      f"{idle_note(repo, entry, refs, now)}")
         return
     gitdir = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip() or "/nonexistent")
     age = now - last_activity(repo, path, gitdir, head)
@@ -349,14 +350,24 @@ def lock_note(entry: dict) -> str:
     return f", locked: {reason}" if reason else ", locked"
 
 
+def idle_note(repo: Path, entry: dict, refs: list[str], now: float) -> str:
+    """For an unmerged worktree idle past STALE_DAYS: "; idle N days; finish, adopt or delete", else empty."""
+    if not entry.get("HEAD") or not refs:
+        return ""
+    _, merged, age = worktree_state(repo, entry, refs, now)
+    if merged or age <= STALE_DAYS * 86400:
+        return ""
+    return f"; idle {int(age // 86400)} days; finish, adopt or delete"
+
+
 def stale_unmerged(repo: Path, now: float) -> list[dict]:
-    """Unmerged worktrees under the managed folders idle for more than STALE_DAYS, locked ones included."""
+    """Unmerged worktrees (managed folders and Codex app worktrees) idle for more than STALE_DAYS, locked ones included."""
     refs = default_refs(repo)
     found = []
     for entry in worktree_list(repo)[1:]:
         path = Path(entry["worktree"])
-        if ("prunable" in entry or inside(path, CODEX_WORKTREES)
-                or not any(inside(path, repo / place) for place in TIDY_DIRS)):
+        if "prunable" in entry or not (inside(path, CODEX_WORKTREES)
+                                       or any(inside(path, repo / place) for place in TIDY_DIRS)):
             continue
         _, merged, age = worktree_state(repo, entry, refs, now)
         if not merged and age > STALE_DAYS * 86400:
