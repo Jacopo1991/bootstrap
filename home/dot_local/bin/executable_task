@@ -940,6 +940,99 @@ def gate_variants(path):
     return variants
 
 
+def gate_variants_at_commit(repo: Path, commit: str, worktree: Path):
+    """Read the gate matrix from the committed tree that would be merged."""
+    try:
+        raw = git(repo, "show", f"{commit}:.task.toml")
+        config = tomllib.loads(raw)
+    except Stop as error:
+        if "does not exist" in str(error) or "Path '" in str(error):
+            config = {}
+        else:
+            raise
+    entries = config.get("gate_variant", [])
+    if not isinstance(entries, list):
+        raise Stop(".task.toml gate_variant must be an array of tables.")
+    variants = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Stop(".task.toml gate_variant must contain tables.")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise Stop(".task.toml gate_variant requires a simple nonempty name.")
+        if name in variants:
+            raise Stop(".task.toml gate_variant names must be unique.")
+        variants[name] = expand_environment(entry.get("env", {}), worktree)
+    return variants
+
+
+def fingerprint_file(path: Path):
+    """Fingerprint a file or directory tree without following symlinks."""
+    digest = hashlib.sha256()
+    try:
+        if path.is_symlink():
+            digest.update(b"link\0" + os.readlink(path).encode())
+        elif path.is_file():
+            digest.update(b"file\0" + path.read_bytes())
+        elif path.is_dir():
+            digest.update(b"dir\0")
+            for child in sorted(path.rglob("*"), key=lambda item: item.relative_to(path).as_posix()):
+                relative = child.relative_to(path).as_posix().encode()
+                if child.is_symlink():
+                    value = b"link\0" + os.readlink(child).encode()
+                elif child.is_file():
+                    value = b"file\0" + child.read_bytes()
+                elif child.is_dir():
+                    value = b"dir\0"
+                else:
+                    raise OSError(f"unsupported file type: {child}")
+                digest.update(len(relative).to_bytes(8, "big") + relative)
+                digest.update(hashlib.sha256(value).digest())
+        else:
+            raise OSError(f"missing input: {path}")
+    except OSError as error:
+        raise Stop(f"Cannot fingerprint gate input {path}: {error}")
+    return digest.hexdigest()
+
+
+def outside_gate_inputs(repo: Path, path: Path, seeds):
+    """Return deterministic fingerprints for seeded data and main-linked environments."""
+    inputs = {}
+    for name in sorted(set(seeds)):
+        source = seed_source(repo, name)
+        inputs[f"seed:{name}"] = fingerprint_file(source)
+    linked_env = any((repo / name).is_dir() for name in ("node_modules", ".venv"))
+    if linked_env:
+        locks = []
+        lock_names = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml",
+                      "uv.lock", "poetry.lock", "Pipfile.lock", "Cargo.lock", "composer.lock"}
+        for candidate in repo.rglob("*"):
+            if candidate.is_file() and candidate.name in lock_names:
+                locks.append(candidate)
+        for lock in sorted(locks):
+            relative = lock.relative_to(repo).as_posix()
+            inputs[f"main-lock:{relative}"] = fingerprint_file(lock)
+        for name in ("node_modules/.package-lock.json", ".venv/pyvenv.cfg"):
+            marker = path / name
+            if marker.exists() or marker.is_symlink():
+                inputs[f"environment-marker:{name}"] = fingerprint_file(marker)
+            else:
+                raise Stop(f"Cannot fingerprint gate input {marker}: install marker is missing")
+    return inputs
+
+
+def attach_outside_gate_inputs(evidence, path: Path, record):
+    repo = main_repo(path)
+    try:
+        configured_seeds = task_config(path).get("drill_seeds", [])
+        if not isinstance(configured_seeds, list) or not all(isinstance(name, str) for name in configured_seeds):
+            raise Stop(".task.toml drill_seeds must be a list of seed names.")
+        evidence["outside_inputs"] = outside_gate_inputs(
+            repo, path, list(dict.fromkeys((record or {}).get("seeds", []) + configured_seeds)))
+    except (Stop, OSError, ValueError) as error:
+        evidence["outside_inputs_error"] = str(error)
+
+
 def exclusive_gate_enabled(path: Path, *, advisory=False) -> bool:
     values = task_config(path)
     if advisory:
@@ -2360,7 +2453,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                     path, base, record, state, evidence_name, display_log, advisory=advisory,
                     gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
                     cancelled=cancelled, evidence_sink=evidence)
-                results.append(dict(evidence[0], name=name))
+            results.append(dict(evidence[0], name=name, environment=environment))
                 logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
                 print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
     log = check_log_path(path, state, evidence_name, advisory)
@@ -2473,6 +2566,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
                                 "trusted": state is not None, "advisory": state is None}
+                    if state is not None and evidence_name == "check.json":
+                        attach_outside_gate_inputs(evidence, path, record)
                     if evidence_sink is not None:
                         evidence_sink.append(evidence)
                     elif evidence_name == "check.json" and state is None:
@@ -2503,6 +2598,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 "record_revision": record.get("revision") if record else "",
                 "result": "passed" if passed else "failed", "steps": results,
                 "time": utc_now(), "trusted": state is not None, "advisory": state is None}
+    if state is not None and evidence_name == "check.json":
+        attach_outside_gate_inputs(evidence, path, record)
     if evidence_sink is not None:
         evidence_sink.append(evidence)
     elif evidence_name == "check.json" and state is None:
@@ -3166,22 +3263,44 @@ def merge_gate(task, path, head):
     return record
 
 
-def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record) -> bool:
-    """Reuse evidence only for the same checked tree, record revision and gate matrix."""
+def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record):
+    """Return whether trusted evidence covers the committed result and all external inputs."""
     try:
         checked = json.loads((task_state(task) / "check.json").read_text())
     except (OSError, json.JSONDecodeError):
-        return False
-    expected_variants = set(gate_variants(task.worktree()))
+        return False, "trusted lane check record is missing or unreadable"
+    if checked.get("trusted") is not True or checked.get("result") != "passed":
+        return False, "lane check is not trusted and passing"
+    if checked.get("sha") != lane_head:
+        return False, "lane check is for a different head"
+    if checked.get("record_revision") != record.get("revision"):
+        return False, "lane check record revision differs"
+    if not is_ancestor(repo, base, lane_head):
+        return False, "current main is not an ancestor of the checked lane head"
+    try:
+        expected_variants = gate_variants_at_commit(repo, lane_head, task.worktree())
+    except (Stop, OSError, ValueError) as error:
+        return False, f"cannot read committed gate variants: {error}"
     checked_variants = checked.get("variants", [])
     if not isinstance(checked_variants, list):
-        return False
-    covered_variants = {item.get("name") for item in checked_variants if isinstance(item, dict)}
-    return (checked.get("trusted") is True and checked.get("result") == "passed"
-            and checked.get("sha") == lane_head
-            and checked.get("record_revision") == record.get("revision")
-            and covered_variants == expected_variants
-            and is_ancestor(repo, base, lane_head))
+        return False, "lane check variant evidence is malformed"
+    covered_variants = {item.get("name"): item.get("environment", {})
+                        for item in checked_variants if isinstance(item, dict)}
+    if covered_variants != expected_variants:
+        return False, "lane check gate variants or environments differ from committed merge result"
+    if "outside_inputs_error" in checked or not isinstance(checked.get("outside_inputs"), dict):
+        return False, checked.get("outside_inputs_error", "lane check has no outside-input fingerprints")
+    try:
+        configured_seeds = task_config(task.worktree()).get("drill_seeds", [])
+        if not isinstance(configured_seeds, list) or not all(isinstance(name, str) for name in configured_seeds):
+            return False, ".task.toml drill_seeds cannot be fingerprinted"
+        current_inputs = outside_gate_inputs(
+            repo, task.worktree(), list(dict.fromkeys(record.get("seeds", []) + configured_seeds)))
+    except (Stop, OSError, ValueError) as error:
+        return False, str(error)
+    if checked["outside_inputs"] != current_inputs:
+        return False, "outside-tree gate input fingerprints changed"
+    return True, "trusted passing check matches committed result, record revision, variants, and outside inputs"
 
 
 def overlap_files(repo: Path, lane_head: str, base: str):
@@ -3322,12 +3441,13 @@ def merge(args):
             overlap = overlap_files(repo, lane_head, base)
             if overlap:
                 raise Stop(overlap_message(overlap))
-            if can_reuse_lane_check(task, repo, lane_head, base, record):
-                print("current main is an ancestor of the checked lane head; trusted passing check "
-                      "matches the head, record revision, and gate variants; reusing it")
+            reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
+            if reusable:
+                print(f"reuse decision: reusing trusted lane check: {reuse_reason}")
                 completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
             else:
+                print(f"reuse decision: running full gate because {reuse_reason}")
                 tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
                 if not gate_passed:
                     if not args.override:
