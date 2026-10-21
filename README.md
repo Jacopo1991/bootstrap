@@ -466,6 +466,47 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 ### Task batches and lanes
 
+`task start` and `task lane` accept `--tier routine|hard|design`. Tasks may
+declare `Tier: hard` alongside their `Verify:` lines; the default is routine.
+The flag takes precedence and the tier is pinned in task state and shown by
+`task status`. Runner lines require a model or a tier. For example:
+
+```text
+1. prepare: builder codex, tier routine
+2. implement: builder codex, tier hard, after: prepare
+```
+
+Without a model, the batch passes `--tier` to `task lane` for routing.
+An explicit runner model takes precedence over tier routing.
+Tier-only tasks keep their tier on every fix round without a model pin; only
+the final vendor swap applies. Explicit-model tasks keep their model escalation rules.
+
+`task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
+temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.
+Without boost, routine uses the usual builder default (Codex gpt-6-luna,
+Claude sonnet); hard and design use Codex gpt-6.1-sol or Claude opus.
+While that vendor is boosted, hard uses Codex gpt-6.1-sol or
+Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
+default. An explicit `--model` always wins; `--no-boost` disables boosted tier
+routing, while Codex hard remains gpt-6.1-sol.
+The launch notice explains the decision. Reviews keep their usual cheap models
+and usage-limit handling regardless of boost.
+Usage limits retry once on the other reviewer vendor and record its actual
+identity. If that fallback uses the builder's vendor, the batch stops for an
+independent review; the merge gate still requires the other vendor.
+
+The shared routing constant is in `home/dot_local/bin/task_routing.py`.
+Optional `~/.config/task/routing.json` overrides defaults and hard/design models,
+for example `{"models":{"claude":{"hard":"fable"}},"extra_lanes":2}`.
+Model keys are `default`, `hard`, `design` under `codex` or `claude`.
+`extra_lanes` is a nonnegative integer, default 2. The batch runner normally
+runs one task at a time; an active vendor boost permits 1 + extra_lanes tasks
+for that vendor. Total concurrency is capped by the largest current vendor
+limit and the slots in `~/.config/task/gate.toml` (default 3).
+Dependencies wait for their predecessor to merge; parked predecessors skip
+their dependants. Expiry reduces new dispatches without interrupting live work.
+`task status` shows the effective vendor limits and gate slots.
+
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
 `--dangerously-bypass-approvals-and-sandbox`; the managed policy hook stays active.
@@ -496,6 +537,16 @@ reply or reviewer command failure exits non-zero without recording a review.
 Plain `task review <repo> <id>` still prints the prompt and headless command for
 manual use; `--record <file>` still records a supplied reply. `--run` and `--record`
 are mutually exclusive, and all review modes refuse in a sandboxed session.
+
+Reports may accumulate rounds with repeated `## Criteria` headings. Merge and review
+use only the final block, which must contain every pinned criterion marked `met`
+with evidence. A missing or incomplete final block blocks; earlier `not met` rows
+are superseded and cannot supply missing final-round evidence.
+
+`task start --seed <name>` copies the main checkout's `.work/<name>` into the
+task worktree, including an existing worktree. Resumed runner lines naming a seed
+apply it through the same start path. Identical targets are left alone; a differing
+file or directory stops with a conflict message and preserves lane work.
 
 Before reporting, builders run advisory `task check` from the worktree on the final
 commit and paste its final PASS/FAIL line, including the log path, under `## Check`
@@ -542,6 +593,15 @@ Checks, merge gates and gate drills all run the matrix. Advisory lane checks
 also accept `task check --variant fake`; trusted checks always run every variant.
 The combined check log labels each run, and JSON evidence and history include
 per-variant results. `task status` lists variant names.
+
+Advisory lane checks write `.work/check.log`. Trusted checks write `check.log`
+in the task's state directory; merge gates write `gate-check.log` there and
+drills write `drill-check.log` in their evidence directory. They leave the lane
+log untouched. Check JSON and history record the log path and summary; status
+and review prompts identify the corresponding trusted or advisory log.
+Merge and published-merge repair preserve the trusted `check.log` in state
+and archive the lane log separately as `advisory-check.log`. Batch fix rounds
+read the log recorded by the latest check, including trusted PM checks.
 
 Always launch build lanes through `task lane`, including from a batch runner:
 
@@ -852,7 +912,8 @@ PyPI and about six for npm (its database is about 200 MB).
   `Jacopo1991/cortex-core`; hand copies and other sources are `global-skill-outside-bootstrap`.
 - **Prompt reminder:** `agent-policy/context_reminder.py` is wired as a native
   `UserPromptSubmit` hook for Claude Code and Codex (`hookSpecificOutput.additionalContext`,
-  reminders for slim-workflow, stopping after two failed attempts or at the time box, reporting as
+  reminders for slim-workflow, stopping when the same check/test fails after two real fix
+  attempts or at the time box (the task brief's stop rules take precedence), reporting as
   the task or skill asks, the given worktree and PM adoption of direct requests, git/gh commands
   on their own, verify-ui only for tasks with a UI to verify, and github-ci). For Claude Code
   it is also a `PreToolUse` hook that adds a "read the github-ci skill first" note before a
@@ -860,6 +921,8 @@ PyPI and about six for npm (its database is about 200 MB).
   `gh secret set`, `gh workflow run`, `gh api` with a write method on a settings endpoint). It
   only adds context; it never blocks, and `pre_tool_use.py` stays the policy gate. Codex has the
   same per-prompt reminder; only Claude Code gets the tool-call note.
+  Missing files, wrong paths and hook denials are resolved within authority or reported;
+  they do not count as repeated failing checks and guardrails must never be bypassed.
 - **Windows, run by the founder** from elevated PowerShell (the founder's own gh login, tasks run
   in the logged-in session, not S4U): `windows\install-skills-task.ps1` installs the skills for the
   Windows-side Claude Code and Codex (`--force` once) and registers `MachineBootstrap-Skills-Update`

@@ -249,7 +249,8 @@ class Reminder(unittest.TestCase):
         self.assertEqual(specific["hookEventName"], "UserPromptSubmit")
         text = specific["additionalContext"]
         self.assertLessEqual(len(text.splitlines()), 8)
-        for needle in ("slim-workflow", "two failed attempts", "time box", "Report as the task or skill asks", "task start <repo> <branch>",
+        for needle in ("slim-workflow", "same check/test", "two real fix attempts", "Task brief stop rules take precedence",
+                       "Missing files, wrong paths or hook denials", "never bypass guardrails", "time box", "Report as the task or skill asks", "task start <repo> <branch>",
                        "worktree you were given", "only when the task has a UI to verify",
                        "git/gh network commands", "on their own", "git -C <path>", "verify-ui", "github-ci",
                        ".github"):

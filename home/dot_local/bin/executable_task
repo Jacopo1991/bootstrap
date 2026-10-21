@@ -4,10 +4,10 @@
 The sandbox protects private task state from lanes running as the same Unix user.
 Write capability there determines trust; vendor environment markers do not.
 
-  task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
+  task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]...
   task runner-check <repo> <file>
-  task runner-start <repo> <runner-file> [--llm]
-  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
+  task runner-start <repo> <runner-file>
+  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
@@ -22,6 +22,8 @@ Write capability there determines trust; vendor environment markers do not.
   task status [<repo>]
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
+    Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
+    Explicit --model always wins. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -43,6 +45,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import secrets
 import selectors
 import shlex
@@ -59,6 +62,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from task_limits import cli_limit, lane_limit
+from task_routing import TIERS, route, lane_limits, active, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -370,10 +374,16 @@ def read_json_object(path):
         return {}
 
 
+def task_tier(text, flag=None):
+    values = re.findall(r"(?im)^Tier:\s*(.*?)\s*$", text)
+    value = flag or (values[0].lower() if values else "routine")
+    if value not in TIERS or (not flag and len(set(values)) > 1):
+        raise Stop("Tier must be routine, hard or design")
+    return value
+
+
 def active_boosts():
-    now = datetime.now(timezone.utc)
-    return {vendor: until for vendor, until in read_json_object(HOME / ".local/state/task/boost.json").items()
-            if vendor in {"claude", "codex"} and plan_time(until) and now < plan_time(until)}
+    return active(HOME)
 
 
 def boost(args):
@@ -402,7 +412,8 @@ def boost(args):
 
 def boost_line():
     active = active_boosts()
-    return "boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items())) if active else ""
+    return ("boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items()))
+            + " (tier routing + batch capacity; routine and reviews unchanged)" if active else "")
 
 
 def plan_time(value):
@@ -672,7 +683,7 @@ def brief_field(text, heading):
 
 
 def save_check_evidence(destination, name, evidence, log):
-    evidence = dict(evidence, summary_tail="\n".join(log.read_text(errors="replace").splitlines()[-20:]))
+    evidence = dict(evidence, log=str(log), summary_tail="\n".join(log.read_text(errors="replace").splitlines()[-20:]))
     atomic_json(destination / name, evidence)
     with (destination / "checks.jsonl").open("a") as stream:
         stream.write(json.dumps(dict(evidence, kind=name)) + "\n")
@@ -1360,14 +1371,48 @@ def cleanup_lane_temporary(temporary):
         return
     path = Path(temporary)
     # Cancellation reads a lane-controlled record; never remove arbitrary paths.
-    if (path.parent != claude_temporary_root()
-            or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name)):
+    root = claude_temporary_root()
+    if not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
+        raise Stop("Invalid Claude lane temporary directory.")
+    if (path.parent.parent == root
+            and re.fullmatch(r"lane-[0-9a-f]{8}", path.parent.name)):
+        try:
+            path.parent.lstat()
+        except FileNotFoundError:
+            return  # The outer lane already removed its entire private tree.
+    if path.parent != root and not private_claude_lane(path.parent, root):
         raise Stop("Invalid Claude lane temporary directory.")
     if path.exists():
         info = path.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise Stop("Claude lane temporary directory must be owned by the user.")
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            pass  # An outer lane may finish concurrently.
+
+
+def finalize_lane_record(path, run, state, **fields):
+    # A terminal record is the completion signal to waiters and batch runners.
+    # Cleanup must precede publication, but a cleanup failure must not hide exit.
+    try:
+        cleanup_lane_temporary(run.get("temporary"))
+    except (OSError, Stop) as error:
+        print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
+    finally:
+        run.update(state=state, ended_at=utc_now(), **fields)
+        atomic_json(path, run)
+
+
+def private_claude_lane(path, root):
+    if path.parent != root or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
+        return False
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o700)
 
 
 def lane_environment(task, builder="codex"):
@@ -1377,7 +1422,13 @@ def lane_environment(task, builder="codex"):
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
     if builder == "claude":
-        temporary = claude_temporary_root() / f"lane-{secrets.token_hex(4)}"
+        root = claude_temporary_root()
+        # Nest only in a verified outer lane grant, keeping bridge sockets short.
+        inherited = os.environ.get("TMPDIR")
+        parent = Path(inherited).resolve() if inherited else root
+        parent = next((candidate for candidate in (parent, *parent.parents)
+                       if private_claude_lane(candidate, root)), root)
+        temporary = parent / f"lane-{secrets.token_hex(4)}"
         temporary.mkdir(mode=0o700)
     else:
         temporary = task.path / ".work/tmp"
@@ -1483,13 +1534,13 @@ def lane(args):
     record = load_record(task)
     refresh_context(task)
     builder = args.builder or record["builder"]
-    model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
+    tier = args.tier or record.get("tier", "routine")
+    model = route(HOME, builder, tier, args.model, not args.no_boost and not args._worker)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
-        upgraded = "gpt-6-astra" if builder == "codex" else "fable"
-        boost_notice = f"boost: {model} -> {upgraded} (until {until})"
-        model = cli_model = upgraded
+        route_kind = 'explicit model' if args.model else ('default routing' if tier == 'routine' else 'tier routing')
+        boost_notice = f"boost: tier {tier}, {builder} -> {model} ({route_kind}; until {until})"
     else:
         boost_notice = ""
     work = path / ".work"
@@ -1522,11 +1573,12 @@ def lane(args):
                 previous = {}
             if previous.get("state") == "running" and pid_alive(previous.get("pid")):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
+            print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
             archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
-                      "--builder", builder, "--model", model, "--no-boost", "--_worker"]
+                      "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
@@ -1537,9 +1589,13 @@ def lane(args):
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
-            if builder != record["builder"]:
-                print(f"Updating task builder from {record['builder']} to {builder}.")
+            if builder != record["builder"] or tier != record.get("tier", "routine"):
+                if builder != record["builder"]:
+                    print(f"Updating task builder from {record['builder']} to {builder}.")
+                if tier != record.get("tier", "routine"):
+                    print(f"Updating task tier to {tier}.")
                 record["builder"] = builder
+                record["tier"] = tier
                 record["revision"] = record_revision(record)
                 atomic_json(task_state(task) / "task.json", record)
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
@@ -1587,16 +1643,13 @@ def lane(args):
                     code = child.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    run.update(state="timed_out", exit_code=None, ended_at=utc_now())
-                    cleanup_lane_temporary(temporary)
-                    atomic_json(lane_record, run)
+                    finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        cleanup_lane_temporary(temporary)
-        run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
-        atomic_json(lane_record, run)
+        finalize_lane_record(lane_record, run, "timed_out" if timed_out else "finished",
+                             exit_code=None if timed_out else code)
     return code
 
 
@@ -1820,6 +1873,18 @@ def seed_source(repo, name):
     return source
 
 
+def same_seed(source, destination):
+    if source.is_symlink() or destination.is_symlink():
+        return (source.is_symlink() and destination.is_symlink()
+                and os.readlink(source) == os.readlink(destination))
+    if source.is_dir() and destination.is_dir():
+        children = {entry.name for entry in source.iterdir()}
+        return children == {entry.name for entry in destination.iterdir()} and all(
+            same_seed(source / name, destination / name) for name in children)
+    return (source.is_file() and destination.is_file()
+            and source.read_bytes() == destination.read_bytes())
+
+
 def seed_worktree(repo, path, names):
     source_root = repo / ".work"
     destination_root = path / ".work"
@@ -1830,6 +1895,9 @@ def seed_worktree(repo, path, names):
     for source in sources:
         destination = destination_root / source.name
         if destination.exists() or destination.is_symlink():
+            if not same_seed(source, destination):
+                raise Stop(f"Seed target already exists and differs: {destination}; "
+                           "preserving lane work. Resolve the conflict before retrying.")
             continue
         if source.is_dir():
             shutil.copytree(source, destination, symlinks=True)
@@ -1844,11 +1912,11 @@ def runner_check(args):
     pending = []
     in_text_rules = False
     task_line = re.compile(
-        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
-        r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
+        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude)"
+        r"(?:,\s*model\s+([^,\s]+))?(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
         r"(?:\b.*)?$"
     )
-    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
+    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:)|$)")
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
         if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
             in_text_rules = True
@@ -1861,7 +1929,10 @@ def runner_check(args):
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
         no_verify_match = no_verify_field.search(line)
-        parsed = task_line.match(no_verify_field.sub("", line))
+        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line)
+        if tier_field and tier_field[1].lower() not in TIERS:
+            problems.append(f"line {number}: invalid tier {tier_field[1]}")
+        parsed = task_line.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", no_verify_field.sub("", line)))
         if parsed:
             task_lines += 1
             ident, builder, model, seed, after = parsed.groups()
@@ -1873,7 +1944,10 @@ def runner_check(args):
                     pending.append(task.id)
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")
-                resolve_model(builder.lower(), model)
+                if not model and not tier_field:
+                    raise Stop("runner task needs a model or tier")
+                if model:
+                    resolve_model(builder.lower(), model)
                 if no_verify is not None:
                     if not no_verify.strip():
                         raise Stop("no-verify needs a nonempty reason.")
@@ -1921,7 +1995,7 @@ def runner_check(args):
             except (Stop, ValueError, IndexError) as error:
                 problems.append(f"line {number}: {error}")
     if task_lines == 0:
-        problems.append("no task lines found (format: N. <id>: builder <b>, model <m>[, seed <s>][, after: <id>])")
+        problems.append("no task lines found (format: N. <id>: builder <b>, model <m> or tier <t>[, seed <s>][, after: <id>])")
     if (CORTEX / f"cortex-kb-{repo.name}").exists():
         info = plan_info(repo)
         remaining = info["limit"] - len(info["merged"])
@@ -1935,7 +2009,7 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, executable, offset, mode, repo = sys.argv[1:]
+source, done, log, executable, offset, repo = sys.argv[1:]
 child = None
 def stop(signum, frame):
     if child is not None:
@@ -1944,11 +2018,8 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
-    with open(source) as stream:
-        command = ([executable, 'exec', '--dangerously-bypass-approvals-and-sandbox',
-                    '-m', 'gpt-6-luna', '-'] if mode == 'llm' else [executable, repo, source])
-        child = subprocess.Popen(command, stdin=stream if mode == 'llm' else subprocess.DEVNULL)
-        code = child.wait()
+    child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL)
+    code = child.wait()
 finally:
     path = pathlib.Path(done)
     content = path.read_bytes() if path.exists() else b''
@@ -2000,17 +2071,16 @@ def runner_start(args):
         previous = json.loads(record.read_text())
         if previous.get('backend') == 'setsid' and pid_alive(previous.get('pid')):
             raise Stop(f'{unit} is already active (setsid).')
-    binary = 'codex' if args.llm else 'task-batch'
-    executable = shutil.which(binary)
+    executable = shutil.which('task-batch')
     if not executable:
-        raise Stop(f'{binary} is unavailable.')
+        raise Stop('task-batch is unavailable.')
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
     command = [sys.executable, str(wrapper), str(source), str(done),
-               str(log), executable, str(done_offset), 'llm' if args.llm else 'batch', str(repo)]
+               str(log), executable, str(done_offset), str(repo)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               '--property=KillMode=process',
@@ -2037,6 +2107,13 @@ def runner_start(args):
 
 def start(args):
     repo = resolve_repo(args.repo)
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    with (common / "task-start.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return start_locked(args, repo)
+
+
+def start_locked(args, repo):
     ensure_origin_head(repo)
     task = Task(repo, args.id)
     if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
@@ -2136,9 +2213,14 @@ def start(args):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
+        if args.tier and args.tier != record.get("tier", "routine"):
+            record["tier"] = args.tier
+            record["revision"] = record_revision(record)
+            atomic_json(record_path, record)
     else:
         previous_seeds = read_json_object(record_path).get("seeds", []) if record_path.exists() else []
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
+                  "tier": task_tier(task_text, args.tier),
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone"),
@@ -2218,6 +2300,13 @@ def sweep_gate_temporary(root):
             continue
 
 
+def check_log_path(path, state, evidence_name, advisory):
+    if advisory:
+        return path / ".work/check.log"
+    destination = state or task_state(Task(main_repo(path), path.name))
+    return destination / Path(evidence_name).with_suffix(".log")
+
+
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
     variants = gate_variants(path)
@@ -2269,9 +2358,9 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                     gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
                     cancelled=cancelled, evidence_sink=evidence)
                 results.append(dict(evidence[0], name=name))
-                logs.append(f"=== variant {name} ===\n" + (work / "check.log").read_text())
+                logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
                 print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
-    log = work / "check.log"
+    log = check_log_path(path, state, evidence_name, advisory)
     log.write_text("\n".join(logs))
     passed = all(row["result"] == "passed" for row in results)
     evidence = {key: value for key, value in results[0].items() if key not in {"name", "steps", "result"}}
@@ -2306,7 +2395,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         state.mkdir(parents=True, exist_ok=True)
     else:
         state = None
-    log = work / "check.log"
+    log = check_log_path(path, state, evidence_name, advisory)
     passed = True
     timeout = timeout_for(path)
     configured_env = configured_environment(path)
@@ -2818,8 +2907,6 @@ def review(args):
     if not args.record:
         reviewer_route = (("claude", "haiku") if record["builder"] == "codex"
                           else ("codex", "gpt-6-luna"))
-        if reviewer_route[0] in active_boosts():
-            reviewer_route = (reviewer_route[0], "opus" if reviewer_route[0] == "claude" else "gpt-6.1-sol")
         if reviewer_route[0] == record["builder"]:
             raise Stop("reviewer vendor must differ from builder")
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
@@ -2829,6 +2916,7 @@ def review(args):
             prompt.extend(["Recorded check (trusted if present, otherwise advisory):",
                            f"Verdict: {'PASS' if checked['result'] == 'passed' else 'FAIL'}; "
                            f"head: {checked['sha']}; trusted: {checked.get('trusted', False)}",
+                           f"Log: {checked.get('log', '(legacy check: no log path saved)')}",
                            "Summary tail:", checked['summary_tail']])
         else:
             prompt.append("Recorded check: missing for the reviewed head.")
@@ -2873,7 +2961,10 @@ def review(args):
                           else default_branch(task.repo))
         review_base = git(task.repo, "merge-base", review_base, head)
         prompt.append(f"Diff range: {review_base}...{head}")
-        prompt.append(f"Reviewer instructions: read {path / '.work/report.md'} alongside the diff; "
+        report_path = path / '.work/report.md'
+        prompt.append("For cumulative reports, use only the last Criteria block; earlier rounds are superseded. "
+                      "A missing or incomplete last block is Blocking; never fall back to an earlier complete round.")
+        prompt.append(f"Reviewer instructions: read {report_path} alongside the diff; "
                       "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
         if record["criteria"]:
@@ -2910,12 +3001,13 @@ def review(args):
         prompt_file.write_text(prompt_text)
         reply_file.unlink(missing_ok=True)
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
-        if record["builder"] == "codex":
-            command = (f"claude -p {add_dir}--permission-mode dontAsk --model {reviewer_route[1]} --effort high "
-                       "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
-        else:
-            command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
-                       f"-m {reviewer_route[1]} -c model_reasoning_effort=high -")
+        def reviewer_command(vendor, model):
+            if vendor == "claude":
+                return (f"claude -p {add_dir}--permission-mode dontAsk --model {model} --effort high "
+                        "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
+            return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+                    f"-m {model} -c model_reasoning_effort=high -")
+        command = reviewer_command(*reviewer_route)
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
@@ -2927,14 +3019,18 @@ def review(args):
             try:
                 run_reviewer(command, path, prompt_file, reply_file)
             except UsageLimit:
-                if reviewer_route != ("claude", "opus"):
+                if used_fallback:
                     raise
-                print("Boosted Claude reviewer hit a usage limit; retrying once with claude haiku.")
+                previous_route = reviewer_route
+                reviewer_route = (("codex", "gpt-6-luna") if reviewer_route[0] == "claude"
+                                  else ("claude", "haiku"))
+                print(f"{previous_route[0]} reviewer hit a usage limit; retrying once with "
+                      f"{reviewer_route[0]} {reviewer_route[1]}.")
                 used_fallback = True
-                reviewer_route = ("claude", "haiku")
-                atomic_json(state / "review-routing.json", {"vendor": "claude", "model": "haiku",
-                                                            "fallback_from": "opus"})
-                command = command.replace("--model opus ", "--model haiku ", 1)
+                atomic_json(state / "review-routing.json", {
+                    "vendor": reviewer_route[0], "model": reviewer_route[1],
+                    "fallback_from": list(previous_route)})
+                command = reviewer_command(*reviewer_route)
                 run_reviewer(command, path, prompt_file, reply_file)
             head = sha(path, "HEAD")
             try:
@@ -2979,7 +3075,8 @@ def review(args):
             problems.append("--reviewer must be <claude|codex> <model>")
         else:
             routed_reviewer = (routed_reviewer[0].lower(), routed_reviewer[1])
-    if routed_reviewer and routed_reviewer[0].lower() == record["builder"]:
+    if (routed_reviewer and routed_reviewer[0].lower() == record["builder"]
+            and not (args.run and used_fallback)):
         problems.append("reviewer vendor must differ from builder")
     if reviewer and reviewer[0].lower() == record["builder"]:
         print(f"WARNING: reply Reviewer: line names builder vendor '{reviewer[0]}'; using routed reviewer identity.")
@@ -3008,6 +3105,27 @@ def review(args):
     return 0
 
 
+def report_criteria(content, criteria):
+    """Validate the final round, never fall back to a superseded complete round."""
+    blocks = re.findall(r"(?ms)^## Criteria[ \t]*(?:\n|\Z)(.*?)(?=^## |\Z)", content)
+    text = blocks[-1] if blocks else ""
+    rows = re.findall(r"(?im)^\s*(?:(?:[-*]|\d+\.)\s+)?#?(\d+)\s+(met|not met):\s*([^\n]*)", text)
+    required = {item['number'] for item in criteria}
+    if (len(rows) != len(required) or {int(row[0]) for row in rows} != required
+            or any(status.lower() != "met" or not evidence.strip() or "(fill in)" in evidence.lower()
+                   for _, status, evidence in rows)):
+        raise Stop("Missing or incomplete final Criteria block: every criterion must be met with evidence.")
+    return text
+
+
+def current_report(content):
+    """Keep cumulative prose, but discard superseded criteria for report validation."""
+    blocks = list(re.finditer(r"(?ms)^## Criteria[ \t]*(?:\n|\Z).*?(?=^## |\Z)", content))
+    for block in reversed(blocks[:-1]):
+        content = content[:block.start()] + content[block.end():]
+    return content
+
+
 def merge_gate(task, path, head):
     missing = []
     record = load_record(task)
@@ -3023,9 +3141,9 @@ def merge_gate(task, path, head):
             or review.get("reviewer") == record["builder"]):
         missing.append("recorded PASS review for lane head with every criterion pass by the other vendor")
     report = path / ".work/report.md"
-    if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", report.read_text(), re.M):
+    content = current_report(report.read_text()) if report.is_file() else ""
+    if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", content, re.M):
         # Blank headings and explanatory placeholders mean the lane has not completed its report.
-        content = report.read_text() if report.is_file() else ""
         headings = (("What changed", "How I verified", "Criteria", "Noticed, not done")
                     if record["criteria"] else ("What changed", "How I verified"))
         sections = [re.search(rf"(?ms)^## {heading}\s*\n(.*?)(?=^## |\Z)", content)
@@ -3033,12 +3151,11 @@ def merge_gate(task, path, head):
         if not all(match and match.group(1).strip() for match in sections) or "(fill in)" in content:
             missing.append("filled .work/report.md")
     if report.is_file():
-        content = report.read_text()
-        section = re.search(r"(?ms)^## Criteria\s*\n(.*?)(?=^## |\Z)", content)
-        criteria_text = section.group(1) if section else ""
-        if any(not re.search(rf"(?m)^\s*(?:(?:[-*]|\d+\.)\s+)?#?{item['number']}\s+(?:met|not met):\s*\S.+$",
-                             criteria_text, re.I) for item in record["criteria"]):
-            missing.append("criterion evidence in .work/report.md")
+        if record["criteria"]:
+            try:
+                report_criteria(content, record["criteria"])
+            except Stop:
+                missing.append("criterion evidence in final Criteria block of .work/report.md")
     if missing:
         error = Stop("Merge refused; missing: " + "; ".join(missing) + ". Use --override \"reason\" only for an explicit exception.")
         error.missing_steps = missing
@@ -3134,7 +3251,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
         else:
             passed = run_check(gate, base, record, task_state(task),
                                evidence_name="gate-check.json", display_log=archived_log)
-        shutil.copy2(gate / ".work/check.log", archived_log)
+        # run_check writes directly to archived_log in the trusted state directory.
         completed_step(task, "gate")
         return git(gate, "rev-parse", f"{gated_head}^{{tree}}"), passed
     finally:
@@ -3301,7 +3418,7 @@ def merge(args):
         shutil.copy2(report_path, archive / "report.md")
     check_log = path / ".work/check.log"
     if check_log.is_file():
-        shutil.copy2(check_log, archive / "check.log")
+        shutil.copy2(check_log, archive / "advisory-check.log")
     completed_step(task, "archived")
     if args.keep:
         return 0
@@ -3800,11 +3917,25 @@ def quality_summary(repo):
             f"reviews per merged task {average}")
 
 
+def stale_worktree_lines(repo):
+    """Unmerged worktrees idle past workspace-tidy's limit; reported only, never removed."""
+    tool = Path(__file__).with_name("workspace-tidy")
+    if not tool.is_file():
+        tool = Path(__file__).with_name("executable_workspace-tidy")
+    try:
+        found = runpy.run_path(str(tool), run_name="task_status_tidy")["stale_unmerged"](repo, time.time())
+    except Exception as error:
+        return [f"idle worktree check unavailable: {error}"]
+    return [f"idle worktree: {repo.name} {item['path']} (branch {item['branch']}, idle {item['days']} days, "
+            f"unmerged{item['locked']}): finish, adopt or delete" for item in found]
+
+
 def status(args):
     active = boost_line()
     if active:
         print(active)
     print(f"Gate slots: {gate_slots()}")
+    print(f"Batch lane limits: {lane_limits(HOME, gate_slots())}; total bounded by gate slots")
     for row in gate_holders():
         print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
@@ -3898,12 +4029,16 @@ def status(args):
                 except (ValueError, TypeError): pass
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
-            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} head={head[:7]} "
+            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} tier={record.get('tier', 'routine') if record else 'routine'} head={head[:7]} "
                   f"{run_label} "
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
                   f"report={'present' if report else 'missing'} idle={idle_label} branch={branch}")
+            if check.get("log"):
+                print(f"    trusted check log: {check['log']}")
             if lane_check.get("advisory"):
+                if lane_check.get("log"):
+                    print(f"    advisory check log: {lane_check['log']}")
                 lane_result = lane_check.get("result", "unknown")
                 current = (lane_check.get("sha") == head and record
                            and lane_check.get("record_revision") == record.get("revision"))
@@ -3950,6 +4085,7 @@ def status(args):
         for request in open_setup_requests(setup_path, repo.name, setup_events):
             attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
                              f"{request.get('text', '')}")
+        attention += stale_worktree_lines(repo)
         improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
         open_count = 0
         if improvements.is_file():
@@ -4026,14 +4162,11 @@ def cancel(args):
         try:
             os.killpg(int(lane_run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, PermissionError) as error:
-            lane_run.update(state="interrupted", ended_at=utc_now())
-            atomic_json(lane_path, lane_run)
+            finalize_lane_record(lane_path, lane_run, "interrupted")
             reason = "could not stop (permission denied)" if isinstance(error, PermissionError) else "already stopped"
             print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
             return 0
-        lane_run.update(state="cancelled", ended_at=utc_now())
-        cleanup_lane_temporary(lane_run.get("temporary"))
-        atomic_json(lane_path, lane_run)
+        finalize_lane_record(lane_path, lane_run, "cancelled")
         print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
         return 0
     run_path = task_state(task) / "run.json"
@@ -4259,10 +4392,13 @@ def repair_published(task, base):
     atomic_json(state / 'merge.json', {'head': head, 'commit': commit, 'time': merged_at})
     print(update_local_default(task.repo, default_branch(task.repo), base))
     if task.path.exists():
-        for name in ('report.md', 'check.log'):
+        for name in ('report.md',):
             source = task.path / '.work' / name
             if source.is_file():
                 shutil.copy2(source, state / name)
+        advisory = task.path / '.work/check.log'
+        if advisory.is_file():
+            shutil.copy2(advisory, state / 'advisory-check.log')
         if not (untracked(task.path) + ignored_leftovers(task.path)):
             preserve_work(task.repo, task.name, task.path, reuse_head=head)
             branch = git(task.path, 'branch', '--show-current')
@@ -4306,8 +4442,7 @@ def repair(args):
             except (OSError, ValueError):
                 lane_run = {}
             if lane_run.get("state") == "running" and not pid_alive(lane_run.get("pid")):
-                lane_run.update(state="interrupted", ended_at=utc_now())
-                atomic_json(lane_path, lane_run)
+                finalize_lane_record(lane_path, lane_run, "interrupted")
                 print(f"Repaired interrupted lane: {repo.name}/{task.id}")
             lock = task_state(task) / "run.lock"
             had_lock = lock.exists()
@@ -4439,11 +4574,6 @@ def gate_drill(args):
             return {"result": "failed", "duration": round(time.monotonic() - started, 3),
                     "error": f"Cannot read drill inputs in {path}."}
         finally:
-            log = path / ".work/check.log"
-            if log.is_file():
-                destination = archive / f"{index}-{phase}"
-                destination.mkdir(exist_ok=True)
-                shutil.copy2(log, destination / "check.log")
             GATE_SLOT.reset(token)
 
     rows = []
@@ -4514,6 +4644,8 @@ def main(argv=None):
         sub.add_argument("id")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
+        if name in {"start", "lane"}:
+            sub.add_argument("--tier", choices=TIERS, help="task Tier line or routine by default")
         if name == "start":
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
@@ -4546,7 +4678,7 @@ def main(argv=None):
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
-    sub = commands.add_parser("boost")
+    sub = commands.add_parser("boost", help="temporary tier routing and extra batch capacity; reviews unchanged")
     sub.add_argument("action", nargs="?", choices=("off",))
     sub.add_argument("--claude-until")
     sub.add_argument("--codex-until")
@@ -4563,7 +4695,6 @@ def main(argv=None):
     sub = commands.add_parser("runner-start", help="launch a validated, detached batch runner")
     sub.add_argument("repo")
     sub.add_argument("file")
-    sub.add_argument("--llm", action="store_true", help="use the legacy Codex runner for this release")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
@@ -4669,7 +4800,7 @@ def main(argv=None):
     except SystemExit as stop:
         finish_detached(stop.code or 0)
         raise
-    except Stop as stop:
+    except (Stop, RoutingParseError) as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1
