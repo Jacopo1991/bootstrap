@@ -4650,7 +4650,7 @@ store.write_text(json.dumps(prs))
             publish(path, run)
 
         args = SimpleNamespace(repo=str(self.repo), id="5", builder="claude", tier=None,
-                               model="opus", no_boost=True, _worker=True, timeout=None)
+                               model="opus", no_boost=True, _worker=True, timeout=None, override="")
         with mock.patch.dict(os.environ, self.env), \
                 mock.patch.object(TASK_MODULE, "HOME", self.home), \
                 mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
