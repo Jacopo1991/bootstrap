@@ -209,7 +209,7 @@ class TaskTool(unittest.TestCase):
         self.git(wt, 'add', '.task.toml')
         self.git(wt, 'commit', '-qm', 'set short check timeout')
         state = self.state()
-        state.mkdir(parents=True)
+        state.mkdir(parents=True, exist_ok=True)
         rows = [{'trusted': True, 'result': 'passed', 'time': f'2026-10-21T00:0{i}:00+00:00',
                  'steps': [{'command': ['just', 'check'], 'duration': 2}]} for i in range(5)]
         (state / 'checks.jsonl').write_text('\n'.join(json.dumps(row) for row in rows))
