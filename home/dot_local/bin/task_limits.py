@@ -31,11 +31,13 @@ def cli_limit(record, output):
 
 
 # Setup #11: Codex lane sandboxes cannot open the NETLINK_ROUTE socket bwrap needs.
-BWRAP_DENIAL = re.compile(r"BLOCKED:.*\b(?:bwrap|bubblewrap)\b.*NETLINK_ROUTE", re.I)
+# The whole line is the denied command plus the denial text; anything more is another blocker.
+BWRAP_DENIAL = re.compile(r"BLOCKED: (?:`[^`]+`|[^`—;&|]+?) [—-] (?:bwrap|bubblewrap(?:[’']s)?) "
+                          r"(?:socket creation )?`?NETLINK_ROUTE`?(?: socket creation)?(?: denied| failed)?\.?", re.I)
 
 
 def bwrap_denial(line):
-    return bool(BWRAP_DENIAL.match(line))
+    return bool(BWRAP_DENIAL.fullmatch(line.strip()))
 
 
 def lane_limit(record, work):

@@ -753,6 +753,27 @@ class BatchTest(unittest.TestCase):
         self.scenario({'lane': [{'final': 'BLOCKED: git push — bwrap failed\n'}]})
         self.assertIn('batch: stopped: lane: BLOCKED: git push', self.run_batch(1))
 
+    def test_bwrap_warning_matches_only_the_sole_denial_line(self):
+        denial = 'BLOCKED: `task check` — bwrap NETLINK_ROUTE denied'
+        for line in (denial + ' and git push is refused', denial + '; also BLOCKED: git commit',
+                     'BLOCKED: `task check` && `git push` — bwrap NETLINK_ROUTE denied',
+                     'BLOCKED: git push — bwrap NETLINK_ROUTE denied, and the remote rejected it',
+                     'BLOCKED: bwrap NETLINK_ROUTE denied, then merge conflict in task.py'):
+            self.assertFalse(batch_module.bwrap_denial(line), line)
+            self.assertEqual(batch_module.terminal_block(line), line)
+        self.assertTrue(batch_module.bwrap_denial(denial + '.'))
+        self.assertEqual(batch_module.terminal_block('Done.\n' + denial + '\n'), '')
+
+    def test_fix_prompt_after_passed_check_states_the_pass_next_to_review_findings(self):
+        self.scenario({'check': [{'output': 'PASS (log: /fixture/check.log)',
+                                  'trusted_log': 'noise\nGate suites finished (failed=0, skipped=2)\nexit 0'}],
+                       'review': [{'verdict': 'FAIL', 'findings': 'REVIEW finding fixture'}, {}]})
+        self.assertIn('merged after 1 fix rounds', self.run_batch())
+        prompt = self.prompts()[1]['prompt']
+        self.assertIn('REVIEW finding fixture', prompt)
+        self.assertIn('PASS (log: /fixture/check.log)', prompt)
+        self.assertIn('Gate suites finished (failed=0, skipped=2)', prompt)
+
     def test_resumed_fix_prompt_carries_trusted_check_and_review_not_advisory_log(self):
         subprocess.run(['task', 'start', str(self.repo), 'one', '--builder', 'codex'],
                        env=self.env, check=True, capture_output=True)

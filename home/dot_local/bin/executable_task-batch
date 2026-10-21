@@ -342,7 +342,7 @@ class Batch:
                 prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch
                 if rounds or findings:
                     prompt += ("\n\nFix round: re-measure, run the tests, finish and commit.\n"
-                               f"Blocking findings:\n{findings}\nFailing check output tail:\n{check_tail}\n")
+                               f"Blocking findings:\n{findings}\nLatest trusted check result:\n{check_tail}\n")
                     if "git merge origin/main" in findings:
                         prompt += MERGE_IN_INSTRUCTION + "\n"
                 prompt += "\n\n" + BLOCK_INSTRUCTION + "\n"
@@ -372,7 +372,10 @@ class Batch:
                     findings = "Failed task check"
                     signature = ("check", failure_key(check_tail))
                 else:
-                    check_tail = ""
+                    # A passed check is still the latest trusted result the next fix prompt states.
+                    check_tail = "\n".join((checked.stdout.strip().splitlines()[-1:]
+                                            + [line for line in check_output(state).splitlines()
+                                               if line.startswith("Gate suites finished")][-1:]))
                     review = {}
                     for _ in range(2):
                         result = self.call("review", ident, "--run", "--append-prompt", BLOCK_INSTRUCTION)
