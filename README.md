@@ -584,7 +584,7 @@ missing 5-hour reading (none yet, or its window has reset) is `5h-warning` too. 
 5-hour window in its readings of the last 7 days (Codex today) has only the weekly rules, and
 `task usage` says so. A runner's capacity, boosted or not, is
 capped by this (0 when exhausted, 1 in the warning band), so boost adds parallel lanes only below
-the warning band. `task usage --weekly-line` appends `, 5-hour exhausted <day and time>` per window.
+the warning band. `task usage --weekly-line` summarizes recorded runs over the last seven days.
 
 While Jacopo holds a spare reset for a vendor (`spare_resets` > 0) there is no reserve: the window is
 spent at the normal pace, `ahead` never holds lanes back, the share ends at 100 % and `task usage`
@@ -594,8 +594,23 @@ A held lane exits 4 (`task lane`, `task review --run`); the batch runner waits a
 `--no-pace` on `task lane`, `task review`, `task runner-start` and `task-batch` skips the check for that
 one command. Overrides, boosts and held-back lanes are logged to `~/.local/state/task/usage/pace.log`.
 `~/.local/state/task/usage/weeks.json` keeps, per vendor and weekly window, the last used %, the day
-the automated share was first seen used up and the lanes held back; `task usage --weekly-line` prints
-`<vendor> week ending <date>: used N %, exhausted <day or no>, lanes held back N` for the company STATUS.
+the automated share was first seen used up and the lanes held back.
+
+`~/.local/state/task/runs.jsonl` records lane rounds and reviews, with vendor, model, effort, tier,
+round, start/end times, plan ID from `TASK_PLAN`, before/after vendor readings and window deltas.
+Unavailable readings and ccusage tokens are null; a window reset makes its delta null.
+Finishes are deduplicated by run ID. Merge and runner park/stop events refer to those IDs.
+Pending records in `pending-runs/` survive crashes; status shows them as unfinished without writing
+an invented end. `task status` summarizes the last day per vendor; `task usage --weekly-line`
+summarizes seven days (unique runs, weekly percentage-point deltas and outcome counts).
+The former weekly pacing-counter report is replaced by this run summary; pacing rules are unchanged.
+For manual reviews, generate the review prompt before launching to capture a start reading; recording
+a review without that prompt leaves its start and before reading null.
+
+A PM logs its run with `task note <repo> - pm-run start`, followed by
+`task note <repo> - pm-run end [finished|failed|interrupted] [reason]`. Set `TASK_VENDOR`, `TASK_MODEL`,
+`TASK_EFFORT`, `TASK_TIER` and `TASK_PLAN` at start to record its identity. Repeating start while pending
+or repeating end is safe. Lane and review commands explicitly use high effort.
 
 The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
 `~/cortex/cortex-kb-company/policy/usage-pacing.toml`; `task` only reads it and the company PM writes it.
