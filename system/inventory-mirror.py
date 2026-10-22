@@ -9,9 +9,13 @@ mount, then publishes the file as /home/agent/project-data/inventory/latest.json
 (owner agent, mode 0600) with an atomic rename. A symlink, hardlink, FIFO or other
 non-regular file is refused at the source and at the destination. A missing
 snapshot, or one whose createdAtISO is older than MAX_AGE, fails the unit so
-`systemctl --failed` shows that Windows has stopped writing it.
+`systemctl --failed` shows that Windows has stopped writing it. Any failure also
+writes one line (UTC time and the error, no file contents) to
+project-data/inventory/last-error, which the agent can read; a successful copy
+removes it.
 """
 import argparse
+import contextlib
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -26,6 +30,9 @@ MOUNT_POINT = "/run/inventory-mirror"
 AGENT = "agent"
 AGENT_HOME = "/home/agent"
 NAME = "latest.json"
+ERROR_NAME = "last-error"
+SELF_NS = "/proc/self/ns/mnt"
+INIT_NS = "/proc/1/ns/mnt"
 MAX_BYTES = 4 * 1024 * 1024
 MAX_AGE = timedelta(hours=36)
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -102,14 +109,19 @@ def validate(data, now):
                       f"{age.total_seconds() / 3600:.1f} hours old (limit {MAX_AGE.total_seconds() / 3600:.0f})")
 
 
-def publish(directory_fd, data, uid, gid):
+def exists_plain(directory_fd, name):
+    """Return whether name exists; refuse when it is not a plain single-link file."""
     try:
-        info = os.stat(NAME, dir_fd=directory_fd, follow_symlinks=False)
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
-        pass
-    else:
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise Refused(f"existing {NAME} is not a plain single-link file")
+        return False
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise Refused(f"existing {name} is not a plain single-link file")
+    return True
+
+
+def publish(directory_fd, name, data, uid, gid):
+    exists_plain(directory_fd, name)
     temp = f".inventory-{uuid.uuid4().hex}.tmp"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                  0o600, dir_fd=directory_fd)
@@ -120,7 +132,7 @@ def publish(directory_fd, data, uid, gid):
             staged.write(data)
             staged.flush()
             os.fsync(staged.fileno())
-        os.rename(temp, NAME, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.rename(temp, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         os.fsync(directory_fd)
     except BaseException:
         try:
@@ -130,11 +142,10 @@ def publish(directory_fd, data, uid, gid):
         raise
 
 
-def mirror(source_file, home=AGENT_HOME, user=AGENT, now=None):
-    """Publish source_file; refuse a missing or stale snapshot."""
+@contextlib.contextmanager
+def inventory_dir(home, user):
+    """Yield (fd, account) for the agent's inventory directory, opened without following symlinks."""
     account = pwd.getpwnam(user)
-    data = read_source(source_file)
-    validate(data, now or datetime.now(timezone.utc))
     home_fd = os.open(home, DIR_FLAGS)
     try:
         if os.fstat(home_fd).st_uid != account.pw_uid:
@@ -143,7 +154,7 @@ def mirror(source_file, home=AGENT_HOME, user=AGENT, now=None):
         try:
             directory_fd = open_agent_dir(base_fd, "inventory", account.pw_uid, account.pw_gid)
             try:
-                publish(directory_fd, data, account.pw_uid, account.pw_gid)
+                yield directory_fd, account
             finally:
                 os.close(directory_fd)
         finally:
@@ -152,10 +163,42 @@ def mirror(source_file, home=AGENT_HOME, user=AGENT, now=None):
         os.close(home_fd)
 
 
-def mount_source():
-    # Never expose Windows files to the shared namespace the agent's sessions use.
-    if os.readlink("/proc/self/ns/mnt") == os.readlink("/proc/1/ns/mnt"):
+def mirror(source_file, home=AGENT_HOME, user=AGENT, now=None):
+    """Publish source_file and clear last-error; refuse a missing or stale snapshot."""
+    data = read_source(source_file)
+    validate(data, now or datetime.now(timezone.utc))
+    with inventory_dir(home, user) as (directory_fd, account):
+        publish(directory_fd, NAME, data, account.pw_uid, account.pw_gid)
+        if exists_plain(directory_fd, ERROR_NAME):
+            os.unlink(ERROR_NAME, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+
+
+def record_error(message, home=AGENT_HOME, user=AGENT, now=None):
+    """Write one line, UTC time and the error, where the agent can read why a run failed."""
+    stamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    line = f"{stamp:%Y-%m-%dT%H:%M:%SZ} {message}\n"
+    with inventory_dir(home, user) as (directory_fd, account):
+        publish(directory_fd, ERROR_NAME, line.encode("utf-8"), account.pw_uid, account.pw_gid)
+
+
+def refuse_shared_namespace():
+    """Refuse unless this mount namespace differs from PID 1's, which the agent's sessions share.
+
+    Reading another process's ns link needs ptrace-read access; PID 1 holds every capability, so
+    the unit's CapabilityBoundingSet must include CAP_SYS_PTRACE. If PID 1 cannot be read this
+    fails closed: without the comparison there is no proof that the namespace is private.
+    """
+    try:
+        init_ns = os.readlink(INIT_NS)
+    except OSError as error:
+        raise Refused(f"cannot read PID 1's mount namespace to prove ours is private: {error}") from error
+    if os.readlink(SELF_NS) == init_ns:
         raise Refused("refusing to mount Windows files in the shared mount namespace")
+
+
+def mount_source():
+    refuse_shared_namespace()
     info = os.lstat(MOUNT_POINT)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
         raise Refused("mount point must be a root-owned 0700 directory")
@@ -164,7 +207,7 @@ def mount_source():
                    check=True, timeout=60, stdin=subprocess.DEVNULL)
 
 
-def main(argv):
+def main(argv, home=AGENT_HOME, user=AGENT, now=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--source-file", help="read this file instead of mounting the Windows folder")
     args = parser.parse_args(argv)
@@ -177,9 +220,14 @@ def main(argv):
             mount_source()
             mounted = True
         source = args.source_file or os.path.join(MOUNT_POINT, NAME)
-        mirror(source)
-    except (Refused, OSError, subprocess.SubprocessError) as error:
-        print(f"inventory-mirror: FAILED: {error}", file=sys.stderr)
+        mirror(source, home, user, now)
+    except Exception as error:
+        message = " ".join(str(error).split())
+        print(f"inventory-mirror: FAILED: {message}", file=sys.stderr)
+        try:
+            record_error(message, home, user, now)
+        except Exception as write_error:
+            print(f"inventory-mirror: could not write {ERROR_NAME}: {write_error}", file=sys.stderr)
         return 1
     finally:
         if mounted:

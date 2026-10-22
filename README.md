@@ -226,7 +226,11 @@ distro already runs, so it can never wake a stopped one. The service mounts the
 export folder read-only (`mount -t drvfs`, `uid=0,umask=077`) in its own private
 mount namespace and unmounts it afterwards, so automount stays off, the agent's
 sessions never see a Windows mount, and the boundary check still passes.
-`system/inventory-mirror.py` refuses to mount in the shared namespace.
+`system/inventory-mirror.py` refuses to mount in the shared namespace by comparing
+its mount namespace with PID 1's, which needs `CAP_SYS_PTRACE` in the unit's
+bounding set; if PID 1 cannot be read it refuses too. Any failure also leaves one
+line (UTC time and the error) in `~/project-data/inventory/last-error`, which a
+successful copy removes.
 
 The copy runs as root but only into agent-owned directories. It refuses a
 symlink, hardlink, FIFO or other non-regular file as the source and as an
