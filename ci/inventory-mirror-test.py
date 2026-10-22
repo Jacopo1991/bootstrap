@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pwd
 import stat
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -111,6 +112,59 @@ class MirrorTests(unittest.TestCase):
         last_error = self.latest.parent / "last-error"
         self.assertEqual(last_error.read_text(), "2026-10-03T01:45:00Z Windows has not written latest.json\n")
         self.assertEqual([p.name for p in last_error.parent.iterdir()], ["last-error"])
+
+    def run_main_mounted(self, now, unmount):
+        """Run main() on the mount path with mount_source and the unmount faked."""
+        real_geteuid = os.geteuid
+        os.geteuid = lambda: 0
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                    mock.patch.object(mirror_module, "mount_source"), \
+                    mock.patch.object(mirror_module, "MOUNT_POINT", str(self.root)), \
+                    mock.patch.object(mirror_module, "unmount", side_effect=unmount) as unmount_mock:
+                code = mirror_module.main([], home=str(self.home), user=USER, now=now)
+        finally:
+            os.geteuid = real_geteuid
+        unmount_mock.assert_called_once()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_unmount_failure_writes_last_error_and_fails_the_run(self):
+        last_error = self.latest.parent / "last-error"
+        for failure, reason in (
+                (OSError(5, "Input/output error"), "unmount failed: [Errno 5] Input/output error"),
+                (subprocess.TimeoutExpired("umount", 60), "unmount failed: Command 'umount' timed out after 60 seconds")):
+            code, out, err = self.run_main_mounted(NOW, mock.Mock(side_effect=failure))
+            self.assertEqual((code, out), (1, ""))
+            self.assertEqual(err, f"inventory-mirror: FAILED: {reason}\n")
+            self.assertEqual(last_error.read_text(), f"2026-10-03T01:30:00Z {reason}\n")
+            self.assertEqual(self.latest.read_bytes(), SNAPSHOT)  # the copy itself was published
+            last_error.unlink()
+        # A mirror failure and an unmount failure are both recorded in the one line.
+        self.source.unlink()
+        code, out, err = self.run_main_mounted(NOW, mock.Mock(side_effect=OSError(5, "Input/output error")))
+        self.assertEqual(code, 1)
+        self.assertEqual(last_error.read_text(), "2026-10-03T01:30:00Z Windows has not written latest.json; "
+                         "unmount failed: [Errno 5] Input/output error\n")
+
+    def test_last_error_survives_a_failed_unmount_and_goes_after_a_clean_one(self):
+        last_error = self.latest.parent / "last-error"
+        last_error.parent.mkdir(parents=True, mode=0o700)
+        last_error.write_text("2026-10-02T00:00:00Z earlier failure\n")
+        code, out, err = self.run_main_mounted(NOW, mock.Mock(side_effect=OSError(5, "Input/output error")))
+        self.assertEqual(code, 1)
+        self.assertIn("unmount failed", last_error.read_text())  # replaced by this run's failure, not removed
+        code, out, err = self.run_main_mounted(NOW, mock.Mock(return_value=None))
+        self.assertEqual((code, out, err), (0, "inventory-mirror: copied\n", ""))
+        self.assertFalse(last_error.exists())
+
+    def test_non_root_run_refuses_without_touching_project_data(self):
+        with mock.patch.object(os, "geteuid", return_value=1000), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = mirror_module.main(["--source-file", str(self.source)],
+                                      home=str(self.home), user=USER, now=NOW)
+        self.assertEqual((code, err.getvalue()), (1, "inventory-mirror: must run as root\n"))
+        self.assertEqual(list(self.home.iterdir()), [])
 
     def test_symlinked_or_linked_last_error_refused(self):
         self.run_mirror()

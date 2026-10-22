@@ -229,8 +229,8 @@ sessions never see a Windows mount, and the boundary check still passes.
 `system/inventory-mirror.py` refuses to mount in the shared namespace by comparing
 its mount namespace with PID 1's, which needs `CAP_SYS_PTRACE` in the unit's
 bounding set; if PID 1 cannot be read it refuses too. Any failure also leaves one
-line (UTC time and the error) in `~/project-data/inventory/last-error`, which a
-successful copy removes.
+line (UTC time and the error), including a failed unmount, in
+`~/project-data/inventory/last-error`, which a copy that unmounted cleanly removes.
 
 The copy runs as root but only into agent-owned directories. It refuses a
 symlink, hardlink, FIFO or other non-regular file as the source and as an

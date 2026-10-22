@@ -11,8 +11,9 @@ non-regular file is refused at the source and at the destination. A missing
 snapshot, or one whose createdAtISO is older than MAX_AGE, fails the unit so
 `systemctl --failed` shows that Windows has stopped writing it. Any failure also
 writes one line (UTC time and the error, no file contents) to
-project-data/inventory/last-error, which the agent can read; a successful copy
-removes it.
+project-data/inventory/last-error, which the agent can read; a copy that also
+unmounted cleanly removes it. The non-root refusal happens before any of this
+and writes nothing.
 """
 import argparse
 import contextlib
@@ -164,11 +165,16 @@ def inventory_dir(home, user):
 
 
 def mirror(source_file, home=AGENT_HOME, user=AGENT, now=None):
-    """Publish source_file and clear last-error; refuse a missing or stale snapshot."""
+    """Publish source_file; refuse a missing or stale snapshot."""
     data = read_source(source_file)
     validate(data, now or datetime.now(timezone.utc))
     with inventory_dir(home, user) as (directory_fd, account):
         publish(directory_fd, NAME, data, account.pw_uid, account.pw_gid)
+
+
+def clear_error(home=AGENT_HOME, user=AGENT):
+    """Remove last-error once the whole run, unmount included, has succeeded."""
+    with inventory_dir(home, user) as (directory_fd, _):
         if exists_plain(directory_fd, ERROR_NAME):
             os.unlink(ERROR_NAME, dir_fd=directory_fd)
             os.fsync(directory_fd)
@@ -207,6 +213,11 @@ def mount_source():
                    check=True, timeout=60, stdin=subprocess.DEVNULL)
 
 
+def unmount():
+    subprocess.run(["/usr/bin/umount", MOUNT_POINT], check=False, timeout=60,
+                   stdin=subprocess.DEVNULL)
+
+
 def main(argv, home=AGENT_HOME, user=AGENT, now=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--source-file", help="read this file instead of mounting the Windows folder")
@@ -215,24 +226,32 @@ def main(argv, home=AGENT_HOME, user=AGENT, now=None):
         print("inventory-mirror: must run as root", file=sys.stderr)
         return 1
     mounted = False
+    failures = []
     try:
         if args.source_file is None:
             mount_source()
             mounted = True
-        source = args.source_file or os.path.join(MOUNT_POINT, NAME)
-        mirror(source, home, user, now)
+        mirror(args.source_file or os.path.join(MOUNT_POINT, NAME), home, user, now)
     except Exception as error:
-        message = " ".join(str(error).split())
+        failures.append(error)
+    if mounted:
+        try:
+            unmount()
+        except (OSError, subprocess.SubprocessError) as error:
+            failures.append(RuntimeError(f"unmount failed: {error}"))
+    if not failures:
+        try:
+            clear_error(home, user)
+        except Exception as error:
+            failures.append(error)
+    if failures:
+        message = " ".join("; ".join(str(error) for error in failures).split())
         print(f"inventory-mirror: FAILED: {message}", file=sys.stderr)
         try:
             record_error(message, home, user, now)
         except Exception as write_error:
             print(f"inventory-mirror: could not write {ERROR_NAME}: {write_error}", file=sys.stderr)
         return 1
-    finally:
-        if mounted:
-            subprocess.run(["/usr/bin/umount", MOUNT_POINT], check=False, timeout=60,
-                           stdin=subprocess.DEVNULL)
     print("inventory-mirror: copied")
     return 0
 
