@@ -7570,12 +7570,49 @@ class WatcherTests(unittest.TestCase):
             with self.assertRaises(subprocess.TimeoutExpired): self.scan()
 
     def test_p5_company_and_product_asks_yaml_forms(self):
-        for repo, labels in [('company', '[ask]'), ('product', '\n  - "ask"')]:
+        for repo, labels in [('company', '[ask]'), ('product-harness', '\n  - "ask"')]:
             self.write(f'cortex/cortex-kb-{repo}/backlog/tasks/ask.md', f'---\nstatus: To Do\nlabels: {labels}\ndue_date: \'2000-01-01\'\n---\n')
         self.assertEqual(len(self.scan()), 2)
         for name, status, due, labels in [('done', 'Done', '2000-01-01', '[ask]'), ('future', 'To Do', '2999-01-01', '[ask]'), ('other', 'To Do', '2000-01-01', '[not-ask]'), ('today', 'To Do', str(self.now.astimezone(self.watch.usage.CPH).date()), '[ask]')]:
             self.write(f'cortex/cortex-kb-company/backlog/tasks/{name}.md', f'---\nstatus: {status}\nlabels: {labels}\ndue_date: {due}\n---\nlabels: [ask]\n')
         self.assertEqual(len(self.scan()), 2)
+
+    def test_p5_reads_only_company_and_active_product_repositories(self):
+        active = ('company', 'product-harness', 'household-signal-harness', 'madplanner-v2',
+                  'consultancy-website', 'home-energy-lab')
+        excluded = ('typo3-dkm', 'customer-harness', 'photo-organizer', 'unknown-product')
+        for repo in active + excluded:
+            self.write(f'cortex/cortex-kb-{repo}/backlog/tasks/ask.md',
+                       '---\nstatus: To Do\nlabels: [ask]\ndue_date: 2000-01-01\n---\n')
+        original = Path.read_text
+        def read_allowed(path, *args, **kwargs):
+            self.assertFalse(any('cortex-kb-' + repo in path.parts for repo in excluded), path)
+            return original(path, *args, **kwargs)
+        with mock.patch.object(Path, 'read_text', read_allowed):
+            found = self.scan()
+        self.assertEqual({Path(row['source']).parts[-4] for row in found.values()},
+                         {'cortex-kb-' + repo for repo in active})
+
+    def test_installed_layout_real_scan_and_ping(self):
+        installed = self.home / '.local/bin'
+        installed.mkdir(parents=True)
+        shutil.copy2(TOOL, installed / 'task')
+        shutil.copy2(TOOL.with_name('executable_task-watch'), installed / 'task-watch')
+        for helper in TOOL.parent.glob('task_*.py'):
+            shutil.copy2(helper, installed / helper.name)
+        self.assertFalse((installed / 'executable_task').exists())
+        ping = self.write('.local/bin/job-ping', '#!/bin/sh\nprintf "%s %s\\n" "$1" "$2" >> "$HOME/pings"\n')
+        ping.chmod(0o755)
+        ask = self.write('cortex/cortex-kb-company/backlog/tasks/ask.md',
+                         '---\nstatus: To Do\nlabels: [ask]\ndue_date: 2000-01-01\n---\n')
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}
+        result = subprocess.run([sys.executable, installed / 'task-watch'], cwd=self.home,
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [json.loads(line) for line in (self.home / '.local/state/task/watch.jsonl').read_text().splitlines()]
+        self.assertEqual([(row['class'], row['source'], row['status']) for row in rows],
+                         [('P5', str(ask), 'open')])
+        self.assertEqual((self.home / 'pings').read_text(), 'task-watch 0\n')
 
     def test_stale_missing_reports_collector_and_git_commit_age(self):
         os.utime(self.report, (0, 0))

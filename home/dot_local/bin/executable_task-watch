@@ -27,8 +27,9 @@ def findings(home, now):
         if unit.strip() and not unit.lstrip().startswith('#'):
             if command('systemctl', '--user', 'show', '--property=ActiveState', '--value', '--', unit.strip()) == 'failed':
                 add('P4', units, unit.strip())
-    scalar = runpy.run_path(str(Path(__file__).with_name('executable_task')))['frontmatter_value']
-    for path in sorted((home / 'cortex').glob('cortex-kb-*/backlog/tasks/*.md')):
+    tool = Path(__file__).with_name('task')
+    scalar = runpy.run_path(str(tool if tool.is_file() else tool.with_name('executable_task')))['frontmatter_value']
+    for path in sorted(path for repo in ('company', 'product-harness', 'household-signal-harness', 'madplanner-v2', 'consultancy-website', 'home-energy-lab') for path in (home / 'cortex' / ('cortex-kb-' + repo)).glob('backlog/tasks/*.md')):
         text = path.read_text()
         labels = re.search(r'(?m)^labels:[^\n]*(?:\n[ \t]+[^\n]*)*', text.split('---', 2)[1] if text.startswith('---') else '')
         labels, due = re.sub(r'(?m)^\s*-\s+', ' ', labels[0][7:]) if labels else '', scalar(text, 'due_date')
@@ -70,6 +71,5 @@ if __name__ == '__main__':
         result = 1
         print('task-watch: source or ledger unavailable; inspect sources', file=sys.stderr)
     finally:
-        if '--coverage' not in sys.argv:
-            subprocess.run([str(Path.home() / '.local/bin/job-ping'), 'task-watch', str(result)], check=False)
+        if '--coverage' not in sys.argv: subprocess.run([str(Path.home() / '.local/bin/job-ping'), 'task-watch', str(result)], check=False)
     sys.exit(result)
