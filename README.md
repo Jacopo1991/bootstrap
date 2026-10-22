@@ -1072,7 +1072,10 @@ messages and calls no models; the company seat carries findings in its next repo
 The timer is shipped without an enablement symlink.
 
 PMs list live user unit/timer names, one per line (blank lines and `#` comments
-allowed), in `~/.config/task/live-units`. Only those units are inspected.
+allowed), in `~/.config/task/live-units`. Only those units produce P4 findings.
+Timers also inspect their triggered unit when needed: an empty next elapse is
+`no next run` only while the timer is not `running` and its unit is neither
+`activating` nor `active`.
 Asks are read from `backlog/tasks/*.md` under these six repositories in `~/cortex/`:
 `cortex-kb-company`, `cortex-kb-product-harness`, `cortex-kb-household-signal-harness`,
 `cortex-kb-madplanner-v2`, `cortex-kb-consultancy-website` and `cortex-kb-home-energy-lab`.
@@ -1086,8 +1089,9 @@ instead of its modification time. Missing files are findings. Without a collecto
 source it remains interim. No new collector, paid-cap, hold or alert schema is inferred.
 
 `~/.local/state/task/watch.jsonl` records opens and closes with class, source, key,
-first_seen and last_seen. `watch-state.json` updates open findings' last_seen on
-every successful scan without repeating ledger lines; cleared findings close once.
+detail (P4 reason), first_seen and last_seen. `watch-state.json` updates open
+findings' last_seen on every successful scan without repeating ledger lines;
+cleared findings close once.
 Source errors fail the run without closing prior findings. A lock serializes runs.
 Only watcher state is written. Each run calls the existing `job-ping task-watch`
 with its result (provision `TASK_WATCH_URL` in the usual pings file); coverage is read-only.
