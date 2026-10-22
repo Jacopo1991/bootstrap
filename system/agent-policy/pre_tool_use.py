@@ -55,6 +55,12 @@ UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "V
                     "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND",
                     "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
                     "npm_config_prefix", "NPM_CONFIG_PREFIX"}
+# A Docker socket carries the agent user's full power (bind-mount any readable path, write
+# anywhere the agent can), so lane sessions, which carry TASK_WORKTREE, may not run a container
+# CLI or choose a daemon. Only unsandboxed agent processes use agent's rootless Docker.
+CONTAINER_CLIS = {"docker", "docker-compose", "podman", "podman-compose", "nerdctl"}
+CONTAINER_ENV_NAMES = {"CONTAINER_HOST", "CONTAINER_CONNECTION"}
+CONTAINER_ENV_PREFIXES = ("DOCKER_", "PODMAN_", "CONTAINERD_")
 INTERPRETERS = {"bash", "sh", "dash", "zsh", "ksh", "csh", "tcsh", "fish", "python",
                 "node", "nodejs", "deno", "bun", "ruby", "perl", "php", "lua"}
 INLINE_FLAG = re.compile(r"^-[A-Za-z]{1,4}$")
@@ -1449,9 +1455,14 @@ def split_command(command: str) -> tuple[list[str], list[str]] | str:
     return segments, operators
 
 
+def lane_session() -> bool:
+    return bool(os.environ.get("TASK_WORKTREE"))
+
+
 def unsafe_env_name(name: str) -> bool:
     name = name.removesuffix("+").split("[", 1)[0]
-    return name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES)
+    return name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES) or lane_session() and (
+        name in CONTAINER_ENV_NAMES or name.startswith(CONTAINER_ENV_PREFIXES))
 
 
 def unwrap_command(tokens: list[str]) -> list[str] | str:
@@ -1460,7 +1471,7 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
         if ENV_ASSIGNMENT.fullmatch(tokens[0]):
             if unsafe_env_name(tokens[0].split("=", 1)[0]):
                 return Denial("command.unsafe_environment",
-                              "Environment variables that change execution or Git behaviour are blocked.")
+                              "Environment variables that change execution, Git or container-daemon behaviour are blocked.")
             tokens = tokens[1:]
             continue
         wrapper = Path(tokens[0]).name.lower()
@@ -1489,7 +1500,7 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
                 elif ENV_ASSIGNMENT.fullmatch(token):
                     if unsafe_env_name(token.split("=", 1)[0]):
                         return Denial("command.unsafe_environment",
-                                      "Environment variables that change execution or Git behaviour are blocked.")
+                                      "Environment variables that change execution, Git or container-daemon behaviour are blocked.")
                     index += 1
                 elif token.startswith("-"):
                     return "Unsupported env option; blocked by policy."
@@ -2288,6 +2299,10 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     host_reason = host_command_reason(tokens, executable)
     if host_reason:
         return Denial("host.command_boundary", host_reason)
+    if executable in CONTAINER_CLIS and lane_session():
+        return Denial("container.lane_boundary",
+                      "Container CLIs (docker, podman, nerdctl) are blocked in lane sessions; "
+                      "a container daemon socket would bypass the lane sandbox.")
     if executable == "sed":
         reason = sed_policy(tokens)
         if reason:

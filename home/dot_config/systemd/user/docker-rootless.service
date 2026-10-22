@@ -1,0 +1,25 @@
+[Unit]
+Description=Rootless Docker for agent evaluations (start and stop by hand; never enabled)
+Documentation=https://docs.docker.com/go/rootless/
+
+# No [Install] section on purpose: this unit cannot be enabled, so it never starts at boot or
+# login. Start it from an unsandboxed agent shell with `systemctl --user start docker-rootless`
+# and stop it when the evaluation ends. It has no socket unit: the daemon itself creates the
+# socket, and only while it runs. The root Docker daemon and its configuration are not involved.
+
+[Service]
+# dockerd-rootless.sh comes from docker-ce-rootless-extras; newuidmap/newgidmap (uidmap) must be on PATH.
+Environment=PATH=/usr/bin:/usr/sbin:/bin:/sbin
+ExecStart=/usr/bin/dockerd-rootless.sh --data-root=%h/.local/share/docker-rootless --host=unix://%t/docker.sock
+# dockerd creates its socket 0660; the boundary check requires an owner-only socket.
+ExecStartPost=/usr/bin/chmod 0600 %t/docker.sock
+ExecReload=/bin/kill -s HUP $MAINPID
+Type=notify
+NotifyAccess=all
+Delegate=yes
+KillMode=mixed
+TimeoutSec=0
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity

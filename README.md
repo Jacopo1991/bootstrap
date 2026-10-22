@@ -91,7 +91,10 @@ umask `002` and requires the distro check to pass.
 The boundary check requires
 `sudo -n true` to fail, checks groups, and attempts to access the admin home and
 open `~admin/.config/gh/hosts.yml` without printing any file contents. It also
-rejects an accessible Docker socket when one exists. On WSL it fails for a
+rejects an accessible Docker socket when one exists, with one exception: agent's
+rootless socket `/run/user/1001/docker.sock` passes only when agent owns it, it is
+not group- or world-accessible, and a process running as agent serves it (any other
+Docker or containerd socket, or any other path, fails). On WSL it fails for a
 Windows-drive mount, a reachable `/mnt/c/Windows`, `WSL_INTEROP` in the agent login
 environment, or an `/run/WSL/<pid>_interop` socket belonging to a process in
 the agent login's ancestry (including WSL's root-owned `/init`). The
@@ -268,6 +271,21 @@ afterwards. Containerd is also disabled at boot. Agent never joins the Docker
 group. The GPU check runs as admin, runs host Python inference as agent, starts
 Docker explicitly for the container check, and stops Docker/socket/containerd
 on exit. No persistent daemon startup is enabled.
+
+The same step also installs `docker-ce-rootless-extras` (pinned to the engine's
+version) and `uidmap`, and adds agent's `/etc/subuid` and `/etc/subgid` ranges only
+if they are missing. On a machine where Docker is already installed, run
+`sudo bash /opt/machine-bootstrap/current/system/gpu-docker.sh --rootless-only`: it
+leaves the NVIDIA toolkit and the root daemon's configuration alone. Evaluations
+(Inspect AI, installed from a hashed lock as `inspect`) use agent's own rootless
+daemon, `docker-rootless.service`, which is started by hand from an unsandboxed
+agent shell and cannot be enabled. Lane sandboxes must not reach its socket; see
+[docs/rootless-docker.md](docs/rootless-docker.md) for starting an evaluation and
+for `checks/docker-containment.py`, the live containment probe. That probe is required
+before first use and again after every Codex or Claude Code upgrade:
+`python3 -I checks/docker-containment.py check --sandbox 'codex sandbox'`, plus its
+`serve` and `probe` modes from a real Claude lane and a real Codex lane (exact commands
+in the doc).
 
 Both host and container must pass `nvidia-smi`, report `sm_120` in
 `torch.cuda.get_arch_list()`, use the expected `(12, 0)` card on `cuda:0`, perform

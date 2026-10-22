@@ -66,6 +66,20 @@ apt_locked() {
   done
 }
 
+# Rootless Docker needs a subordinate id range per file. Add one only when the user has none;
+# a range that exists is never changed. Usage: ensure_subid_range /etc/subuid agent --add-subuids
+ensure_subid_range() {
+  local file=$1 user=$2 option=$3 start
+  if [[ -e $file ]] && awk -F: -v user="$user" '$1 == user { found = 1 } END { exit !found }' "$file"; then
+    awk -F: -v user="$user" '$1 == user && $3 >= 65536 { ok = 1 } END { exit !ok }' "$file" || {
+      echo "$user has a range in $file smaller than 65536 ids; fix it by hand." >&2; return 1;
+    }
+    return 0
+  fi
+  start=$(awk -F: 'BEGIN { n = 165536 } { if ($2 + $3 > n) n = $2 + $3 } END { print n }' "$file" 2>/dev/null || echo 165536)
+  usermod "$option" "$start-$((start + 65535))" "$user"
+}
+
 apt_key() {
   local name=$1 url=$2 checksum=$3 format=$4 temp
   temp=$(mktemp)

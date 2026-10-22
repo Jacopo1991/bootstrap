@@ -68,6 +68,59 @@ check_vscode_ssh_boundary() {
   echo 'PASS: AgentDev SSH policy, service activation and loopback listener enforced.'
 }
 
+ROOTLESS_DOCKER_SOCKET=/run/user/1001/docker.sock
+
+# Users of the processes listening on a socket path. $3 is `ss -H -xlpn` output; $2 the /proc dir.
+docker_socket_listeners() {
+  local path=$1 proc_dir=${2:-/proc} pid
+  awk -v path="$path" '$5 == path { while (match($0, /pid=[0-9]+/)) {
+    print substr($0, RSTART + 4, RLENGTH - 4); $0 = substr($0, RSTART + RLENGTH) } }' <<< "${3-}" |
+    while read -r pid; do
+      stat -c %U -- "$proc_dir/$pid" 2>/dev/null || echo unknown
+    done
+}
+
+# The root Docker socket must stay unreachable. The one allowed Docker socket is agent's rootless
+# daemon at $1, owned by $2, owner-only, and served by a process of $2; any other reachable Docker
+# or containerd socket fails. Usage: check_docker_sockets PATH USER SS_OUTPUT PROC_DIR SOCKET...
+check_docker_sockets() {
+  local expected=$1 want=$2 ss_output=$3 proc_dir=$4 path mode listeners
+  local reachable=0
+  shift 4
+  for path in "$@"; do
+    [[ -S $path && ( -r $path || -w $path ) ]] || continue
+    if [[ $path != "$expected" ]]; then
+      echo "FAIL: agent has Docker socket access: $path" >&2; return 1
+    fi
+    mode=$(stat -L -c %a -- "$path")
+    if [[ $(stat -L -c %U -- "$path") != "$want" ]] || (( 8#$mode & 8#077 )); then
+      echo "FAIL: rootless Docker socket $path must be owned by $want and owner-only (mode $mode)." >&2; return 1
+    fi
+    listeners=$(docker_socket_listeners "$path" "$proc_dir" "$ss_output")
+    if [[ -z $listeners ]] || grep -qvx -- "$want" <<< "$listeners"; then
+      echo "FAIL: rootless Docker socket $path is not served by a process running as $want." >&2; return 1
+    fi
+    reachable=1
+  done
+  if (( reachable )); then
+    echo 'PASS: only the owner-only rootless Docker socket is reachable.'
+  else
+    echo 'PASS: no Docker socket is reachable.'
+  fi
+}
+
+docker_socket_candidates() {
+  local path
+  shopt -s nullglob
+  for path in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock \
+    "$ROOTLESS_DOCKER_SOCKET" /run/user/*/docker.sock /run/user/*/podman/podman.sock \
+    "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/docker.sock}"; do
+    echo "$path"
+  done
+  [[ ${DOCKER_HOST:-} == unix://* ]] && echo "${DOCKER_HOST#unix://}"
+  return 0
+}
+
 # Unit tests source the same predicates without running account checks.
 if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
   return 0
@@ -91,9 +144,8 @@ fi
 if (exec 3< "$admin_home/.config/gh/hosts.yml") 2>/dev/null; then
   echo 'FAIL: admin gh credentials are readable.' >&2; exit 1;
 fi
-if [[ -S /var/run/docker.sock && ( -r /var/run/docker.sock || -w /var/run/docker.sock ) ]]; then
-  echo 'FAIL: agent has Docker socket access.' >&2; exit 1;
-fi
+mapfile -t docker_sockets < <(docker_socket_candidates | sort -u)
+check_docker_sockets "$ROOTLESS_DOCKER_SOCKET" agent "$(ss -H -xlpn 2>/dev/null || true)" /proc "${docker_sockets[@]}"
 if grep -qiE 'microsoft|wsl' /proc/version; then
   if has_windows_drive_mount < /proc/mounts; then
     echo 'FAIL: Windows drive is mounted.' >&2; exit 1;
