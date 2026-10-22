@@ -659,7 +659,7 @@ class TaskTool(unittest.TestCase):
                 (self.repo / '.task.toml').write_bytes(config)
                 output = self.raw_task('status')
                 self.assertIn('env keys: unavailable (', output)
-                self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
+                self.assertRegex(output, r'z-good:\n  project lock: [^\n]+\n  env keys: PRODUCT_DIR')
                 self.assertNotIn('do-not-display', output)
                 if config == b'\xff':
                     self.assertIn(f'Cannot read {self.repo / ".task.toml"}', output)
@@ -668,7 +668,7 @@ class TaskTool(unittest.TestCase):
         config.mkdir()  # A real OSError from the newly added configuration read.
         output = self.raw_task('status')
         self.assertIn(f'env keys: unavailable (Cannot read {config}.)', output)
-        self.assertIn('z-good:\n  env keys: PRODUCT_DIR', output)
+        self.assertRegex(output, r'z-good:\n  project lock: [^\n]+\n  env keys: PRODUCT_DIR')
 
     def test_configured_environment_rejects_reserved_names(self):
         names = TASK_MODULE.GIT_OVERRIDE_ENV | {'GIT_OVERRIDE_ENV', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
