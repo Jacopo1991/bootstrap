@@ -256,6 +256,17 @@ class TaskTool(unittest.TestCase):
             api.acquire(self.home, self.repo, 'seat-b')
         self.assertIn('Sources changed', out.getvalue())
 
+    def test_project_lock_corrupt_file_is_held_until_forced_release(self):
+        target = TASK_MODULE.task_lock.path(self.home, self.repo)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('{broken')
+        self.assertIn('held by unknown', self.raw_task('lock', 'proj'))
+        with self.assertRaises(TASK_MODULE.task_lock.LockBusy):
+            TASK_MODULE.task_lock.acquire(self.home, self.repo, 'seat-a')
+        self.raw_task('lock', 'proj', '--release', code=1)
+        self.raw_task('lock', 'proj', '--release', '--force')
+        self.assertFalse(target.exists())
+
     def test_adaptive_check_timeout_uses_trusted_passes_only(self):
         repo = self.home / 'dev_workspace/proj'
         worktree = repo / '.worktrees/t1'
@@ -1808,6 +1819,7 @@ sys.exit(7)
                                    '--working-directory', str(self.repo), '--property=StandardInput=null'])
         self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
         self.assertIn('--property=KillMode=process', args)
+        self.assertIn('--setenv=TASK_HOLDER=unnamed', args)
         command = args[args.index(sys.executable):]
         subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
         call = json.loads((runner.parent / 'runner-call').read_text())
@@ -1843,6 +1855,33 @@ sys.exit(7)
                         self.assertEqual(current, 'batch: stopped: runner exited (code 7) '
                                          f'without a final line; see {runner.with_suffix(".log")}\n')
                     self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
+
+    def test_runner_passes_lock_holder_to_children(self):
+        runner = self.runner_fixture()
+        runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
+        batch = self.home / 'bin/task-batch'
+        batch.write_text(textwrap.dedent(f'''\
+            #!/usr/bin/env python3
+            import json, os, subprocess, sys
+            rows = []
+            for args in (('lane', 'proj', '5'), ('review', 'proj', '5', '--run'), ('merge', 'proj', '5')):
+                result = subprocess.run([sys.executable, {str(TOOL)!r}, *args], env=os.environ, capture_output=True, text=True)
+                rows.append(dict(args=args, code=result.returncode, output=result.stdout + result.stderr))
+            open(os.path.join(os.getcwd(), '.work/runner-children.json'), 'w').write(json.dumps(rows))
+        '''))
+        batch.chmod(0o755)
+        env = dict(self.env, TASK_HOLDER='batch-seat')
+        self.raw_task('runner-start', 'proj', str(runner), env=env)
+        args = json.loads((self.home / 'service-args').read_text())
+        command = args[args.index(sys.executable):]
+        clean = {**IDENTITY, 'HOME': str(self.home), 'PATH': self.env['PATH'],
+                 'TASK_HOLDER': args[args.index('--setenv=TASK_HOLDER=batch-seat')].split('=', 2)[2]}
+        subprocess.run(command, cwd=self.repo, env=clean, check=False, capture_output=True)
+        rows = json.loads((self.repo / '.work/runner-children.json').read_text())
+        self.assertEqual([row['args'][0] for row in rows], ['lane', 'review', 'merge'])
+        for row in rows:
+            self.assertNotIn('held by batch-seat', row['output'])
+        self.assertIn('held by batch-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
 
     def test_runner_llm_flag_removed(self):
         runner = self.runner_fixture()

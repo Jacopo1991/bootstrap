@@ -804,6 +804,9 @@ def atomic_json(path: Path, value):
             temporary.unlink(missing_ok=True)
 
 
+task_lock.atomic_write = atomic_json
+
+
 def criteria_from(text: str):
     return [{"number": int(number), "text": body.strip(), "checked": checked == "x"}
             for checked, number, body in re.findall(
@@ -1422,6 +1425,9 @@ def pid_alive(pid):
         return False
     except (PermissionError, ValueError, TypeError, OSError):
         return False
+
+
+task_lock.process_alive = pid_alive
 
 
 def task_run_pids(run_id):
@@ -2368,6 +2374,7 @@ def runner_start(args):
     executable = shutil.which('task-batch')
     if not executable:
         raise Stop('task-batch is unavailable.')
+    holder = os.environ.get('TASK_HOLDER') or 'unnamed'
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
@@ -2380,6 +2387,7 @@ def runner_start(args):
               '--property=KillMode=process',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
               '--setenv=PATH=' + os.environ.get('PATH', ''),
+              '--setenv=TASK_HOLDER=' + holder,
               *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
         result = subprocess.run(launch, capture_output=True, text=True)
@@ -2392,7 +2400,7 @@ def runner_start(args):
             raise Stop(f'{unit} is already active.')
         with log.open('a') as output:
             process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                       start_new_session=True, env={**os.environ, "TASK_NO_PACE": "1"} if args.no_pace else None)
+                                       start_new_session=True, env={**os.environ, "TASK_HOLDER": holder, **({"TASK_NO_PACE": "1"} if args.no_pace else {})})
         data.update(backend='setsid', pid=process.pid)
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
