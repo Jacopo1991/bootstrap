@@ -56,6 +56,7 @@ current_temp=$(sudo mktemp -d /opt/machine-bootstrap/.current.XXXXXX)
 sudo ln -s "$public_source" "$current_temp/current"
 sudo mv -T -- "$current_temp/current" /opt/machine-bootstrap/current
 sudo rmdir "$current_temp"
+sudo python3 "$ROOT/system/prune-revisions.py" /opt/machine-bootstrap/revisions 5
 
 # Agent guardrails (deny rules, forbidden/prompt command rules, policy hooks) go into the
 # root-owned managed settings of Claude Code and Codex, written from the published revision

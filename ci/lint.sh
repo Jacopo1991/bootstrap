@@ -48,6 +48,7 @@ run python3 ci/managed-policy-test.py
 run python3 ci/git-default-merge-test.py
 run python3 ci/agent-drift-test.py
 run python3 ci/inventory-mirror-test.py
+run python3 ci/prune-revisions-test.py
 run bash ci/new-project-test.sh
 run bash ci/pre-commit-test.sh
 run python3 ci/osv-db-test.py
