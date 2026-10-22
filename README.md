@@ -724,8 +724,10 @@ Everyone else uses `task hold pull "reason"` with `TASK_HOLDER` set or `--holder
 Existence holds work; the text is for people. Unreadable or nonregular markers also hold work.
 
 The only mode is drain: running steps finish, and new work-changing `task` commands refuse.
-Runner units and the workspace-tidy service also have systemd conditions for both markers.
-Status, checks, usage, lock display and hold inspection remain available.
+Runner units and the workspace-tidy service also have systemd conditions for both markers;
+workspace-tidy pauses because it deletes worktrees and branches.
+Checks (attached or detached) run gates, and repair changes work state, so both refuse.
+Status, usage, boost, lock display and hold inspection remain available.
 For a stop beyond drain, pull a hold first, then use the existing
 `systemctl --user stop task-runner-<repo>-<batch>.service` for runner units and
 `task cancel <repo> <id>` for recorded lanes. Reconcile interrupted work through the

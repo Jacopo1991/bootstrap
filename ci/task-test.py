@@ -228,11 +228,13 @@ class TaskTool(unittest.TestCase):
             ('lane', 'proj', '5'), ('lane', 'proj', '5', '--_worker'),
             ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
             ('merge', 'proj', '5', '--detach'), ('runner-start', 'proj', 'runner-b1.md'),
+            ('check', 'proj', '5'), ('check', 'proj', '5', '--detach'),
+            ('check',), ('check', '--detach'), ('repair', 'proj'),
             ('realign', 'proj'), ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
             ('gate-drill', 'proj'), ('plan', 'proj', '--sign'),
         ]
         self.assertEqual(TASK_MODULE.HOLD_WORK_COMMANDS,
-                         {'start', 'lane', 'merge', 'runner-start', 'realign', 'close', 'gate-drill'})
+                         {'start', 'lane', 'check', 'merge', 'runner-start', 'realign', 'close', 'gate-drill', 'repair'})
         runner = self.runner_fixture('setsid')
         agent = self.home / '.local/state/task/hold'
         for marker in (HOLD_FIXTURE, agent):
@@ -258,7 +260,7 @@ class TaskTool(unittest.TestCase):
         HOLD_FIXTURE.write_text('Jacopo: keep it held')
         try:
             self.raw_task('hold', 'pull', 'agent reason')
-            for command in [('status', 'proj'), ('check', 'proj', '5'), ('usage',),
+            for command in [('status', 'proj'), ('usage',), ('boost',),
                             ('lock', 'proj'), ('runner-check', 'proj', str(runner)), ('plan', 'proj')]:
                 self.raw_task(*command)
             displayed = self.raw_task('hold')

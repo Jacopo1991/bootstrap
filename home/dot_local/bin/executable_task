@@ -72,7 +72,7 @@ from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits,
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 JACOPO_HOLD = Path("/etc/agent-hold")
-HOLD_WORK_COMMANDS = {"start", "lane", "merge", "runner-start", "realign", "close", "gate-drill"}
+HOLD_WORK_COMMANDS = {"start", "lane", "check", "merge", "runner-start", "realign", "close", "gate-drill", "repair"}
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
 GATE_SLOT = ContextVar("gate_slot", default=None)
