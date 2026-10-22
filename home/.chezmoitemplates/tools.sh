@@ -55,6 +55,7 @@ mise exec -- uv pip sync --quiet --require-hashes --python "$inspect_root/venv/b
 ln -sfn "$inspect_root/venv/bin/inspect" "$HOME/.local/bin/inspect"
 inspect_expected=$(sed -n 's/^inspect-ai==//p' "$inspect_root/requirements.in")
 [[ $("$inspect_root/venv/bin/python" -c 'import importlib.metadata as m; print(m.version("inspect-ai"))') == "$inspect_expected" ]]
+"$inspect_root/venv/bin/python" -c 'import openai'
 # Create pre-commit's store here: inside the agent sandbox ~/.cache is read-only and
 # pre-commit then runs local hooks from the existing store without writing to it.
 "$HOME/.local/bin/pre-commit" gc >/dev/null
