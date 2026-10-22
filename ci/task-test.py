@@ -613,17 +613,24 @@ class TaskTool(unittest.TestCase):
         self.stub_models()
         (wt / '.work/prompt.md').write_text('task')
         self.budget_fixture(points=1)
-        args = SimpleNamespace(repo=str(self.repo), id='5', builder=None, tier=None, model=None, override='',
-                               _worker=False, no_pace=True, no_boost=True, timeout=None)
-        with self.budget_environment() as api:
-            original_popen = api.subprocess.Popen
+        crash = self.home / 'crash-before-spawn.py'
+        crash.write_text(textwrap.dedent(f'''\
+            import runpy, subprocess
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            original_popen = subprocess.Popen
             def crash_worker(argv, *positional, **keywords):
                 if '--_worker' in argv: raise RuntimeError('crash before launch')
                 return original_popen(argv, *positional, **keywords)
-            with mock.patch.object(api.subprocess, 'Popen', side_effect=crash_worker):
-                with self.assertRaisesRegex(RuntimeError, 'crash before launch'):
-                    api.lane(args)
-            api.task_lock.OWNERS.pop(str(self.repo))[0].close()
+            with mock.patch.object(subprocess, 'Popen', side_effect=crash_worker):
+                api['main'](['lane', {str(self.repo)!r}, '5', '--plan', 'chain', '--no-pace', '--no-boost'])
+        '''))
+        # Let process exit release the launcher's lock, as a real crash would.
+        result = subprocess.run([sys.executable, str(crash)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('RuntimeError: crash before launch', result.stderr)
+        self.assertIn('free', self.raw_task('lock', 'proj'))
         self.assertEqual(self.run_rows(), [])
         pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
         self.assertEqual(len(pending), 1)
