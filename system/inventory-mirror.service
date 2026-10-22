@@ -15,6 +15,8 @@ NoNewPrivileges=yes
 ProtectSystem=full
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+# CAP_SYS_PTRACE: inventory-mirror.py reads PID 1's /proc/1/ns/mnt to refuse a
+# mount in the shared namespace; the kernel allows that only with ptrace-read access.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_PTRACE
 TimeoutStartSec=120
 ExecStart=/usr/bin/python3 /opt/machine-bootstrap/current/system/inventory-mirror.py
