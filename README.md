@@ -732,6 +732,15 @@ every `~/cortex/*` repository for local keyword and semantic search.
 
 - **Pin:** `@tobilu/qmd` 2.8.3 in the npm lockfile (v2); `tools.sh` links
   `~/.local/bin/qmd`. The monthly pin updater leaves it alone, so bump it by hand.
+- **Override (`@modelcontextprotocol/server` 2.3.0):** `package.json` has an npm
+  `overrides` entry under `@tobilu/qmd` that moves qmd's MCP server dependency to
+  2.3.0. qmd 2.8.3, the latest release, pins it exactly at 2.0.0, which carries
+  GHSA-46jr-4wx8-v453, GHSA-jm63-cq47-j5jp and GHSA-rvq5-wwqv-78pq (fixed in 2.3.0).
+  JSON has no comments, so the reason lives here. The override also moves
+  `@modelcontextprotocol/core` to 2.3.0, and both packages are Apache-2.0 from 2.3.0
+  (2.0.0 was MIT). Drop the override once a qmd release no longer pins `@modelcontextprotocol/server` at
+  2.0.0 (check with `npm view @tobilu/qmd dependencies`); bump qmd, remove the entry,
+  regenerate the lock and rerun `ci/osv-db-test.py`.
 - **Config:** chezmoi renders `~/.config/qmd/index.yml` with one collection per
   non-hidden `~/cortex/*` directory (mask `**/*.md`). Each one-line context is
   `<repo>: <title>` taken from that repository's `INTENT.md` front matter at

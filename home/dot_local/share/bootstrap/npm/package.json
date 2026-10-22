@@ -16,6 +16,9 @@
   "overrides": {
     "@axe-core/playwright": {
       "playwright-core": "$playwright-core"
+    },
+    "@tobilu/qmd": {
+      "@modelcontextprotocol/server": "2.3.0"
     }
   }
 }
