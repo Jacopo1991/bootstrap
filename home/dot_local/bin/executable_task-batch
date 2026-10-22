@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import task_usage
+import task_usage, task_lock
 from task_limits import bwrap_denial, cli_limit, lane_limit
 from task_routing import TIERS, guards, lane_limits, override_problem
 
@@ -205,7 +205,7 @@ class Batch:
                 if self.stopping.is_set():
                     raise Stop("batch is stopping")
                 self.output("+ " + shlex.join(argv))
-                child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, pass_fds=task_lock.descriptors())
             with child:
                 while True:
                     try:
@@ -574,6 +574,11 @@ def main():
     except Exception as error:
         batch.append(f"batch: stopped: {error}")
         return 1
+    try:
+        task_lock.atomic_write = task_usage._write
+        task_lock.work(Path.home(), batch.repo)
+    except task_lock.LockBusy as error:
+        batch.append(f'batch: stopped: {error}'); return 1
     return batch.run()
 
 
