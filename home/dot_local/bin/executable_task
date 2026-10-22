@@ -767,6 +767,7 @@ def realign(args):
     info = plan_info(resolve_repo(args.repo))
     if not info["path"].is_file():
         raise Stop("Create INTENT.md before realignment")
+    task_lock.work(HOME, resolve_repo(args.repo))
     prompt = ("Read-only drift review. Answer with Verdict: on plan | drifted | plan unclear, "
               "then evidence per merged task: does it serve current and its pass test; contradictions "
               "between INTENT, STATUS and decisions; and what the founder must decide. "
@@ -1422,7 +1423,6 @@ def pid_alive(pid):
         return False
 
 
-task_lock.process_alive = pid_alive
 
 
 def task_run_pids(run_id):
@@ -1822,6 +1822,7 @@ def lane(args):
     binary = builder
     if not shutil.which(binary):
         raise Stop(f"{binary} is not installed or available on PATH.")
+    task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
     command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
                 "--output-last-message", str(final), "-"] if builder == "codex" else
@@ -2339,7 +2340,7 @@ def runner_unit(repo, batch):
 def runner_service(unit):
     try:
         result = subprocess.run(['systemctl', '--user', 'show', unit,
-                                 '--property=ActiveState,ExecMainStartTimestamp'],
+                                 '--property=ActiveState,ExecMainStartTimestamp,MainPID'],
                                 capture_output=True, text=True)
         return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
     except OSError:
@@ -2369,7 +2370,8 @@ def runner_start(args):
     executable = shutil.which('task-batch')
     if not executable:
         raise Stop('task-batch is unavailable.')
-    holder = os.environ.get('TASK_HOLDER') or 'unnamed'
+    holder = os.environ['TASK_HOLDER']
+    task_lock.work(HOME, repo)
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
@@ -2399,8 +2401,11 @@ def runner_start(args):
         data.update(backend='setsid', pid=process.pid)
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
-    runner_pid = data.get("pid") or int(runner_service(unit).get("MainPID", "0") or 0) or None
-    task_lock.acquire(HOME, repo, pid=runner_pid)
+    runner_pid = data.get('pid') or runner_service(unit).get('MainPID', '')
+    if not str(runner_pid).isdigit() or int(runner_pid) <= 0:
+        task_lock.write(HOME, repo, {'invalid': True})
+        raise Stop('Cannot establish runner MainPID; inspect the runner and recover with task lock <repo> --release --force.')
+    task_lock.acquire(HOME, repo, pid=int(runner_pid), unit=unit if data['backend'] == 'systemd' else None)
     print(f'{unit}: log={log}')
     return 0
 
@@ -2474,15 +2479,18 @@ def start_locked(args, repo):
         candidate = repo / name
         if candidate.is_symlink() and not candidate.exists():
             print(f"warning: environment link {candidate} does not resolve.")
+    for name in args.seed: seed_source(repo, name)
+    task_tier(task_text, args.tier)
     if task.path.exists():
         task.worktree()
+        task_lock.work(HOME, repo, sha(task.path, "HEAD"))
         print(f"{task.path} already exists.")
     else:
         default = default_branch(repo)
-        fetch(repo)
         exclude(repo, ".worktrees/")
         branch, remote_only = task.existing_branch()
         if branch and remote_only:
+            task_lock.work(HOME, repo, sha(repo, f"origin/{branch}"))
             git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
             print(f"Created {task.path} on {branch}, from origin's existing branch.")
         elif branch:
@@ -2495,11 +2503,13 @@ def start_locked(args, repo):
                 if checked_branch == branch and checked_out and Path(checked_out).resolve() != task.path.resolve():
                     raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
                                f"move or free that worktree before `task start` can adopt it at {task.path}.")
+            task_lock.work(HOME, repo, sha(repo, branch))
             git(repo, "worktree", "add", "-q", str(task.path), branch)
             print(f"Created {task.path} on the existing branch {branch}.")
         else:
             base, label = base_commit(repo, default)
             branch = task.branch_name()
+            task_lock.work(HOME, repo, base)
             git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
             print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
     seed_worktree(repo, task.path, args.seed)
@@ -2886,6 +2896,8 @@ def check(args):
         raise Stop("Uncommitted or untracked files; commit them (or delete them) first:\n" + "\n".join(changes))
     if not is_ancestor(path, base, "HEAD"):
         print(f"note: {label} has commits this branch lacks; `task merge` brings them in.")
+    if args.variant and not advisory: raise Stop('--variant is only available for advisory lane checks.')
+    if not advisory: task_lock.work(HOME, repo, sha(path, 'HEAD'))
     prepare_environment(repo, path)
     if record and record.get("no_verify"):
         print(f"exception: verification omitted: {record['no_verify']}")
@@ -3351,6 +3363,7 @@ def review(args):
             print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
             return 0
+        task_lock.work(HOME, repo, head)
         used_fallback = False
         for attempt in range(2):
             try:
@@ -3656,6 +3669,7 @@ def merge(args):
                                                               for item in error.missing_steps]})
         for item in json.loads((archive / "exception.json").read_text())["waived"]:
             print(f"exception: {item['step']} waived: {args.override}")
+    task_lock.work(HOME, repo, base)
     task_event(task, "merge")
     if is_ancestor(repo, lane_head, base):
         commit = base
@@ -3703,6 +3717,7 @@ def merge(args):
                 print(f"{label} moved during the gate; re-gating against the new tip.")
                 continue
             if on_github(repo):
+                task_lock.verify(HOME, repo)
                 git(repo, "push", "-q", "origin", f"{lane_head}:refs/heads/{branch}")
                 pr = open_pr(repo, branch)
                 if not pr:
@@ -3718,6 +3733,7 @@ def merge(args):
                 if latest != base:
                     print(f"{label} moved before PR merge; re-gating against the new tip.")
                     continue
+                task_lock.verify(HOME, repo)
                 gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", lane_head)
                 completed_step(task, "published")
                 try:
@@ -3743,6 +3759,7 @@ def merge(args):
                 commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
                              "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
                 if has_origin(repo):
+                    task_lock.verify(HOME, repo)
                     pushed = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
                     if pushed.returncode:
                         fetch(repo)
@@ -4126,6 +4143,7 @@ def close(args):
         except (OSError, json.JSONDecodeError):
             exception_reason = "unspecified override"
         summary += f"\n\nException: merge override — {exception_reason}"
+    task_lock.work(HOME, repo)
     if has_origin(task.kb):
         return close_with_pr(task, before, archive, args, criteria, status, summary)
     changed = apply_close_update(task.kb, task, before, archive, criteria, status, summary)
@@ -4857,6 +4875,9 @@ def gate_drill(args):
         if repo not in cli_seeds:
             raise Stop(f"Seed repository {repo_name} is not in this drill.")
         cli_seeds[repo].append(name)
+    for repo, names in cli_seeds.items():
+        for name in names: seed_source(repo, name)
+    for repo in repos: task_lock.work(HOME, repo)
     archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
     archive.mkdir(parents=True)
     run_name = secrets.token_hex(3)
