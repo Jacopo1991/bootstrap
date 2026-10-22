@@ -238,19 +238,10 @@ class TaskTool(unittest.TestCase):
         api.acquire(self.home, self.repo, 'seat-a', ttl=120)
         self.assertGreaterEqual(api.read(self.home, self.repo)['expires_epoch'], first['expires_epoch'])
         data = api.read(self.home, self.repo)
-        dead = subprocess.Popen(['true'])
-        dead.wait()
-        data.update(pid=dead.pid, boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                    expires_epoch=time.time() + 600, start='1')
+        data.update(expires_epoch=time.time() - 1, taken_at=original)
         api.write(self.home, self.repo, data)
         self.assertTrue(api.free(api.read(self.home, self.repo)))
-        data.update(pid=os.getpid(), boot_id='other-boot')
-        api.write(self.home, self.repo, data)
-        self.assertTrue(api.free(api.read(self.home, self.repo)))
-        data.update(pid=None, boot_id=None, expires_epoch=time.time() - 1, taken_at=original)
-        api.write(self.home, self.repo, data)
-        self.assertTrue(api.free(api.read(self.home, self.repo)))
-        data.update(expires_epoch=time.time() + 600, released=False, pid=None, boot_id=None)
+        data.update(expires_epoch=time.time() + 600, released=False)
         api.write(self.home, self.repo, data)
         (self.repo / 'a.txt').write_text('changed\n')
         self.git(self.repo, 'add', 'a.txt')
@@ -260,20 +251,41 @@ class TaskTool(unittest.TestCase):
             api.acquire(self.home, self.repo, 'seat-b', revision=self.git(self.repo, 'rev-parse', 'HEAD'))
         self.assertIn('Sources changed', out.getvalue())
 
+    def lock_process(self, holder='batch-seat'):
+        script = self.home / 'lock-owner.py'
+        script.write_text(textwrap.dedent(f'''\
+            import pathlib, sys, time
+            sys.path.insert(0, {str(TOOL.parent)!r})
+            import task_lock, task_usage
+            task_lock.atomic_write = task_usage._write
+            task_lock.acquire(pathlib.Path.home(), {str(self.repo)!r}, sys.argv[1], revision=task_lock.head({str(self.repo)!r}))
+            print('locked', flush=True)
+            time.sleep(30)
+        '''))
+        child = subprocess.Popen([sys.executable, str(script), holder], env=self.env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop_lock_process, child)
+        self.assertEqual(child.stdout.readline().strip(), 'locked')
+        return child
+
+    def stop_lock_process(self, child):
+        if child.poll() is None: child.kill()
+        child.communicate()
+
     def test_project_lock_child_refresh_keeps_runner_process(self):
         api = TASK_MODULE.task_lock
-        runner = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        runner = self.lock_process()
         try:
-            first = api.acquire(self.home, self.repo, 'batch-seat', pid=runner.pid)
+            first = api.read(self.home, self.repo)
             refreshed = api.acquire(self.home, self.repo, 'batch-seat')
-            self.assertEqual(refreshed['pid'], runner.pid)
-            self.assertEqual(refreshed['boot_id'], first['boot_id'])
+            self.assertTrue(refreshed['process'])
+            self.assertEqual(refreshed['token'], first['token'])
             runner.terminate()
             runner.wait()
             self.assertTrue(api.free(api.read(self.home, self.repo)))
             self.raw_task('start', 'proj', 'docs', '--builder', 'codex', env=dict(self.env, TASK_HOLDER='batch-seat'))
             recovered = api.read(self.home, self.repo)
-            self.assertNotEqual(recovered['pid'], runner.pid)
+            self.assertTrue(recovered['process'])
             self.assertNotEqual(recovered['token'], first['token'])
         finally:
             if runner.poll() is None:
@@ -298,26 +310,39 @@ class TaskTool(unittest.TestCase):
             self.assertIn('TASK_HOLDER', self.raw_task(*command, env=unnamed, code=1))
         self.raw_task('runner-start', 'proj', 'invalid.md', code=1)
         self.assertIsNone(TASK_MODULE.task_lock.read(self.home, self.repo))
-        children = [subprocess.Popen([sys.executable, str(TOOL), 'lock', 'proj', '--holder', name],
+        barrier = self.home / 'acquire.py'
+        barrier.write_text(textwrap.dedent(f'''\
+            import pathlib, runpy, sys, time
+            home = pathlib.Path.home()
+            (home / (sys.argv[1] + '.ready')).touch()
+            while not (home / 'go').exists(): time.sleep(.005)
+            sys.argv = [{str(TOOL)!r}, 'lock', 'proj', '--holder', sys.argv[1]]
+            runpy.run_path({str(TOOL)!r}, run_name='__main__')
+        '''))
+        children = [subprocess.Popen([sys.executable, str(barrier), name],
                     env=self.env, cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     for name in ('seat-a', 'seat-b')]
+        for name in ('seat-a', 'seat-b'): self.wait_runner_file(self.home / (name + '.ready'))
+        (self.home / 'go').touch()
         outputs = [child.communicate() for child in children]
         self.assertEqual(sorted(child.returncode for child in children), [0, 1], outputs)
 
-    def test_project_lock_recovery_commands_pid_reuse_and_pending_sources(self):
+    def test_project_lock_recovery_commands_and_pending_sources(self):
         api = TASK_MODULE.task_lock
-        for cause in ('dead', 'boot', 'reuse', 'ttl'):
+        for cause in ('dead', 'ttl'):
             with self.subTest(cause=cause):
                 api.release(self.home, self.repo, force=True)
-                data = api.acquire(self.home, self.repo, 'test-seat', pid=os.getpid())
-                if cause == 'dead': data['pid'] = 99999999
-                if cause == 'boot': data['boot_id'] = 'other-boot'
-                if cause == 'reuse': data['start'] = str(int(data['start']) + 1)
-                if cause == 'ttl': data.update(pid=None, expires_epoch=0)
+                if cause == 'dead':
+                    process = self.lock_process('test-seat')
+                    data = api.read(self.home, self.repo)
+                    process.kill(); process.wait()
+                else:
+                    data = api.acquire(self.home, self.repo, 'test-seat')
+                    data['expires_epoch'] = 0
                 api.write(self.home, self.repo, data)
                 self.raw_task('start', 'proj', 'docs', '--builder', 'codex')
                 recovered = api.read(self.home, self.repo)
-                self.assertNotEqual(recovered['pid'], data['pid'])
+                self.assertTrue(recovered['process'])
                 self.assertNotEqual(recovered['token'], data['token'])
         api.release(self.home, self.repo)
         old = api.read(self.home, self.repo)['head']
@@ -332,15 +357,16 @@ class TaskTool(unittest.TestCase):
 
     def test_project_lock_malformed_fields_and_inspection_errors_refuse(self):
         api = TASK_MODULE.task_lock
-        data = api.acquire(self.home, self.repo, 'test-seat', pid=os.getpid())
-        for key, value in [('released', 'false'), ('pid', '123'), ('pid', True),
+        data = api.acquire(self.home, self.repo, 'test-seat')
+        for key, value in [('released', 'false'), ('process', 'true'), ('pending', 1),
                            ('expires_epoch', '1'), ('expires_epoch', float('nan')),
-                           ('taken_at', 1), ('boot_id', None), ('start', None)]:
+                           ('taken_at', 1), ('holder', None), ('token', None)]:
             with self.subTest(key=key, value=value):
                 api.write(self.home, self.repo, dict(data, **{key: value}))
                 self.assertIn('--release --force', self.raw_task('start', 'proj', 'docs', '--builder', 'codex', code=1))
         api.write(self.home, self.repo, data)
-        for operation in ('identity',):
+        api.work(self.home, self.repo)
+        for operation in ('active',):
             with mock.patch.object(api, operation, side_effect=PermissionError('inspection denied')):
                 with self.assertRaisesRegex(api.LockBusy, '--release --force'):
                     api.acquire(self.home, self.repo, 'test-seat')
@@ -348,35 +374,79 @@ class TaskTool(unittest.TestCase):
             with self.assertRaisesRegex(api.LockBusy, '--release --force'):
                 api.acquire(self.home, self.repo, 'test-seat')
 
-    def test_project_lock_missing_boot_and_source_revision_refuse(self):
+    def test_project_lock_source_revision_refuses(self):
         api = TASK_MODULE.task_lock
-        data = api.acquire(self.home, self.repo, 'test-seat', pid=os.getpid())
-        original = Path.read_text
-        def without_boot(path, *args, **kwargs):
-            if str(path) == '/proc/sys/kernel/random/boot_id': return ''
-            return original(path, *args, **kwargs)
-        with mock.patch.object(Path, 'read_text', without_boot):
-            with self.assertRaisesRegex(api.LockBusy, '--release --force'):
-                api.acquire(self.home, self.repo, 'test-seat')
-        self.assertEqual(api.read(self.home, self.repo), data)
+        data = api.acquire(self.home, self.repo, 'test-seat')
         with mock.patch.object(api, 'head', side_effect=api.LockBusy('Cannot establish execution source revision')):
             with self.assertRaisesRegex(api.LockBusy, 'source revision'):
                 api.work(self.home, self.repo)
         self.assertEqual(api.read(self.home, self.repo), data)
 
-    def test_project_lock_merge_refuses_after_takeover(self):
+    def test_project_lock_merge_prevents_takeover_through_publication(self):
         wt, _ = self.started()
         self.commit_in(wt, 'b.txt')
         self.prepare_merge_evidence('5')
-        # The trusted gate stand-in changes ownership while merge is waiting for it.
+        # Even an administrative release cannot open a publication race.
         script = self.home / 'during-check.sh'
         script.write_text(f'"{sys.executable}" "{TOOL}" lock proj --release\n'
                           f'"{sys.executable}" "{TOOL}" lock proj --holder intruder\n')
         script.chmod(0o755)
         base = self.git(self.repo, 'rev-parse', 'origin/main')
-        output = self.raw_task('merge', 'proj', '5', '--keep', code=1)
-        self.assertIn('held by intruder', output)
-        self.assertEqual(self.git(self.repo, 'rev-parse', 'origin/main'), base)
+        output = self.raw_task('merge', 'proj', '5', '--keep')
+        self.assertIn('Merged t5', output)
+        self.assertNotEqual(self.git(self.repo, 'rev-parse', 'origin/main'), base)
+        self.assertIn('still running', (self.home / '.local/state/task/proj/t5/gate-check.log').read_text())
+
+    def test_project_lock_local_merge_checks_ownership_before_recording(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        self.git(self.repo, 'remote', 'remove', 'origin')
+        before = self.git(self.repo, 'rev-parse', 'main')
+        # Simulate replacement of the ownership record while the local merge gates.
+        replacement = self.home / 'replace-lock.py'
+        replacement.write_text(textwrap.dedent('''\
+            import json, pathlib
+            target = pathlib.Path.home() / '.local/state/task/proj/lock.json'
+            data = json.loads(target.read_text())
+            data.update(holder='intruder', token='replacement-token')
+            target.write_text(json.dumps(data))
+        '''))
+        during = self.home / 'during-check.sh'
+        during.write_text(f'"{sys.executable}" "{replacement}"\n')
+        during.chmod(0o755)
+        self.assertIn('held by intruder', self.raw_task('merge', 'proj', '5', '--keep', code=1))
+        self.assertEqual(self.git(self.repo, 'rev-parse', 'main'), before)
+        self.assertFalse((self.home / '.local/state/task/proj/t5/merge.json').exists())
+
+    def test_project_lock_lane_outlives_launcher_and_worker(self):
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('Build the b file.')
+        self.stub_models()
+        release = self.home / 'release-builder'
+        self.raw_task('lock', 'proj', '--holder', 'test-seat', '--ttl', '.001')
+        self.raw_task('lane', 'proj', '5', env=dict(self.env, LANE_STUB_RELEASE=str(release)))
+        self.wait_runner_file(wt / '.work/model-call.json')
+        data = TASK_MODULE.task_lock.read(self.home, self.repo)
+        data['expires_epoch'] = 0
+        TASK_MODULE.task_lock.write(self.home, self.repo, data)
+        self.assertTrue(data['process'])
+        self.assertIn('held by test-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
+        worker = json.loads((wt / '.work/lane.json').read_text())['pid']
+        os.kill(worker, signal.SIGKILL)
+        try:
+            # The builder inherited ownership too, so killing its wrapper cannot admit overlap.
+            self.assertIn('held by test-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
+        finally:
+            release.touch()
+            self.wait_project_lock_free()
+        self.raw_task('start', 'proj', 'docs', '--builder', 'codex', env=dict(self.env, TASK_HOLDER='other'))
+
+    def wait_project_lock_free(self, timeout=10):
+        api = TASK_MODULE.task_lock
+        deadline = time.monotonic() + timeout
+        while not api.free(api.read(self.home, self.repo)) and time.monotonic() < deadline: time.sleep(.02)
+        self.assertTrue(api.free(api.read(self.home, self.repo)), 'process lock must be released before cleanup')
 
     def test_adaptive_check_timeout_uses_trusted_passes_only(self):
         repo = self.home / 'dev_workspace/proj'
@@ -1884,10 +1954,21 @@ else:
     print('MainPID=' + os.environ.get('FAKE_MAINPID', str(os.getppid())))
 """,
             'systemd-run': """#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, subprocess, sys
 home = pathlib.Path(os.environ['HOME'])
 (home / 'service-args').write_text(json.dumps(sys.argv[1:]))
-sys.exit(int(os.environ.get('SERVICE_EXIT', '0')))
+code = int(os.environ.get('SERVICE_EXIT', '0'))
+if not code:
+    env = dict(os.environ)
+    for arg in sys.argv:
+        if arg.startswith('--setenv='):
+            key, value = arg[len('--setenv='):].split('=', 1)
+            env[key] = value
+    subprocess.Popen(sys.argv[sys.argv.index(sys.executable):], env=env,
+                     cwd=sys.argv[sys.argv.index('--working-directory') + 1],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+sys.exit(code)
 """,
             'task-batch': """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
@@ -1933,7 +2014,7 @@ sys.exit(7)
         self.assertIn('--property=KillMode=process', args)
         self.assertIn('--setenv=TASK_HOLDER=test-seat', args)
         command = args[args.index(sys.executable):]
-        subprocess.run(command, cwd=self.repo, env=self.env, check=False, capture_output=True)
+        self.wait_project_lock_free()
         call = json.loads((runner.parent / 'runner-call').read_text())
         self.assertEqual(call['args'], [str(self.repo), str(runner)])
         self.assertEqual(call['prompt'], '')
@@ -1953,12 +2034,10 @@ sys.exit(7)
                     done = runner.with_suffix('.done')
                     stale = done.read_text() + final + '\n'
                     done.write_text(stale)
-                    self.raw_task('runner-start', 'proj', str(runner))
-                    self.assertIn('last=(no .done line)', self.raw_task('status', 'proj'))
+                    self.raw_task('runner-start', 'proj', str(runner), env=dict(self.env, RUNNER_FINAL=own_final))
                     args = json.loads((self.home / 'service-args').read_text())
                     command = args[args.index(sys.executable):]
-                    subprocess.run(command, cwd=self.repo,
-                                   env=dict(self.env, RUNNER_FINAL=own_final), capture_output=True)
+                    self.wait_project_lock_free()
                     current = done.read_text()[len(stale):]
                     self.assertTrue(done.read_text().startswith(stale))
                     if own_final:
@@ -2005,33 +2084,74 @@ sys.exit(7)
         try:
             rows = json.loads(self.wait_runner_file(self.repo / '.work/runner-children.json'))
             self.assertEqual([row['code'] for row in rows], [0, 0, 0], rows)
-            self.assertEqual(api.read(self.home, self.repo)['pid'], data['pid'])
+            self.assertEqual(api.read(self.home, self.repo)['token'], data['token'])
             self.assertIn('held by batch-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
             self.assertTrue(self.git(self.repo, 'rev-parse', 'origin/main'))
         finally:
             (self.repo / '.work/children-stop').touch()
             deadline = time.monotonic() + 5
-            while api.alive(data) and time.monotonic() < deadline: time.sleep(.02)
-            self.assertFalse(api.alive(data), 'runner must exit before fixture cleanup')
+            self.wait_project_lock_free()
 
-    def test_project_lock_active_unit_and_invalid_mainpid(self):
+    def test_project_lock_systemd_runner_process_ignores_ttl(self):
         runner = self.runner_fixture()
-        self.raw_task('runner-start', 'proj', str(runner))
-        api = TASK_MODULE.task_lock
-        data = api.read(self.home, self.repo)
-        self.assertEqual(data['unit'], 'task-runner-proj-b1')
-        data['expires_epoch'] = 0
-        api.write(self.home, self.repo, data)
-        (self.home / 'active').touch()
-        self.raw_task('start', 'proj', 'docs', '--builder', 'codex')
-        self.assertEqual(api.read(self.home, self.repo)['pid'], data['pid'])
-        self.assertIn('held by test-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
-        (self.home / 'active').unlink()
-        self.raw_task('start', 'proj', 'docs', '--builder', 'codex')
-        self.assertIsNone(api.read(self.home, self.repo)['unit'])
-        output = self.raw_task('runner-start', 'proj', str(runner), env=dict(self.env, FAKE_MAINPID='0'), code=1)
-        self.assertIn('Cannot establish runner MainPID', output)
-        self.assertIn('held by unknown', self.raw_task('lock', 'proj'))
+        hold = runner.parent / 'hold'
+        hold.touch()
+        try:
+            self.raw_task('runner-start', 'proj', str(runner))
+            api = TASK_MODULE.task_lock
+            data = api.read(self.home, self.repo)
+            self.assertTrue(data['process'])
+            data['expires_epoch'] = 0
+            api.write(self.home, self.repo, data)
+            self.raw_task('start', 'proj', 'docs', '--builder', 'codex')
+            self.assertEqual(api.read(self.home, self.repo)['token'], data['token'])
+            self.assertIn('held by test-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
+        finally:
+            hold.unlink()
+            self.wait_project_lock_free()
+        self.raw_task('start', 'proj', 'docs', '--builder', 'codex', env=dict(self.env, TASK_HOLDER='other'))
+
+    def test_runner_real_batch_handoff_survives_wrapper_death(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        report = (wt / '.work/report.md').read_text()
+        (wt / '.work/report.md').unlink()  # The real batch must run a lane first.
+        runner = self.runner_fixture('setsid')
+        runner.write_text('1. T-5: builder codex, model gpt-6-luna\nTime box: 0.5 min\n')
+        for name, target in [('task', TOOL), ('task-batch', TOOL.with_name('executable_task-batch'))]:
+            binary = self.home / 'bin' / name
+            binary.unlink(missing_ok=True)
+            binary.symlink_to(target)
+        self.stub_models()
+        codex = self.home / 'bin/codex'
+        codex.write_text(MODEL_STUB.replace("prompt = sys.stdin.read()",
+                         "prompt = sys.stdin.read()\n(work / 'report.md').write_text(" + repr(report) + ")"))
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reviewer = self.home / 'bin/claude'
+        reviewer.write_text('#!/bin/sh\nprintf ' + repr('Verdict: PASS\nCommit: ' + head +
+                            '\n#1 pass: exists\n#2 pass: checked\nBlocking: none\nNotes: none\n'))
+        release = self.home / 'release-builder'
+        env = dict(self.env, TASK_HOLDER='real-batch-seat', LANE_STUB_RELEASE=str(release))
+        self.raw_task('runner-start', 'proj', str(runner), '--no-pace', env=env)
+        try:
+            self.wait_runner_file(wt / '.work/model-call.json')
+            api = TASK_MODULE.task_lock
+            data = api.read(self.home, self.repo)
+            data['expires_epoch'] = 0
+            api.write(self.home, self.repo, data)
+            wrapper = json.loads(runner.with_suffix('.json').read_text())['pid']
+            os.kill(wrapper, signal.SIGKILL)
+            self.assertIn('held by real-batch-seat', self.raw_task('lock', 'proj', '--holder', 'other', code=1))
+        finally:
+            release.touch()
+            self.wait_project_lock_free(timeout=40)
+        done = runner.with_suffix('.done').read_text()
+        self.assertIn('T-5: merged', done)
+        self.assertIn('batch: finished', done)
+        self.assertTrue((self.state() / 'merge.json').is_file())
+        self.assertEqual(json.loads((self.state() / 'review.json').read_text())['verdict'], 'PASS')
+        self.assertEqual(self.git(self.repo, 'merge-base', '--is-ancestor', head, 'origin/main'), '')
 
     def test_runner_llm_flag_removed(self):
         runner = self.runner_fixture()
@@ -3228,6 +3348,11 @@ store.write_text(json.dumps(prs))
         socket_root = TASK_MODULE.gate_temporary_root() if socket_test else None
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory(
             dir=socket_root, prefix='s')))
+        def close_project_locks():
+            for key in list(TASK_MODULE.task_lock.OWNERS):
+                if Path(key).is_relative_to(self.home):
+                    TASK_MODULE.task_lock.OWNERS.pop(key)[0].close()
+        self.addCleanup(close_project_locks)
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
         for name, body in STUBS.items():

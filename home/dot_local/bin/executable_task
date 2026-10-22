@@ -1861,6 +1861,7 @@ def lane(args):
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
                 child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
+                                         pass_fds=task_lock.descriptors(),
                                          stdin=subprocess.DEVNULL, stdout=log,
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
@@ -1903,6 +1904,7 @@ def lane(args):
                 # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
                 stream = task_usage.ClaudeStream(HOME) if raw else None
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
+                                         pass_fds=task_lock.descriptors(),
                                          stdout=subprocess.PIPE if output else None)
                 try:
                     deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
@@ -2305,7 +2307,12 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, executable, offset, repo = sys.argv[1:]
+source, done, log, executable, offset, repo, modules, ready = sys.argv[1:]
+sys.path.insert(0, modules)
+import task_lock, task_usage
+task_lock.atomic_write = task_usage._write
+task_lock.work(pathlib.Path.home(), repo)
+pathlib.Path(ready).touch()
 child = None
 def stop(signum, frame):
     if child is not None:
@@ -2314,7 +2321,7 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
-    child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL)
+    child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL, pass_fds=task_lock.descriptors())
     code = child.wait()
 finally:
     path = pathlib.Path(done)
@@ -2377,8 +2384,9 @@ def runner_start(args):
     log = work / f'runner-{batch}.log'
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
+    ready = work / f'runner-{batch}.ready'; ready.unlink(missing_ok=True)
     command = [sys.executable, str(wrapper), str(source), str(done),
-               str(log), executable, str(done_offset), str(repo)]
+               str(log), executable, str(done_offset), str(repo), str(Path(__file__).resolve().parent), str(ready)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               '--property=KillMode=process',
@@ -2397,15 +2405,14 @@ def runner_start(args):
             raise Stop(f'{unit} is already active.')
         with log.open('a') as output:
             process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                       pass_fds=task_lock.descriptors(),
                                        start_new_session=True, env={**os.environ, "TASK_HOLDER": holder, **({"TASK_NO_PACE": "1"} if args.no_pace else {})})
         data.update(backend='setsid', pid=process.pid)
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
-    runner_pid = data.get('pid') or runner_service(unit).get('MainPID', '')
-    if not str(runner_pid).isdigit() or int(runner_pid) <= 0:
-        task_lock.write(HOME, repo, {'invalid': True})
-        raise Stop('Cannot establish runner MainPID; inspect the runner and recover with task lock <repo> --release --force.')
-    task_lock.acquire(HOME, repo, pid=int(runner_pid), unit=unit if data['backend'] == 'systemd' else None)
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline: time.sleep(.02)
+    if not ready.exists(): raise Stop('Runner did not acquire its process lock; inspect its log before retrying.')
     print(f'{unit}: log={log}')
     return 0
 
@@ -2767,6 +2774,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
+                                           pass_fds=task_lock.descriptors(),
                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                            start_new_session=True)
                 if state:
@@ -3200,6 +3208,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
+                                       pass_fds=task_lock.descriptors(),
                                        stderr=errors, start_new_session=True)
             task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
@@ -3655,6 +3664,7 @@ def merge(args):
                    "them first:\n" + "\n".join(changes))
     lane_head = sha(path, "HEAD")
     record = load_record(task)
+    task_lock.work(HOME, repo, base)
     if lane_head != record.get('base_sha') and is_ancestor(repo, lane_head, base):
         repair_published(task, base)
         return 0
@@ -3669,7 +3679,6 @@ def merge(args):
                                                               for item in error.missing_steps]})
         for item in json.loads((archive / "exception.json").read_text())["waived"]:
             print(f"exception: {item['step']} waived: {args.override}")
-    task_lock.work(HOME, repo, base)
     task_event(task, "merge")
     if is_ancestor(repo, lane_head, base):
         commit = base
@@ -3756,6 +3765,7 @@ def merge(args):
                     print(f"WARNING: {reason} Exception recorded; the published merge was not reverted.")
                 print(f"Merged PR #{pr} ({pr_merge_commit[:7]}) from reviewed head {lane_head[:7]}.")
             else:
+                task_lock.verify(HOME, repo)
                 commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
                              "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
                 if has_origin(repo):
@@ -3776,6 +3786,7 @@ def merge(args):
             break
         else:
             raise Stop(f"{default} kept moving during three gate attempts; rerun `task merge`.")
+    task_lock.verify(HOME, repo)
     atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit,
                                         "time": datetime.now(timezone.utc).isoformat()})
     try:
@@ -4875,8 +4886,6 @@ def gate_drill(args):
         if repo not in cli_seeds:
             raise Stop(f"Seed repository {repo_name} is not in this drill.")
         cli_seeds[repo].append(name)
-    for repo, names in cli_seeds.items():
-        for name in names: seed_source(repo, name)
     for repo in repos: task_lock.work(HOME, repo)
     archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
     archive.mkdir(parents=True)
