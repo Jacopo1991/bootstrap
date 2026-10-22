@@ -20,6 +20,7 @@ import task_usage as usage  # noqa: E402
 
 FIXTURES = ROOT / "ci/fixtures/usage"
 NOW = datetime(2026, 10, 20, 20, 0, tzinfo=timezone.utc)  # a minute-level hour after the Codex fixture
+FIVE_LEFT = timedelta(hours=5)  # a whole 5-hour window left: the full 5-hour reserve applies
 DEAD = 2 ** 22 + 7  # above the largest pid, so never alive
 
 
@@ -31,11 +32,11 @@ class Usage(unittest.TestCase):
     def setUp(self):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="usage-test-")))
 
-    def claude(self, used, left, five=0.1, age=timedelta(minutes=5)):
+    def claude(self, used, left, five=0.1, age=timedelta(minutes=5), five_left=FIVE_LEFT):
         """Write the state a recorded stream leaves: used is a percent, left hours until the weekly reset."""
         reset = NOW + timedelta(hours=left)
         event = {"rate_limit_info": {"unifiedWindows": {
-            "five_hour": {"utilization": five, "resetsAt": epoch(NOW + timedelta(hours=2))},
+            "five_hour": {"utilization": five, "resetsAt": epoch(NOW + five_left)},
             "seven_day": {"utilization": used / 100, "resetsAt": epoch(reset)}}}}
         usage.record_claude(self.home, event, NOW - age)
 
@@ -198,6 +199,105 @@ class Usage(unittest.TestCase):
         self.assertIn("pace: under-used-near-reset", text)
         self.assertIn("spend before the reset", text)
 
+    def release_policy(self):
+        policy = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
+        policy.parent.mkdir(parents=True)
+        policy.write_text("under_use_percent = 95\nunder_use_hours = 24\n[reserve]\nclaude = 30\n")
+
+    def test_weekly_reserve_is_released_in_the_final_window_only(self):
+        self.release_policy()
+        for used, left, limit, expected in ((69, 30, 70, "under"),(72, 30, 70, usage.EXHAUSTED),
+                                            (72, 20, 100, "under-used-near-reset"), (72, 24, 100, "under-used-near-reset")):
+            with self.subTest(used=used, left=left):
+                self.claude(used, left)
+                found = self.verdict()
+                self.assertEqual((found["limit"], found["verdict"], found["released"]), (limit, expected, limit == 100))
+        self.claude(72, 30)
+        self.assertIn("automated share used up (72 % of 70 %)", usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"])
+        self.claude(72, 20)
+        decision = usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)
+        self.assertEqual((decision["hold"], decision["spend"]), ("", (NOW + timedelta(hours=20)).isoformat()))
+
+    def test_five_hour_bands_keep_their_reserve_in_the_final_window(self):
+        self.release_policy()
+        for five, expected in ((54, "ok"), (55, "5h-warning"), (70, "5h-exhausted")):  # reserve 30: warning 55, exhausted 70
+            with self.subTest(five=five):
+                self.claude(72, 20, five=five / 100)
+                found = self.verdict()
+                self.assertEqual((found["limit"], found["five"]), (100, expected))
+        self.claude(72, 20, five=0.7)
+        self.assertIn("5-hour window used up (70 % of 70 %)", usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"])
+
+    def test_usage_says_when_the_reserve_is_released(self):
+        self.release_policy()
+        self.claude(72, 30)
+        self.assertNotIn("reserve released", "\n".join(usage.report(self.home, NOW)))
+        self.claude(72, 20)
+        text = "\n".join(usage.report(self.home, NOW))
+        self.assertIn(f"reserve released until {usage._when(NOW + timedelta(hours=20))}", text)
+        self.assertIn("exhausted at 70 %", text)  # the 5-hour bands still show the reserve
+
+    def test_usage_in_the_release_window_names_the_100_limit_even_when_it_is_used_up(self):
+        self.release_policy()
+        until = f"reserve released until {usage._when(NOW + timedelta(hours=20))}"
+        for used in (72, 100):
+            with self.subTest(used=used):
+                self.claude(used, 20)
+                text = "\n".join(usage.report(self.home, NOW))
+                self.assertNotIn("reserve 30 %", text)
+                self.assertIn(f"100 % limit used up, {until}" if used == 100 else until, text)
+        self.assertEqual((self.verdict()["verdict"], self.verdict()["limit"]), (usage.EXHAUSTED, 100))
+        self.assertIn("automated share used up (100 % of 100 %)", usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"])
+        self.claude(100, 30)  # outside the window the old wording stays
+        self.assertIn("reserve 30 % used up", "\n".join(usage.report(self.home, NOW)))
+
+    def test_a_vendor_with_a_spare_reset_gets_the_release_wording_first(self):
+        self.release_policy()
+        policy = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
+        policy.write_text(policy.read_text() + "[spare_resets]\nclaude = 1\n")
+        until = f"reserve released until {usage._when(NOW + timedelta(hours=20))}"
+        for used, left, first in ((72, 20, f"100 % weekly limit, {until}; {usage.SPARE}"),
+                                  (100, 20, f"100 % limit used up, {until}; {usage.SPARE}"), (72, 30, usage.SPARE)):
+            with self.subTest(used=used, left=left):
+                self.claude(used, left)
+                self.assertTrue(self.verdict()["released"] == (left == 20))
+                self.assertIn(f"policy: {first}", "\n".join(usage.report(self.home, NOW)))
+        self.claude(72, 20)
+        decision = usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)
+        self.assertEqual((decision["hold"], decision["spend"]), ("", (NOW + timedelta(hours=20)).isoformat()))
+
+    def test_five_hour_reserve_scales_with_the_time_left_in_the_window(self):
+        self.release_policy()  # reserve 30: full window exhausted at 70, warning at 55
+        for hours, five, expected, out, warn in ((1.5, 62, "ok", 91, 76), (1.5, 76, "5h-warning", 91, 76), (1.5, 91, "5h-exhausted", 91, 76),
+                                                 (4.5, 62, "5h-warning", 73, 58), (4.5, 57, "ok", 73, 58), (4.5, 73, "5h-exhausted", 73, 58),
+                                                 (5, 62, "5h-warning", 70, 55), (7, 62, "5h-warning", 70, 55)):
+            with self.subTest(hours=hours, five=five):
+                self.claude(40, 100, five=five / 100, five_left=timedelta(hours=hours))
+                found = self.verdict()
+                self.assertEqual((found["five"], 100 - found["five_reserve"], 100 - found["five_reserve"] - usage.FIVE_BAND),
+                                 (expected, out, warn))
+        self.claude(40, 100, five=0.8, five_left=timedelta(hours=1.5))
+        text = "\n".join(usage.report(self.home, NOW))
+        self.assertIn("exhausted at 91 %, warning at 76 % (reserve 9 % of 30 %, scaled by the time left)", text)
+        self.assertEqual(usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"], "")
+        self.claude(40, 100, five=0.95, five_left=timedelta(hours=1.5))
+        self.assertIn("5-hour window used up (95 % of 91 %)", usage.gate(self.home, "lane", "claude", "hard", "p", "t", NOW)["hold"])
+
+    def test_stale_and_missing_five_hour_readings_keep_the_full_reserve(self):
+        self.release_policy()
+        self.claude(40, 100, five=0.8, age=timedelta(minutes=46), five_left=timedelta(hours=1.5))
+        self.assertEqual((self.verdict()["five"], self.verdict()["five_reserve"]), ("5h-warning", 9))  # no lane ran: scaled, 76 <= 80 < 91
+        self.busy("claude", at=NOW - timedelta(minutes=30), pid=DEAD)  # a lane ran since the reading: stale
+        found = self.verdict()
+        self.assertEqual((found["five"], found["five_reserve"]), ("5h-exhausted", 30))  # 80 >= 70 on the full reserve
+        event = {"rate_limit_info": {"unifiedWindows": {
+            "five_hour": {"utilization": 0.8, "resetsAt": epoch(NOW - timedelta(hours=1))},
+            "seven_day": {"utilization": 0.4, "resetsAt": epoch(NOW + timedelta(hours=100))}}}}
+        usage.record_claude(self.home, event, NOW - timedelta(minutes=5))  # that window has reset: no reading
+        found = self.verdict()
+        self.assertEqual((found["five"], found["missing"], found["five_reserve"]), ("5h-warning", True, 30))
+        self.assertEqual(self.verdict("codex")["five_reserve"], 10)  # no reading at all
+
     def test_batch_gate_refuses_ahead_vendors_only(self):
         self.claude(70, 84)
         reason, _ = usage.batch_gate(self.home, ["claude"], NOW)
@@ -240,7 +340,7 @@ class Usage(unittest.TestCase):
         line = json.loads((FIXTURES / "codex-rollout-sample.jsonl").read_text().splitlines()[0])
         line["timestamp"] = (NOW - age).isoformat()
         line["payload"]["rate_limits"] = {
-            "primary": {"used_percent": five, "window_minutes": 300, "resets_at": epoch(NOW + timedelta(hours=2))},
+            "primary": {"used_percent": five, "window_minutes": 300, "resets_at": epoch(NOW + FIVE_LEFT)},
             "secondary": {"used_percent": week, "window_minutes": 10080, "resets_at": epoch(NOW + timedelta(hours=84))}}
         self.codex(json.dumps(line) + "\n")
 
@@ -269,7 +369,7 @@ class Usage(unittest.TestCase):
             held = usage.gate(self.home, kind, "claude", tier, "proj", "t1", NOW)
             self.assertEqual(held["vendor"], "claude")
             self.assertIn("5-hour window used up (80 % of 75 %)", held["hold"])
-            self.assertIn(f"until the reset at {NOW + timedelta(hours=2):%Y-%m-%d %H:%M} UTC", held["hold"])
+            self.assertIn(f"until the reset at {NOW + FIVE_LEFT:%Y-%m-%d %H:%M} UTC", held["hold"])
         self.busy("codex")
         self.five("codex", 80)  # codex in its warning band with a lane running: no room there either
         held = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)

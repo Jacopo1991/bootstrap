@@ -91,7 +91,10 @@ umask `002` and requires the distro check to pass.
 The boundary check requires
 `sudo -n true` to fail, checks groups, and attempts to access the admin home and
 open `~admin/.config/gh/hosts.yml` without printing any file contents. It also
-rejects an accessible Docker socket when one exists. On WSL it fails for a
+rejects an accessible Docker socket when one exists, with one exception: agent's
+rootless socket `/run/user/1001/docker.sock` passes only when agent owns it, it is
+not group- or world-accessible, and a process running as agent serves it (any other
+Docker or containerd socket, or any other path, fails). On WSL it fails for a
 Windows-drive mount, a reachable `/mnt/c/Windows`, `WSL_INTEROP` in the agent login
 environment, or an `/run/WSL/<pid>_interop` socket belonging to a process in
 the agent login's ancestry (including WSL's root-owned `/init`). The
@@ -268,6 +271,21 @@ afterwards. Containerd is also disabled at boot. Agent never joins the Docker
 group. The GPU check runs as admin, runs host Python inference as agent, starts
 Docker explicitly for the container check, and stops Docker/socket/containerd
 on exit. No persistent daemon startup is enabled.
+
+The same step also installs `docker-ce-rootless-extras` (pinned to the engine's
+version) and `uidmap`, and adds agent's `/etc/subuid` and `/etc/subgid` ranges only
+if they are missing. On a machine where Docker is already installed, run
+`sudo bash /opt/machine-bootstrap/current/system/gpu-docker.sh --rootless-only`: it
+leaves the NVIDIA toolkit and the root daemon's configuration alone. Evaluations
+(Inspect AI, installed from a hashed lock as `inspect`) use agent's own rootless
+daemon, `docker-rootless.service`, which is started by hand from an unsandboxed
+agent shell and cannot be enabled. Lane sandboxes must not reach its socket; see
+[docs/rootless-docker.md](docs/rootless-docker.md) for starting an evaluation and
+for `checks/docker-containment.py`, the live containment probe. That probe is required
+before first use and again after every Codex or Claude Code upgrade:
+`python3 -I checks/docker-containment.py check --sandbox 'codex sandbox'`, plus its
+`serve` and `probe` modes from a real Claude lane and a real Codex lane (exact commands
+in the doc).
 
 Both host and container must pass `nvidia-smi`, report `sm_120` in
 `torch.cuda.get_arch_list()`, use the expected `(12, 0)` card on `cuda:0`, perform
@@ -536,7 +554,9 @@ The interactive status-line `rate_limits` is not read. ccusage is for per-projec
 Verdicts, with weekly used % against the share of the week elapsed: `exhausted-automated-share`
 (used ≥ 100 − reserve), `under-used-near-reset` (used below `under_use_percent` with at most
 `under_use_hours` left), `ahead` (more than `ahead_margin` points above the elapsed share), `under`
-(more than that below it) and `on`. `task lane`, `task review --run` and each batch start (`task-batch`,
+(more than that below it) and `on`. In the final `under_use_hours` before a vendor's weekly reset the
+weekly reserve is released (limit 100 %; every `task usage` verdict, exhausted included, says "reserve
+released until <reset>"); the 5-hour bands keep their reserve. `task lane`, `task review --run` and each batch start (`task-batch`,
 so `task runner-start` too) apply the verdict:
 
 | Verdict | Effect |
@@ -547,7 +567,9 @@ so `task runner-start` too) apply the verdict:
 | `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
 
 The 5-hour window is a second pace input per vendor with the same reserves (it ignores spare resets,
-which only refill the weekly window). `5h-exhausted` (used ≥ 100 − reserve): no new lane or review on
+which only refill the weekly window). The reserve shrinks with the time left in the window: reserve ×
+hours left ÷ 5 (30 with 1.5 h left is 9: exhausted at 91 %, warning at 76 %); a missing or stale reading
+keeps the full reserve, and `task usage` shows the effective values. `5h-exhausted` (used ≥ 100 − reserve): no new lane or review on
 that vendor until the 5-hour reset, which `task usage` and the hold message show; running ones finish,
 and a routine lane moves to the other vendor when that has room on both windows. `5h-warning`
 (15 points lower): at most one lane or review of that vendor runs machine-wide (`task` records each
@@ -562,7 +584,7 @@ the warning band. `task usage --weekly-line` appends `, 5-hour exhausted <day an
 
 While Jacopo holds a spare reset for a vendor (`spare_resets` > 0) there is no reserve: the window is
 spent at the normal pace, `ahead` never holds lanes back, the share ends at 100 % and `task usage`
-says "spare reset held; reset at 100 %".
+says "spare reset held; reset at 100 %", after the release wording in the final `under_use_hours`.
 
 A held lane exits 4 (`task lane`, `task review --run`); the batch runner waits a minute and asks again.
 `--no-pace` on `task lane`, `task review`, `task runner-start` and `task-batch` skips the check for that

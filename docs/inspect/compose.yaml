@@ -1,0 +1,15 @@
+# Sandbox for the Inspect AI end-to-end probe: no network, no bind mounts, nothing privileged.
+# tests (ci/rootless-docker-test.py) fail if this file gains a mount, a port, a capability or
+# any network mode but "none".
+services:
+  default:
+    image: python:3.12-slim
+    command: tail -f /dev/null
+    init: true
+    network_mode: none
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
