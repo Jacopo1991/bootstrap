@@ -3255,8 +3255,79 @@ store.write_text(json.dumps(prs))
             destination = tidy['archive_ignored'](self.repo, wt / '.work/fixture', files, [])
         record = json.loads((destination / 'manifest.json').read_text())
         self.assert_archive_skips({row['path']: row for row in record['skipped']}, payloads)
-        self.assertTrue((destination / 'keep.log').exists())
-        self.assertFalse((destination / 'house.sqlite').exists())
+        self.assertTrue((destination / 'ignored/keep.log').exists())
+        self.assertFalse((destination / 'ignored/house.sqlite').exists())
+
+    def test_archive_ignored_manifest_collisions(self):
+        import runpy
+        source = self.home / 'ignored-source'
+        source.mkdir()
+        outside = self.home / 'outside.txt'
+        outside.write_text('untouched')
+        (source / 'manifest.json').write_text('original ignored manifest')
+        (source / 'manifest.json.tmp').symlink_to(outside)
+        with mock.patch.dict(os.environ, HOME=str(self.home)):
+            tidy = runpy.run_path(str(ROOT / 'home/dot_local/bin/executable_workspace-tidy'),
+                                  run_name='archive_test')
+            destination = tidy['archive_ignored'](self.repo, source,
+                [Path('manifest.json'), Path('manifest.json.tmp')], [])
+        self.assertIsNotNone(destination)
+        self.assertEqual(outside.read_text(), 'untouched')
+        self.assertEqual((destination / 'ignored/manifest.json').read_text(),
+                         'original ignored manifest')
+        self.assertTrue((destination / 'ignored/manifest.json.tmp').is_symlink())
+        self.assertEqual(json.loads((destination / 'manifest.json').read_text()), {'skipped': []})
+
+    def test_archive_prune_keeps_unreadable_and_malformed_snapshots(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = root / 'proj/t5/good'
+        snapshot.mkdir(parents=True)
+        report_file = snapshot / 'report.md'
+        report_file.write_text('keep')
+        make_read_only(self, report_file, 0)
+        for name, record in [('array', []), ('scalar', 1), ('bad-pruned', {'pruned': {}})]:
+            bad = snapshot.with_name(name)
+            bad.mkdir()
+            (bad / 'manifest.json').write_text(json.dumps(record))
+            (bad / 'copy.db').write_text('keep in invalid snapshot')
+        report = []
+        TASK_MODULE.prune_evidence_archive(root, True, report)
+        self.assertTrue(report_file.exists())
+        self.assertTrue(any('kept' in line and 'report.md' in line for line in report))
+        for name in ('array', 'scalar', 'bad-pruned'):
+            self.assertTrue((snapshot.with_name(name) / 'copy.db').exists())
+            self.assertTrue(any('cannot prune' in line and name in line for line in report))
+
+    def test_archive_unreadable_ordinary_capture_keeps_worktree(self):
+        import runpy
+        wt, _ = self.started()
+        file = wt / '.work/report.md'
+        file.write_text('keep')
+        make_read_only(self, file, 0)
+        report = []
+        with mock.patch.dict(os.environ, HOME=str(self.home)):
+            tidy = runpy.run_path(str(ROOT / 'home/dot_local/bin/executable_workspace-tidy'),
+                                  run_name='archive_test')
+            self.assertFalse(tidy['archive_work'](self.repo, wt, report))
+            self.assertIsNone(tidy['archive_ignored'](self.repo, wt,
+                                                    [Path('.work/report.md')], report))
+        self.assertTrue(wt.exists())
+        self.assertTrue(file.exists())
+        self.assertTrue(any('kept' in line and 'cannot archive' in line for line in report))
+
+    def test_archive_task_prune_uses_shared_big_evidence_rule(self):
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        (snapshot / 'manifest.json').write_text('{}')
+        big = snapshot / 'check.log'
+        subprocess.run(['truncate', '-s', '51M', str(big)], check=True)
+        (snapshot / 'report.md').write_text('keep')
+        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
+        self.assertIn(str(big), out)
+        self.assertTrue(big.exists())
+        self.raw_task('repair', '--prune-archive', 'proj')
+        self.assertFalse(big.exists())
+        self.assertEqual((snapshot / 'report.md').read_text(), 'keep')
 
     def test_archive_prune_dry_run_apply_and_symlinks(self):
         root = self.home / '.local/state/task/archive'
@@ -3309,14 +3380,14 @@ store.write_text(json.dumps(prs))
 
     def test_archive_unreadable_file_records_null_hash(self):
         wt, _ = self.started()
-        for name in ('check.db', 'check.txt'):
+        for name in ('check.db',):
             file = wt / '.work' / name
             file.write_bytes(b'db')
             make_read_only(self, file, 0)
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
             TASK_MODULE.preserve_work(self.repo, 't5', wt)
         manifest = next(self.work_archives().glob('*/manifest.json'))
-        for name in ('check.db', 'check.txt'):
+        for name in ('check.db',):
             row = next(row for row in json.loads(manifest.read_text())['skipped'] if row['path'] == name)
             self.assertIsNone(row['sha256'])
             self.assertIn('error', row)

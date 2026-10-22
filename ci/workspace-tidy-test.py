@@ -362,7 +362,7 @@ class Safety(unittest.TestCase):
         base = self.home / ".local/state/task/archive/proj/ignored"
         for relative, text in (("logs/run.log", "log line"), (".bash_profile", "export X=1"),
                                ("pkg.egg-info/PKG-INFO", "info")):
-            copies = list(base.glob(f"ignored-ignored-*/{relative}"))
+            copies = list(base.glob(f"ignored-ignored-*/ignored/{relative}"))
             self.assertEqual([copy.read_text() for copy in copies], [text], out)
         self.assertEqual(list(base.glob("*/node_modules")), [], "caches are not archived")
 

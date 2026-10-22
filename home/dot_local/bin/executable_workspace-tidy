@@ -287,13 +287,16 @@ def archive_ignored(repo, path, files, report):
             if omission:
                 skipped.append(dict(omission, path=str(relative)))
                 continue
-            target = pending / relative
+            target = pending / 'ignored' / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             if (path / relative).is_symlink():
                 target.symlink_to(os.readlink(path / relative))
             else:
                 shutil.copy2(path / relative, target)
-        task['atomic_json'](pending / 'manifest.json', {'skipped': skipped})
+        with tempfile.NamedTemporaryFile(mode='w', dir=pending, delete=False) as stream:
+            json.dump({'skipped': skipped}, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+        Path(stream.name).replace(pending / 'manifest.json')
         destination = base / f"{path.name}-ignored-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except OSError as error:

@@ -87,13 +87,13 @@ WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
                ".ruff_cache", ".cache"}
 
 
-def archive_exclusion(item, info, size=None):
+def archive_exclusion(item, info, size=None, errors=None):
     """Shared no-follow copy/prune rule; hashes are streamed, never buffered whole."""
     mode = info.st_mode
     record = {"size": info.st_size if size is None else size}
     if stat.S_ISLNK(mode):
         return None
-    if archive_runtime(item, info) or (stat.S_ISREG(mode) and item.suffix == '.pyc'):
+    if archive_runtime(item, info, errors) or (stat.S_ISREG(mode) and item.suffix == '.pyc'):
         return dict(record, reason="cache/runtime")
     if not stat.S_ISREG(mode):
         return None
@@ -115,7 +115,9 @@ def archive_exclusion(item, info, size=None):
                     digest.update(chunk)
                 return dict(record, reason=reason, sha256=digest.hexdigest())
     except OSError as error:
-        return dict(record, reason=reason or "unreadable file", sha256=None, error=str(error))
+        if reason is None:
+            raise
+        return dict(record, reason=reason, sha256=None, error=str(error))
     return None
 
 
@@ -134,6 +136,8 @@ def prune_evidence_archive(root, apply, report):
             continue
         try:
             record = json.loads(manifest.read_text()) if manifest.exists() else {}
+            if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
+                raise ValueError("manifest must be an object with a pruned list")
             contents, sizes, _ = archive_inventory(manifest.parent)
             excluded = set()
             for item, meta in contents:
@@ -142,7 +146,11 @@ def prune_evidence_archive(root, apply, report):
                 if item.parent in excluded:
                     excluded.add(item)
                     continue
-                removal = archive_exclusion(item, meta, sizes[item])
+                try:
+                    removal = archive_exclusion(item, meta, sizes[item])
+                except OSError as error:
+                    report.append(f"archive: kept {item}: {error}")
+                    continue
                 if removal is None:
                     continue
                 excluded.add(item)
@@ -939,7 +947,12 @@ def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=
                 continue
             relative = str(item.relative_to(source))
             mode = info.st_mode
-            omission = archive_exclusion(item, info, sizes[item]) if item != source else None
+            try:
+                omission = archive_exclusion(item, info, sizes[item], errors) if item != source else None
+            except OSError as error:
+                errors[item] = str(error)
+                excluded.add(item)
+                continue
             reason = None
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                 special.append(relative)
@@ -977,7 +990,8 @@ def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=
                                                 "head": reuse_head or (head.stdout.strip()
                                                                        if not head.returncode else None)})
         if strict and errors:
-            raise OSError("evidence could not be fully read or copied")
+            raise OSError("evidence could not be fully read or copied: " +
+                          "; ".join(f"{item}: {error}" for item, error in errors.items()))
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except (OSError, shutil.Error) as error:
@@ -4641,13 +4655,15 @@ def prune_archive(repo, dry_run=False):
         container = next((parent for parent in item.parents if parent in containers), None)
         if container is None:
             continue
-        runtime = archive_runtime(item, info, errors)
+        try:
+            omission = archive_exclusion(item, info, sizes[item], errors)
+        except OSError as error:
+            errors[item] = str(error)
+            continue
         if any(path == item or item in path.parents for path in errors):
             continue
-        large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
-                     info.st_size >= 50 * 1024 ** 2 and not archive_evidence(item, info))
         # Named runtime trees are removed whole; generic contents preserve evidence.
-        if not (runtime or item in disposable or large_log):
+        if not (omission or item in disposable):
             continue
         removed.add(item)
         freed += allocated.get(item, 0)
