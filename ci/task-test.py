@@ -41,6 +41,20 @@ os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
+# Test-only source seam: installed commands have no environment override for /etc.
+HOLD_FIXTURE = Path(audit_state.name) / 'etc/agent-hold'
+HOLD_FIXTURE.parent.mkdir()
+def hold_fixture_source(source):
+    return source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
+fixture_bin = Path(audit_state.name) / 'bin'
+fixture_bin.mkdir()
+for sibling in TOOL.parent.iterdir():
+    if sibling.is_file() and sibling != TOOL:
+        (fixture_bin / sibling.name).symlink_to(sibling)
+fixture_tool = fixture_bin / TOOL.name
+fixture_tool.write_text(hold_fixture_source(TOOL.read_text()))
+fixture_tool.chmod(0o755)
+TOOL = fixture_tool
 REVIEW_FIXTURES = ROOT / "ci/fixtures/reviews"
 SPARE_HELD = "spare reset held; reset at 100 %"
 # "Idle 10 days" with an hour of margin: the host wall clock steps back by seconds, so a
@@ -207,6 +221,158 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_hold_work_commands_refuse_both_markers_before_any_launch(self):
+        commands = [
+            ('start', 'proj', 'docs', '--builder', 'codex'),
+            ('start', 'proj', 'docs', '--builder', 'codex', '--refresh'),
+            ('lane', 'proj', '5'), ('lane', 'proj', '5', '--_worker'),
+            ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
+            ('merge', 'proj', '5', '--detach'), ('runner-start', 'proj', 'runner-b1.md'),
+            ('realign', 'proj'), ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
+            ('gate-drill', 'proj'), ('plan', 'proj', '--sign'),
+        ]
+        self.assertEqual(TASK_MODULE.HOLD_WORK_COMMANDS,
+                         {'start', 'lane', 'merge', 'runner-start', 'realign', 'close', 'gate-drill'})
+        runner = self.runner_fixture('setsid')
+        agent = self.home / '.local/state/task/hold'
+        for marker in (HOLD_FIXTURE, agent):
+            with self.subTest(marker=marker):
+                marker.write_text('human reason; not JSON and no parsed mode')
+                try:
+                    for command in commands:
+                        output = self.raw_task(*command, code=1, env=dict(self.env,
+                            TASK_HOLD_SHARED=str(self.home / 'absent'), AGENT_HOLD_STATE=str(self.home / 'absent')))
+                        self.assertIn(str(marker), output, command)
+                        self.assertIn('human reason', output, command)
+                        self.assertIn('Release:', output, command)
+                    self.assertFalse((self.home / 'service-args').exists())
+                    self.assertFalse((runner.parent / 'runner-call').exists())
+                    self.assertFalse((self.repo / '.worktrees').exists())
+                    self.assertFalse((self.state('docs') / 'task.json').exists())
+                finally:
+                    marker.unlink()
+
+    def test_hold_read_only_commands_and_release_preserves_jacopo(self):
+        self.started()
+        runner = self.runner_fixture()
+        HOLD_FIXTURE.write_text('Jacopo: keep it held')
+        try:
+            self.raw_task('hold', 'pull', 'agent reason')
+            for command in [('status', 'proj'), ('check', 'proj', '5'), ('usage',),
+                            ('lock', 'proj'), ('runner-check', 'proj', str(runner)), ('plan', 'proj')]:
+                self.raw_task(*command)
+            displayed = self.raw_task('hold')
+            self.assertIn('Jacopo: keep it held', displayed)
+            self.assertIn('agent reason', displayed)
+            self.assertIn('sudo agent-hold release', displayed)
+            self.raw_task('hold', 'release')
+            self.assertFalse((self.home / '.local/state/task/hold').exists())
+            self.assertEqual(HOLD_FIXTURE.read_text(), 'Jacopo: keep it held')
+            self.assertIn('Jacopo: keep it held', self.raw_task('hold'))
+        finally:
+            HOLD_FIXTURE.unlink()
+        self.assertIn('no hold', self.raw_task('hold'))
+        self.raw_task('start', 'proj', 'docs', '--builder', 'codex')
+
+    def test_hold_round_trip_holder_required_and_content_is_only_display(self):
+        self.assertIn('no hold', self.raw_task('hold'))
+        unnamed = dict(self.env)
+        unnamed.pop('TASK_HOLDER')
+        self.assertIn('TASK_HOLDER', self.raw_task('hold', 'pull', 'reason', env=unnamed, code=1))
+        self.raw_task('hold', 'pull', code=1)
+        marker = self.home / '.local/state/task/hold'
+        for extra, name in [((), 'test-seat'), (('--holder', 'named-seat'), 'named-seat')]:
+            self.raw_task('hold', 'pull', 'pause here', *extra)
+            data = json.loads(marker.read_text())
+            self.assertEqual((data['mode'], data['who'], data['why']), ('drain', name, 'pause here'))
+            datetime.fromisoformat(data['when'])
+            self.raw_task('hold', 'release', env=unnamed)
+            self.assertFalse(marker.exists())
+        self.raw_task('hold', 'pull', 'named', '--holder', 'seat', env=unnamed)
+        self.raw_task('hold', 'release')
+        for content in ('', '{broken', '{"mode":"released"}'):
+            marker.write_text(content)
+            self.assertIn(str(marker), self.raw_task('realign', 'proj', code=1))
+        self.raw_task('hold', 'release')
+        self.assertIn('no hold', self.raw_task('hold'))
+
+    def test_hold_inspection_errors_fail_closed(self):
+        marker = self.home / '.local/state/task/hold'
+        for path in (marker, HOLD_FIXTURE):
+            with self.subTest(path=path):
+                path.write_text('unreadable reason')
+                make_read_only(self, path, 0o000)
+                self.assertIn('cannot read', self.raw_task('realign', 'proj', code=1))
+                restore_access(path)
+                path.unlink()
+                path.mkdir()
+                self.assertIn('not a regular file', self.raw_task('realign', 'proj', code=1))
+                path.rmdir()
+                path.symlink_to(self.home / 'absent')
+                self.assertIn('not a regular file', self.raw_task('realign', 'proj', code=1))
+                path.unlink()
+                os.mkfifo(path)
+                self.assertIn('not a regular file', self.raw_task('realign', 'proj', code=1))
+                path.unlink()
+                path.write_bytes(b'\xff')
+                self.assertIn('cannot read', self.raw_task('realign', 'proj', code=1))
+                path.unlink()
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(Path, 'lstat', side_effect=PermissionError('inspection denied')):
+            self.assertIn('cannot inspect', TASK_MODULE.hold_status())
+        marker.touch()
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(os, 'open', side_effect=FileNotFoundError('changed during inspection')):
+            self.assertIn('cannot read', TASK_MODULE.hold_status())
+        marker.unlink()
+
+    def test_hold_root_command_and_install_wiring(self):
+        source = (ROOT / 'system/agent-hold').read_text()
+        self.assertLessEqual(len(source.splitlines()), 25)
+        def root_command(*args, uid=0):
+            with mock.patch.object(sys, 'argv', ['agent-hold', *args]), \
+                    mock.patch.object(os, 'geteuid', return_value=uid), \
+                    mock.patch.object(os, 'fchown') as ownership, \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(out):
+                try:
+                    exec(compile(hold_fixture_source(source), 'agent-hold-fixture', 'exec'), {'__name__': '__main__'})
+                    code = 0
+                except SystemExit as stopped:
+                    code = stopped.code
+                return code, out.getvalue(), ownership.call_args_list
+        self.assertEqual(root_command()[0], 0)
+        self.assertIn('no hold', root_command()[1])
+        self.assertEqual(root_command('pull', 'human pause', uid=1001)[0], 1)
+        code, output, owners = root_command('pull', 'human pause')
+        try:
+            self.assertEqual(code, 0, output)
+            self.assertIn('jacopo', output)
+            self.assertIn('human pause', output)
+            self.assertEqual(owners[0].args[1:], (0, 0))
+            self.assertEqual(stat.S_IMODE(HOLD_FIXTURE.stat().st_mode), 0o644)
+            datetime.fromisoformat(HOLD_FIXTURE.read_text().split()[2].rstrip(':'))
+            self.assertIn('human pause', self.raw_task('hold'))
+            self.assertEqual(root_command('release', uid=1001)[0], 1)
+            self.assertTrue(HOLD_FIXTURE.exists())
+            self.assertEqual(root_command('release')[0], 0)
+            self.assertFalse(HOLD_FIXTURE.exists())
+        finally:
+            HOLD_FIXTURE.unlink(missing_ok=True)
+        installer = (ROOT / 'system/agent-hold.sh').read_text()
+        self.assertIn('require_root', installer)
+        self.assertIn('install -o root -g root -m 0755', installer)
+        self.assertIn('/usr/local/bin/agent-hold', installer)
+        self.assertIn('sudo "$bash_cmd" "$ROOT/system/agent-hold.sh"', (ROOT / 'install.sh').read_text())
+
+    def test_hold_unit_conditions(self):
+        units = ROOT / 'home/dot_config/systemd/user'
+        for name in ('workspace-tidy.service',):
+            unit = (units / name).read_text().split('[Service]')[0]
+            self.assertIn('ConditionPathExists=!/etc/agent-hold', unit.splitlines())
+            self.assertIn('ConditionPathExists=!%h/.local/state/task/hold', unit.splitlines())
+        self.assertNotIn('ConditionPathExists', (units / 'task-watch.service').read_text())
+
     def test_project_lock_contention_commands_and_read_only_status(self):
         self.started()
         self.raw_task('lock', 'proj', '--holder', 'seat-a')
@@ -2164,6 +2330,10 @@ sys.exit(7)
                                    '--working-directory', str(self.repo), '--property=StandardInput=null'])
         self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
         self.assertIn('--property=KillMode=process', args)
+        for condition in ('ConditionPathExists=!/etc/agent-hold',
+                          f'ConditionPathExists=!{self.home}/.local/state/task/hold'):
+            self.assertEqual(args.count(condition), 1)
+            self.assertEqual(args[args.index(condition) - 1], '-p')
         self.assertIn('--setenv=TASK_HOLDER=test-seat', args)
         command = args[args.index(sys.executable):]
         self.wait_project_lock_free()

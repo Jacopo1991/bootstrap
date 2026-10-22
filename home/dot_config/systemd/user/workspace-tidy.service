@@ -1,5 +1,7 @@
 [Unit]
 Description=Remove finished worktrees and merged branches; report stray folders (no agent runs)
+ConditionPathExists=!/etc/agent-hold
+ConditionPathExists=!%h/.local/state/task/hold
 
 [Service]
 Type=oneshot

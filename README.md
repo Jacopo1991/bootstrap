@@ -715,6 +715,23 @@ Merge and published-merge repair preserve the trusted `check.log` in state
 and archive the lane log separately as `advisory-check.log`. Batch fix rounds
 read the log recorded by the latest check, including trusted PM checks.
 
+### Hold switch
+
+`task hold` shows the two holds. Jacopo uses `sudo agent-hold pull "reason"` and
+`sudo agent-hold release`; `agent-hold` shows his marker at `/etc/agent-hold`.
+Everyone else uses `task hold pull "reason"` with `TASK_HOLDER` set or `--holder <name>`.
+`task hold release` removes only `~/.local/state/task/hold`, never Jacopo's marker.
+Existence holds work; the text is for people. Unreadable or nonregular markers also hold work.
+
+The only mode is drain: running steps finish, and new work-changing `task` commands refuse.
+Runner units and the workspace-tidy service also have systemd conditions for both markers.
+Status, checks, usage, lock display and hold inspection remain available.
+For a stop beyond drain, pull a hold first, then use the existing
+`systemctl --user stop task-runner-<repo>-<batch>.service` for runner units and
+`task cancel <repo> <id>` for recorded lanes. Reconcile interrupted work through the
+existing cancel path; interrupted work is never auto-merged. Inspect and reconcile
+before the appropriate owner releases the hold. There is no automatic stop or release.
+
 Always launch build lanes through `task lane`, including from a batch runner:
 
 ```sh
