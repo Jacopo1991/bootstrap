@@ -25,7 +25,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
@@ -7615,6 +7615,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual((self.home / 'pings').read_text(), 'task-watch 0\n')
 
     def test_stale_missing_reports_collector_and_git_commit_age(self):
+        self.now = datetime(2026, 10, 22, 12, tzinfo=self.watch.usage.CPH)
         os.utime(self.report, (0, 0))
         self.assertIn('seat-report:seat-report', self.scan())
         self.report.unlink()
@@ -7623,9 +7624,34 @@ class WatcherTests(unittest.TestCase):
         self.assertIn('collector:collector', self.scan())
         (self.home / '.config/task/watch-reports.json').unlink()
         self.write('cortex/cortex-kb-company/STATUS.md', 'report')
-        with mock.patch.object(self.watch, 'command', return_value=str(int(self.now.timestamp() - 7300))) as command:
+        with mock.patch.object(self.watch, 'command', return_value=str(int(self.now.timestamp() - 7900))) as command:
             self.assertIn('seat-report:seat-report', self.scan())
         self.assertIn('--format=%ct', command.call_args.args)
+
+    def report_at(self, stamp, checked):
+        os.utime(self.report, (stamp.timestamp(), stamp.timestamp()))
+        self.now = checked
+        return 'seat-report:seat-report' in self.scan()
+
+    def test_report_overnight_age_excludes_night_and_handles_dst(self):
+        for year, month, day in [(2026, 10, 22), (2026, 3, 28), (2026, 10, 24)]:
+            stamp = datetime(year, month, day, 23, tzinfo=self.watch.usage.CPH)
+            next_day = stamp.date() + timedelta(days=1)
+            for hour, minute in [(1, 30), (6, 59), (9, 10), (9, 11)]:
+                checked = datetime.combine(next_day, datetime.min.time(), self.watch.usage.CPH).replace(hour=hour, minute=minute)
+                with self.subTest(stamp=stamp, checked=checked):
+                    self.assertEqual(self.report_at(stamp, checked), hour == 9 and minute == 11)
+
+    def test_report_daytime_gap_and_short_grace(self):
+        stamp = datetime(2026, 10, 22, 10, tzinfo=self.watch.usage.CPH)
+        for minute, stale in [(0, False), (10, False), (11, True)]:
+            with self.subTest(minute=minute):
+                self.assertEqual(self.report_at(stamp, stamp.replace(hour=12, minute=minute)), stale)
+
+    def test_report_late_evening_age_resumes_in_morning(self):
+        stamp = datetime(2026, 10, 22, 22, 30, tzinfo=self.watch.usage.CPH)
+        self.assertFalse(self.report_at(stamp, stamp.replace(day=23, hour=7, minute=40)))
+        self.assertTrue(self.report_at(stamp, stamp.replace(day=23, hour=8, minute=41)))
 
     def test_ledger_open_update_close_reopen_and_source_failure(self):
         state = self.home / '.local/state/task'

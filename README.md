@@ -1058,9 +1058,12 @@ The timer is shipped without an enablement symlink.
 
 PMs list live user unit/timer names, one per line (blank lines and `#` comments
 allowed), in `~/.config/task/live-units`. Only those units are inspected.
-Asks are read from `~/cortex/cortex-kb-*/backlog/tasks/*.md`.
+Asks are read from `backlog/tasks/*.md` under these six repositories in `~/cortex/`:
+`cortex-kb-company`, `cortex-kb-product-harness`, `cortex-kb-household-signal-harness`,
+`cortex-kb-madplanner-v2`, `cortex-kb-consultancy-website` and `cortex-kb-home-energy-lab`.
 The default report check uses the company `STATUS.md` commit age, with a two-hour
-cadence. The seat may name existing report/collector heartbeat files through
+cadence plus a ten-minute grace, counting only 07:00-23:00 Europe/Copenhagen
+(including daylight saving). The seat may name existing report/collector heartbeat files through
 `~/.config/task/watch-reports.json`, a mapping such as
 `{"seat-report":{"path":"reports/company.md","seconds":7200},"collector":{"path":"reports/collector.json","seconds":3600}}`.
 Paths are relative to home or absolute; `"git":true` uses the file's latest commit
