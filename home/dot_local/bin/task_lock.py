@@ -32,7 +32,7 @@ def free(data, now=None):
     try: return not data or data.get("released") or not alive(data) or float(data["expires_epoch"]) <= (now or time.time())
     except (KeyError, TypeError, ValueError): return False
 
-def write(home, repo, data): atomic_write(path(home, repo), data)
+write = lambda home, repo, data: atomic_write(path(home, repo), data)
 
 def acquire(home, repo, holder=None, ttl=120, pid=None):
     target = path(home, repo); target.parent.mkdir(parents=True, exist_ok=True)
@@ -46,8 +46,8 @@ def acquire(home, repo, holder=None, ttl=120, pid=None):
         new_head = head(repo)
         if current and free(current, now) and current.get("head", "") != new_head:
             print(f"Sources changed since the previous lock change ({current.get('head','')[:7]} -> {new_head[:7]}); re-read before acting.")
-        boot = Path("/proc/sys/kernel/random/boot_id")
-        data = {"holder": name, "pid": pid, "boot_id": boot.read_text().strip() if pid and boot.exists() else None,
+        pid = pid or (current.get("pid") if current and current.get("holder") == name else None); boot = Path("/proc/sys/kernel/random/boot_id")
+        data = {"holder": name, "pid": pid, "boot_id": current.get("boot_id") if current and pid == current.get("pid") else boot.read_text().strip() if pid and boot.exists() else None,
                 "taken_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
                 "expires_at": datetime.fromtimestamp(now + ttl * 60, timezone.utc).isoformat(),
                 "expires_epoch": now + ttl * 60, "head": new_head, "released": False}

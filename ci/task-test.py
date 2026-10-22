@@ -256,6 +256,22 @@ class TaskTool(unittest.TestCase):
             api.acquire(self.home, self.repo, 'seat-b')
         self.assertIn('Sources changed', out.getvalue())
 
+    def test_project_lock_child_refresh_keeps_runner_process(self):
+        api = TASK_MODULE.task_lock
+        runner = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        try:
+            first = api.acquire(self.home, self.repo, 'batch-seat', pid=runner.pid)
+            refreshed = api.acquire(self.home, self.repo, 'batch-seat')
+            self.assertEqual(refreshed['pid'], runner.pid)
+            self.assertEqual(refreshed['boot_id'], first['boot_id'])
+            runner.terminate()
+            runner.wait()
+            self.assertTrue(api.free(api.read(self.home, self.repo)))
+        finally:
+            if runner.poll() is None:
+                runner.terminate()
+                runner.wait()
+
     def test_project_lock_corrupt_file_is_held_until_forced_release(self):
         target = TASK_MODULE.task_lock.path(self.home, self.repo)
         target.parent.mkdir(parents=True, exist_ok=True)
