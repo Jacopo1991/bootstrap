@@ -18,7 +18,7 @@ expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
             "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "verify-enable", "gate-browser",
             "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
-            "agentdev-shell-mcp"}
+            "task-watch", "agentdev-shell-mcp"}
 assert drift.EXPECTED_BINARIES == expected
 allowed_helpers = {"task_limits.py", "task_routing.py", "task_usage.py", "task_lock.py"}
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
@@ -29,11 +29,13 @@ for script in (ROOT / "home/dot_local/bin").iterdir():
 with tempfile.TemporaryDirectory() as temp:
     installed = Path(temp) / ".local/bin"
     installed.mkdir(parents=True)
-    for name in ("task", "task-batch", *allowed_helpers):
+    for name in ("task", "task-batch", "task-watch", *allowed_helpers):
         source = name if name in allowed_helpers else "executable_" + name
         shutil.copy2(ROOT / "home/dot_local/bin" / source, installed / name)
-    for name in ("task", "task-batch"):
-        result = subprocess.run([sys.executable, "-I", str(installed / name), "--help"],
+    for name in ("task", "task-batch", "task-watch"):
+        option = "--coverage" if name == "task-watch" else "--help"
+        flags = [] if name == "task-watch" else ["-I"]
+        result = subprocess.run([sys.executable, *flags, str(installed / name), option],
                                 cwd=temp, capture_output=True, text=True)
         assert result.returncode == 0, (name, result.stderr)
 assert drift.compare_sets(expected, expected) == []

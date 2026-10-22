@@ -52,9 +52,12 @@ def main(argv):
         return 0 if check(argv[1], int(argv[2])) else 1
     root = Path(__file__).resolve().parent.parent
     bin_dir = root / "home/dot_local/bin"
-    entries = [bin_dir / "executable_task", bin_dir / "executable_task-batch"]
+    entries = [bin_dir / "executable_task", bin_dir / "executable_task-batch", bin_dir / "executable_task-watch"]
     entries.extend(path for path in bin_dir.glob("*watch*") if path.is_file())
     failed = False
+    if len((bin_dir / "executable_task-watch").read_text().splitlines()) > 75:
+        print("task-watch exceeds 75 production lines")
+        failed = True
     for line in (root / "ci/task-line-budget.txt").read_text().splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue

@@ -1,0 +1,11 @@
+[Unit]
+Description=Read task findings for the company seat (no agent runs)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.local/bin/task-watch
+NoNewPrivileges=yes
+PrivateTmp=yes
+TimeoutStartSec=5min

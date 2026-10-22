@@ -1,0 +1,9 @@
+[Unit]
+Description=Check task findings every 15 minutes (PM enables after review)
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+
+[Install]
+WantedBy=timers.target

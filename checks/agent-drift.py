@@ -20,7 +20,7 @@ EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleak
                      "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just",
                      "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
                      "verify-enable", "gate-browser", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch",
-                     "job-ping", "agentdev-shell-mcp"}
+                     "task-watch", "job-ping", "agentdev-shell-mcp"}
 VERSION_COMMANDS = {
     "claude": ["claude", "--version"],
     "codex": ["codex", "--version"],
