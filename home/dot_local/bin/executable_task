@@ -21,7 +21,7 @@ Write capability there determines trust; vendor environment markers do not.
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
   task note <repo> <id> improve|intervention|setup <text>
-  task note - - setup-done <n>
+  task note - - setup-done <n>; task note <repo> - pm-run start|end [finished|failed|interrupted] [reason] (TASK_VENDOR, TASK_MODEL, TASK_EFFORT, TASK_TIER, TASK_PLAN)
   task status [<repo>]
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
@@ -1635,6 +1635,8 @@ def finalize_lane_record(path, run, state, **fields):
         print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
     finally:
         run.update(state=state, ended_at=utc_now(), **fields)
+        if run.get("usage_run"):
+            task_usage.run_log(HOME, run["usage_run"], "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
         atomic_json(path, run)
 
 
@@ -1817,7 +1819,7 @@ def lane(args):
         raise Stop(f"{binary} is not installed or available on PATH.")
     final = work / "final.md"
     command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
-                "--output-last-message", str(final), "-"] if builder == "codex" else
+                "-c", "model_reasoning_effort=high", "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", "high",
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
@@ -1858,6 +1860,7 @@ def lane(args):
                                          close_fds=True)
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
+                                      "usage_run": task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier),
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
             if builder != record["builder"] or tier != record.get("tier", "routine"):
@@ -3171,6 +3174,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
     run_file = reply_file.with_name("review-run.json")
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
+    usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
     atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
@@ -3198,6 +3202,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
+        task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
@@ -3320,7 +3325,7 @@ def review(args):
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)
-        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1]})
+        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1])})
         prompt_file = state / "review-prompt.md"
         reply_file = state / "review-response.md"
         prompt_file.write_text(prompt_text)
@@ -3426,6 +3431,8 @@ def review(args):
         meta["no_check"] = args.no_check
     save_review_history(state, meta, text)
     atomic_json(state / "review.json", meta)
+    if not args.run:
+        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, plan=os.environ.get("TASK_PLAN"), ccusage_tokens=None)), "finished")
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     if args.run:
@@ -3750,6 +3757,7 @@ def merge(args):
             raise Stop(f"{default} kept moving during three gate attempts; rerun `task merge`.")
     atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit,
                                         "time": datetime.now(timezone.utc).isoformat()})
+    task_usage.run_outcome(HOME, repo.name, task.id, "merged")
     try:
         review = json.loads((archive / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -4162,6 +4170,14 @@ def open_setup_requests(path, repo_name=None, events=None):
 
 
 def note(args):
+    if args.kind == "pm-run":
+        pending = HOME / ".local/state/task" / f"pm-{args.repo}.json"
+        if args.text == "start":
+            atomic_json(pending, read_json_object(pending) if read_json_object(pending).get("id") and (HOME / ".local/state/task/pending-runs" / (read_json_object(pending)["id"] + ".json")).exists() else task_usage.run_log(HOME, repo=args.repo, task="-", kind="pm", vendor=os.environ.get("TASK_VENDOR"), model=os.environ.get("TASK_MODEL"), effort=os.environ.get("TASK_EFFORT"), tier=os.environ.get("TASK_TIER", "routine")))
+        else:
+            if not read_json_object(pending): raise Stop("No PM run started; use pm-run start first.")
+            task_usage.run_log(HOME, read_json_object(pending), next((word for word in args.text.split() if word in {"finished", "failed", "interrupted"}), "finished"), reason=args.text)
+        return 0
     if args.kind == "setup-done":
         if args.repo != "-" or args.id != "-" or len(args.text) != 1 or not args.text[0].isdigit():
             raise Stop("Usage: task note - - setup-done <n>.")
@@ -4281,6 +4297,7 @@ def stale_worktree_lines(repo):
 
 
 def status(args):
+    print("\n".join(task_usage.run_summary(HOME)))
     active = boost_line()
     if active:
         print(active)
@@ -5050,7 +5067,7 @@ def main(argv=None):
     sub = commands.add_parser("note")
     sub.add_argument("repo")
     sub.add_argument("id")
-    sub.add_argument("kind", choices=("improve", "intervention", "setup", "setup-done"))
+    sub.add_argument("kind", choices=("improve", "intervention", "setup", "setup-done", "pm-run"))
     sub.add_argument("text", nargs="+")
     sub = commands.add_parser("status")
     sub.add_argument("repo", nargs="?")
