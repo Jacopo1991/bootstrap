@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import fcntl, json, re, runpy, subprocess, sys
+import fcntl, functools, json, re, runpy, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
 sys.dont_write_bytecode = True
 import task_usage as usage
-COVERAGE = "P1 interim: company skill check (no recorded machine-readable paid cap schema)\nP2 task usage readers and policy: weekly and 5-hour exhaustion/reserve\nP3 interim: company skill check (no product channel feed)\nP4 ~/.config/task/live-units: failed units/timers; secret alerts and other harm interim: company skill check (no retained alert source)\nP5 overdue Backlog asks; hold interim: company skill check (task hold state not present)\nseat-report company STATUS.md or named file: 2 hours plus 10-minute grace, counting only 07:00-23:00 Copenhagen\ncollector interim: company skill check unless a heartbeat file/cadence is named in watch-reports.json"
+COVERAGE = "P1 interim: company skill check (no recorded machine-readable paid cap schema)\nP2 task usage readers and policy: weekly and 5-hour exhaustion/reserve\nP3 interim: company skill check (no product channel feed)\nP4 ~/.config/task/live-units: failed, inactive, disabled, no next run, not found; secret alerts and other harm interim: company skill check (no retained alert source)\nP5 overdue Backlog asks; hold interim: company skill check (task hold state not present)\nseat-report company STATUS.md or named file: 2 hours plus 10-minute grace, counting only 07:00-23:00 Copenhagen\ncollector interim: company skill check unless a heartbeat file/cadence is named in watch-reports.json"
 def report_clock(stamp):
     # Each local day contributes only its 07:00-23:00 reporting window.
     local = datetime.fromtimestamp(stamp, usage.CPH)
@@ -22,14 +22,17 @@ def findings(home, now):
         if item['verdict'] == usage.EXHAUSTED or item['five'] == usage.FIVE_OUT:
             add('P2', 'task usage', vendor)
     units = home / '.config/task/live-units'
+    @functools.cache
+    def show(unit):
+        return dict(line.split('=', 1) for line in command('systemctl', '--user', 'show', '--property=LoadState,ActiveState,SubState,TriggeredBy,Unit,Triggers,UnitFileState,NextElapseUSecRealtime', '--', unit).splitlines())
     for unit in units.read_text().splitlines() if units.exists() else []:
         unit = unit.strip()
         if unit and not unit.startswith('#'):
-            props = dict(line.split('=', 1) for line in command('systemctl', '--user', 'show', '--property=LoadState,ActiveState,TriggeredBy,UnitFileState,NextElapseUSecRealtime', '--', unit).splitlines())
+            props = show(unit)
             reason = 'not found' if props.get('LoadState') == 'not-found' else 'failed' if props.get('ActiveState') == 'failed' else ''
             if not reason and props.get('ActiveState') != 'active' and (unit.endswith('.timer') or unit.endswith('.service') and not props.get('TriggeredBy')): reason = 'inactive'
             if not reason and unit.endswith('.timer'):
-                reason = 'disabled' if props.get('UnitFileState') != 'enabled' else 'no next run' if props.get('NextElapseUSecRealtime', '') in ('', 'n/a') else ''
+                reason = 'disabled' if props.get('UnitFileState') != 'enabled' else 'no next run' if props.get('NextElapseUSecRealtime', '') in ('', 'n/a') and props.get('SubState') != 'running' and not any(show(target).get('ActiveState') in ('activating', 'active') for target in (props.get('Unit') or props.get('Triggers', '')).split()) else ''
             if reason:
                 add('P4', units, unit)
                 found['P4:' + unit]['detail'] = reason

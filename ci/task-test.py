@@ -8113,7 +8113,7 @@ class WatcherTests(unittest.TestCase):
         return self.watch.findings(self.home, self.now)
 
     def unit_properties(self, **overrides):
-        props = dict(LoadState='loaded', ActiveState='active', TriggeredBy='',
+        props = dict(LoadState='loaded', ActiveState='active', SubState='waiting', TriggeredBy='', Unit='', Triggers='',
                      UnitFileState='enabled', NextElapseUSecRealtime='Thu 2026-10-22 14:01:00 CEST')
         props.update(overrides)
         return '\n'.join(f'{key}={value}' for key, value in props.items())
@@ -8125,6 +8125,9 @@ class WatcherTests(unittest.TestCase):
             self.assertIn(kind, out.getvalue())
         for kind in ('P1', 'P3'):
             self.assertIn(kind + ' interim: company skill check', out.getvalue())
+        p4 = next(line for line in out.getvalue().splitlines() if line.startswith('P4 '))
+        for reason in ('failed', 'inactive', 'disabled', 'no next run', 'not found'):
+            self.assertIn(reason, p4)
         self.assertEqual(self.scan(), {})
 
     def test_p2_existing_readers_reserve_weekly_and_five_hour(self):
@@ -8145,7 +8148,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(list(found), ['P4:product.service'])
         self.assertEqual(command.call_count, 2)
         for call, unit in zip(command.call_args_list, ('product.service', 'product.timer')):
-            self.assertEqual(call.args, ('systemctl', '--user', 'show', '--property=LoadState,ActiveState,TriggeredBy,UnitFileState,NextElapseUSecRealtime', '--', unit))
+            self.assertEqual(call.args, ('systemctl', '--user', 'show', '--property=LoadState,ActiveState,SubState,TriggeredBy,Unit,Triggers,UnitFileState,NextElapseUSecRealtime', '--', unit))
         with mock.patch.object(self.watch, 'command', side_effect=subprocess.TimeoutExpired('systemctl', 20)):
             with self.assertRaises(subprocess.TimeoutExpired): self.scan()
 
@@ -8178,6 +8181,47 @@ class WatcherTests(unittest.TestCase):
                     self.assertEqual(found['P4:' + unit]['detail'], reason)
                 else:
                     self.assertEqual(found, {})
+
+    def test_p4_fake_systemctl_timer_running_unit_and_waiting_without_next_elapse(self):
+        self.write('.config/task/live-units', 'product.timer\nproduct.service\n')
+        properties = self.write('unit-properties.json', '{}')
+        systemctl = self.write('bin/systemctl', '#!/usr/bin/python3\n'
+                              'import json, os, pathlib, sys\n'
+                              'home = pathlib.Path(os.environ["HOME"])\n'
+                              'with (home / "unit-calls").open("a") as log: log.write(sys.argv[-1] + "\\n")\n'
+                              'print(json.loads((home / "unit-properties.json").read_text())[sys.argv[-1]])\n')
+        systemctl.chmod(0o755)
+        env = dict(HOME=str(self.home), PATH=f'{systemctl.parent}:/usr/bin:/bin',
+                   PYTHONDONTWRITEBYTECODE='1')
+        cases = [
+            ({'SubState': 'running'}, 'activating', None),
+            ({'SubState': 'running'}, 'inactive', None),
+            ({}, 'activating', None),
+            ({}, 'active', None),
+            ({'NextElapseUSecRealtime': 'n/a'}, 'active', None),
+            ({'Unit': '', 'Triggers': 'product.service'}, 'activating', None),
+            ({}, 'inactive', 'no next run'),
+            ({}, 'failed', 'no next run'),
+            ({'SubState': 'running', 'UnitFileState': 'disabled'}, 'active', 'disabled'),
+            ({'SubState': 'running', 'ActiveState': 'failed'}, 'active', 'failed'),
+            ({'SubState': 'running', 'ActiveState': 'inactive'}, 'active', 'inactive'),
+        ]
+        for overrides, active, reason in cases:
+            with self.subTest(timer=overrides, service=active):
+                timer = dict(Unit='product.service', NextElapseUSecRealtime='')
+                timer.update(overrides)
+                properties.write_text(json.dumps({
+                    'product.timer': self.unit_properties(**timer),
+                    'product.service': self.unit_properties(ActiveState=active, TriggeredBy='product.timer'),
+                }))
+                (self.home / 'unit-calls').unlink(missing_ok=True)
+                with mock.patch.dict(os.environ, env, clear=True):
+                    found = self.scan()
+                self.assertEqual(found.get('P4:product.timer', {}).get('detail'), reason)
+                self.assertEqual(found.get('P4:product.service', {}).get('detail'),
+                                 'failed' if active == 'failed' else None)
+                self.assertEqual((self.home / 'unit-calls').read_text().splitlines(),
+                                 ['product.timer', 'product.service'])
 
     def test_p4_fake_systemctl_reason_updates_and_recovery_close(self):
         self.write('.config/task/live-units', 'product.timer\n')
