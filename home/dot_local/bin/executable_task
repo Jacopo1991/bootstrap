@@ -65,6 +65,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
+import task_lock
 from task_limits import bwrap_denial, cli_limit, lane_limit
 from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
 
@@ -2395,6 +2396,8 @@ def runner_start(args):
         data.update(backend='setsid', pid=process.pid)
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
+    runner_pid = data.get("pid") or int(runner_service(unit).get("MainPID", "0") or 0) or None
+    task_lock.acquire(HOME, repo, pid=runner_pid)
     print(f'{unit}: log={log}')
     return 0
 
@@ -4303,6 +4306,7 @@ def status(args):
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
         print(f"{repo.name}:")
+        print(f"  project lock: {task_lock.display(task_lock.read(HOME, repo))}")
         try:
             keys = ", ".join(sorted(configured_environment(repo))) or "(none)"
         except Stop as error:
@@ -5045,6 +5049,7 @@ def main(argv=None):
     sub.add_argument("repo")
     sub.add_argument("file")
     sub.add_argument("--no-pace", action="store_true", help="run the batch without usage pacing (logged)")
+    task_lock.configure(commands)
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
@@ -5076,13 +5081,14 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign", "runner-start", "gate-drill"} or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign", "runner-start", "gate-drill"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
             print(f"task {args.command}: {stop}", file=sys.stderr)
             return 1
     try:
+        task_lock.before_work(args, HOME, resolve_repo)
         if args.command == "note":
             if args.kind != "setup-done":
                 if args.kind == "intervention" and args.text[0] in "ABCDEFGH" and len(args.text) > 1:
@@ -5135,6 +5141,7 @@ def main(argv=None):
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
                       "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
+                      "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo),
                       "gate-drill": gate_drill}[args.command](args) or 0
         finally:
             if lock:
@@ -5152,7 +5159,7 @@ def main(argv=None):
     except SystemExit as stop:
         finish_detached(stop.code or 0)
         raise
-    except (Stop, RoutingParseError) as stop:
+    except (Stop, RoutingParseError, task_lock.LockBusy) as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1

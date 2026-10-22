@@ -207,6 +207,55 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_project_lock_contention_commands_and_read_only_status(self):
+        self.raw_task('lock', 'proj', '--holder', 'seat-a')
+        commands = [
+            ('start', 'proj', 'new-task', '--builder', 'codex'),
+            ('lane', 'proj', '5'), ('runner-start', 'proj', 'runner-demo.md'),
+            ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
+            ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
+        ]
+        env = dict(self.env, TASK_HOLDER='seat-b')
+        for command in commands:
+            result = subprocess.run([sys.executable, str(TOOL), *command], env=env, cwd=self.home,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertIn('held by seat-a', result.stdout + result.stderr, command)
+        self.assertIn('seat-a', self.raw_task('lock', 'proj'))
+        self.assertIn('proj:', self.raw_task('status', 'proj'))
+
+    def test_project_lock_crash_ttl_refresh_and_source_change(self):
+        api = TASK_MODULE.task_lock
+        with mock.patch.dict(os.environ, TASK_HOLDER='seat-env'):
+            self.assertEqual(api.acquire(self.home, self.repo)['holder'], 'seat-env')
+        api.release(self.home, self.repo)
+        first = api.acquire(self.home, self.repo, 'seat-a', ttl=120)
+        original = first['taken_at']
+        api.acquire(self.home, self.repo, 'seat-a', ttl=120)
+        self.assertGreaterEqual(api.read(self.home, self.repo)['expires_epoch'], first['expires_epoch'])
+        data = api.read(self.home, self.repo)
+        dead = subprocess.Popen(['true'])
+        dead.wait()
+        data.update(pid=dead.pid, boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                    expires_epoch=time.time() + 600)
+        api.write(self.home, self.repo, data)
+        self.assertTrue(api.free(api.read(self.home, self.repo)))
+        data.update(pid=os.getpid(), boot_id='other-boot')
+        api.write(self.home, self.repo, data)
+        self.assertTrue(api.free(api.read(self.home, self.repo)))
+        data.update(pid=None, boot_id=None, expires_epoch=time.time() - 1, taken_at=original)
+        api.write(self.home, self.repo, data)
+        self.assertTrue(api.free(api.read(self.home, self.repo)))
+        data.update(expires_epoch=time.time() + 600, released=False, pid=None, boot_id=None)
+        api.write(self.home, self.repo, data)
+        (self.repo / 'a.txt').write_text('changed\n')
+        self.git(self.repo, 'add', 'a.txt')
+        self.git(self.repo, 'commit', '-qm', 'source changed')
+        api.release(self.home, self.repo)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            api.acquire(self.home, self.repo, 'seat-b')
+        self.assertIn('Sources changed', out.getvalue())
+
     def test_adaptive_check_timeout_uses_trusted_passes_only(self):
         repo = self.home / 'dev_workspace/proj'
         worktree = repo / '.worktrees/t1'
