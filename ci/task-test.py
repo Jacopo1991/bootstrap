@@ -232,7 +232,7 @@ class TaskTool(unittest.TestCase):
         api = TASK_MODULE.task_lock
         with mock.patch.dict(os.environ, TASK_HOLDER='seat-env'):
             self.assertEqual(api.acquire(self.home, self.repo)['holder'], 'seat-env')
-        api.release(self.home, self.repo)
+        api.release(self.home, self.repo, holder='seat-env')
         first = api.acquire(self.home, self.repo, 'seat-a', ttl=120)
         original = first['taken_at']
         api.acquire(self.home, self.repo, 'seat-a', ttl=120)
@@ -246,7 +246,7 @@ class TaskTool(unittest.TestCase):
         (self.repo / 'a.txt').write_text('changed\n')
         self.git(self.repo, 'add', 'a.txt')
         self.git(self.repo, 'commit', '-qm', 'source changed')
-        api.release(self.home, self.repo)
+        api.release(self.home, self.repo, holder='seat-a')
         with contextlib.redirect_stdout(io.StringIO()) as out:
             api.acquire(self.home, self.repo, 'seat-b', revision=self.git(self.repo, 'rev-parse', 'HEAD'))
         self.assertIn('Sources changed', out.getvalue())
@@ -299,9 +299,64 @@ class TaskTool(unittest.TestCase):
         self.assertIn('held by unknown', self.raw_task('lock', 'proj'))
         with self.assertRaises(TASK_MODULE.task_lock.LockBusy):
             TASK_MODULE.task_lock.acquire(self.home, self.repo, 'seat-a')
-        self.raw_task('lock', 'proj', '--release', code=1)
+        self.assertIn('held by unknown', self.raw_task('lock', 'proj', '--release', code=1))
         self.raw_task('lock', 'proj', '--release', '--force')
         self.assertFalse(target.exists())
+
+    def test_project_lock_release_requires_recorded_holder(self):
+        api = TASK_MODULE.task_lock
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                self.raw_task('lock', 'proj', '--holder', 'seat-a')
+                before = api.path(self.home, self.repo).read_text()
+                args = ('--holder', 'seat-b') if explicit else ()
+                output = self.raw_task('lock', 'proj', '--release', *args,
+                                       env=dict(self.env, TASK_HOLDER='seat-a' if explicit else 'seat-b'), code=1)
+                self.assertIn('held by seat-a', output)
+                self.assertIn('--release --force', output)
+                self.assertEqual(api.path(self.home, self.repo).read_text(), before)
+                self.assertIn('seat-a', self.raw_task('lock', 'proj'))
+                args = ('--holder', 'seat-a') if explicit else ()
+                self.raw_task('lock', 'proj', '--release', *args,
+                              env=dict(self.env, TASK_HOLDER='seat-b' if explicit else 'seat-a'))
+                self.assertIn('free', self.raw_task('lock', 'proj'))
+
+    def test_project_lock_release_without_identity_and_forced_recovery(self):
+        api = TASK_MODULE.task_lock
+        unnamed = dict(self.env)
+        unnamed.pop('TASK_HOLDER')
+        for held in (False, True):
+            with self.subTest(held=held):
+                if held: self.raw_task('lock', 'proj', '--holder', 'seat-a')
+                before = api.read(self.home, self.repo)
+                for identity in (None, '', '   '):
+                    env = unnamed if identity is None else dict(unnamed, TASK_HOLDER=identity)
+                    self.assertIn('TASK_HOLDER', self.raw_task('lock', 'proj', '--release', env=env, code=1))
+                    self.assertEqual(api.read(self.home, self.repo), before)
+                self.raw_task('lock', 'proj', '--release', '--force', env=unnamed)
+                self.assertIn('free', self.raw_task('lock', 'proj'))
+
+    def test_project_lock_release_free_lock_is_noop(self):
+        api = TASK_MODULE.task_lock
+        self.raw_task('lock', 'proj', '--release', '--holder', 'seat-b')
+        self.assertIsNone(api.read(self.home, self.repo))
+        data = api.acquire(self.home, self.repo, 'seat-a')
+        for fields in ({'released': True}, {'expires_epoch': 0}, {'process': True}):
+            with self.subTest(fields=fields):
+                api.write(self.home, self.repo, dict(data, **fields))
+                self.raw_task('lock', 'proj', '--release', '--holder', 'seat-b')
+                self.assertTrue(api.free(api.read(self.home, self.repo)))
+
+    def test_project_lock_release_refuses_running_work_even_with_force(self):
+        self.lock_process('seat-a')
+        api = TASK_MODULE.task_lock
+        before = api.path(self.home, self.repo).read_text()
+        for holder in ('seat-a', 'seat-b'):
+            for args in ((), ('--force',)):
+                with self.subTest(holder=holder, args=args):
+                    output = self.raw_task('lock', 'proj', '--release', '--holder', holder, *args, code=1)
+                    self.assertIn('Work is still running', output)
+                    self.assertEqual(api.path(self.home, self.repo).read_text(), before)
 
     def test_project_lock_identity_invalid_arguments_and_simultaneous_take(self):
         unnamed = dict(self.env)
