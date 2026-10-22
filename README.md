@@ -281,7 +281,11 @@ leaves the NVIDIA toolkit and the root daemon's configuration alone. Evaluations
 daemon, `docker-rootless.service`, which is started by hand from an unsandboxed
 agent shell and cannot be enabled. Lane sandboxes must not reach its socket; see
 [docs/rootless-docker.md](docs/rootless-docker.md) for starting an evaluation and
-for `checks/docker-containment.py`, the live containment probe.
+for `checks/docker-containment.py`, the live containment probe. That probe is required
+before first use and again after every Codex or Claude Code upgrade:
+`python3 -I checks/docker-containment.py check --sandbox 'codex sandbox'`, plus its
+`serve` and `probe` modes from a real Claude lane and a real Codex lane (exact commands
+in the doc).
 
 Both host and container must pass `nvidia-smi`, report `sm_120` in
 `torch.cuda.get_arch_list()`, use the expected `(12, 0)` card on `cuda:0`, perform
