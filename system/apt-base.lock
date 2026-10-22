@@ -11,6 +11,7 @@ xz-utils=5.6.1+really5.4.5-1ubuntu0.3
 sudo=1.9.15p5-3ubuntu5.24.04.3
 openssh-server=1:9.6p1-3ubuntu13.19
 passwd=1:4.13+dfsg1-4ubuntu3.2
+uidmap=1:4.13+dfsg1-4ubuntu3.2
 acl=2.3.2-1build1.1
 python3=3.12.3-0ubuntu2.1
 util-linux=2.39.3-9ubuntu6.6
