@@ -36,16 +36,17 @@ def lock(path):
 docker = lock("system/apt-docker.lock")
 assert docker["docker-ce-rootless-extras"] == docker["docker-ce"] == docker["docker-ce-cli"], docker
 assert "uidmap" in lock("system/apt-base.lock")
-assert (INSPECT / "requirements.in").read_text() == "inspect-ai==0.3.283\n"
+assert (INSPECT / "requirements.in").read_text() == "inspect-ai==0.3.283\nopenai==3.26.0\n"
 inspect_lock = (INSPECT / "requirements.lock").read_text()
 assert "\ninspect-ai==0.3.283 \\\n" in inspect_lock
+assert "\nopenai==3.26.0 \\\n" in inspect_lock
 blocks = re.findall(r"^[A-Za-z0-9][A-Za-z0-9._-]*==\S+ \\\n((?:    --hash=sha256:[0-9a-f]{64}(?: \\)?\n)+)", inspect_lock, re.M)
 assert len(blocks) == len(re.findall(r"^[A-Za-z0-9][A-Za-z0-9._-]*==", inspect_lock, re.M)) > 50
 assert "home/dot_local/share/bootstrap/inspect/requirements.in" in inspect_lock.splitlines()[1] + inspect_lock.splitlines()[2]
 tools = read("home/.chezmoitemplates/tools.sh")
 for needle in ('uv pip sync --quiet --require-hashes --python "$inspect_root/venv/bin/python" "$inspect_root/requirements.lock"',
                'ln -sfn "$inspect_root/venv/bin/inspect" "$HOME/.local/bin/inspect"',
-               "m.version(\"inspect-ai\")", '== "$inspect_expected" ]]'):
+               "m.version(\"inspect-ai\")", '== "$inspect_expected" ]]', '"$inspect_root/venv/bin/python" -c \'import openai\''):
     assert needle in tools, needle
 assert "inspect/requirements.lock" in read("home/run_onchange_after_10-tools.sh.tmpl")
 print("PASS: rootless extras, uidmap and Inspect AI 0.3.283 are pinned; Inspect installs from its hashed lock")
