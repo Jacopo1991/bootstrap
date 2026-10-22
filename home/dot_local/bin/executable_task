@@ -572,7 +572,7 @@ def plan_time(value):
         return None
 
 
-def plan_budget(ident, fields=None, clear=None):
+def plan_budget(ident, fields=None, clear=None, reserve=True):
     try:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", ident): raise ValueError("invalid id")
         plan = tomllib.loads((CORTEX / "cortex-kb-company/plans" / f"{ident}.toml").read_text())
@@ -603,11 +603,11 @@ def plan_budget(ident, fields=None, clear=None):
                 if "*" not in allowed and any(t.lower() not in [a.lower() for a in allowed] for t in fields.get("tasks", [fields["task"]])): raise Stop(f"Plan {ident}: outside allowed work")
                 if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
                 matching = [r for r in rows if all(r.get(k) == fields[k] for k in ("repo", "task", "kind")) and r.get("type") != "outcome"]
-                fields["round"] = int(os.environ.get("TASK_PLAN_ROUND", fields.get("round", 1 + sum(r.get("outcome") in {"finished", "failed", "interrupted"} for r in matching))))
+                fields.setdefault("round", 1 + sum(r.get("outcome") in {"finished", "failed", "interrupted"} for r in matching))
                 prior = next((r for r in matching if r.get("round") == fields["round"]), None)
-                if prior: return prior
+                if prior and reserve: return prior
                 if used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
-                return task_usage.run_log(HOME, plan=ident, **fields)
+                return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
         return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(disabled)}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise Stop(f"Missing or malformed plan/log {ident}: {error}") from error
@@ -1889,14 +1889,15 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            model_override = guards(tier, recorded, model, args.override)
+            usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier)
             if tier_changed:
                 task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
                 print(f"override recorded: tier {recorded} to {tier} ({args.override})")
-            if guards(tier, recorded, model, args.override):
+            if model_override:
                 task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
-            usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]
             if args.override:
@@ -2353,7 +2354,7 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, executable, offset, repo, modules, ready, usage_run = sys.argv[1:]
+source, done, log, executable, offset, repo, modules, ready = sys.argv[1:]
 sys.path.insert(0, modules)
 import task_lock, task_usage
 task_lock.atomic_write = task_usage._write
@@ -2370,7 +2371,6 @@ try:
     child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL, pass_fds=task_lock.descriptors())
     code = child.wait()
 finally:
-    if usage_run: task_usage.run_log(pathlib.Path.home(), __import__('json').loads(usage_run), 'finished' if code == 0 else 'failed')
     path = pathlib.Path(done)
     content = path.read_bytes() if path.exists() else b''
     text = content.decode()
@@ -2426,7 +2426,7 @@ def runner_start(args):
         raise Stop('task-batch is unavailable.')
     holder = os.environ['TASK_HOLDER']
     task_lock.work(HOME, repo)
-    usage_run = budget_run(repo=repo.name, task=batch, tasks=args.plan_tasks, kind="runner-start", vendor=os.environ.get("TASK_VENDOR", "codex")) if os.environ.get("TASK_PLAN") else None
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=batch, tasks=args.plan_tasks, kind="runner-start", vendor=os.environ.get("TASK_VENDOR", "codex")), reserve=False)
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
@@ -2434,7 +2434,7 @@ def runner_start(args):
     done_offset = done.stat().st_size if done.exists() else 0
     ready = work / f'runner-{batch}.ready'; ready.unlink(missing_ok=True)
     command = [sys.executable, str(wrapper), str(source), str(done),
-               str(log), executable, str(done_offset), str(repo), str(Path(__file__).resolve().parent), str(ready), json.dumps(usage_run) if usage_run else ""]
+               str(log), executable, str(done_offset), str(repo), str(Path(__file__).resolve().parent), str(ready)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               '--property=KillMode=process',
@@ -2471,10 +2471,9 @@ def start(args):
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     with (common / "task-start.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        usage_run = budget_run(repo=repo.name, task=Task(repo, args.id).id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
         try: return start_locked(args, repo)
         finally:
-            if usage_run: task_usage.run_log(HOME, usage_run, "failed" if sys.exc_info()[0] else "finished")
+            if getattr(args, "usage_run", None): task_usage.run_log(HOME, args.usage_run, "failed" if sys.exc_info()[0] else "finished")
 
 
 def start_locked(args, repo):
@@ -2543,6 +2542,7 @@ def start_locked(args, repo):
     if task.path.exists():
         task.worktree()
         task_lock.work(HOME, repo, sha(task.path, "HEAD"))
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
         print(f"{task.path} already exists.")
     else:
         default = default_branch(repo)
@@ -2550,8 +2550,7 @@ def start_locked(args, repo):
         branch, remote_only = task.existing_branch()
         if branch and remote_only:
             task_lock.work(HOME, repo, sha(repo, f"origin/{branch}"))
-            git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
-            print(f"Created {task.path} on {branch}, from origin's existing branch.")
+            create, source = ["--track", "-b", branch, str(task.path), f"origin/{branch}"], f"{branch}, from origin's existing branch"
         elif branch:
             for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
                 lines = block.splitlines()
@@ -2563,14 +2562,15 @@ def start_locked(args, repo):
                     raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
                                f"move or free that worktree before `task start` can adopt it at {task.path}.")
             task_lock.work(HOME, repo, sha(repo, branch))
-            git(repo, "worktree", "add", "-q", str(task.path), branch)
-            print(f"Created {task.path} on the existing branch {branch}.")
+            create, source = [str(task.path), branch], f"the existing branch {branch}"
         else:
             base, label = base_commit(repo, default)
             branch = task.branch_name()
             task_lock.work(HOME, repo, base)
-            git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
-            print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
+            create, source = ["--no-track", "-b", branch, str(task.path), base], f"{branch} from {label} {base[:7]}"
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
+        git(repo, "worktree", "add", "-q", *create)
+        print(f"Created {task.path} on {source}.")
     seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
     exclude(task.path, ".work/")
