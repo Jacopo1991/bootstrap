@@ -91,7 +91,10 @@ umask `002` and requires the distro check to pass.
 The boundary check requires
 `sudo -n true` to fail, checks groups, and attempts to access the admin home and
 open `~admin/.config/gh/hosts.yml` without printing any file contents. It also
-rejects an accessible Docker socket when one exists. On WSL it fails for a
+rejects an accessible Docker socket when one exists, with one exception: agent's
+rootless socket `/run/user/1001/docker.sock` passes only when agent owns it, it is
+not group- or world-accessible, and a process running as agent serves it (any other
+Docker or containerd socket, or any other path, fails). On WSL it fails for a
 Windows-drive mount, a reachable `/mnt/c/Windows`, `WSL_INTEROP` in the agent login
 environment, or an `/run/WSL/<pid>_interop` socket belonging to a process in
 the agent login's ancestry (including WSL's root-owned `/init`). The
@@ -223,7 +226,11 @@ distro already runs, so it can never wake a stopped one. The service mounts the
 export folder read-only (`mount -t drvfs`, `uid=0,umask=077`) in its own private
 mount namespace and unmounts it afterwards, so automount stays off, the agent's
 sessions never see a Windows mount, and the boundary check still passes.
-`system/inventory-mirror.py` refuses to mount in the shared namespace.
+`system/inventory-mirror.py` refuses to mount in the shared namespace by comparing
+its mount namespace with PID 1's, which needs `CAP_SYS_PTRACE` in the unit's
+bounding set; if PID 1 cannot be read it refuses too. Any failure also leaves one
+line (UTC time and the error), including a failed unmount, in
+`~/project-data/inventory/last-error`, which a copy that unmounted cleanly removes.
 
 The copy runs as root but only into agent-owned directories. It refuses a
 symlink, hardlink, FIFO or other non-regular file as the source and as an
@@ -269,6 +276,21 @@ group. The GPU check runs as admin, runs host Python inference as agent, starts
 Docker explicitly for the container check, and stops Docker/socket/containerd
 on exit. No persistent daemon startup is enabled.
 
+The same step also installs `docker-ce-rootless-extras` (pinned to the engine's
+version) and `uidmap`, and adds agent's `/etc/subuid` and `/etc/subgid` ranges only
+if they are missing. On a machine where Docker is already installed, run
+`sudo bash /opt/machine-bootstrap/current/system/gpu-docker.sh --rootless-only`: it
+leaves the NVIDIA toolkit and the root daemon's configuration alone. Evaluations
+(Inspect AI, installed from a hashed lock as `inspect`) use agent's own rootless
+daemon, `docker-rootless.service`, which is started by hand from an unsandboxed
+agent shell and cannot be enabled. Lane sandboxes must not reach its socket; see
+[docs/rootless-docker.md](docs/rootless-docker.md) for starting an evaluation and
+for `checks/docker-containment.py`, the live containment probe. That probe is required
+before first use and again after every Codex or Claude Code upgrade:
+`python3 -I checks/docker-containment.py check --sandbox 'codex sandbox'`, plus its
+`serve` and `probe` modes from a real Claude lane and a real Codex lane (exact commands
+in the doc).
+
 Both host and container must pass `nvidia-smi`, report `sm_120` in
 `torch.cuda.get_arch_list()`, use the expected `(12, 0)` card on `cuda:0`, perform
 and compare a CUDA matrix multiply, and run a tiny public GPT-2 model on GPU.
@@ -300,6 +322,49 @@ no hook-trust review or bypass is involved. Hooks are additional guardrails; the
 Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
 
 #### Managed guardrails
+
+Literal shell scripts and all directly invoked recipe bodies are judged by the
+command policy, fail-closed: syntax or execution inputs it cannot model are denied.
+`task check` is the single explicit trusted gate entry for lanes. Direct `just`,
+`make`, `npm run` and `pnpm run` calls do not inherit gate trust.
+Recipe comparisons use the merge base with `origin/HEAD`, falling back to local
+`main`, `master`, then the worktree's source branch recorded in Git's reflogs.
+Without a usable base, recipe execution is denied with an explanatory message.
+Unchanged recipes use the same strict judge as changed recipes, including nested
+shell files. Simple literal Just and package scripts are supported; Make syntax,
+runner configuration, non-shell programs and dynamic script paths in judged bodies
+are denied. Recipe cwd changes are denied because lines may run in separate shells.
+
+Run scripts and recipes in separate calls after commands that may change files.
+A script or recipe run itself counts as changing for later scripts in the same
+chain: `bash a.sh && bash b.sh` and `just check && just lint` are refused because
+the first run could rewrite the second definition. Redirects to `/dev/null` do
+not count as file changes. Shell assignments affecting resolution or startup
+(including `CDPATH`, `PATH`, `BASH_ENV` and `ENV`) are refused. Builtin assignment
+forms (`printf -v`, `read`, `mapfile`, `readarray`, `getopts`, declarations), shell
+resolution changes (`hash`, `enable`, aliases, `shopt`, `set -o`) and wrappers
+around them are denied. Plain prints and read-only commands remain allowed.
+Quoted print literals may contain brackets, braces, stars, question marks and
+tildes; these characters do not make a print an assignment or shell expansion.
+Only literal `cd <path>` is modelled in typed commands and ordinary shell files;
+cwd options, variable operands and directory-stack operations are denied.
+
+Package scripts and install lifecycle scripts use the same checks for npm, pnpm,
+Yarn and Bun. Run targets must be explicitly defined in `package.json`; binary
+and file fallbacks are refused. Yarn (including `yarnpkg`) and Bun support explicit
+`run` and `install` forms. Fetch-and-run forms (`exec`, `dlx`, `x`, `create`,
+`bunx`, and `pnpx`) are refused. `npx` requires explicit `--no-install` or `--no`,
+an existing executable in local `node_modules/.bin`, and a script the policy can
+judge. Node-shebang binaries are denied.
+
+This inspection is not a process sandbox: inherited environment, mutable installed
+commands, dependency lifecycle code, executable tool configuration and concurrent
+file replacement remain execution boundaries for the OS sandbox. The trusted
+`task check` gate runs arbitrary project verification through its existing controls.
+The lane check is advisory: its worktree recipes and scripts are mutable. The PM's
+merge gate provides trusted verification. The task executable, rather than the
+command hook, enforces PM/lane authority for other task routes; `task status`
+remains available for inspection.
 
 The guardrails are root-owned, so an agent in any permission mode (including Claude
 `--dangerously-skip-permissions` and Codex `--dangerously-bypass-approvals-and-sandbox`)
@@ -422,6 +487,122 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 **One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, backlog tasks and decisions in the knowledge repository.
 
 ### Task batches and lanes
+
+`task start` and `task lane` accept `--tier routine|hard|design`. Tasks may
+declare `Tier: hard` alongside their `Verify:` lines; the default is routine.
+The flag takes precedence and the tier is pinned in task state and shown by
+`task status`. Runner lines require a model or a tier. For example:
+
+```text
+1. prepare: builder codex, tier routine
+2. implement: builder codex, tier hard, after: prepare
+```
+
+Without a model, the batch passes `--tier` to `task lane` for routing.
+An explicit runner model takes precedence over tier routing.
+Tier-only tasks keep their tier on every fix round without a model pin; only
+the final vendor swap applies. Explicit-model tasks keep their model escalation rules.
+
+`task boost --claude-until <ISO datetime> --codex-until <ISO datetime>` sets
+temporary vendor allowance; `task boost off [--claude] [--codex]` clears it.
+Without boost, routine uses the usual builder default (Codex gpt-6-luna,
+Claude sonnet); hard and design use Codex gpt-6.1-sol or Claude opus.
+While that vendor is boosted, hard uses Codex gpt-6.1-sol or
+Claude fable; design uses Codex gpt-6-astra or Claude opus. Routine keeps its
+default. An explicit `--model` wins, except that top models run only for their
+specialty: `gpt-6-astra` needs `Tier: design` and `fable` needs `Tier: hard`.
+`task lane` refuses them on any other tier, and the batch parks that task with the
+reason, whether the model came from `--model`, a runner line or a fix round. The tier
+is the one recorded for the task; a `--tier` flag or runner `tier` that differs from it
+is refused on `task lane` and `task start`, so it never changes the recorded tier or
+makes the model eligible, unless a valid `--override` is given (the change is ledgered).
+Only Jacopo can switch a model: `task lane --override "Jacopo YYYY-MM-DD: <request>"`
+(runner line field `, override: Jacopo YYYY-MM-DD: <request>`) permits it; any other
+text is refused. Each use is appended to
+`~/.local/state/task/usage/overrides.jsonl` and shown in `task status` and
+`task usage --weekly-line`. `--no-pace` does not override this, and reviews never use
+these models, override or not.
+`--no-boost` disables boosted tier
+routing, while Codex hard remains gpt-6.1-sol.
+The launch notice explains the decision. Reviews keep their usual cheap models
+and usage-limit handling regardless of boost.
+Usage limits retry once on the other reviewer vendor and record its actual
+identity. If that fallback uses the builder's vendor, the batch stops for an
+independent review; the merge gate still requires the other vendor.
+
+The shared routing constant is in `home/dot_local/bin/task_routing.py`.
+Optional `~/.config/task/routing.json` overrides defaults and hard/design models,
+for example `{"models":{"claude":{"hard":"fable"}},"extra_lanes":2}`.
+Model keys are `default`, `hard`, `design` under `codex` or `claude`.
+`extra_lanes` is a nonnegative integer, default 2. The batch runner normally
+runs one task at a time; an active vendor boost permits 1 + extra_lanes tasks
+for that vendor. Total concurrency is capped by the largest current vendor
+limit and the slots in `~/.config/task/gate.toml` (default 3).
+Dependencies wait for their predecessor to merge; parked predecessors skip
+their dependants. Expiry reduces new dispatches without interrupting live work.
+`task status` shows the effective vendor limits and gate slots.
+
+#### Usage pacing
+
+`task usage` shows, per vendor, weekly and 5-hour use, the weekly reset (UTC and Europe/Copenhagen),
+the reading's age, the share of the week elapsed, the pace verdict and the policy applied. It spends
+no tokens. Readings are the vendors' own numbers: the newest Codex `rate_limits` in
+`~/.codex/sessions/**/rollout-*.jsonl` and the newest Claude `rate_limit_event`. Claude lanes and
+`task review --run` run `claude -p --output-format stream-json --verbose`: the events go to
+`.work/lane.jsonl` (reviews: `review-response.jsonl` in the task state) and the newest reading per
+window to `~/.local/state/task/usage/claude.json`; `lane.log`, `final.md` and the review reply keep
+the plain text. A reading with no `rate_limit_event` yet, from before the last weekly reset, or older
+than 7 days is `unknown` with the reason, and `task` then behaves as before and prints a warning.
+The interactive status-line `rate_limits` is not read. ccusage is for per-project attribution only.
+
+Verdicts, with weekly used % against the share of the week elapsed: `exhausted-automated-share`
+(used ≥ 100 − reserve), `under-used-near-reset` (used below `under_use_percent` with at most
+`under_use_hours` left), `ahead` (more than `ahead_margin` points above the elapsed share), `under`
+(more than that below it) and `on`. In the final `under_use_hours` before a vendor's weekly reset the
+weekly reserve is released (limit 100 %; every `task usage` verdict, exhausted included, says "reserve
+released until <reset>"); the 5-hour bands keep their reserve. `task lane`, `task review --run` and each batch start (`task-batch`,
+so `task runner-start` too) apply the verdict:
+
+| Verdict | Effect |
+| --- | --- |
+| `on`, `under`, unknown | unchanged (unknown prints a warning) |
+| `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna) even when `--model` names another one (only `--no-pace`, logged, keeps it); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
+| `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
+| `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+
+The 5-hour window is a second pace input per vendor with the same reserves (it ignores spare resets,
+which only refill the weekly window). The reserve shrinks with the time left in the window: reserve ×
+hours left ÷ 5 (30 with 1.5 h left is 9: exhausted at 91 %, warning at 76 %); a missing or stale reading
+keeps the full reserve, and `task usage` shows the effective values. `5h-exhausted` (used ≥ 100 − reserve): no new lane or review on
+that vendor until the 5-hour reset, which `task usage` and the hold message show; running ones finish,
+and a routine lane moves to the other vendor when that has room on both windows. `5h-warning`
+(15 points lower): at most one lane or review of that vendor runs machine-wide (`task` records each
+started process under `~/.local/state/task/usage/running/`); a new one is held until it ends. A
+reading older than 45 minutes while that vendor's lanes ran since counts as `5h-warning` and prints a
+warning. For a vendor that has a 5-hour window (Claude; Codex once one shows in its readings), a
+missing 5-hour reading (none yet, or its window has reset) is `5h-warning` too. A vendor with no
+5-hour window in its readings of the last 7 days (Codex today) has only the weekly rules, and
+`task usage` says so. A runner's capacity, boosted or not, is
+capped by this (0 when exhausted, 1 in the warning band), so boost adds parallel lanes only below
+the warning band. `task usage --weekly-line` appends `, 5-hour exhausted <day and time>` per window.
+
+While Jacopo holds a spare reset for a vendor (`spare_resets` > 0) there is no reserve: the window is
+spent at the normal pace, `ahead` never holds lanes back, the share ends at 100 % and `task usage`
+says "spare reset held; reset at 100 %", after the release wording in the final `under_use_hours`.
+
+A held lane exits 4 (`task lane`, `task review --run`); the batch runner waits a minute and asks again.
+`--no-pace` on `task lane`, `task review`, `task runner-start` and `task-batch` skips the check for that
+one command. Overrides, boosts and held-back lanes are logged to `~/.local/state/task/usage/pace.log`.
+`~/.local/state/task/usage/weeks.json` keeps, per vendor and weekly window, the last used %, the day
+the automated share was first seen used up and the lanes held back; `task usage --weekly-line` prints
+`<vendor> week ending <date>: used N %, exhausted <day or no>, lanes held back N` for the company STATUS.
+
+The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
+`~/cortex/cortex-kb-company/policy/usage-pacing.toml`; `task` only reads it and the company PM writes it.
+A missing file or key means the built-in defaults; an invalid file is reported and the defaults apply.
+[`docs/usage-pacing.example.toml`](docs/usage-pacing.example.toml) shows every key at its default:
+`[reserve]` (claude 25, codex 10), `[spare_resets]` (claude 0, codex 1), `priority`, `ahead_margin` (10),
+`under_use_percent` (60), `under_use_hours` (36) and `research_backlog`.
 
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
@@ -551,6 +732,15 @@ every `~/cortex/*` repository for local keyword and semantic search.
 
 - **Pin:** `@tobilu/qmd` 2.8.3 in the npm lockfile (v2); `tools.sh` links
   `~/.local/bin/qmd`. The monthly pin updater leaves it alone, so bump it by hand.
+- **Override (`@modelcontextprotocol/server` 2.3.0):** `package.json` has an npm
+  `overrides` entry under `@tobilu/qmd` that moves qmd's MCP server dependency to
+  2.3.0. qmd 2.8.3, the latest release, pins it exactly at 2.0.0, which carries
+  GHSA-46jr-4wx8-v453, GHSA-jm63-cq47-j5jp and GHSA-rvq5-wwqv-78pq (fixed in 2.3.0).
+  JSON has no comments, so the reason lives here. The override also moves
+  `@modelcontextprotocol/core` to 2.3.0, and both packages are Apache-2.0 from 2.3.0
+  (2.0.0 was MIT). Drop the override once a qmd release no longer pins `@modelcontextprotocol/server` at
+  2.0.0 (check with `npm view @tobilu/qmd dependencies`); bump qmd, remove the entry,
+  regenerate the lock and rerun `ci/osv-db-test.py`.
 - **Config:** chezmoi renders `~/.config/qmd/index.yml` with one collection per
   non-hidden `~/cortex/*` directory (mask `**/*.md`). Each one-line context is
   `<repo>: <title>` taken from that repository's `INTENT.md` front matter at

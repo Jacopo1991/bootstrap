@@ -157,6 +157,112 @@ class Tidy(unittest.TestCase):
             self.assertIn(kept, branches, f"{kept} must survive:\n{out}")
         self.assertEqual((wt / "dirty/a.txt").read_text(), "changed\n")
 
+    def test_locked_idle_unmerged_worktrees_are_reported_with_the_lock_reason_and_kept(self):
+        wt = self.repo / ".worktrees"
+        for name, reason in (("held", ["--reason", "session 42 running"]), ("bare", [])):
+            run(self.repo, "worktree", "add", "-q", "-b", name, str(wt / name), old=True)
+            (wt / name / f"{name}.txt").write_text(name)
+            run(wt / name, "add", f"{name}.txt", old=True)
+            run(wt / name, "commit", "-qm", name, old=True)
+            run(self.repo, "worktree", "lock", *reason, str(wt / name))
+            age(wt / name)
+        run(self.repo, "worktree", "add", "-q", "-b", "held-new", str(wt / "held-new"))
+        (wt / "held-new/n.txt").write_text("n")
+        run(wt / "held-new", "add", "n.txt")
+        run(wt / "held-new", "commit", "-qm", "new")
+        run(self.repo, "worktree", "lock", str(wt / "held-new"))
+        stale = TIDY_MODULE.stale_unmerged(self.repo, time.time())
+        found = {item["branch"]: item for item in stale}
+        self.assertEqual(found["held"]["locked"], ", locked: session 42 running")
+        self.assertEqual(found["bare"]["locked"], ", locked")
+        self.assertEqual(found["open"]["locked"], "")
+        self.assertNotIn("held-new", found)
+        self.assertNotIn("locked", found, "a merged locked worktree is not unmerged")
+        for mode in ((), ("--apply",)):
+            out = self.tidy(*mode)
+            self.assertIn(f"open worktree {wt / 'held'} (held, unmerged work, idle 10 days, locked: "
+                          "session 42 running); finish, adopt or delete", out)
+            self.assertIn(f"open worktree {wt / 'bare'} (bare, unmerged work, idle 10 days, locked); "
+                          "finish, adopt or delete", out)
+            self.assertNotIn("held-new, unmerged", out)
+        for name in ("held", "bare", "held-new", "locked"):
+            self.assertTrue((wt / name).is_dir(), name)
+        self.assertLessEqual({"held", "bare", "held-new", "locked"}, self.branches())
+
+    def test_idle_unmerged_codex_worktrees_are_reported_and_kept(self):
+        age(self.codex_open)
+        locked = self.home / ".codex/worktrees/lk01/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-locked", str(locked), old=True)
+        (locked / "l.txt").write_text("l")
+        run(locked, "add", "l.txt", old=True)
+        run(locked, "commit", "-qm", "locked Codex work", old=True)
+        run(self.repo, "worktree", "lock", "--reason", "codex session", str(locked))
+        age(locked)
+        recent = self.home / ".codex/worktrees/rc02/proj"
+        run(self.repo, "worktree", "add", "-q", "-b", "codex-recent", str(recent))
+        (recent / "r.txt").write_text("r")
+        run(recent, "add", "r.txt")
+        run(recent, "commit", "-qm", "recent Codex work")
+        before = TIDY_MODULE.CODEX_WORKTREES
+        TIDY_MODULE.CODEX_WORKTREES = self.home / ".codex/worktrees"
+        try:
+            found = {item["branch"]: item for item in TIDY_MODULE.stale_unmerged(self.repo, time.time())}
+        finally:
+            TIDY_MODULE.CODEX_WORKTREES = before
+        self.assertEqual(found["codex-open"]["path"], self.codex_open)
+        self.assertEqual(found["codex-open"]["days"], 10)
+        self.assertEqual(found["codex-open"]["locked"], "")
+        self.assertEqual(found["codex-locked"]["locked"], ", locked: codex session")
+        for merged_or_recent in ("codex-recent", "codex-done", "codex-dirty"):
+            self.assertNotIn(merged_or_recent, found)
+        for mode in ((), ("--apply",)):
+            out = self.tidy(*mode)
+            self.assertIn(f"Codex worktree {self.codex_open} (codex-open) kept: branch is not merged or "
+                          "detached commit is outside the default branch; idle 10 days; "
+                          "finish, adopt or delete", out)
+            self.assertIn(f"Codex worktree {locked} (codex-locked) kept: worktree is locked; idle 10 days; "
+                          "finish, adopt or delete", out)
+            self.assertNotIn("(codex-recent) kept: branch is not merged or detached commit is outside the "
+                             "default branch; idle", out)
+        for path in (self.codex_open, locked, recent):
+            self.assertTrue(path.is_dir(), path)
+        self.assertLessEqual({"codex-open", "codex-locked", "codex-recent"}, self.branches())
+
+    def test_idle_unmerged_worktrees_outside_the_managed_folders_are_reported_and_kept(self):
+        stray = self.repo.parent / "proj-wt"
+        elsewhere = self.home / "elsewhere/lane"
+        run(self.repo, "worktree", "add", "-q", "-b", "elsewhere", str(elsewhere), old=True)
+        (elsewhere / "e.txt").write_text("e")
+        run(elsewhere, "add", "e.txt", old=True)
+        run(elsewhere, "commit", "-qm", "elsewhere work", old=True)
+        run(self.repo, "worktree", "lock", "--reason", "pinned by hand", str(elsewhere))
+        age(elsewhere)
+        recent = self.home / "elsewhere/recent"
+        run(self.repo, "worktree", "add", "-q", "-b", "elsewhere-recent", str(recent))
+        (recent / "r.txt").write_text("r")
+        run(recent, "add", "r.txt")
+        run(recent, "commit", "-qm", "recent work")
+        merged = self.home / "elsewhere/merged"
+        run(self.repo, "worktree", "add", "-q", "-b", "elsewhere-merged", str(merged), old=True)
+        age(merged)
+        found = {item["branch"]: item for item in TIDY_MODULE.stale_unmerged(self.repo, time.time())}
+        self.assertEqual(found["sibling"]["path"], stray)
+        self.assertEqual(found["sibling"]["days"], 10)
+        self.assertEqual(found["elsewhere"]["path"], elsewhere)
+        self.assertEqual(found["elsewhere"]["locked"], ", locked: pinned by hand")
+        for not_listed in ("elsewhere-recent", "elsewhere-merged"):
+            self.assertNotIn(not_listed, found)
+        for mode in ((), ("--apply",)):
+            out = self.tidy(*mode)
+            self.assertIn(f"worktree outside the repository: {stray} (sibling); idle 10 days; "
+                          "finish, adopt or delete; when idle:", out)
+            self.assertIn(f"open worktree {elsewhere} (elsewhere, unmerged work, idle 10 days, locked: "
+                          "pinned by hand); finish, adopt or delete", out)
+            self.assertNotIn("(elsewhere-recent); idle", out)
+        for path in (stray, elsewhere, recent, merged):
+            self.assertTrue(path.is_dir(), path)
+        self.assertLessEqual({"sibling", "elsewhere", "elsewhere-recent", "elsewhere-merged"}, self.branches())
+
     def test_strays_and_project_data_are_reported_never_removed(self):
         out = self.tidy("--apply")
         self.assertIn("worktree outside the repository", out)
@@ -221,6 +327,141 @@ class Safety(unittest.TestCase):
         self.assertEqual(len(archived), 1)
         self.assertEqual(archived[0].read_text(), 'evidence')
         self.assertFalse(cache.exists(), out)
+
+    def branches(self):
+        return set(run(self.repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/").stdout.split())
+
+    def ignore(self, *patterns):
+        with (self.repo / ".git/info/exclude").open("a") as stream:
+            stream.write("\n".join(patterns) + "\n")
+
+    def archive_files(self):
+        root = self.home / ".local/state/task/archive"
+        return sorted(str(item.relative_to(root)) for item in root.rglob("*") if item.is_file()) \
+            if root.exists() else []
+
+    def test_ignored_non_cache_files_are_archived_then_worktree_is_removed(self):
+        self.ignore("logs/", ".bash_profile", "*.egg-info/")
+        path = self.worktree("ignored", "-b", "ignored")
+        (path / "logs").mkdir()
+        (path / "logs/run.log").write_text("log line")
+        (path / ".bash_profile").write_text("export X=1")
+        (path / "pkg.egg-info").mkdir()
+        (path / "pkg.egg-info/PKG-INFO").write_text("info")
+        (path / "node_modules").mkdir()
+        (path / "node_modules/x.js").write_text("x")
+        age(path)
+        out = self.tidy(apply=False)
+        self.assertIn("would archive 3 ignored files and would be removed", out)
+        self.assertTrue((path / "logs/run.log").exists())
+        self.assertIn("ignored", self.branches())
+        self.assertEqual(self.archive_files(), [])
+        out = self.tidy()
+        self.assertFalse(path.exists(), out)
+        self.assertNotIn("ignored", self.branches())
+        base = self.home / ".local/state/task/archive/proj/ignored"
+        for relative, text in (("logs/run.log", "log line"), (".bash_profile", "export X=1"),
+                               ("pkg.egg-info/PKG-INFO", "info")):
+            copies = list(base.glob(f"ignored-ignored-*/ignored/{relative}"))
+            self.assertEqual([copy.read_text() for copy in copies], [text], out)
+        self.assertEqual(list(base.glob("*/node_modules")), [], "caches are not archived")
+
+    def test_secret_looking_ignored_files_keep_the_worktree_and_are_never_copied(self):
+        self.ignore(".env", "secrets/", "logs/")
+        env =self.worktree("with-env", "-b", "with-env")
+        (env / ".env").write_text("TOKEN=hunter2")
+        (env / "logs").mkdir()
+        (env / "logs/run.log").write_text("fine to archive, but not alone")
+        nested = self.worktree("with-secrets", "-b", "with-secrets")
+        (nested / "secrets").mkdir()
+        (nested / "secrets/token").write_text("hunter2")
+        for path in (env, nested):
+            age(path)
+        out = self.tidy()
+        self.assertEqual((env / ".env").read_text(), "TOKEN=hunter2", out)
+        self.assertEqual((nested / "secrets/token").read_text(), "hunter2", out)
+        self.assertIn("finished worktree kept", out)
+        self.assertIn("looks like a secret", out)
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(self.archive_files(), [], "nothing is copied when a secret blocks removal")
+        self.assertTrue({"with-env", "with-secrets"} <= self.branches())
+
+    def test_secrets_under_work_and_claude_keep_the_worktree_and_are_never_copied(self):
+        self.ignore(".claude/")
+        work = self.worktree("work-env", "-b", "work-env")
+        (work / ".work").mkdir()
+        (work / ".work/report.md").write_text("evidence")
+        (work / ".work/.env").write_text("TOKEN=hunter2")
+        claude = self.worktree("claude-secret", "-b", "claude-secret")
+        (claude / ".claude/secrets").mkdir(parents=True)
+        (claude / ".claude/secrets/token").write_text("hunter2")
+        for path in (work, claude):
+            age(path)
+        out = self.tidy(apply=False)
+        self.assertNotIn("would be removed", out)
+        out = self.tidy()
+        self.assertEqual((work / ".work/.env").read_text(), "TOKEN=hunter2", out)
+        self.assertEqual((work / ".work/report.md").read_text(), "evidence", out)
+        self.assertEqual((claude / ".claude/secrets/token").read_text(), "hunter2", out)
+        self.assertEqual(out.count("looks like a secret"), 2, out)
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(self.archive_files(), [], "no .work archive when a secret blocks removal")
+        self.assertTrue({"work-env", "claude-secret"} <= self.branches())
+
+    def test_secret_looking_files_inside_a_cache_are_not_scanned_or_archived(self):
+        self.ignore("data/")
+        path = self.worktree("cache-pem", "-b", "cache-pem")
+        (path / "node_modules/pkg").mkdir(parents=True)
+        (path / "node_modules/pkg/cert.pem").write_text("PEMDATA")
+        (path / "data/build").mkdir(parents=True)
+        (path / "data/build/id_rsa").write_text("KEYDATA")
+        (path / "data/notes.txt").write_text("kept")
+        age(path)
+        out = self.tidy()
+        self.assertFalse(path.exists(), out)
+        self.assertNotIn("cache-pem", self.branches())
+        files = self.archive_files()
+        self.assertEqual(len([name for name in files if name.endswith("data/notes.txt")]), 1, files)
+        self.assertFalse([name for name in files if "cert.pem" in name or "id_rsa" in name], files)
+
+    def test_secret_at_depth_three_in_an_ignored_non_cache_directory_keeps_the_worktree(self):
+        self.ignore("data/")
+        path = self.worktree("deep-env", "-b", "deep-env")
+        (path / "data/a/b").mkdir(parents=True)
+        (path / "data/a/b/.env").write_text("TOKEN=hunter2")
+        (path / "data/a/note.txt").write_text("fine")
+        age(path)
+        out = self.tidy()
+        self.assertEqual((path / "data/a/b/.env").read_text(), "TOKEN=hunter2", out)
+        self.assertIn("looks like a secret", out)
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(self.archive_files(), [], "nothing is copied when a secret blocks removal")
+        self.assertIn("deep-env", self.branches())
+
+    def test_other_blockers_still_keep_a_worktree_with_ignored_files(self):
+        self.ignore("logs/")
+        dirty = self.worktree("dirty-logs", "-b", "dirty-logs")
+        (dirty / "logs").mkdir()
+        (dirty / "logs/run.log").write_text("log")
+        (dirty / "a.txt").write_text("edited")
+        age(dirty)
+        out = self.tidy()
+        self.assertEqual((dirty / "a.txt").read_text(), "edited", out)
+        self.assertTrue((dirty / "logs/run.log").exists())
+        self.assertEqual(self.archive_files(), [])
+
+    def test_ignored_archive_failure_keeps_worktree(self):
+        self.ignore("logs/")
+        path = self.worktree("ignored-failure", "-b", "ignored-failure")
+        (path / "logs").mkdir()
+        (path / "logs/run.log").write_text("must survive")
+        age(path)
+        archive = self.home / ".local/state/task/archive"
+        archive.mkdir(parents=True)
+        (archive / "proj").write_text("obstruct archive directory")
+        out = self.tidy()
+        self.assertIn("cannot archive ignored files", out)
+        self.assertEqual((path / "logs/run.log").read_text(), "must survive")
 
     def test_hidden_or_flagged_changes_are_kept(self):
         hidden = self.worktree("hidden", "--detach")

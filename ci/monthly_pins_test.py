@@ -30,6 +30,13 @@ class ResolverTests(unittest.TestCase):
             pins.render_lock(entries, {"alpha": "1.1"})
         self.assertEqual(lock, "alpha=1.0\nbeta=2.0\n")
 
+    def test_rootless_extras_must_match_the_engine_version(self) -> None:
+        same = "docker-ce=5:29.9.2\ndocker-ce-cli=5:29.9.2\ndocker-ce-rootless-extras=5:29.9.2\n"
+        pins.require_engine_match(same)
+        pins.require_engine_match("alpha=1.0\n")
+        with self.assertRaises(pins.ResolveError):
+            pins.require_engine_match(same.replace("rootless-extras=5:29.9.2", "rootless-extras=5:29.9.1"))
+
     def test_version_and_snapshot_resolvers_are_monotonic(self) -> None:
         self.assertTrue(pins.version_is_newer("24.22.0", "24.21.0"))
         self.assertFalse(pins.version_is_newer("24.20.9", "24.21.0"))

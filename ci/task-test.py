@@ -11,6 +11,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import hashlib
 import json
 import os
 import signal
@@ -24,6 +25,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
@@ -40,6 +42,27 @@ os.environ["AGENT_POLICY_STATE_DIR"] = audit_state.name
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executable_task"))
 REVIEW_FIXTURES = ROOT / "ci/fixtures/reviews"
+SPARE_HELD = "spare reset held; reset at 100 %"
+# "Idle 10 days" with an hour of margin: the host wall clock steps back by seconds, so a
+# worktree aged exactly 10 days when the test reads the clock can read 9 days in `task status`.
+IDLE_TEN_DAYS = 10 * 86400 + 3600
+PAST = '2000-01-01T00:00:00+00:00'  # for commits and merges that must precede a later sign-off
+
+
+def restore_access(path):
+    """Give the owner full access back so the tree can be removed; a path already gone is fine."""
+    path = Path(path)
+    try:
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    except FileNotFoundError:
+        pass
+
+
+def make_read_only(case, path, mode):
+    """chmod a fixture path and register the restore first, so a failing or erroring test cannot
+    leave a locked directory behind in the lane's .work/tmp."""
+    case.addCleanup(restore_access, path)
+    Path(path).chmod(mode)
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
@@ -132,6 +155,13 @@ if pathlib.Path(sys.argv[0]).name == 'codex':
     final = pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1])
     final.write_text('codex-final: ' + prompt)
     print('codex-log')
+elif '--output-format' in sys.argv:
+    reset = int(time.time()) + 3 * 86400
+    window = {'utilization': 0.4, 'resetsAt': reset}
+    print(json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {
+        'rateLimitType': 'seven_day', **window, 'unifiedWindows': {'five_hour': {**window, 'utilization': 0.1}, 'seven_day': window}}}))
+    print(json.dumps({'type': 'result', 'result': 'claude-final: ' + prompt}))
+    print('claude-log', file=sys.stderr)
 else:
     print('claude-final: ' + prompt, end='')
     print('claude-log', file=sys.stderr)
@@ -177,6 +207,52 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def test_adaptive_check_timeout_uses_trusted_passes_only(self):
+        repo = self.home / 'dev_workspace/proj'
+        worktree = repo / '.worktrees/t1'
+        worktree.mkdir(parents=True)
+        state = self.home / '.local/state/task/proj/t1'
+        state.mkdir(parents=True)
+        history = [
+            {'trusted': True, 'result': 'passed', 'time': f'2026-10-21T00:0{i}:00+00:00', 'steps': [
+                {'command': ['just', 'check'], 'duration': duration}]}
+            for i, duration in enumerate([1100, 1000, 950, 800, 700])]
+        history += [{'trusted': True, 'result': 'failed', 'time': '9', 'steps': [
+            {'command': ['just', 'check'], 'duration': 9999}]},
+            {'trusted': False, 'result': 'passed', 'time': '10', 'steps': [
+                {'command': ['just', 'check'], 'duration': 9999}]}]
+        (state / 'checks.jsonl').write_text('\n'.join(json.dumps(row) for row in history))
+        (worktree / '.task.toml').write_text('check_timeout = 1200\n')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            configured, effective, used = TASK_MODULE.step_timeout(worktree, ['just', 'check'])
+            self.assertEqual((configured, effective, used), (1200, 2200, [1100, 1000, 950, 800, 700]))
+            self.assertIn('median 950 s', TASK_MODULE.gate_warning(worktree))
+            (worktree / '.task.toml').write_text('check_timeout = 1300\n')
+            self.assertEqual(TASK_MODULE.gate_warning(worktree), '')
+        (state / 'checks.jsonl').unlink()
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            self.assertEqual(TASK_MODULE.step_timeout(worktree, ['just', 'check']), (1300, 1300, []))
+
+    def test_task_check_uses_trusted_history_from_main_repo(self):
+        wt, _ = self.started()
+        (wt / '.task.toml').write_text('check_timeout = 1\n')
+        self.git(wt, 'add', '.task.toml')
+        self.git(wt, 'commit', '-qm', 'set short check timeout')
+        state = self.state()
+        state.mkdir(parents=True, exist_ok=True)
+        rows = [{'trusted': True, 'result': 'passed', 'time': f'2026-10-21T00:0{i}:00+00:00',
+                 'steps': [{'command': ['just', 'check'], 'duration': 2}]} for i in range(5)]
+        (state / 'checks.jsonl').write_text('\n'.join(json.dumps(row) for row in rows))
+        script = self.home / 'during-check.sh'
+        script.write_text('#!/bin/sh\nsleep 1.2\n')
+        script.chmod(0o755)
+        out = self.raw_task('check', cwd=wt)
+        self.assertIn('PASS (log:', out)
+        evidence = json.loads((state / 'check.json').read_text())
+        step = evidence['steps'][0]
+        self.assertEqual((step['configured_timeout'], step['effective_timeout']), (1, 4))
+        self.assertEqual(step['history_durations'], [2, 2, 2, 2, 2])
+
     def test_cumulative_report_uses_only_final_criteria_block(self):
         criteria = [{"number": 1}, {"number": 2}]
         old = "## Criteria\n#1 not met: failing check\n#2 not met: missing work\n"
@@ -187,6 +263,69 @@ class TaskTool(unittest.TestCase):
             with self.subTest(tail=tail), self.assertRaises(TASK_MODULE.Stop):
                 TASK_MODULE.report_criteria(final + tail if tail else "", criteria)
 
+    def test_main_only_catches_routing_parse_errors(self):
+        with mock.patch.object(TASK_MODULE, 'foreground_lock', return_value=None), \
+                mock.patch.object(TASK_MODULE, 'finish_detached'), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            with mock.patch.object(TASK_MODULE, 'status', side_effect=TASK_MODULE.RoutingParseError('bad policy')):
+                self.assertEqual(TASK_MODULE.main(['status', 'proj']), 1)
+                self.assertIn('bad policy', errors.getvalue())
+            with mock.patch.object(TASK_MODULE, 'status', side_effect=ValueError('internal bug')):
+                with self.assertRaisesRegex(ValueError, 'internal bug'):
+                    TASK_MODULE.main(['status', 'proj'])
+
+    def test_concurrent_starts_serialize_on_repository_lock(self):
+        lock_path = self.repo / '.git/task-start.lock'
+        children = []
+        with lock_path.open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                for ident in ('parallel-one', 'parallel-two'):
+                    children.append(subprocess.Popen(
+                        [sys.executable, str(TOOL), 'start', 'proj', ident, '--builder', 'codex'],
+                        env=self.env, cwd=self.home, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True))
+                # Both real commands must wait for this repository's start lock.
+                for child in children:
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        child.communicate(timeout=0.25)
+                self.assertFalse((self.repo / '.worktrees/parallel-one').exists())
+                self.assertFalse((self.repo / '.worktrees/parallel-two').exists())
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        try:
+            for child, ident in zip(children, ('parallel-one', 'parallel-two')):
+                output, _ = child.communicate(timeout=20)
+                self.assertEqual(child.returncode, 0, output)
+                wt = self.repo / '.worktrees' / ident
+                self.assertEqual(self.git(wt, 'branch', '--show-current'), ident)
+                self.assertEqual(self.git(wt, 'rev-parse', 'HEAD'), self.git(self.repo, 'rev-parse', ident))
+                self.assertTrue((wt / '.work/context').is_dir())
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
+
+    def test_runner_tier_only_and_documented_dependency_example(self):
+        runner = self.home / 'runner.md'
+        runner.write_text('1. prepare: builder codex, tier routine\n'
+                          '2. implement: builder codex, tier hard, after: prepare\n')
+        self.assertIn('runner file OK (2 tasks)', self.raw_task('runner-check', 'proj', str(runner)))
+        runner.write_text('1. missing: builder codex\n')
+        self.assertIn('model or tier', self.raw_task('runner-check', 'proj', str(runner), code=1))
+
+    def test_unboosted_route_notice_and_tier_only_update_message(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('Implement task')
+        self.assertIn('cannot change this task', self.lane_refused('--tier', 'hard'))
+        out = self.task('lane', 'proj', '5', '--tier', 'hard', '--override', 'Jacopo 2026-10-21: tier')
+        self.wait_for_lane(wt)
+        self.assertIn('route: hard -> codex gpt-6.1-sol', out)
+        self.assertIn('Updating task tier to hard.', out)
+        self.assertNotIn('Updating task builder', out)
+
     def test_quality_dispatch_brief_and_evidence_instruction(self):
         task = self.kb / "backlog/tasks/t-5 - Add-the-b-file.md"
         task.write_text(task.read_text() + "\n## Read first\n\na.txt and justfile\n\n"
@@ -194,10 +333,9 @@ class TaskTool(unittest.TestCase):
         wt, dispatch = self.started()
         self.assertIn("Read first:\na.txt and justfile", dispatch)
         self.assertIn("Test against:\nci/fixtures/reviews/haiku-3-fenced.md", dispatch)
-        self.assertIn("PASS/FAIL plus the log path", dispatch)
-        self.assertIn("under `## Check`", dispatch)
         self.assertIn("## Check", (wt / '.work/report.md').read_text())
         direct = self.raw_task('start', 'proj', 'direct', '--builder', 'codex')
+        self.assertIn('Acceptance criteria:\n(PM: none given)\nVerify:\n(PM: none given)', direct)
         self.assertIn('Read first:\n(PM: none given)', direct)
         self.assertIn('Test against:\n(PM: none given)', direct)
         request = self.repo / '.worktrees/direct/.work/request.md'
@@ -229,7 +367,7 @@ class TaskTool(unittest.TestCase):
         prompt = json.loads((wt / '.work/reviewer-call.json').read_text())['prompt']
         self.assertIn('Verdict: FAIL; head: ' + head, prompt)
         self.assertIn('FAILED (failures=1)', prompt)
-        self.assertIn('file:line', prompt)
+        self.assertIn('lane-contract.md', prompt)
         checks = [json.loads(line) for line in (self.state() / 'checks.jsonl').read_text().splitlines()]
         self.assertEqual([item['result'] for item in checks], ['passed', 'failed'])
 
@@ -728,7 +866,7 @@ class TaskTool(unittest.TestCase):
         name = 'backlog/decisions/d-status.md'
         (self.kb / 'backlog/decisions').mkdir()
         original = '---\nstatus: accepted\n---\n## Decision\nKeep the data.\n'
-        self.commit_in(self.kb, name, original)
+        self.commit_in(self.kb, name, original, when=PAST)
         self.task('plan', 'proj', '--sign')
         for revised, counted in (
                 (original.replace('accepted', 'replaced'), False),
@@ -739,7 +877,10 @@ class TaskTool(unittest.TestCase):
                 (original.replace('Keep the data.', 'Delete the data.'), True)):
             (self.kb / name).write_text(revised)
             self.assertEqual('decisions changed:' in self.task('plan', 'proj'), counted)
-        (self.kb / name).write_text(original.replace('accepted', 'replaced'))
+        # A status word of another length: git then sees the edit by size. With "replaced" (same
+        # length as "accepted") only timestamps differ, and after a backward step of the host
+        # clock `git add` can find the file unchanged and stage nothing.
+        (self.kb / name).write_text(original.replace('accepted', 'superseded'))
         self.git(self.kb, 'add', name)
         subprocess.run(['git', '-C', str(self.kb), 'commit', '-qm', 'status'],
                        env=dict(self.env, GIT_COMMITTER_DATE='2099-01-01T00:00:00+00:00'), check=True)
@@ -755,8 +896,8 @@ class TaskTool(unittest.TestCase):
         status_name = 'backlog/decisions/d-status.md'
         binary_name = 'backlog/decisions/d-bytes.md'
         original = '---\nstatus: accepted\n---\nKeep the data.\n'
-        self.commit_in(self.kb, status_name, original)
-        self.commit_in(self.kb, binary_name, original)
+        self.commit_in(self.kb, status_name, original, when=PAST)
+        self.commit_in(self.kb, binary_name, original, when=PAST)
         self.task('plan', 'proj', '--sign')
         (self.kb / status_name).write_text(original.replace('accepted', 'replaced'))
         (self.kb / binary_name).write_bytes(b'\xff')
@@ -801,7 +942,7 @@ class TaskTool(unittest.TestCase):
         )
         name = 'backlog/decisions/decision-22.md'
         (self.kb / 'backlog/decisions').mkdir()
-        self.commit_in(self.kb, name, old)
+        self.commit_in(self.kb, name, old, when=PAST)
         self.task('plan', 'proj', '--sign')
         (self.kb / name).write_text(new)
         self.assertNotIn('decisions changed:', self.task('plan', 'proj'))
@@ -906,23 +1047,258 @@ class TaskTool(unittest.TestCase):
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('task\n')
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
-        for builder, requested, extra, expected in [
-                ('codex', 'gpt-6-luna', [], 'gpt-6-astra'),
-                ('claude', 'sonnet', [], 'fable'),
-                ('codex', 'gpt-6-luna', ['--no-boost'], 'gpt-6-luna'),
-                ('claude', 'sonnet', ['--no-boost'], 'sonnet'),
-                ('codex', 'gpt-6-astra', ['--no-boost'], 'gpt-6-astra')]:
+        for builder in ('codex', 'claude'):
+            for tier in ('routine', 'hard', 'design'):
+                expected = {'codex': {'routine': 'gpt-6-luna', 'hard': 'gpt-6.1-sol', 'design': 'gpt-6-astra'},
+                            'claude': {'routine': 'sonnet', 'hard': 'fable', 'design': 'opus'}}[builder][tier]
+                (wt / '.work/model-call.json').unlink(missing_ok=True)
+                (wt / '.work/final.md').unlink(missing_ok=True)
+                # Astra and fable follow the recorded tier, so the task is recorded at each tier first.
+                self.task('start', 'proj', '5', '--builder', builder, '--tier', tier, '--override', 'Jacopo 2026-10-21: tier')
+                out = self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier)
+                record = self.wait_for_lane(wt)
+                self.assertEqual(record['model'], expected)
+                self.assertIn(f'tier {tier}', out)
+                explicit = 'gpt-6-luna' if builder == 'codex' else 'sonnet'
+                (wt / '.work/model-call.json').unlink(missing_ok=True)
+                (wt / '.work/final.md').unlink(missing_ok=True)
+                self.task('lane', 'proj', '5', '--builder', builder, '--tier', tier, '--model', explicit)
+                self.assertEqual(self.wait_for_lane(wt)['model'], explicit)
             (wt / '.work/model-call.json').unlink(missing_ok=True)
             (wt / '.work/final.md').unlink(missing_ok=True)
-            out = self.task('lane', 'proj', '5', '--builder', builder, '--model', requested, *extra)
-            record = self.wait_for_lane(wt)
-            self.assertEqual(record['exit_code'], 0)
-            self.assertEqual(record['model'], expected)
-            self.assertEqual(record['cli_model'], expected)
-            call = json.loads((wt / '.work/model-call.json').read_text())
-            self.assertIn(expected, call['args'])
-            if not extra:
-                self.assertIn(f'boost: {requested} -> {expected}', out)
+            self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost', '--override', 'Jacopo 2026-10-21: tier')
+            no_boost_hard = 'gpt-6.1-sol' if builder == 'codex' else explicit
+            self.assertEqual(self.wait_for_lane(wt)['model'], no_boost_hard)
+
+    def lane_refused(self, *options, env=None):
+        out = self.raw_task('lane', 'proj', '5', *options, code=1, env=env)
+        self.assertFalse((self.repo / '.worktrees/t5/.work/lane.json').exists())
+        return out
+
+    def test_astra_only_for_the_design_tier(self):
+        self.stub_models()
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: design\n')
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for tier in ('routine', 'hard'):
+            out = self.lane_refused('--tier', tier, '--model', 'gpt-6-astra')
+            self.assertIn(f'gpt-6-astra is for Tier: design tasks only (this one is {tier})', out)
+            self.assertIn('gpt-6-luna', out)
+            self.assertIn('gpt-6.1-sol', out)
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra')
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+
+    def test_fable_only_for_the_hard_tier(self):
+        self.stub_models()
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: hard\n')
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for tier in ('routine', 'design'):
+            for model in ('fable', 'claude-fable-5-1'):
+                out = self.lane_refused('--builder', 'claude', '--tier', tier, '--model', model)
+                self.assertIn(f'{model} is for Tier: hard tasks only (this one is {tier})', out)
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--tier', 'hard', '--model', 'fable')
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'fable')
+
+    def test_no_pace_and_pace_do_not_override_the_top_model_rule(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.readings(codex=(70, 84))
+        for options, env in (((), None), (('--no-pace',), None), ((), dict(self.env, TASK_NO_PACE='1'))):
+            out = self.lane_refused('--model', 'gpt-6-astra', *options, env=env)
+            self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
+            self.assertNotIn('route:', out)
+
+    def test_a_tier_flag_does_not_raise_eligibility_over_the_recorded_tier(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        cases = (('codex', 'design', 'gpt-6-astra'), ('claude', 'hard', 'fable'))
+        for builder, tier, model in cases:
+            out = self.lane_refused('--builder', builder, '--tier', tier, '--model', model)
+            self.assertIn(f'{model} is for Tier: {tier} tasks only (this one is routine)', out)
+            self.assertIn('--override', out)
+        # Tier routing that would pick astra is refused: the --tier cannot change the recorded tier.
+        self.assertIn("--tier design cannot change this task's recorded tier (routine)", self.lane_refused('--tier', 'design'))
+        self.assertEqual(self.overrides(), [])
+        request = 'Jacopo 2026-10-21: design look'
+        for builder, tier, model in cases:
+            (wt / '.work/final.md').unlink(missing_ok=True)
+            out = self.raw_task('lane', 'proj', '5', '--builder', builder, '--tier', tier, '--model', model, '--override', request)
+            self.assertEqual(self.wait_for_lane(wt)['model'], model)
+            self.assertIn(f'override recorded: {model} on a ', out)
+        # The ledger names the tier the task was recorded at; the first override moved it to design.
+        self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
+                         [('tier change', 'routine to design', request), ('gpt-6-astra', 'routine', request),
+                          ('tier change', 'design to hard', request), ('fable', 'design', request)])
+
+    def test_a_tier_flag_never_changes_the_recorded_tier_without_an_override(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        # The review's sequence: a tier change with a cheap model, then astra on the now-design task.
+        out = self.lane_refused('--tier', 'design', '--model', 'gpt-6-luna')
+        self.assertIn("--tier design cannot change this task's recorded tier (routine)", out)
+        self.assertIn('--override', out)
+        out = self.lane_refused('--tier', 'design', '--model', 'gpt-6-luna', '--override', 'Jacopo 2026-10-21')
+        self.assertIn('override must read', out)
+        self.assertIn('gpt-6-astra is for Tier: design tasks only (this one is routine)', self.lane_refused('--model', 'gpt-6-astra'))
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'routine')
+        # `task start` on the existing record is the same rule.
+        out = self.raw_task('start', 'proj', '5', '--builder', 'codex', '--tier', 'design', code=1)
+        self.assertIn("cannot change this task's recorded tier (routine)", out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'routine')
+        self.assertEqual(self.overrides(), [])
+        request = 'Jacopo 2026-10-21: design pass'
+        out = self.raw_task('lane', 'proj', '5', '--tier', 'design', '--model', 'gpt-6-luna', '--override', request)
+        self.wait_for_lane(wt)
+        self.assertIn('Updating task tier to design.', out)
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
+        self.assertEqual([(e['model'], e['tier'], e['override']) for e in self.overrides()],
+                         [('tier change', 'routine to design', request)])
+
+    def overrides(self):
+        path = self.home / '.local/state/task/usage/overrides.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_override_allows_astra_on_a_routine_task_and_is_recorded(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        request = 'Jacopo 2026-10-21: use Astra on this one'
+        out = self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', request)
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+        self.assertIn('override recorded', out)
+        # The detached worker re-runs the lane with the override but does not record it a second time.
+        (entry,) = self.overrides()
+        self.assertEqual((entry['repo'], entry['task'], entry['model'], entry['tier'], entry['override']),
+                         ('proj', 'T-5', 'gpt-6-astra', 'routine', request))
+        self.assertRegex(entry['time'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d')
+        # An override on a model that is within its tier is not an override: nothing recorded.
+        (wt / '.work/final.md').unlink(missing_ok=True)
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-luna', '--override', request)
+        self.wait_for_lane(wt)
+        self.assertEqual(len(self.overrides()), 1)
+
+    def test_without_an_override_the_tier_rule_holds_and_nothing_is_recorded(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        for options in ((), ('--override', ''), ('--override', '  ')):
+            out = self.lane_refused('--model', 'gpt-6-astra', *options)
+            self.assertIn('gpt-6-astra is for Tier: design tasks only', out)
+            self.assertIn('--override', out)
+        self.assertEqual(self.overrides(), [])
+
+    def test_override_must_name_jacopo_with_a_valid_date_and_a_request(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        bad = ('x', 'Jacopo', 'Jacopo 2026-10-21', 'Jacopo 2026-10-21:', 'Jacopo 2026-10-21:   ', 'Jacopo 2026-13-40: look',
+               'Jacopo 2026-02-30: look', 'Bob 2026-10-21: look', 'Jacopo 21-10-2026: look', 'Jacopo: look 2026-10-21')
+        for text in bad:
+            for model in ('gpt-6-astra', 'gpt-6-luna'):
+                with self.subTest(text=text, model=model):
+                    out = self.lane_refused('--model', model, '--override', text)
+                    self.assertIn('Jacopo YYYY-MM-DD: <request>', out)
+        self.assertEqual(self.overrides(), [])
+        # Name case does not matter.
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'jacopo 2026-10-21: look')
+        self.wait_for_lane(wt)
+        self.assertEqual([entry['override'] for entry in self.overrides()], ['jacopo 2026-10-21: look'])
+
+    def test_runner_check_requires_the_dated_override_format(self):
+        runner = self.home / 'runner.md'
+        for text in ('x', 'Jacopo 2026-10-21', 'Jacopo 2026-13-01: look'):
+            runner.write_text(f'1. a: builder codex, model gpt-6-astra, override: {text}\n')
+            self.assertIn('Jacopo YYYY-MM-DD: <request>', self.raw_task('runner-check', 'proj', str(runner), code=1))
+        runner.write_text('1. a: builder codex, model gpt-6-astra, override: Jacopo 2026-10-21: look, with a comma\n')
+        self.assertIn('runner file OK', self.raw_task('runner-check', 'proj', str(runner)))
+
+    def test_reviews_refuse_astra_and_fable_even_with_an_override(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21: design look')
+        self.wait_for_lane(wt)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'review.md'
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n')
+        for vendor, model in (('codex', 'gpt-6-astra'), ('claude', 'fable'), ('claude', 'claude-fable-5-1')):
+            out = self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', vendor, model, code=1)
+            self.assertIn(f'reviews never use {model}; no override applies', out)
+        # `task review` takes no override at all, and the lane override leaves the routed reviewer cheap.
+        self.assertIn('unrecognized arguments: --override', self.raw_task(
+            'review', 'proj', '5', '--run', '--override', 'Jacopo 2026-10-21', code=2))
+        self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply.read_text()))
+        from task_routing import TOP_ONLY
+        route = json.loads((self.state() / 'review-routing.json').read_text())
+        self.assertNotIn(route['model'], TOP_ONLY)
+
+    def test_status_and_weekly_line_show_overrides(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('task\n')
+        self.assertIn('model overrides, last 7 days: 0', self.raw_task('status', 'proj'))
+        self.assertEqual(self.raw_task('usage', '--weekly-line').splitlines()[-1], 'model overrides, last 7 days: 0')
+        self.raw_task('lane', 'proj', '5', '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-21: design look')
+        self.wait_for_lane(wt)
+        for out in (self.raw_task('status', 'proj'), self.raw_task('usage', '--weekly-line')):
+            self.assertIn('model overrides, last 7 days: 1 (proj/T-5 gpt-6-astra on routine at ', out)
+            self.assertIn('Jacopo 2026-10-21: design look', out)
+
+    def test_reviews_never_pick_astra_or_fable(self):
+        from task_routing import TOP_ONLY
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        for builder in ('codex', 'claude'):
+            for tier in ('routine', 'hard', 'design'):
+                with self.subTest(builder=builder, tier=tier):
+                    self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier,
+                              '--override', 'Jacopo 2026-10-21: tier')
+                    self.raw_task('check', 'proj', '5')
+                    self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+                    route = json.loads((self.state() / 'review-routing.json').read_text())
+                    self.assertNotIn(route['model'], TOP_ONLY)
+                    call = json.loads((wt / '.work/reviewer-call.json').read_text())
+                    self.assertFalse(set(TOP_ONLY) & set(call['args']))
+        # The deeper review a pace spend picks is the other cap on review models.
+        self.assertFalse(set(TOP_ONLY) & set(TASK_MODULE.task_usage.DEEPER.values()))
+
+    def test_tier_file_flag_state_and_status(self):
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nTier: hard\n')
+        self.task('start', 'proj', '5', '--builder', 'codex')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'hard')
+        self.assertIn('tier=hard', self.task('status', 'proj'))
+        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex', '--tier', 'design', '--override', 'Jacopo 2026-10-21: tier')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
+
+    def test_tier_defaults_and_override_policy(self):
+        from task_routing import route, lane_limits
+        for vendor, default in [('codex', 'gpt-6-luna'), ('claude', 'sonnet')]:
+            for tier in ('routine', 'hard', 'design'):
+                expected = default if tier == 'routine' else {'codex': 'gpt-6.1-sol', 'claude': 'opus'}[vendor]
+                self.assertEqual(route(self.home, vendor, tier), expected)
+                no_boost_expected = 'gpt-6.1-sol' if vendor == 'codex' and tier == 'hard' else default
+                self.assertEqual(route(self.home, vendor, tier, boosted=False), no_boost_expected)
+        config = self.home / '.config/task'
+        config.mkdir(parents=True, exist_ok=True)
+        (config / 'routing.json').write_text(json.dumps(dict(models={'claude': {'hard': 'opus'}}, extra_lanes=1)))
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
+        self.assertEqual(route(self.home, 'claude', 'hard'), 'opus')
+        self.assertEqual(route(self.home, 'claude', 'routine'), 'sonnet')
+        self.assertEqual(route(self.home, 'claude', 'hard', 'sonnet'), 'sonnet')
+        self.assertEqual(lane_limits(self.home, 3), {'codex': 1, 'claude': 2})
 
     def test_boost_reviewer_models_and_recorded_identity(self):
         self.stub_reviewers()
@@ -930,7 +1306,7 @@ class TaskTool(unittest.TestCase):
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
         head = self.git(wt, 'rev-parse', 'HEAD')
         reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
-        for builder, vendor, model in [('codex', 'claude', 'opus'), ('claude', 'codex', 'gpt-6.1-sol')]:
+        for builder, vendor, model in [('codex', 'claude', 'haiku'), ('claude', 'codex', 'gpt-6-luna')]:
             self.task('start', 'proj', '5', '--refresh', '--builder', builder)
             self.raw_task("check", "proj", '5')
             self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
@@ -938,29 +1314,10 @@ class TaskTool(unittest.TestCase):
             self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
             self.assertIn(model, json.loads((wt / '.work/reviewer-call.json').read_text())['args'])
 
-    def test_boosted_claude_limit_falls_back_once_and_records_actual_reviewer(self):
+    def test_review_limit_retries_once_without_boost_and_after_boost(self):
         self.stub_reviewers()
         wt, _ = self.started()
-        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
-        head = self.git(wt, 'rev-parse', 'HEAD')
-        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
-        self.raw_task("check", "proj", '5')
-        out = self.raw_task('review', 'proj', '5', '--run', env=dict(self.env,
-                            REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit · resets 5pm (UTC)\n\n",
-                            REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
-        calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
-        self.assertEqual([call[call.index('--model') + 1] for call in calls], ['opus', 'haiku'])
-        self.assertIn('retrying once', out)
-        route = json.loads((self.state() / 'review-routing.json').read_text())
-        self.assertEqual(route, dict(vendor='claude', model='haiku', fallback_from='opus'))
-        review = json.loads((self.state() / 'review.json').read_text())
-        self.assertEqual((review['reviewer'], review['model'], review['verdict']), ('claude', 'haiku', 'PASS'))
-        self.assertEqual((self.state() / 'review.md').read_text(), reply)
-
-    def test_review_limit_without_boost_or_after_fallback_is_not_retried(self):
-        self.stub_reviewers()
-        wt, _ = self.started()
-        for boosted, expected in ((False, ['haiku']), (True, ['opus', 'haiku'])):
+        for boosted in (False, True):
             with self.subTest(boosted=boosted):
                 (wt / '.work/reviewer-count').unlink(missing_ok=True)
                 (wt / '.work/reviewer-calls.jsonl').unlink(missing_ok=True)
@@ -969,10 +1326,13 @@ class TaskTool(unittest.TestCase):
                 self.raw_task("check", "proj", '5')
                 out = self.raw_task('review', 'proj', '5', '--run', code=1,
                                     env=dict(self.env, REVIEW_STUB_REPLY="You've hit your weekly limit",
+                                             REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
                                              REVIEW_STUB_EXIT='2'))
                 self.assertIn('ended by usage limit', out)
                 calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
-                self.assertEqual([call[call.index('--model') + 1] for call in calls], expected)
+                self.assertEqual(len(calls), 2)
+                self.assertIn('haiku', calls[0])
+                self.assertIn('gpt-6-luna', calls[1])
                 self.assertFalse((self.state() / 'review.json').exists())
 
     def test_boosted_reviewer_other_errors_do_not_fall_back(self):
@@ -985,21 +1345,9 @@ class TaskTool(unittest.TestCase):
                                      REVIEW_STUB_EXIT='1'))
         self.assertIn('exited with status 1', out)
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
-        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'opus')
+        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'haiku')
 
-    def test_boosted_claude_fallback_without_verdict_stops_after_one_try(self):
-        self.stub_reviewers()
-        wt, _ = self.started()
-        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00')
-        self.raw_task("check", "proj", '5')
-        out = self.raw_task('review', 'proj', '5', '--run', code=1,
-                            env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your Opus limit",
-                                     REVIEW_STUB_FIRST_EXIT='1', REVIEW_STUB_REPLY='No verdict'))
-        self.assertIn('review produced no verdict', out)
-        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
-        self.assertFalse((self.state() / 'review.json').exists())
-
-    def test_boosted_codex_limit_is_reported_without_fallback(self):
+    def test_boosted_codex_limit_retries_once(self):
         self.stub_reviewers()
         self.raw_task('start', 'proj', '5', '--builder', 'claude')
         wt = self.repo / '.worktrees/t5'
@@ -1007,10 +1355,38 @@ class TaskTool(unittest.TestCase):
         self.raw_task("check", "proj", '5')
         out = self.raw_task('review', 'proj', '5', '--run', code=1,
                             env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
+                                     REVIEW_STUB_REPLY="You've hit your weekly limit",
                                      REVIEW_STUB_EXIT='1'))
         self.assertIn('ended by usage limit', out)
-        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
         self.assertFalse((self.state() / 'review.json').exists())
+
+    def test_reviewer_fallback_records_actual_route_and_stops_without_verdict(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        for builder, vendor, model in (('codex', 'codex', 'gpt-6-luna'), ('claude', 'claude', 'haiku')):
+            self.task('start', 'proj', '5', '--refresh', '--builder', builder)
+            self.raw_task('check', 'proj', '5')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            for reply in ('No verdict available', f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'):
+                with self.subTest(builder=builder, reply=reply):
+                    (wt / '.work/reviewer-count').unlink(missing_ok=True)
+                    (self.state() / 'review.json').unlink(missing_ok=True)
+                    first_limit = "You've hit your weekly limit"
+                    out = self.raw_task('review', 'proj', '5', '--run',
+                        code=1 if reply.startswith('No') else 0,
+                        env=dict(self.env, REVIEW_STUB_FIRST_REPLY=first_limit,
+                                 REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.", REVIEW_STUB_FIRST_EXIT='2',
+                                 REVIEW_STUB_REPLY=reply, REVIEW_STUB_EXIT='0'))
+                    self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
+                    route = json.loads((self.state() / 'review-routing.json').read_text())
+                    self.assertEqual((route['vendor'], route['model']), (vendor, model))
+                    if reply.startswith('No'):
+                        self.assertIn('review produced no verdict', out)
+                        self.assertFalse((self.state() / 'review.json').exists())
+                    else:
+                        meta = json.loads((self.state() / 'review.json').read_text())
+                        self.assertEqual((meta['reviewer'], meta['model']), (vendor, model))
 
     def test_plan_refusals_exceptions_and_resume(self):
         plan = self.kb / 'INTENT.md'
@@ -1159,8 +1535,8 @@ class TaskTool(unittest.TestCase):
         self.assertIn('1/1', self.task('plan', 'proj'))
         self.task('status', 'proj')
         self.assertIn('realignment due', self.task('start', 'proj', '5', code=1))
-        from datetime import datetime, timezone
-        (state / 'merge.json').write_text(json.dumps({'time': datetime.now(timezone.utc).isoformat()}))
+        # A merge before the new sign-off, at a fixed past time (see PAST).
+        (state / 'merge.json').write_text(json.dumps({'time': PAST}))
         self.assertIn('0/1', self.task('plan', 'proj', '--sign'))
         decisions = self.kb / 'backlog/decisions'
         decisions.mkdir()
@@ -1341,7 +1717,7 @@ home = pathlib.Path(os.environ['HOME'])
 (home / 'service-args').write_text(json.dumps(sys.argv[1:]))
 sys.exit(int(os.environ.get('SERVICE_EXIT', '0')))
 """,
-            'codex': """#!/usr/bin/env python3
+            'task-batch': """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 work = pathlib.Path.cwd() / '.work'
 (work / 'runner-call').write_text(json.dumps(dict(args=sys.argv[1:], prompt=sys.stdin.read(),
@@ -1355,7 +1731,6 @@ if os.environ.get('RUNNER_FINAL'):
         stream.write(os.environ['RUNNER_FINAL'] + '\\n')
 sys.exit(7)
 """}
-        scripts['task-batch'] = scripts['codex']
         for name, body in scripts.items():
             path = self.home / 'bin' / name
             path.write_text(body)
@@ -1420,16 +1795,11 @@ sys.exit(7)
                                          f'without a final line; see {runner.with_suffix(".log")}\n')
                     self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
 
-    def test_runner_llm_opt_in(self):
+    def test_runner_llm_flag_removed(self):
         runner = self.runner_fixture()
-        self.raw_task('runner-start', 'proj', str(runner), '--llm')
-        args = json.loads((self.home / 'service-args').read_text())
-        subprocess.run(args[args.index(sys.executable):], cwd=self.repo, env=self.env,
-                       check=False, capture_output=True)
-        call = json.loads((runner.parent / 'runner-call').read_text())
-        self.assertEqual(call['args'], ['exec', '--dangerously-bypass-approvals-and-sandbox',
-                                        '-m', 'gpt-6-luna', '-'])
-        self.assertEqual(call['prompt'], runner.read_text())
+        out = self.raw_task('runner-start', 'proj', str(runner), '--llm', code=2)
+        self.assertIn('unrecognized arguments: --llm', out)
+        self.assertFalse((self.home / 'service-args').exists())
 
     def test_runner_fallback_survives_callers_group_and_cancel(self):
         runner = self.runner_fixture('setsid')
@@ -1800,6 +2170,16 @@ store.write_text(json.dumps(prs))
                             else:
                                 self.assertNotIn('ended by usage limit', out)
 
+    def test_status_shows_bwrap_denial_once_as_known_warning(self):
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'lane.json').write_text(json.dumps(dict(builder='codex', state='finished', exit_code=0)))
+        for final, shown in (('BLOCKED: `task check` — bwrap NETLINK_ROUTE denied', 1),
+                             ('BLOCKED: git commit', 0)):
+            (work / 'final.md').write_text('Done.\n' + final + '\n')
+            out = self.raw_task('status', 'proj')
+            self.assertEqual(out.count('Known warning (setup #11)'), shown)
+
     def test_reliability_status_does_not_write_and_repair_does(self):
         import json
         self.started()
@@ -1829,6 +2209,7 @@ store.write_text(json.dumps(prs))
         shutil.rmtree(context)
         context.symlink_to(outside, target_is_directory=True)
         task = SimpleNamespace(path=wt, kb=self.kb, file=None)
+        self.enterContext(mock.patch.object(TASK_MODULE, 'HOME', self.home))
         TASK_MODULE.refresh_context(task)
         self.assertFalse(context.is_symlink())
         self.assertEqual((context / 'INTENT.md').read_text(), 'intent')
@@ -1860,7 +2241,7 @@ store.write_text(json.dumps(prs))
         self.git(self.kb, 'commit', '-qm', 'decisions')
         self.task('plan', 'proj', '--sign')
         wt, out = self.started()
-        self.assertIn("Context: .work/context/", out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
         context = wt / ".work/context"
         self.assertEqual((context / 'INTENT.md').read_bytes(), (self.kb / 'INTENT.md').read_bytes())
         self.assertEqual((context / "backlog/decisions" / decision.name).read_text(), "binding decision")
@@ -2615,12 +2996,16 @@ store.write_text(json.dumps(prs))
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY)
+        self.contract_text = "# Fake lane contract\n"
+        self.install_contract(".agents")
         for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID"):
             self.env.pop(marker, None)
         self.gate_dir = self.home / "shared-gate"
         self.gate_dir.mkdir()
         self.env["TASK_GATE_DIR"] = str(self.gate_dir)
-        self.origin = self.home / "origin.git"
+        self.lane_root = self.home / "task-lane"
+        self.env["TASK_LANE_TEMP_ROOT"] = str(self.lane_root)
+        self.origin =self.home / "origin.git"
         self.git(self.home, "init", "-q", "--bare", "-b", "main", str(self.origin))
         self.repo = self.home / "dev_workspace/proj"
         self.repo.mkdir(parents=True)
@@ -2673,6 +3058,30 @@ store.write_text(json.dumps(prs))
         self.assertEqual(result.returncode, code, result.stdout + result.stderr)
         return result.stdout + result.stderr
 
+    def install_contract(self, root, text=None):
+        path = self.home / root / "skills/slim-workflow/lane-contract.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.contract_text if text is None else text)
+
+    def test_start_copies_contract_by_source_order_and_lane_refreshes_it(self):
+        copy = self.repo / ".worktrees/t5/.work/context/lane-contract.md"
+        self.install_contract(".claude", "claude copy\n")
+        self.started()
+        self.assertEqual(copy.read_text(), self.contract_text, ".agents wins over .claude")
+        (self.home / ".agents/skills/slim-workflow/lane-contract.md").unlink()
+        self.install_contract(".claude", "claude copy\n")
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            TASK_MODULE.refresh_context(TASK_MODULE.Task(self.repo, "T-5"))
+        self.assertEqual(copy.read_text(), "claude copy\n", "refresh falls back to .claude and replaces the copy")
+        self.assertFalse(copy.stat().st_mode & 0o222)
+
+    def test_start_stops_without_an_installed_contract(self):
+        for root in (".agents", ".claude"):
+            (self.home / root / "skills/slim-workflow/lane-contract.md").unlink(missing_ok=True)
+        out = self.task("start", "proj", "T-5", "--builder", "codex", code=1)
+        self.assertIn("No lane contract", out)
+        self.assertFalse((self.repo / ".worktrees/t5").exists(), "stops before creating the worktree")
+
     def started(self):
         out = self.task("start", "proj", "T-5", "--builder", "codex")
         wt = self.repo / ".worktrees/t5"
@@ -2686,8 +3095,7 @@ store.write_text(json.dumps(prs))
         """Simulate the sandbox's private-state mount, independently of vendor markers."""
         state = self.home / ".local/state/task"
         state.mkdir(parents=True, exist_ok=True)
-        state.chmod(0o555)
-        self.addCleanup(state.chmod, 0o755)
+        make_read_only(self, state, 0o555)
         return state
 
     def stub_models(self):
@@ -2748,10 +3156,14 @@ store.write_text(json.dumps(prs))
         self.raw_task("check", "proj", "5")
         return wt
 
-    def commit_in(self, wt, name, text="x\n"):
+    def commit_in(self, wt, name, text="x\n", when=None):
+        """Commit a file. Pass `when` for a commit that must precede a later sign-off: the host
+        wall clock steps back by seconds, so a commit made "now" can end up dated after it."""
         (wt / name).write_text(text)
         self.git(wt, "add", name)
-        self.git(wt, "commit", "-qm", f"add {name}")
+        stamp = {} if when is None else {"GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+        subprocess.run(["git", "-C", str(wt), "commit", "-qm", f"add {name}"],
+                       env=dict(self.env, **stamp), check=True, capture_output=True)
 
     def start_slow_detached_gate(self):
         wt, _ = self.started()
@@ -2774,6 +3186,316 @@ store.write_text(json.dumps(prs))
     def work_archives(self):
         return self.home / ".local/state/task/archive/proj/t5"
 
+    def archive_fixture(self, root):
+        root.mkdir(parents=True, exist_ok=True)
+        payloads = {'house.sqlite': b'database', 'house.sqlite-wal': b'wal',
+                    'other.sqlite3': b'db', 'other.db': b'db', 'other.duckdb': b'db',
+                    'house.sqlite-shm': b'shm', 'house.sqlite-journal': b'journal',
+                    'innocent.txt': b'SQLite format 3\0payload', 'module.pyc': b'cache',
+                    'report.md': b'report', 'check.json': b'{}', 'review.txt': b'review'}
+        for name, content in payloads.items():
+            (root / name).write_bytes(content)
+        for name, size in [('check-report.json', '51M'), ('keep.log', '49M')]:
+            subprocess.run(['truncate', '-s', size, str(root / name)], check=True)
+        (root / '.pycache').mkdir()
+        (root / '.pycache/source.py').write_text('cache')
+        outside = self.home / 'outside.sqlite'
+        outside.write_bytes(b'SQLite format 3\0outside')
+        (root / 'linked.db').symlink_to(outside)
+        (root / 'linked-dir').symlink_to(self.home, target_is_directory=True)
+        return payloads, outside
+
+    def assert_archive_skips(self, skipped, payloads, prefix=''):
+        import hashlib
+        for name in ('house.sqlite', 'house.sqlite-wal', 'other.sqlite3', 'other.db',
+                     'other.duckdb', 'house.sqlite-shm', 'house.sqlite-journal', 'innocent.txt'):
+            entry = skipped[prefix + name]
+            self.assertEqual(entry['size'], len(payloads[name]))
+            self.assertEqual(entry['sha256'], hashlib.sha256(payloads[name]).hexdigest())
+            self.assertEqual(entry['reason'], 'database')
+        big = skipped[prefix + 'check-report.json']
+        self.assertEqual(big['size'], 51 * 1024 ** 2)
+        digest = hashlib.sha256()
+        for _ in range(51):
+            digest.update(bytes(1024 ** 2))
+        self.assertEqual(big['sha256'], digest.hexdigest())
+        self.assertEqual(big['reason'], 'file over 50 MB')
+        for name in ('.pycache', 'module.pyc'):
+            self.assertEqual(skipped[prefix + name]['reason'], 'cache/runtime')
+            self.assertNotIn('sha256', skipped[prefix + name])
+
+    def test_archive_exclusions_shared_with_ignored_files(self):
+        import runpy
+        wt, _ = self.started()
+        payloads, outside = self.archive_fixture(wt / '.work/fixture')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
+        manifest = next(self.work_archives().glob('*/manifest.json'))
+        skipped = {row['path']: row for row in json.loads(manifest.read_text())['skipped']}
+        self.assert_archive_skips(skipped, payloads, 'fixture/')
+        saved = manifest.parent / '.work/fixture'
+        for name in ('keep.log', 'report.md', 'check.json', 'review.txt'):
+            self.assertTrue((saved / name).is_file())
+        self.assertTrue((saved / 'linked.db').is_symlink())
+        self.assertTrue((saved / 'linked-dir').is_symlink())
+        self.assertTrue(outside.exists())
+        self.assertTrue((wt / '.work/fixture/house.sqlite').exists())
+        # Exercise tidy's real ignored-file entry point with the same payloads.
+        tool = ROOT / 'home/dot_local/bin/executable_workspace-tidy'
+        with mock.patch.dict(os.environ, HOME=str(self.home)):
+            tidy = runpy.run_path(str(tool), run_name='archive_test')
+            files = [item.relative_to(wt / '.work/fixture')
+                     for item in (wt / '.work/fixture').iterdir() if item.name != '.pycache']
+            files.append(Path('.pycache/source.py'))
+            destination = tidy['archive_ignored'](self.repo, wt / '.work/fixture', files, [])
+        record = json.loads((destination / 'manifest.json').read_text())
+        self.assert_archive_skips({row['path']: row for row in record['skipped']}, payloads)
+        self.assertTrue((destination / 'ignored/keep.log').exists())
+        self.assertFalse((destination / 'ignored/house.sqlite').exists())
+
+    def test_archive_ignored_manifest_collisions(self):
+        import runpy
+        source = self.home / 'ignored-source'
+        source.mkdir()
+        outside = self.home / 'outside.txt'
+        outside.write_text('untouched')
+        (source / 'manifest.json').write_text('original ignored manifest')
+        (source / 'manifest.json.tmp').symlink_to(outside)
+        with mock.patch.dict(os.environ, HOME=str(self.home)):
+            tidy = runpy.run_path(str(ROOT / 'home/dot_local/bin/executable_workspace-tidy'),
+                                  run_name='archive_test')
+            destination = tidy['archive_ignored'](self.repo, source,
+                [Path('manifest.json'), Path('manifest.json.tmp')], [])
+        self.assertIsNotNone(destination)
+        self.assertEqual(outside.read_text(), 'untouched')
+        self.assertEqual((destination / 'ignored/manifest.json').read_text(),
+                         'original ignored manifest')
+        self.assertTrue((destination / 'ignored/manifest.json.tmp').is_symlink())
+        self.assertEqual(json.loads((destination / 'manifest.json').read_text()), {'skipped': []})
+
+    def test_archive_prune_keeps_unreadable_and_malformed_snapshots(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = root / 'proj/t5/good'
+        snapshot.mkdir(parents=True)
+        report_file = snapshot / 'report.md'
+        report_file.write_text('keep')
+        make_read_only(self, report_file, 0)
+        for name, record in [('array', []), ('scalar', 1), ('bad-pruned', {'pruned': {}})]:
+            bad = snapshot.with_name(name)
+            bad.mkdir()
+            (bad / 'manifest.json').write_text(json.dumps(record))
+            (bad / 'copy.db').write_text('keep in invalid snapshot')
+        report = []
+        TASK_MODULE.prune_evidence_archive(root, True, report)
+        self.assertTrue(report_file.exists())
+        self.assertTrue(any('kept' in line and 'report.md' in line for line in report))
+        for name in ('array', 'scalar', 'bad-pruned'):
+            self.assertTrue((snapshot.with_name(name) / 'copy.db').exists())
+            self.assertTrue(any('cannot prune' in line and name in line for line in report))
+
+    def test_archive_unreadable_ordinary_capture_keeps_worktree(self):
+        import runpy
+        wt, _ = self.started()
+        file = wt / '.work/report.md'
+        file.write_text('keep')
+        make_read_only(self, file, 0)
+        report = []
+        with mock.patch.dict(os.environ, HOME=str(self.home)):
+            tidy = runpy.run_path(str(ROOT / 'home/dot_local/bin/executable_workspace-tidy'),
+                                  run_name='archive_test')
+            self.assertFalse(tidy['archive_work'](self.repo, wt, report))
+            self.assertIsNone(tidy['archive_ignored'](self.repo, wt,
+                                                    [Path('.work/report.md')], report))
+        self.assertTrue(wt.exists())
+        self.assertTrue(file.exists())
+        self.assertTrue(any('kept' in line and 'cannot archive' in line for line in report))
+
+    def test_archive_task_prune_uses_shared_big_evidence_rule(self):
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        (snapshot / 'manifest.json').write_text('{}')
+        big = snapshot / 'check.log'
+        subprocess.run(['truncate', '-s', '51M', str(big)], check=True)
+        (snapshot / 'report.md').write_text('keep')
+        outside = self.home / 'outside-manifest'
+        outside.write_text('untouched')
+        (snapshot / 'manifest.json.tmp').symlink_to(outside)
+        for name, record in [('array', []), ('bad-pruned', {'pruned': {}})]:
+            bad = self.work_archives() / name
+            bad.mkdir()
+            (bad / 'manifest.json').write_text(json.dumps(record))
+            (bad / 'copy.db').write_bytes(b'db')
+        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
+        self.assertIn(str(big), out)
+        self.assertTrue(big.exists())
+        out = self.raw_task('repair', '--prune-archive', 'proj')
+        self.assertFalse(big.exists())
+        self.assertEqual((snapshot / 'report.md').read_text(), 'keep')
+        self.assertEqual(outside.read_text(), 'untouched')
+        row, = json.loads((snapshot / 'manifest.json').read_text())['pruned']
+        self.assertEqual(row['path'], 'check.log')
+        self.assertEqual(row['size'], 51 * 1024 ** 2)
+        digest = hashlib.sha256()
+        for _ in range(51):
+            digest.update(bytes(1024 ** 2))
+        self.assertEqual(row['sha256'], digest.hexdigest())
+        self.assertEqual(row['reason'], 'file over 50 MB')
+        self.assertIsNotNone(__import__('datetime').datetime.fromisoformat(row['date']))
+        for name in ('array', 'bad-pruned'):
+            self.assertTrue((self.work_archives() / name / 'copy.db').exists())
+            self.assertIn('cannot prune ' + str(self.work_archives() / name), out)
+
+    def test_archive_dry_runs_do_not_hash_and_tidy_skips_pending(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        (snapshot / 'manifest.json').write_text('{}')
+        (snapshot / 'copy.db').write_bytes(b'db')
+        subprocess.run(['truncate', '-s', '51M', str(snapshot / 'check.log')], check=True)
+        pending = self.work_archives() / '.pending-active'
+        pending.mkdir()
+        (pending / 'copy.db').write_bytes(b'db')
+        report = []
+        with mock.patch.object(TASK_MODULE.hashlib, 'sha256', side_effect=AssertionError('dry-run hash')), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.prune_evidence_archive(root, False, report)
+            TASK_MODULE.prune_archive(self.repo, dry_run=True)
+        self.assertTrue(any('database' in line and 'copy.db' in line for line in report))
+        TASK_MODULE.prune_evidence_archive(root, True, [])
+        self.assertEqual((pending / 'copy.db').read_bytes(), b'db')
+        self.assertFalse((snapshot / 'copy.db').exists())
+
+    def test_archive_prune_failed_unlink_is_not_recorded(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        manifest = snapshot / 'manifest.json'
+        manifest.write_text('{}')
+        database = snapshot / 'copy.db'
+        database.write_bytes(b'db')
+        unlink = Path.unlink
+        def fail_database(path, *args, **kwargs):
+            if path == database:
+                raise PermissionError('fixture unlink denied')
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', fail_database):
+            report = []
+            TASK_MODULE.prune_evidence_archive(root, True, report)
+            with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    TASK_MODULE.prune_archive(self.repo)
+                self.assertIn('fixture unlink denied', output.getvalue())
+        self.assertEqual(json.loads(manifest.read_text()), {})
+        self.assertTrue(database.exists())
+        self.assertTrue(any('fixture unlink denied' in line for line in report))
+
+    def test_archive_repair_records_first_removal_when_second_fails(self):
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        manifest = snapshot / 'manifest.json'
+        manifest.write_text('{}')
+        (snapshot / 'copy.db').write_bytes(b'db')
+        subprocess.run(['truncate', '-s', '51M', str(snapshot / 'check.log')], check=True)
+        unlink, attempted = Path.unlink, []
+        def fail_second(path, *args, **kwargs):
+            if path.parent == snapshot and path.name in ('copy.db', 'check.log'):
+                attempted.append(path)
+                if len(attempted) == 2:
+                    row, = json.loads(manifest.read_text())['pruned']
+                    self.assertEqual(row['path'], attempted[0].name)
+                    raise PermissionError('second removal denied')
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', fail_second), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            TASK_MODULE.prune_archive(self.repo)
+        self.assertEqual(len(attempted), 2)
+        self.assertFalse(attempted[0].exists())
+        self.assertTrue(attempted[1].exists())
+        row, = json.loads(manifest.read_text())['pruned']
+        self.assertEqual(row['path'], attempted[0].name)
+        self.assertEqual(set(row), {'path', 'size', 'sha256', 'reason', 'date'})
+        self.assertIn('second removal denied', output.getvalue())
+
+    def test_atomic_json_failure_removes_temporary_file(self):
+        directory = self.home / 'atomic-json'
+        directory.mkdir()
+        target = directory / 'manifest.json'
+        target.write_text('{}')
+        for operation in ('serialization', 'replace'):
+            with self.subTest(operation=operation):
+                patch = (mock.patch.object(TASK_MODULE.json, 'dumps', side_effect=ValueError('serialize'))
+                         if operation == 'serialization' else
+                         mock.patch.object(TASK_MODULE.os, 'replace', side_effect=OSError('replace')))
+                with patch, self.assertRaises((ValueError, OSError)):
+                    TASK_MODULE.atomic_json(target, {'new': True})
+                self.assertEqual(list(directory.iterdir()), [target])
+                self.assertEqual(target.read_text(), '{}')
+
+    def test_archive_prune_dry_run_apply_and_symlinks(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = root / 'proj/t5/snapshot'
+        payloads, outside = self.archive_fixture(snapshot / '.work')
+        (snapshot / '.work/empty-after').mkdir()
+        (snapshot / '.work/empty-after/copy.db').write_bytes(b'db')
+        manifest = snapshot / 'manifest.json'
+        manifest.write_text(json.dumps({'skipped': [{'path': 'old'}]}))
+        (snapshot / 'manifest.json.tmp').symlink_to(outside)
+        outside_content = outside.read_bytes()
+        # Old ignored-file archives have no manifest yet.
+        old = root / 'proj/t5/old-ignored'
+        old.mkdir()
+        (old / 'copy.db').write_bytes(b'db')
+        (root / 'linked').symlink_to(self.home, target_is_directory=True)
+        before = manifest.read_bytes()
+        report = []
+        tidy = ROOT / 'home/dot_local/bin/executable_workspace-tidy'
+        dry_run = subprocess.run([sys.executable, str(tidy)], env=self.env,
+                                 capture_output=True, text=True, check=True)
+        report = dry_run.stdout.splitlines()
+        self.assertEqual(manifest.read_bytes(), before)
+        self.assertTrue((snapshot / '.work/house.sqlite').exists())
+        self.assertTrue((old / 'copy.db').exists())
+        self.assertFalse((old / 'manifest.json').exists())
+        listed = {line.split('would remove ', 1)[1].rsplit(' (', 1)[0]
+                  for line in report if 'would remove ' in line and ' bytes)' in line}
+        subprocess.run([sys.executable, str(tidy), '--apply'], env=self.env,
+                       capture_output=True, text=True, check=True)
+        record = json.loads(manifest.read_text())
+        pruned = {row['path']: row for row in record['pruned']}
+        self.assert_archive_skips(pruned, payloads, '.work/')
+        self.assertEqual(record['skipped'], [{'path': 'old'}])
+        self.assertEqual(listed, {str(snapshot / row['path']) for row in record['pruned']} |
+                         {str(old / 'copy.db')})
+        for row in record['pruned']:
+            self.assertFalse((snapshot / row['path']).exists())
+            self.assertIsNotNone(__import__('datetime').datetime.fromisoformat(row['date']))
+        for name in ('keep.log', 'report.md', 'check.json', 'review.txt'):
+            self.assertTrue((snapshot / '.work' / name).exists())
+        self.assertFalse((snapshot / '.work/empty-after').exists())
+        total = sum(row['size'] for row in record['pruned']) + 2
+        self.assertTrue(any(f'{total} bytes total' in line for line in report))
+        self.assertTrue((snapshot / '.work/linked.db').is_symlink())
+        self.assertTrue(outside.exists())
+        self.assertEqual(outside.read_bytes(), outside_content)
+        TASK_MODULE.prune_evidence_archive(root, True, [])
+        self.assertEqual(json.loads(manifest.read_text()), record)
+
+    def test_archive_unreadable_file_records_null_hash(self):
+        wt, _ = self.started()
+        for name in ('check.db',):
+            file = wt / '.work' / name
+            file.write_bytes(b'db')
+            make_read_only(self, file, 0)
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.preserve_work(self.repo, 't5', wt)
+        manifest = next(self.work_archives().glob('*/manifest.json'))
+        for name in ('check.db',):
+            row = next(row for row in json.loads(manifest.read_text())['skipped'] if row['path'] == name)
+            self.assertIsNone(row['sha256'])
+            self.assertIn('error', row)
+            self.assertFalse((manifest.parent / '.work' / name).exists())
+
     def test_archive_runtime_failures_and_deep_tree(self):
         wt, _ = self.started()
         work = wt / '.work'
@@ -2782,11 +3504,9 @@ store.write_text(json.dumps(prs))
             (work / name / 'state').write_text('runtime')
         (work / 'outside').symlink_to(self.home)
         (work / 'unreadable').write_text('private')
-        (work / 'unreadable').chmod(0)
-        self.addCleanup(lambda: (work / 'unreadable').chmod(0o600) if work.exists() else None)
+        make_read_only(self, work / 'unreadable', 0)
         (work / 'locked').mkdir()
-        (work / 'locked').chmod(0)
-        self.addCleanup(lambda: (work / 'locked').chmod(0o700) if work.exists() else None)
+        make_read_only(self, work / 'locked', 0)
         os.mkfifo(work / 'pipe')
         deep = work / 'deep'
         for _ in range(400):
@@ -2914,8 +3634,7 @@ store.write_text(json.dumps(prs))
         gate = self.repo / '.worktrees/.task-gate-t5-99999999'
         (gate / 'locked').mkdir(parents=True)
         (gate / 'locked/file').write_text('held')
-        (gate / 'locked').chmod(0o500)
-        self.addCleanup(lambda: (gate / 'locked').chmod(0o700))
+        make_read_only(self, gate / 'locked', 0o500)
         failed = subprocess.CompletedProcess([], 1)
         warning = io.StringIO()
         with mock.patch.object(TASK_MODULE, 'run_git', return_value=failed), \
@@ -2940,8 +3659,7 @@ store.write_text(json.dumps(prs))
         locked = saved / '.work/large/locked'
         locked.mkdir()
         (locked / 'evidence.txt').write_text('keep inaccessible evidence')
-        locked.chmod(0)
-        self.addCleanup(lambda: locked.chmod(0o700))
+        make_read_only(self, locked, 0)
         pending = root / '.pending-old'
         pending.mkdir()
         (pending / 'partial').write_text('partial')
@@ -3103,9 +3821,9 @@ store.write_text(json.dumps(prs))
                 self.assertEqual((container / '.work' / name).read_text(), 'keep')
                 self.assertEqual((container / '.work/reports' / name).read_text(), 'keep report')
             record = json.loads((container / 'manifest.json').read_text())
-            self.assertTrue(any(line.startswith('pruned: .work/runtime/data ')
+            self.assertTrue(any(line['path'] == '.work/runtime/data'
                                 for line in record['pruned']))
-            self.assertTrue(any(line.startswith('pruned: .work/t8venv ')
+            self.assertTrue(any(line['path'] == '.work/t8venv'
                                 for line in record['pruned']))
         self.assertEqual(json.loads((finished / 'manifest.json').read_text())['head'], 'original')
         manifest = (finished / 'manifest.json').read_bytes()
@@ -3304,22 +4022,109 @@ store.write_text(json.dumps(prs))
         self.assertIn("`task lane proj T-5`", out)
         self.assertIn(str(wt / ".work/prompt.md"), out)
         self.assertIn("t-5 - Add-the-b-file.md", out)
-        commit_at = out.index("Commit on the branch")
-        check_at = out.index("then run `task check`", commit_at)
-        report_at = out.index("in `.work/report.md`", check_at)
-        later_commit_at = out.index("any later commit needs a new check", report_at)
-        self.assertLess(commit_at, check_at)
-        self.assertLess(check_at, report_at)
-        self.assertLess(report_at, later_commit_at)
-        for line in ("three lines: `changed: ...`, `verified: ...`, and `not done: ...`",
-                     "followed by `report written`", "for advisory feedback",
-                     "runs the trusted gate", "A PM may run `task check --detach`",
-                     "PM can use `task merge --detach`"):
-            self.assertIn(line, out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
+        self.assertIn("Acceptance criteria:\n- [ ] #1 b exists\n- [ ] #2 checks pass\n", out)
+        self.assertIn("Verify:\nVerify: `true`\n", out)
+        self.assertEqual((wt / ".work/dispatch.md").read_text(), out.split("Dispatch prompt:\n\n", 1)[1])
+        for rule in ("Commit on the branch", "advisory feedback", "three lines", "task merge --detach",
+                     "apply_patch", "heredocs"):
+            self.assertNotIn(rule, out)
+        self.assertEqual((wt / ".work/context/lane-contract.md").read_text(), self.contract_text)
         self.assertEqual(self.git(self.repo, "status", "--porcelain"), "", "worktrees stay out of status")
         again = self.task("start", "proj", "5", "--builder", "codex")
         self.assertNotIn("Created", again, "starting twice reuses the worktree")
         self.task("start", "proj", "T-9", "--builder", "codex", code=1)  # no such task
+
+    def test_status_lists_idle_unmerged_worktrees_and_never_removes_them(self):
+        old = int(time.time()) - IDLE_TEN_DAYS
+        stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
+        for name, idle in (('stale', True), ('recent', False)):
+            path = self.repo / '.worktrees' / name
+            self.git(self.repo, 'worktree', 'add', '-q', '-b', name, str(path))
+            (path / f'{name}.txt').write_text(name)
+            self.git(path, 'add', f'{name}.txt')
+            subprocess.run(['git', '-C', str(path), 'commit', '-qm', name], check=True,
+                           env=dict(self.env, **(stamp if idle else {})), capture_output=True)
+            if idle:
+                gitdir = Path(self.git(path, 'rev-parse', '--absolute-git-dir'))
+                for marker in (path / '.git', gitdir / 'logs/HEAD'):
+                    os.utime(marker, (old, old))
+        merged = self.repo / '.worktrees/merged'
+        self.git(self.repo, 'worktree', 'add', '-q', '-b', 'merged', str(merged))
+        for marker in (merged / '.git', Path(self.git(merged, 'rev-parse', '--absolute-git-dir')) / 'logs/HEAD'):
+            os.utime(marker, (old, old))
+        for args in ((), ('proj',)):
+            attention = self.raw_task('status', *args).split('Needs attention:', 1)[1]
+            self.assertIn(f"idle worktree: proj {self.repo / '.worktrees/stale'} (branch stale, idle 10 days, "
+                          "unmerged): finish, adopt or delete", attention)
+            self.assertNotIn('recent', attention)
+            self.assertNotIn('.worktrees/merged', attention)
+        for name in ('stale', 'recent', 'merged'):
+            self.assertTrue((self.repo / '.worktrees' / name).is_dir())
+
+    def test_status_lists_locked_idle_unmerged_worktrees_with_the_lock_reason(self):
+        old = int(time.time()) - IDLE_TEN_DAYS
+        stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
+        for name, reason in (('held', ['--reason', 'session 42 running']), ('bare', [])):
+            path = self.repo / '.worktrees' / name
+            self.git(self.repo, 'worktree', 'add', '-q', '-b', name, str(path))
+            (path / f'{name}.txt').write_text(name)
+            self.git(path, 'add', f'{name}.txt')
+            subprocess.run(['git', '-C', str(path), 'commit', '-qm', name], check=True,
+                           env=dict(self.env, **stamp), capture_output=True)
+            for marker in (path / '.git', Path(self.git(path, 'rev-parse', '--absolute-git-dir')) / 'logs/HEAD'):
+                os.utime(marker, (old, old))
+            self.git(self.repo, 'worktree', 'lock', *reason, str(path))
+        for args in ((), ('proj',)):
+            attention = self.raw_task('status', *args).split('Needs attention:', 1)[1]
+            self.assertIn(f"idle worktree: proj {self.repo / '.worktrees/held'} (branch held, idle 10 days, "
+                          "unmerged, locked: session 42 running): finish, adopt or delete", attention)
+            self.assertIn(f"idle worktree: proj {self.repo / '.worktrees/bare'} (branch bare, idle 10 days, "
+                          "unmerged, locked): finish, adopt or delete", attention)
+        for name in ('held', 'bare'):
+            self.assertTrue((self.repo / '.worktrees' / name).is_dir())
+
+    def test_status_lists_idle_unmerged_codex_worktrees(self):
+        old = int(time.time()) - IDLE_TEN_DAYS
+        stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
+        codex = self.home / '.codex/worktrees/ab12/proj'
+        recent = self.home / '.codex/worktrees/cd34/proj'
+        for path, branch, idle in ((codex, 'codex-idle', True), (recent, 'codex-recent', False)):
+            self.git(self.repo, 'worktree', 'add', '-q', '-b', branch, str(path))
+            (path / f'{branch}.txt').write_text(branch)
+            self.git(path, 'add', f'{branch}.txt')
+            subprocess.run(['git', '-C', str(path), 'commit', '-qm', branch], check=True,
+                           env=dict(self.env, **(stamp if idle else {})), capture_output=True)
+            if idle:
+                for marker in (path / '.git', Path(self.git(path, 'rev-parse', '--absolute-git-dir')) / 'logs/HEAD'):
+                    os.utime(marker, (old, old))
+        for args in ((), ('proj',)):
+            attention = self.raw_task('status', *args).split('Needs attention:', 1)[1]
+            self.assertIn(f"idle worktree: proj {codex} (branch codex-idle, idle 10 days, "
+                          "unmerged): finish, adopt or delete", attention)
+            self.assertNotIn('codex-recent', attention)
+        self.assertTrue(codex.is_dir() and recent.is_dir())
+
+    def test_status_lists_idle_unmerged_worktrees_outside_the_managed_folders(self):
+        old = int(time.time()) - IDLE_TEN_DAYS
+        stamp = {'GIT_AUTHOR_DATE': f'@{old} +0000', 'GIT_COMMITTER_DATE': f'@{old} +0000'}
+        elsewhere = self.home / 'elsewhere/lane'
+        recent = self.home / 'elsewhere/recent'
+        for path, branch, idle in ((elsewhere, 'elsewhere-idle', True), (recent, 'elsewhere-recent', False)):
+            self.git(self.repo, 'worktree', 'add', '-q', '-b', branch, str(path))
+            (path / f'{branch}.txt').write_text(branch)
+            self.git(path, 'add', f'{branch}.txt')
+            subprocess.run(['git', '-C', str(path), 'commit', '-qm', branch], check=True,
+                           env=dict(self.env, **(stamp if idle else {})), capture_output=True)
+            if idle:
+                for marker in (path / '.git', Path(self.git(path, 'rev-parse', '--absolute-git-dir')) / 'logs/HEAD'):
+                    os.utime(marker, (old, old))
+        for args in ((), ('proj',)):
+            attention = self.raw_task('status', *args).split('Needs attention:', 1)[1]
+            self.assertIn(f"idle worktree: proj {elsewhere} (branch elsewhere-idle, idle 10 days, "
+                          "unmerged): finish, adopt or delete", attention)
+            self.assertNotIn('elsewhere-recent', attention)
+        self.assertTrue(elsewhere.is_dir() and recent.is_dir())
 
     def test_setup_requests_are_pm_intake_and_status_attention(self):
         out = self.raw_task("note", "proj", "5", "setup", "Please configure the new provider")
@@ -3377,10 +4182,7 @@ store.write_text(json.dumps(prs))
         out = self.raw_task("review", "proj", "5")
         prompt = (self.state() / "review-prompt.md").read_text()
         self.assertIn(f"Outcome: {expected}", prompt)
-        self.assertIn(
-            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
-            "or the change breaks something that worked.", prompt)
-        self.assertIn("Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.", prompt)
+        self.assertIn(f"Mandatory read: {self.repo / '.worktrees/t5/.work/context/lane-contract.md'}.", prompt)
         self.assertNotIn(">-", prompt)
 
     def test_frontmatter_title_reads_quoted_folded_and_literal_scalars(self):
@@ -3466,19 +4268,62 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         state = self.state()
-        state.chmod(0o555)
-        try:
-            out = self.raw_task("check", "proj", "5")
-            self.assertIn("advisory lane check (not evidence for merge)", out)
-            self.assertIn("PASS", out)
-            evidence = __import__("json").loads((wt / ".work/check.json").read_text())
-            self.assertEqual(evidence["result"], "passed")
-            self.assertTrue(evidence["advisory"])
-            self.assertFalse(evidence["trusted"])
-            self.assertTrue((wt / ".work/check.log").is_file())
-            self.assertFalse((state / "check.json").exists())
-        finally:
-            state.chmod(0o755)
+        make_read_only(self, state, 0o555)
+        out = self.raw_task("check", "proj", "5")
+        self.assertIn("advisory lane check (not evidence for merge)", out)
+        self.assertIn("PASS", out)
+        evidence = __import__("json").loads((wt / ".work/check.json").read_text())
+        self.assertEqual(evidence["result"], "passed")
+        self.assertTrue(evidence["advisory"])
+        self.assertFalse(evidence["trusted"])
+        self.assertTrue((wt / ".work/check.log").is_file())
+        self.assertFalse((state / "check.json").exists())
+
+    def test_read_only_fixtures_leave_the_lane_tmp_removable(self):
+        lane_tmp = self.home / 'lane/.work/tmp'
+
+        def lock_tree(case, *, restore):
+            fixture = lane_tmp / case.id().rsplit('.', 1)[-1]
+            (fixture / 'inner').mkdir(parents=True)
+            (fixture / 'inner/file').write_text('held')
+            (fixture / 'private').write_text('private')
+            for path, mode in ((fixture / 'private', 0), (fixture / 'inner', 0), (fixture, 0o555)):
+                if restore:
+                    make_read_only(case, path, mode)
+                else:
+                    path.chmod(mode)
+
+        class Restored(unittest.TestCase):
+            def test_failing(self):
+                lock_tree(self, restore=True)
+                self.fail('leaves every path locked')
+
+            def test_erroring(self):
+                lock_tree(self, restore=True)
+                raise RuntimeError('leaves every path locked')
+
+        class Unrestored(unittest.TestCase):
+            def test_failing(self):
+                lock_tree(self, restore=False)
+                self.fail('leaves every path locked')
+
+        def run(case):
+            suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
+            return unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+
+        result = run(Restored)
+        self.assertEqual((len(result.failures), len(result.errors)), (1, 1))
+        shutil.rmtree(lane_tmp)  # no chmod first: the fixtures must have restored access
+        self.assertFalse(lane_tmp.exists())
+        if os.geteuid():  # control: without the restore the same tree blocks removal
+            lane_tmp.mkdir(parents=True)
+            run(Unrestored)
+            with self.assertRaises(PermissionError):
+                shutil.rmtree(lane_tmp)
+            locked = lane_tmp / 'test_failing'
+            for path in (locked, locked / 'inner', locked / 'private'):
+                restore_access(path)
+            shutil.rmtree(lane_tmp)
 
     def test_agent_advisory_check_returns_real_failure_code(self):
         wt, _ = self.started()
@@ -3607,6 +4452,66 @@ store.write_text(json.dumps(prs))
             for expansion in ("$NO_PROXY", "${NO_PROXY", "$no_proxy", "${no_proxy"):
                 self.assertNotIn(expansion, source,
                                  f"{path.relative_to(ROOT)} must not expand unset {expansion}")
+
+    def test_advisory_check_tmpdir_is_outside_the_checkout(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (wt / ".work/tmp").mkdir(parents=True, exist_ok=True)
+        outside = self.home / "lane-tmp"
+        outside.mkdir()
+        guard = f'case "$(realpath "$TMPDIR")" in "{wt.resolve()}"*) exit 1;; esac; test -d "$TMPDIR"'
+        (self.home / "during-check.sh").write_text(f'{guard} || exit 7\necho "$TMPDIR" >> "$HOME/gate-tmp"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        task_record_path = self.state() / "task.json"
+        record = json.loads(task_record_path.read_text())
+        record["verify"] = [f'{guard} && echo "$TMPDIR" >> "$HOME/verify-tmp"']
+        record["revision"] = TASK_MODULE.record_revision(record)
+        task_record_path.write_text(json.dumps(record))
+        self.sandbox_state()
+        shared = self.home / f"task-gate-{os.getuid()}"
+        shared.mkdir()
+        lane_dir = self.lane_root / "proj-t5"
+        lane_json = wt / ".work/lane.json"
+        # Per case: the lane record, the inherited TMPDIR, the expected parent, whether the record gains the path.
+        cases = {
+            "recorded directory": ({"state": "running", "temporary": str(outside)}, wt / ".work/tmp", outside, False),
+            "no record, shared gate TMPDIR": (None, shared, lane_dir, False),
+            "record inside the checkout, TMPDIR inside the checkout": (
+                {"state": "running", "temporary": str(wt / ".work/tmp")}, wt / ".work/tmp", lane_dir, True),
+            "record names a vanished directory": (
+                {"state": "running", "temporary": str(self.home / "gone")}, shared, lane_dir, True),
+        }
+        for matrix in (False, True):
+            if matrix:
+                (wt / ".task.toml").write_text('[[gate_variant]]\nname = "one"\n[[gate_variant]]\nname = "two"\n')
+                self.git(wt, "add", ".task.toml")
+                self.git(wt, "commit", "-qm", "gate variants")
+            for label, (lane_record, inherited, expected, recorded) in cases.items():
+                with self.subTest(matrix=matrix, case=label):
+                    for name in ("gate", "verify"):
+                        (self.home / f"{name}-tmp").unlink(missing_ok=True)
+                    shutil.rmtree(lane_dir, ignore_errors=True)
+                    lane_json.unlink(missing_ok=True)
+                    if lane_record:
+                        lane_json.write_text(json.dumps(lane_record))
+                    out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1", TMPDIR=str(inherited)))
+                    self.assertIn("PASS", out)
+                    for name in ("gate", "verify"):
+                        lines = (self.home / f"{name}-tmp").read_text().splitlines()
+                        self.assertEqual(len(lines), 2 if matrix else 1)
+                        for line in lines:
+                            seen = Path(line)
+                            self.assertEqual(seen.parent, expected)
+                            self.assertNotEqual(seen.parent, inherited, "the inherited TMPDIR is never the parent")
+                            self.assertFalse(seen.exists(), "the advisory check TMPDIR is removed afterwards")
+                    if recorded:
+                        self.assertEqual(json.loads(lane_json.read_text())["temporary"], str(lane_dir))
+                        self.assertEqual(stat.S_IMODE(lane_dir.stat().st_mode), 0o700)
+                    self.assertEqual(lane_dir.exists(), expected == lane_dir)
+        with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
+            lane_json.unlink(missing_ok=True)
+            self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(lane_dir))
+            self.assertFalse(lane_json.exists(), "no lane record is invented for a check outside a lane")
 
     def test_check_steps_append_localhost_proxy_bypasses(self):
         wt, _ = self.started()
@@ -3774,6 +4679,11 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call["tmpdir"], str(wt / ".work/tmp"))
             self.assertEqual(call["task_worktree"], str(wt))
             self.assertTrue(Path(call["tmpdir"]).is_dir())
+            recorded = Path(json.loads((wt / ".work/lane.json").read_text())["temporary"])
+            self.assertEqual(recorded, self.lane_root / "proj-t5")
+            self.assertTrue(recorded.is_dir())
+            with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
+                self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
             self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
                                             "--output-last-message", str(wt / ".work/final.md"), "-"])
@@ -3790,6 +4700,7 @@ store.write_text(json.dumps(prs))
             release.touch()
             record = self.wait_for_lane(wt)
         self.assertEqual(record["exit_code"], 0)
+        self.assertFalse(recorded.exists(), "the Codex lane's recorded temporary directory is removed")
         self.assertEqual((wt / ".work/final.md").read_text(), "codex-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt)
         self.assertIn("codex-log", (wt / ".work/lane.log").read_text())
         self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))
@@ -3929,7 +4840,7 @@ store.write_text(json.dumps(prs))
         self.assertIn(str(log), status)
         self.assertIn(evidence["log"], status)
 
-    def test_batch_tail_uses_actual_check_log(self):
+    def test_batch_tail_uses_trusted_check_log_only(self):
         loader = importlib.machinery.SourceFileLoader(
             "batch_log_test", str(ROOT / "home/dot_local/bin/executable_task-batch"))
         spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -3943,13 +4854,13 @@ store.write_text(json.dumps(prs))
             self.assertFalse(TASK_MODULE.run_check(wt, "", state=self.state()))
             evidence = json.loads((self.state() / "check.json").read_text())
             self.assertTrue(evidence["trusted"])
-            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
+            self.assertEqual(batch.check_output(self.state()),
                              Path(evidence["log"]).read_text())
-            self.assertNotEqual(batch.check_output(self.state(), wt / ".work"), advisory)
+            self.assertNotEqual(batch.check_output(self.state()), advisory)
             (wt / "FAIL").unlink()
             self.assertTrue(TASK_MODULE.run_check(wt, "", advisory=True))
-            self.assertEqual(batch.check_output(self.state(), wt / ".work"),
-                             (wt / ".work/check.log").read_text())
+            # A newer advisory run never replaces the trusted result in a fix prompt (PM 2026-10-21).
+            self.assertEqual(batch.check_output(self.state()), Path(evidence["log"]).read_text())
 
     def test_repair_published_preserves_trusted_check_log(self):
         wt, _ = self.started()
@@ -3979,7 +4890,8 @@ store.write_text(json.dumps(prs))
         self.raw_task("lane", "proj", "5", "--builder", "claude")
         record = self.wait_for_lane(wt)
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
-        self.assertEqual(call["args"], ["-p", "--model", "sonnet", "--effort", "high",
+        self.assertEqual(call["args"], ["-p", "--output-format", "stream-json", "--verbose",
+                                       "--model", "sonnet", "--effort", "high",
                                        "--permission-mode", "acceptEdits", "--allowedTools",
                                        "Bash Read Write Edit Glob Grep",
                                        "--settings", str(wt / ".work/claude-settings.json")])
@@ -4029,11 +4941,237 @@ store.write_text(json.dumps(prs))
         self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
         self.assertEqual(record["exit_code"], 3)
         self.assertEqual(record["model"], "sonnet")
-        self.assertEqual((wt / ".work/final.md").read_text(), "claude-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt)
+        self.assertEqual((wt / ".work/final.md").read_text(), "claude-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt + "\n")
+        events = [json.loads(line) for line in (wt / ".work/lane.jsonl").read_text().splitlines()]
+        self.assertEqual([event["type"] for event in events], ["rate_limit_event", "result"])
+        self.assertEqual(json.loads((self.home / ".local/state/task/usage/claude.json").read_text())["seven_day"]["utilization"], 0.4)
         log = (wt / ".work/lane.log").read_text()
         self.assertIn("claude-log", log)
         self.assertIn("claude-final", log)
         self.assertIn("lane: finished (exit 3)", self.raw_task("status", "proj"))
+
+    def readings(self, claude=None, codex=None):
+        """Fixture usage readings in the temporary HOME: (weekly used %, hours until the weekly reset)."""
+        now = datetime.now(timezone.utc)
+        if claude:
+            event = {"rate_limit_info": {"unifiedWindows": {"seven_day": {
+                "utilization": claude[0] / 100, "resetsAt": int(now.timestamp() + claude[1] * 3600)}}}}
+            TASK_MODULE.task_usage.record_claude(self.home, event, now)
+        if codex:
+            limits = {"primary": {"used_percent": codex[0], "window_minutes": 10080,
+                                  "resets_at": int(now.timestamp() + codex[1] * 3600)}}
+            path = self.home / ".codex/sessions/2026/10/20/rollout-fixture.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"timestamp": now.isoformat(), "payload": {"rate_limits": limits}}) + "\n")
+
+    def pace_lane(self, *options, code=0, builder="claude", recorded=()):
+        self.stub_models()
+        self.raw_task("start", "proj", "5", "--builder", builder, *recorded)
+        wt = self.repo / ".worktrees/t5"
+        (wt / ".work/prompt.md").write_text("Approved task.\n")
+        out = self.raw_task("lane", "proj", "5", *options, code=code)
+        return wt, out
+
+    def pace_log(self):
+        path = self.home / ".local/state/task/usage/pace.log"
+        return path.read_text() if path.exists() else ""
+
+    def test_usage_command_prints_both_vendors_and_the_weekly_line(self):
+        out = self.raw_task("usage")
+        self.assertIn("claude: unknown (no rate_limit_event recorded yet", out)
+        self.assertIn("codex: unknown (no rollout file under", out)
+        self.readings(claude=(50, 84), codex=(40, 84))
+        out = self.raw_task("usage")
+        for expected in ("claude: weekly used 50 %, 5-hour used n/a", "Europe/Copenhagen", "week elapsed 50 %",
+                         "pace: on", "codex: weekly used 40 %", SPARE_HELD):
+            self.assertIn(expected, out)
+        lines = self.raw_task("usage", "--weekly-line").splitlines()
+        self.assertRegex(lines[0], r"^claude week ending \d{4}-\d\d-\d\d: used 50 %, exhausted no, lanes held back 0$")
+        self.assertRegex(lines[1], r"^codex week ending \d{4}-\d\d-\d\d: used 40 %, exhausted no, lanes held back 0$")
+
+    def test_usage_policy_file_override_changes_the_verdict(self):
+        self.readings(claude=(60, 84))
+        self.assertIn("pace: on", self.raw_task("usage"))  # 60 % used, 50 % of the week gone, margin 10
+        policy = self.home / "policy.toml"
+        policy.write_text("ahead_margin = 5\n[reserve]\nclaude = 50\n")
+        (self.home / ".config/task").mkdir(parents=True)
+        (self.home / ".config/task/usage-policy-path").write_text(str(policy))
+        out = self.raw_task("usage")
+        self.assertIn("pace: exhausted-automated-share", out)
+        self.assertIn("reserve 50 %", out)
+
+    def test_pace_lane_with_an_unknown_reading_warns_and_changes_nothing(self):
+        wt, out = self.pace_lane()  # nothing recorded: unchanged behaviour plus a warning
+        self.assertIn("pace warning: claude usage unknown", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+
+    def test_pace_lane_ahead_uses_the_cheaper_model_and_holds_non_priority_repos(self):
+        self.readings(claude=(70, 84))
+        wt, out = self.pace_lane()
+        self.assertIn("route: routine -> claude haiku", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "haiku")
+        self.readings(claude=(70, 84))  # the Claude stub's own event replaced the reading
+        priority = self.home / ".local/state/task/madplanner-v2/t1"
+        priority.mkdir(parents=True)
+        (priority / "task.json").write_text("{}")
+        (wt / ".work/lane.json").unlink()
+        out = self.raw_task("lane", "proj", "5", code=4)
+        self.assertIn("held back by usage pacing: claude is ahead of pace; only madplanner-v2 gets new lanes", out)
+        self.assertFalse((wt / ".work/lane.json").exists())
+        self.assertIn("held lane proj/T-5", self.pace_log())
+        self.assertIn("lanes held back 1", self.raw_task("usage", "--weekly-line"))
+        self.raw_task("lane", "proj", "5", "--no-pace")
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+        self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
+
+    def test_pace_lane_ahead_overrides_an_explicit_model_unless_no_pace(self):
+        self.readings(claude=(70, 84))
+        wt, out = self.pace_lane("--model", "opus")
+        self.assertIn("route: routine -> claude haiku", out)
+        self.assertIn("routine lane uses haiku, not opus", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "haiku")
+        self.readings(claude=(70, 84))
+        (wt / ".work/lane.json").unlink()
+        out = self.raw_task("lane", "proj", "5", "--model", "opus", "--no-pace")
+        self.assertIn("route: routine -> claude opus", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "opus")
+        self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
+
+    def test_pace_lane_ahead_overrides_an_explicit_codex_model_unless_no_pace(self):
+        policy = self.home / "policy.toml"
+        policy.write_text("[spare_resets]\ncodex = 0\n")  # by default Codex holds a spare reset and is never ahead
+        (self.home / ".config/task").mkdir(parents=True)
+        (self.home / ".config/task/usage-policy-path").write_text(str(policy))
+        self.readings(codex=(80, 84))
+        wt, out = self.pace_lane("--model", "gpt-6.1-sol", builder="codex")
+        self.assertIn("route: routine -> codex gpt-6-luna", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
+        self.readings(codex=(80, 84))
+        (wt / ".work/lane.json").unlink()
+        out = self.raw_task("lane", "proj", "5", "--model", "gpt-6.1-sol", "--no-pace")
+        self.assertIn("route: routine -> codex gpt-6.1-sol", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6.1-sol")
+        self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
+
+    def test_pace_lane_exhausted_moves_routine_to_the_other_vendor_and_holds_hard(self):
+        self.readings(claude=(80, 84), codex=(20, 84))
+        wt, out = self.pace_lane()
+        self.assertIn("automated share used up; routine lane moves to codex", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
+        self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "codex")
+        self.raw_task("lane", "proj", "5", "--builder", "claude", "--tier", "hard", "--override", "Jacopo 2026-10-21: tier", code=4)
+        self.readings(codex=(100, 84))
+        out = self.raw_task("lane", "proj", "5", "--builder", "claude", code=4)
+        self.assertIn("claude automated share used up (80 % of 75 %)", out)
+
+    def test_pace_lane_exhausted_with_spare_reset_asks_jacopo(self):
+        self.readings(claude=(80, 84), codex=(100, 84))
+        wt, out = self.pace_lane(builder="codex", code=4)
+        self.assertIn("Jacopo: codex is at 100 %; use your spare reset", out)
+
+    def test_pace_lane_under_used_near_reset_switches_the_boost_on_until_the_reset(self):
+        self.readings(claude=(40, 30))
+        # Fable follows the recorded tier, so the task is started as hard.
+        wt, out = self.pace_lane("--tier", "hard", recorded=("--tier", "hard"))
+        self.assertRegex(out, r"pace: claude under-used near its reset; boost on until ")
+        self.assertEqual(self.wait_for_lane(wt)["model"], "fable")
+        until = json.loads((self.home / ".local/state/task/boost.json").read_text())["claude"]
+        self.assertIn(f"boost on for claude until {until}", self.pace_log())
+        self.assertIn(f"boost: claude until {until}", self.raw_task("status", "proj"))
+
+    def test_pace_review_holds_exhausted_reviewer_and_goes_deeper_when_under_used(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
+        self.readings(claude=(80, 84))
+        out = self.raw_task("review", "proj", "5", "--run", code=4)
+        self.assertIn("held back by usage pacing: claude automated share used up", out)
+        self.assertFalse((wt / ".work/reviewer-call.json").exists())
+        self.readings(claude=(40, 30))
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```\n"
+        self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        call = json.loads((wt / ".work/reviewer-call.json").read_text())
+        self.assertEqual(call["args"][call["args"].index("--model") + 1], "opus")
+        self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "opus")
+
+    def test_review_run_records_claude_stream_events_and_plain_reply(self):
+        self.stub_reviewers()
+        self.raw_task("start", "proj", "5", "--builder", "codex")
+        wt = self.repo / ".worktrees/t5"
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```"
+        stub = self.home / "bin/claude"
+        stub.write_text("#!/usr/bin/env python3\nimport json, os, sys, time\nsys.stdin.read()\n"
+                        "print(json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {'unifiedWindows': {'seven_day': "
+                        "{'utilization': 0.3, 'resetsAt': int(time.time()) + 86400}}}}))\n"
+                        "print(json.dumps({'type': 'result', 'result': os.environ['REVIEW_STUB_REPLY']}))\n")
+        self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((self.state() / "review-response.md").read_text(), reply + "\n")
+        self.assertIn('"rate_limit_event"', (self.state() / "review-response.jsonl").read_text())
+        self.assertEqual(json.loads((self.home / ".local/state/task/usage/claude.json").read_text())["seven_day"]["utilization"], 0.3)
+
+    def test_claude_worker_cleans_temp_before_publishing_finished(self):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / ".work"
+        (work / "prompt.md").write_text("task\n")
+        record = work / "lane.json"
+        record.write_text(json.dumps({"state": "running", "pid": os.getpid()}))
+        publish = TASK_MODULE.atomic_json
+        terminal = []
+
+        def observe(path, run):
+            if path == record and run["state"] == "finished":
+                # Observe at the publication boundary, with no polling or sleeps.
+                self.assertFalse(Path(run["temporary"]).exists())
+                terminal.append(run.copy())
+            publish(path, run)
+
+        args = SimpleNamespace(repo=str(self.repo), id="5", builder="claude", tier=None,
+                               model="opus", no_boost=True, _worker=True, timeout=None, override="")
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, "HOME", self.home), \
+                mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
+            self.assertEqual(TASK_MODULE.lane(args), 0)
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(json.loads(record.read_text())["state"], "finished")
+
+    def test_lane_finalization_cleanup_order_and_failure(self):
+        record = self.home / "lane.json"
+        root = self.home / "claude-temp"
+        root.mkdir()
+        for state in ("finished", "timed_out", "cancelled", "interrupted"):
+            for missing in ("neither", "inner", "outer"):
+                with self.subTest(state=state, missing=missing):
+                    outer = root / "lane-12345678"
+                    outer.mkdir(mode=0o700, exist_ok=True)
+                    temporary = outer / "lane-87654321"
+                    temporary.mkdir(mode=0o700)
+                    if missing == "inner":
+                        temporary.rmdir()
+                    elif missing == "outer":
+                        shutil.rmtree(outer)
+                    run = {"state": "running", "temporary": str(temporary)}
+                    record.write_text(json.dumps(run))
+                    publish = TASK_MODULE.atomic_json
+
+                    def observe(path, value):
+                        self.assertFalse(temporary.exists())
+                        self.assertEqual(json.loads(record.read_text())["state"], "running")
+                        publish(path, value)
+
+                    with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
+                            mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
+                        TASK_MODULE.finalize_lane_record(record, run, state)
+                    self.assertEqual(json.loads(record.read_text())["state"], state)
+            for error in (PermissionError("denied"), TASK_MODULE.Stop("unsafe path")):
+                with self.subTest(state=state, error=type(error).__name__), \
+                        mock.patch.object(TASK_MODULE, "cleanup_lane_temporary", side_effect=error), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    TASK_MODULE.finalize_lane_record(record, {}, state)
+                    self.assertEqual(json.loads(record.read_text())["state"], state)
 
     def test_claude_lane_accepts_opus_and_records_selected_model(self):
         self.stub_models()
@@ -4043,8 +5181,8 @@ store.write_text(json.dumps(prs))
         self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", "opus")
         record = self.wait_for_lane(wt)
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
-        self.assertEqual(call["args"][:3], ["-p", "--model", "opus"])
-        self.assertEqual(call["args"][3:], ["--effort", "high", "--permission-mode", "acceptEdits",
+        self.assertEqual(call["args"][:6], ["-p", "--output-format", "stream-json", "--verbose", "--model", "opus"])
+        self.assertEqual(call["args"][6:], ["--effort", "high", "--permission-mode", "acceptEdits",
                                             "--allowedTools", "Bash Read Write Edit Glob Grep",
                                             "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
@@ -4136,12 +5274,15 @@ store.write_text(json.dumps(prs))
         self.stub_models()
         wt, _ = self.started()
         (wt / ".work/prompt.md").write_text("task\n")
+        # Fable follows the recorded tier, so the task is recorded as hard first.
+        self.raw_task("start", "proj", "5", "--builder", "codex", "--tier", "hard", "--override", "Jacopo 2026-10-21: tier")
         for model, cli in TASK_MODULE.MODELS["claude"].items():
-            out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model)
+            tier = ("--tier", "hard") if cli == "fable" else ()
+            out = self.raw_task("lane", "proj", "5", "--builder", "claude", "--model", model, *tier)
             record = self.wait_for_lane(wt)
             self.assertEqual((record["model"], record["cli_model"]), (model, cli))
             call = json.loads((wt / ".work/model-call.json").read_text())
-            self.assertEqual(call["args"][:3], ["-p", "--model", cli])
+            self.assertEqual(call["args"][4:6], ["--model", cli])
         self.assertEqual(json.loads((self.state() / "task.json").read_text())["builder"], "claude")
         self.stub_reviewers()
         head = self.git(wt, "rev-parse", "HEAD")
@@ -4314,14 +5455,17 @@ store.write_text(json.dumps(prs))
         self.assertIn("nonempty reason", self.raw_task("runner-check", "proj", str(runner), code=1))
         out = self.raw_task("start", "proj", "docs", "--builder", "codex",
                             "--no-verify", "gate is its verification")
-        self.assertIn("edit or apply_patch tool, never shell heredocs or cat >", out)
-        self.assertIn("avoid backticks in shell commands", out)
+        self.assertIn("Mandatory read: .work/context/lane-contract.md", out)
+        self.assertNotIn("heredocs", out)
 
     def test_setup_68_runner_preserves_trailing_text_and_optional_field_positions(self):
         runner = self.home / "runner.md"
         (self.repo / ".work").mkdir(exist_ok=True)
         (self.repo / ".work/pinned").write_text("seed")
         for suffix in (
+                ", tier hard",
+                ", tier design, seed pinned, after: previous",
+                ", no-verify: manual check, tier routine, after: previous",
                 ", note here",
                 " some free text",
                 ", seed pinned, after: previous, note here",
@@ -4352,6 +5496,7 @@ store.write_text(json.dumps(prs))
             "```\n")
         self.assertIn("runner file OK (2 tasks)", self.raw_task("runner-check", "proj", str(runner)))
         for contents, expected in (
+            ("1. docs: builder codex, model gpt-6-luna, tier extreme\n", "invalid tier"),
             ("1. docs: builder codex, model sonnet\n", "not available for the codex builder"),
             ("1. docs: builder codex, model gpt-6-luna, seed absent\n", "Seed does not exist"),
             ("1. docs: builder codex, model gpt-6-luna, seed ..\n", "Invalid seed name"),
@@ -4414,7 +5559,7 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
         exclude_path = self.repo / ".git/info/exclude"
-        exclude_path.chmod(0o444)
+        make_read_only(self, exclude_path, 0o444)
         self.sandbox_state()
         out = self.raw_task("check", "proj", "5", env=dict(self.env, CLAUDECODE="1"))
         self.assertIn("advisory lane check (not evidence for merge)", out)
@@ -4482,20 +5627,21 @@ store.write_text(json.dumps(prs))
         run_path.write_text(__import__("json").dumps({"command": "merge", "state": "running", "completed": []}))
         run_env = dict(self.env, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(run_path))
         out = self.raw_task("merge", "proj", "5", env=run_env)
-        self.assertIn("main unchanged since the lane's check; reusing it", out)
+        self.assertIn("trusted passing check", out)
+        self.assertIn("reuse decision: reusing trusted lane check", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1,
                          "unchanged default should not rerun just check in a gate worktree")
         self.assertIn("gate", __import__("json").loads(run_path.read_text())["completed"])
         self.assertFalse((self.home / "sync-probe").exists(), "no dependency change should not probe or run sync")
 
-    def test_merge_regates_when_default_moved_after_lane_check(self):
+    def test_merge_regates_when_default_moved_after_lane_check_and_is_not_in_lane(self):
         self.checked_lane_with_counter()
         other = self.home / "other"
         self.git(self.home, "clone", "-q", str(self.origin), str(other))
         self.commit_in(other, "c.txt")
         self.git(other, "push", "-q", "origin", "main")
         out = self.raw_task("merge", "proj", "5")
-        self.assertNotIn("main unchanged since the lane's check; reusing it", out)
+        self.assertNotIn("reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
                          "default movement requires checking the would-be merge result")
 
@@ -4509,21 +5655,87 @@ store.write_text(json.dumps(prs))
         if override:
             args.extend(["--override", "permit fresh gate after stale check evidence"])
         out = self.raw_task(*args)
-        self.assertNotIn("main unchanged since the lane's check; reusing it", out)
+        self.assertNotIn("reusing it", out)
         self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
                          "stale or failed check records must rerun the merge gate")
 
     def test_merge_does_not_reuse_check_with_different_head(self):
         self.assert_check_record_regates(lambda check: check.update(sha="0" * 40), override=True)
 
-    def test_merge_does_not_reuse_check_with_different_base(self):
-        self.assert_check_record_regates(lambda check: check.update(base_sha="0" * 40))
+    def test_merge_reuses_check_when_newer_main_was_merged_before_check(self):
+        wt, _ = self.started()
+        other = self.home / "other"
+        self.git(self.home, "clone", "-q", str(self.origin), str(other))
+        self.commit_in(other, "c.txt")
+        self.git(other, "push", "-q", "origin", "main")
+        self.git(wt, "fetch", "-q", "origin")
+        self.git(wt, "merge", "--no-edit", "origin/main")
+        self.commit_in(wt, "b.txt")
+        self.prepare_merge_evidence("5")
+        (self.home / "just-count").unlink(missing_ok=True)
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        check = __import__("json").loads((self.state() / "check.json").read_text())
+        self.assertEqual(check["base_sha"], self.git(wt, "rev-parse", "origin/main"))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("trusted passing check", out)
+        self.assertIn("reuse decision: reusing trusted lane check", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
+
+    def test_merge_does_not_reuse_check_with_different_record_revision(self):
+        self.assert_check_record_regates(lambda check: check.update(record_revision="wrong"))
+
+    def test_merge_does_not_reuse_check_missing_gate_variant_coverage(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text('[[gate_variant]]\nname = "extra"\n')
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "configure gate variant")
+        self.prepare_merge_evidence("5")
+        (self.home / "just-count").unlink(missing_ok=True)
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        check_path = self.state() / "check.json"
+        check = __import__("json").loads(check_path.read_text())
+        self.assertEqual({row["name"] for row in check["variants"]}, {"extra"})
+        check["variants"] = []
+        check_path.write_text(__import__("json").dumps(check))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertNotIn("reusing it", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
+
+    def test_merge_does_not_reuse_when_committed_variant_environment_differs(self):
+        wt, _ = self.started()
+        (wt / ".task.toml").write_text('[[gate_variant]]\nname = "extra"\n[gate_variant.env]\nCOUNT = "new"\n')
+        self.git(wt, "add", ".task.toml")
+        self.git(wt, "commit", "-qm", "configure gate variant environment")
+        self.prepare_merge_evidence("5")
+        (self.home / "just-count").unlink(missing_ok=True)
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        check_path = self.state() / "check.json"
+        check = __import__("json").loads(check_path.read_text())
+        check["variants"][0]["environment_template"]["COUNT"] = "old"
+        check_path.write_text(__import__("json").dumps(check))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("gate variants or environments differ", out)
+        self.assertIn("reuse decision: running full gate", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2)
 
     def test_merge_does_not_reuse_failed_check_record(self):
         self.assert_check_record_regates(lambda check: check.update(result="failed"), override=True)
 
-    def test_merge_does_not_reuse_legacy_check_without_base_sha(self):
-        self.assert_check_record_regates(lambda check: check.pop("base_sha"))
+    def test_merge_reuses_check_without_legacy_base_sha(self):
+        self.checked_lane_with_counter()
+        check_path = self.state() / "check.json"
+        check = __import__("json").loads(check_path.read_text())
+        check.pop("base_sha")
+        check_path.write_text(__import__("json").dumps(check))
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("reuse decision: reusing trusted lane check", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1)
 
     def test_merge_does_not_reuse_advisory_check(self):
         self.assert_check_record_regates(lambda check: check.update(trusted=False, advisory=True))
@@ -4660,7 +5872,7 @@ store.write_text(json.dumps(prs))
         self.raw_task("review", "proj", "5", "--append-prompt", instruction)
         prompt = (self.state() / "review-prompt.md").read_text()
         self.assertTrue(prompt.endswith(instruction + "\n"))
-        self.assertIn("Verdict: PASS|FAIL", prompt)
+        self.assertIn("Mandatory read:", prompt)
 
     def test_review_prints_claude_headless_command_and_persisted_prompt(self):
         wt, _ = self.started()
@@ -4675,18 +5887,10 @@ store.write_text(json.dumps(prs))
         self.assertEqual(__import__("json").loads((self.state() / "review-routing.json").read_text()),
                          {"vendor": "claude", "model": "haiku"})
         self.assertTrue(prompt.read_text().endswith(
-            "Return exactly this final fenced block, with plain text only inside it:\n"
-            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
-            "or the change breaks something that worked. Everything else is a non-blocking "
-            "note: list it under 'Notes', never as a reason to FAIL.\n"
-            "Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.\n"
-            "```review\nVerdict: PASS|FAIL\nCommit: <full sha>\n"
-            "#1 pass|fail|unclear: <one line of evidence>\n"
-            "#2 pass|fail|unclear: <one line of evidence>\n```\n"
-            "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
-            "Blocking finding must identify a named requested criterion or a concrete defect or regression, "
-            "with file:line. Put all other "
-            "observations under Notes.\n"))
+            f"Mandatory read: {wt / '.work/context/lane-contract.md'}. Reply in its review block with the "
+            "full 40-character Commit sha, then one line per criterion: "
+            "`#N pass|fail|unclear: <one line of evidence>`.\n"))
+        self.assertNotIn("Split findings", prompt.read_text())
         for command in ("git --no-optional-locks diff", "git --no-optional-locks log",
                         "git --no-optional-locks show"):
             self.assertIn(command, prompt.read_text())
@@ -4709,6 +5913,8 @@ store.write_text(json.dumps(prs))
         expected_args = shlex.split(expected_command.split(" < ")[0])
         if expected_args[0] == "GIT_OPTIONAL_LOCKS=0":
             expected_args.pop(0)
+        if expected_args[0] == "claude":  # --run records stream-json; the printed manual command stays plain
+            expected_args[2:2] = ["--output-format", "stream-json", "--verbose"]
         reply = (f"```review\nVerdict: {verdict}\nCommit: {head}\n"
                  f"Reviewer: {builder} wrong-model\n"
                  f"#1 {'pass' if verdict == 'PASS' else 'fail'}: inspected b\n"
@@ -4758,7 +5964,9 @@ store.write_text(json.dumps(prs))
         self.assertIn(diagnostic, out)
         self.assertEqual((self.state() / 'review-stderr.log').read_text(), diagnostic)
         self.assertEqual(json.loads((self.state() / 'review-run.json').read_text()),
-                         dict(builder='codex', state='finished', exit_code=1))
+                         dict(builder='claude', state='finished', exit_code=1))
+        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text()),
+                         dict(vendor='claude', model='haiku', fallback_from=['codex', 'gpt-6-luna']))
 
     def test_review_run_cleans_inherited_environment_before_hook_and_diff(self):
         import json
@@ -5622,6 +6830,8 @@ exit 1
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "false"])
         self.assertEqual(check["steps"][-1]["exit"], 1)
+        for step in check["steps"]:
+            self.assertEqual((step["configured_timeout"], step["effective_timeout"]), (900, 900))
 
     def test_acceptance_2_no_verify_requires_recorded_reason(self):
         task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
@@ -5683,6 +6893,8 @@ exit 1
         self.git(wt, "commit", "-qm", "set task timeout")
         out = self.task("check", "proj", "5", code=1)
         self.assertIn("ran over 1s", out)
+        step = json.loads((self.state() / "check.json").read_text())["steps"][0]
+        self.assertEqual((step["configured_timeout"], step["effective_timeout"]), (1, 1))
         pid = int(sleeper.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
@@ -5795,6 +7007,49 @@ exit 1
         out = self.raw_task("merge", "proj", "5", code=1)
         self.assertIn("main changed a.txt that this task also changed; ask the lane to run `git merge origin/main` on its branch, then `task check` and a new review", out)
         self.assertEqual(self.git(wt, "rev-parse", "HEAD"), lane_head)
+
+    def checked_lane_then_main_edits(self, name, lane_text, main_text):
+        """Check a lane that edits `name`, then move main with its own edit of the same file."""
+        (self.repo / name).write_text("one\nmiddle\nthree\n")
+        self.git(self.repo, "add", name)
+        self.git(self.repo, "commit", "-qm", f"add {name}")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        wt, _ = self.started()
+        (wt / name).write_text(lane_text)
+        self.git(wt, "commit", "-qam", f"lane edits {name}")
+        self.prepare_merge_evidence("5")
+        (self.home / "during-check.sh").write_text('echo run >> "$HOME/just-count"\n')
+        (self.home / "during-check.sh").chmod(0o755)
+        self.raw_task("check", "proj", "5")
+        (self.repo / name).write_text(main_text)
+        self.git(self.repo, "commit", "-qam", f"main edits {name}")
+        self.git(self.repo, "push", "-q", "origin", "main")
+        return wt
+
+    def test_markdown_only_overlap_that_merges_cleanly_runs_the_gate_on_the_merged_result(self):
+        self.checked_lane_then_main_edits("README.md", "lane\nmiddle\nthree\n", "one\nmiddle\nmain\n")
+        out = self.raw_task("merge", "proj", "5")
+        self.assertIn("reuse decision: running full gate because main changed only Markdown files", out)
+        self.assertIn("Merged", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 2,
+                         "the lane check is not reused; the gate runs on the merged result")
+        self.assertEqual(self.git(self.repo, "show", "origin/main:README.md"), "lane\nmiddle\nmain")
+
+    def test_non_markdown_overlap_that_merges_cleanly_still_blocks(self):
+        wt = self.checked_lane_then_main_edits("code.py", "lane\nmiddle\nthree\n", "one\nmiddle\nmain\n")
+        before = self.git(self.origin, "rev-parse", "main")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("main changed code.py that this task also changed; ask the lane to run `git merge origin/main`", out)
+        self.assertEqual(len((self.home / "just-count").read_text().splitlines()), 1, "no gate ran")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), before)
+
+    def test_markdown_overlap_with_a_conflict_still_blocks(self):
+        self.checked_lane_then_main_edits("README.md", "lane\nmiddle\nthree\n", "main\nmiddle\nthree\n")
+        before = self.git(self.origin, "rev-parse", "main")
+        out = self.raw_task("merge", "proj", "5", code=1)
+        self.assertIn("main changed README.md that this task also changed; ask the lane to run `git merge origin/main`", out)
+        self.assertNotIn("Merged", out)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), before)
 
     def test_round2_refused_push_is_resumable_without_override(self):
         wt, _ = self.started()
@@ -6046,6 +7301,18 @@ Reviewer: codex gpt-6-luna
         _, _, _, judgments = TASK_MODULE.parse_review_reply(text, [1, 2, 3, 4, 5, 6])
         self.assertEqual(judgments, {2: ("fail", ""), 5: ("pass", "colon evidence"),
                                      6: ("fail", "spaced dash evidence")})
+
+    def test_fenced_review_with_blocking_and_notes_inside_the_fence_parses(self):
+        text = (REVIEW_FIXTURES / "fence-with-sections.md").read_text()
+        self.assertEqual(TASK_MODULE.parse_review_reply(text, []),
+                         ("PASS", "097ee880fcd0a472d3aabdc03de70db78d6dd8c3", None, {}))
+        sha = "b" * 40
+        fail = (f"```review\nVerdict: FAIL\nCommit: {sha}\n#1 fail: broken\n\n"
+                "**Blocking**\n- #1: a.py:3 breaks\n\nNotes\n- none\n```\n")
+        self.assertEqual(TASK_MODULE.parse_review_reply(fail, [1]),
+                         ("FAIL", sha, None, {1: ("fail", "broken")}))
+        with self.assertRaises(TASK_MODULE.ReviewParseError):
+            TASK_MODULE.parse_review_reply(fail.replace("**Blocking**", "Findings"), [1])
 
     def test_haiku3_fenced_fixture_records_fail_without_criteria(self):
         fixture = REVIEW_FIXTURES / "haiku-3-fenced.md"

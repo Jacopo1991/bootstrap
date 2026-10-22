@@ -47,6 +47,15 @@ mise exec -- uv pip sync --quiet --require-hashes --python "$pre_commit_root/ven
 ln -sfn "$pre_commit_root/venv/bin/pre-commit" "$HOME/.local/bin/pre-commit"
 pre_commit_expected=$(sed -n 's/^pre-commit==//p' "$pre_commit_root/requirements.in")
 [[ $("$HOME/.local/bin/pre-commit" --version) == "pre-commit $pre_commit_expected" ]]
+# Inspect AI (model evaluations) from its own hashed lock, one venv for every project.
+# Its containers run on agent's rootless Docker, which is started by hand (see the README).
+inspect_root="$HOME/.local/share/bootstrap/inspect"
+mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$inspect_root/venv"
+mise exec -- uv pip sync --quiet --require-hashes --python "$inspect_root/venv/bin/python" "$inspect_root/requirements.lock"
+ln -sfn "$inspect_root/venv/bin/inspect" "$HOME/.local/bin/inspect"
+inspect_expected=$(sed -n 's/^inspect-ai==//p' "$inspect_root/requirements.in")
+[[ $("$inspect_root/venv/bin/python" -c 'import importlib.metadata as m; print(m.version("inspect-ai"))') == "$inspect_expected" ]]
+"$inspect_root/venv/bin/python" -c 'import openai'
 # Create pre-commit's store here: inside the agent sandbox ~/.cache is read-only and
 # pre-commit then runs local hooks from the existing store without writing to it.
 "$HOME/.local/bin/pre-commit" gc >/dev/null

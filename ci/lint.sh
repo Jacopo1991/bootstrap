@@ -45,9 +45,11 @@ run python3 ci/agent-config-test.py
 run python3 ci/claude-lean-session-test.py
 run python3 ci/claude-managed-mods-test.py
 run python3 ci/managed-policy-test.py
+run python3 ci/rootless-docker-test.py
 run python3 ci/git-default-merge-test.py
 run python3 ci/agent-drift-test.py
 run python3 ci/inventory-mirror-test.py
+run python3 ci/prune-revisions-test.py
 run bash ci/new-project-test.sh
 run bash ci/pre-commit-test.sh
 run python3 ci/osv-db-test.py
@@ -56,6 +58,7 @@ run python3 ci/gate-browser-test.py
 run python3 ci/skills-hooks-test.py
 run python3 ci/workspace-tidy-test.py
 run python3 ci/task-test.py
+run python3 ci/task-usage-test.py
 run python3 ci/task-batch-test.py
 run python3 ci/task-line-budget-test.py
 run python3 ci/task-line-budget.py

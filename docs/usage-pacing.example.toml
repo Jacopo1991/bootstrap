@@ -1,0 +1,32 @@
+# Usage-pacing policy for `task` (company-owned; the company PM writes the real file).
+# Real file: the path in ~/.config/task/usage-policy-path, default
+# /home/agent/cortex/cortex-kb-company/policy/usage-pacing.toml. A missing file or key means the values below.
+# Keys outside a [table] must come first (TOML), as here.
+# `task` only reads this file. An invalid file is reported and the built-in defaults apply.
+
+# When the allowance is tight (a vendor is ahead of pace), only the first repository in this
+# list that has an unmerged task gets new lanes.
+priority = ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"]
+
+# Ahead of pace = weekly use is more than this many points above the share of the week elapsed.
+ahead_margin = 10
+
+# Under-used near the reset = weekly use below this percent with at most this many hours left.
+under_use_percent = 60
+under_use_hours = 36
+
+# Pre-approved research the PM may spend left-over allowance on (third in line after stronger
+# models on queued work and deeper other-vendor reviews). `task` never creates tasks from it.
+research_backlog = []
+
+# Percent of the weekly allowance kept for Jacopo's own use. Automated lanes and reviews stop
+# when weekly use reaches 100 - reserve.
+[reserve]
+claude = 25
+codex = 10
+
+# Spare resets Jacopo holds. While one is held the vendor has no reserve: lanes run at the normal
+# pace until the vendor reaches 100 % and `task usage` says "spare reset held; reset at 100 %".
+[spare_resets]
+claude = 0
+codex = 1

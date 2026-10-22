@@ -2,23 +2,31 @@
 """Sequence an approved batch using the installed task command, without a model."""
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+import tomllib
+import threading
+import signal
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from task_limits import cli_limit, lane_limit
+import task_usage
+from task_limits import bwrap_denial, cli_limit, lane_limit
+from task_routing import TIERS, guards, lane_limits, override_problem
 
 
 TASK_LINE = re.compile(
-    r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
-    r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
+    r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude)"
+    r"(?:,\s*model\s+([^,\s]+))?(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
     r"(?:\b.*)?$")
-NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
+NO_VERIFY = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
+OVERRIDE = re.compile(r"(?i),\s*override:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
 HOOK_DENIAL = ("Command blocked by PreToolUse hook: ", "Blocked by PreToolUse hook",
                "Execution stopped by PreToolUse hook")
 BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end your final reply "
@@ -26,12 +34,19 @@ BLOCK_INSTRUCTION = ("If a hook or sandbox denial stops a required step, end you
 FIX_SCOPE_INSTRUCTION = ("Fix only inside this task's scope. If a finding needs changes to files "
                          "the task forbids, do not make them: end your final reply with `BLOCKED:` "
                          "and the finding.")
+MERGE_IN_INSTRUCTION = ("If the findings only ask for `git merge origin/main`, make no other change and skip "
+                        "`task check` this round; the trusted check runs at the new head.")
+OUTPUT_LOCK = threading.Lock()
+LAUNCH_LOCK = threading.Lock()
+HELD = 4  # `task lane` exit status: held back by usage pacing
+HOLD_SECONDS = 60
 
 
 def terminal_block(output):
     lines = [line for line in output.splitlines() if line.strip()]
     last = lines[-1] if lines else ""
-    return last if last.startswith(("BLOCKED:", *HOOK_DENIAL)) else ""
+    # The known bwrap sandbox denial (setup #11) is an environment warning, not a stop.
+    return last if last.startswith(("BLOCKED:", *HOOK_DENIAL)) and not bwrap_denial(last) else ""
 
 
 class Stop(Exception):
@@ -46,14 +61,10 @@ def data(path):
     return json.loads(read(path) or "{}")
 
 
-def check_output(state, work):
-    """Use the log belonging to the latest check, including trusted PM runs."""
+def check_output(state):
+    """The latest trusted check log; a lane's advisory check.log never goes into a prompt."""
     trusted = data(state / "check.json")
-    advisory = data(work / "check.json")
-    evidence = max((trusted, advisory), key=lambda item: item.get("time", ""))
-    if evidence is trusted and trusted.get("trusted") and trusted.get("log"):
-        return read(Path(trusted["log"]))
-    return read(work / "check.log")
+    return read(Path(trusted["log"])) if trusted.get("trusted") and trusted.get("log") else ""
 
 
 def name(ident):
@@ -71,15 +82,26 @@ def parse(source):
             if re.fullmatch(r"\s*```\s*", line):
                 in_rules = False
             continue
-        no_verify_field = NO_VERIFY.search(line)
-        match = TASK_LINE.match(NO_VERIFY.sub("", line))
+        override_field = OVERRIDE.search(line)
+        line_rest = OVERRIDE.sub("", line)
+        no_verify_field = NO_VERIFY.search(line_rest)
+        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line_rest)
+        match = TASK_LINE.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", NO_VERIFY.sub("", line_rest)))
         if match:
             ident, builder, model, seed, after = match.groups()
+            tier = tier_field[1].lower() if tier_field else None
+            if not model and not tier:
+                raise Stop("runner task needs a model or tier")
+            if tier is not None and tier not in TIERS:
+                raise Stop(f"Invalid tier: {tier}")
             no_verify = no_verify_field[1].strip() if no_verify_field else None
             if no_verify is not None and not no_verify.strip():
                 raise Stop("no-verify needs a nonempty reason")
-            current = dict(id=ident, builder=builder.lower(), model=model,
-                           seed=seed, after=after, no_verify=no_verify, lines=[line])
+            override = override_field[1].strip() if override_field else ""
+            if override_field and (problem := override_problem(override, required=True)):
+                raise Stop(problem)
+            current = dict(id=ident, builder=builder.lower(), model=model, seed=seed, after=after,
+                           tier=tier, no_verify=no_verify, override=override, lines=[line])
             tasks.append(current)
         elif re.match(r"(?i)^\s*(?:\d+\.|[-*])\s+[^:\s]+:\s*builder\b", line):
             raise Stop("Invalid runner task line: " + line)
@@ -116,6 +138,33 @@ def blocking(text):
     return re.sub(r"(?im)^Commit:.*$", "", text).strip()
 
 
+def default_branch(path):
+    return next((ref for ref in ("origin/HEAD", "origin/main", "main")
+                 if not run_git(path, "rev-parse", "-q", "--verify", ref).returncode), None)
+
+
+def run_git(path, *args):
+    return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
+
+
+def merge_in_only(path, reviewed, head):
+    """True when every commit after the reviewed head cleanly merges the default branch."""
+    def run(*args):
+        return run_git(path, *args)
+    default = default_branch(path)
+    if not default or not reviewed:
+        return False
+    commits = run("rev-list", "--parents", f"{reviewed}..{head}", "--not", default).stdout.splitlines()
+    for line in commits:
+        commit, *parents = line.split()
+        if len(parents) != 2 or run("merge-base", "--is-ancestor", parents[1], default).returncode:
+            return False
+        merged = run("merge-tree", "--write-tree", *parents)
+        if merged.returncode or merged.stdout.split()[:1] != [run("rev-parse", f"{commit}^{{tree}}").stdout.strip()]:
+            return False
+    return bool(commits)
+
+
 def failure_key(text):
     """Ignore Git heads and timing noise when comparing consecutive failures."""
     text = re.sub(r"\b[0-9a-f]{7,40}\b", "<sha>", text)
@@ -124,24 +173,56 @@ def failure_key(text):
 
 
 class Batch:
-    def __init__(self, repo, source):
+    def __init__(self, repo, source, stopping=None, ident=None, no_pace=False):
+        self.no_pace = no_pace
         self.repo = repo
         self.source = source
         self.done = repo / ".work" / source.with_suffix(".done").name
-        self.current = None
+        self.stopping = stopping if stopping is not None else threading.Event()
+        self.ident = ident
+
+    def stop(self):
+        # Do not let a worker pass its stop check while another launches a CLI.
+        with LAUNCH_LOCK:
+            self.stopping.set()
+
+    def output(self, text):
+        prefix = f"[{self.ident}] " if self.ident else ""
+        with OUTPUT_LOCK:
+            for line in text.splitlines():
+                print(prefix + line, flush=True)
 
     def append(self, line):
         self.done.parent.mkdir(parents=True, exist_ok=True)
         with self.done.open("a") as stream:
             stream.write(" ".join(line.split()) + "\n")
-        print(line, flush=True)
+        self.output(line)
 
     def call(self, command, *args, retry=False):
         argv = ["task", command, str(self.repo), *map(str, args)]
         while True:
-            print("+ " + shlex.join(argv), flush=True)
-            result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            print(result.stdout, end="", flush=True)
+            with LAUNCH_LOCK:
+                if self.stopping.is_set():
+                    raise Stop("batch is stopping")
+                self.output("+ " + shlex.join(argv))
+                child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            with child:
+                while True:
+                    try:
+                        output, _ = child.communicate(timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if self.stopping.is_set():
+                            child.terminate()
+                            output, _ = child.communicate()
+                            self.output(output)
+                            raise Stop("batch is stopping")
+                result = subprocess.CompletedProcess(argv, child.returncode, output)
+            self.output(result.stdout)
+            if command == "lane" and result.returncode == HELD:
+                if self.stopping.wait(HOLD_SECONDS):
+                    raise Stop("batch is stopping")
+                continue
             if not (retry and result.returncode == 3):
                 return result
 
@@ -157,6 +238,10 @@ class Batch:
         if git(path, "rev-parse", "HEAD") == record["base_sha"]:
             return False
         if re.match(r"(?i)WIP\b", git(path, "log", "-1", "--format=%s")):
+            return False
+        # `default...HEAD` is the diff from the merge-base: a merge-only head adds nothing of its own.
+        default = default_branch(path)
+        if default and not run_git(path, "diff", "--quiet", f"{default}...HEAD").returncode:
             return False
         report = read(path / ".work/report.md")
         headings = ["What changed", "How I verified"]
@@ -194,6 +279,10 @@ class Batch:
         denied = terminal_block(read(state / "review-response.md"))
         if denied:
             raise Stop(f"reviewer: {denied}")
+        routing = data(state / "review-routing.json")
+        builder = data(state / "task.json").get("builder")
+        if routing.get("fallback_from") and routing.get("vendor") == builder:
+            raise Stop("reviewer fallback used the builder vendor; independent review required before merge")
 
     def task(self, task):
         ident, box = task["id"], task["box"]
@@ -207,6 +296,10 @@ class Batch:
         dispatch = ""
         if not resumed or task["seed"]:
             options = ["--builder", task["builder"]]
+            if task.get("tier"):
+                options += ["--tier", task["tier"]]
+            if task["override"]:
+                options += ["--override", task["override"]]
             if task["seed"]:
                 options += ["--seed", task["seed"]]
             if task.get("no_verify"):
@@ -226,6 +319,8 @@ class Batch:
                      "avoid backticks in shell commands. If a merge-in is needed, run `git merge origin/main`.\n")
         started = time.monotonic()
         builder, model = task["builder"], task["model"]
+        tier = task.get("tier")
+        tier_only = model is None
         rounds, previous, findings, check_tail = 0, None, "", ""
         # Never launch a duplicate lane or overwrite the prompt of a running lane.
         previous_limit = lane_limit(data(work / "lane.json"), work) if resumed else ""
@@ -239,23 +334,45 @@ class Batch:
             findings = (f"Previous lane ended by usage limit: {previous_limit}. Resume, finish and commit."
                         if previous_limit else blocking(read(state / "review.md")) or
                         "Unfinished work: finish and commit.")
-            check_tail = "\n".join(check_output(state, work).splitlines()[-80:])
+            check_tail = "\n".join(check_output(state).splitlines()[-80:])
+        # Merge-in rounds do not count toward the cap: their time is subtracted.
+        exempt, round_start, merge_in_since = 0.0, 0.0, None
+
+        def over_cap():
+            now = time.monotonic()
+            return now - started - exempt - (now - merge_in_since if merge_in_since is not None else 0) >= 3 * box * 60
         while True:
-            if time.monotonic() - started >= 3 * box * 60:
+            if over_cap():
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             if run_lane:
+                try:
+                    recorded = data(state / "task.json").get("tier", "routine")
+                    guards(tier or recorded, recorded, model, task["override"])
+                except ValueError as error:
+                    return f"parked: {error}"
+                round_start = time.monotonic()
+                reviewed = data(state / "review.json").get("commit")
                 prompt = task["block"] + "\n\nDispatch instructions:\n" + dispatch
                 if rounds or findings:
                     prompt += ("\n\nFix round: re-measure, run the tests, finish and commit.\n"
-                               f"Blocking findings:\n{findings}\nFailing check output tail:\n{check_tail}\n")
+                               f"Blocking findings:\n{findings}\nLatest trusted check result:\n{check_tail}\n")
+                    if "git merge origin/main" in findings:
+                        prompt += MERGE_IN_INSTRUCTION + "\n"
                 prompt += "\n\n" + BLOCK_INSTRUCTION + "\n"
                 if rounds or findings:
                     prompt += FIX_SCOPE_INSTRUCTION + "\n"
                 (work / "prompt.md").write_text(prompt)
-                self.require("lane", ident, "--builder", builder, "--model", model, "--timeout", box)
+                options = ["--tier", tier] if tier else []
+                if model:
+                    options += ["--model", model]
+                if task["override"]:
+                    options += ["--override", task["override"]]
+                self.require("lane", ident, "--builder", builder, "--timeout", box, *options)
                 self.require("wait", ident, "--max", box, retry=True)
                 self.lane_outcome(work)
-            if time.monotonic() - started >= 3 * box * 60:
+                if (rounds or findings) and merge_in_only(path, reviewed, git(path, "rev-parse", "HEAD")):
+                    merge_in_since = round_start
+            if over_cap():
                 return f"parked: total time cap; last blocking findings: {findings or 'unfinished'}"
             record = data(state / "task.json")
             if not self.finished(path, record):
@@ -266,11 +383,14 @@ class Batch:
                 # Only lane final.md and the reviewer's own reply are inspected.
                 checked = self.call("check", ident, retry=True)
                 if checked.returncode:
-                    check_tail = "\n".join((check_output(state, work) or checked.stdout).splitlines()[-80:])
+                    check_tail = "\n".join((check_output(state) or checked.stdout).splitlines()[-80:])
                     findings = "Failed task check"
                     signature = ("check", failure_key(check_tail))
                 else:
-                    check_tail = ""
+                    # A passed check is still the latest trusted result the next fix prompt states.
+                    check_tail = "\n".join((checked.stdout.strip().splitlines()[-1:]
+                                            + [line for line in check_output(state).splitlines()
+                                               if line.startswith("Gate suites finished")][-1:]))
                     review = {}
                     for _ in range(2):
                         result = self.call("review", ident, "--run", "--append-prompt", BLOCK_INSTRUCTION)
@@ -281,7 +401,7 @@ class Batch:
                                 and candidate.get("verdict") in {"PASS", "FAIL"}):
                             review = candidate
                             break
-                    if time.monotonic() - started >= 3 * box * 60:
+                    if over_cap():
                         return f"parked: total time cap; last blocking findings: {findings or 'time cap'}"
                     if (review.get("verdict") == "PASS"
                             and all(v == "pass" for v in review.get("judgments", {}).values())):
@@ -299,55 +419,153 @@ class Batch:
                 return f"parked: fix rounds exhausted; last blocking findings: {findings}; {check_tail}"
             previous = signature
             rounds += 1
-            if rounds == 2:
-                stronger = "gpt-6.1-sol" if builder == "codex" else "opus"
+            if rounds == 2 and not tier_only:
                 if model in {"gpt-6.1-sol", "gpt-6-astra", "opus", "claude-opus-5-5", "fable", "claude-fable-5-1"}:
                     rounds = 3
                 else:
-                    model = stronger
+                    model = "gpt-6.1-sol" if builder == "codex" else "opus"
             if rounds == 3:
                 builder = "claude" if builder == "codex" else "codex"
-                model = "opus" if builder == "claude" else "gpt-6.1-sol"
+                if not tier_only:
+                    model = "opus" if builder == "claude" else "gpt-6.1-sol"
             run_lane = True
+            if merge_in_since is not None:
+                exempt += time.monotonic() - merge_in_since
+                merge_in_since = None
+
+    def run_task(self, task):
+        try:
+            return self.task(task)
+        except BaseException:
+            self.stop()
+            raise
 
     def run(self):
         try:
             self.require("runner-check", self.source)
-            parked, consecutive = set(), 0
-            for task in parse(self.source):
-                self.current = task["id"]
-                if task["after"] and name(task["after"]) in parked:
-                    self.append(f"{self.current}: not started: after {task['after']}")
-                    parked.add(name(self.current))
-                    continue
-                outcome = self.task(task)
-                self.append(f"{self.current}: {outcome}")
-                self.current = None
-                if outcome.startswith("parked:"):
-                    parked.add(name(task["id"]))
-                    consecutive += 1
-                    if consecutive == 2:
-                        raise Stop("two tasks parked in a row")
-                else:
-                    consecutive = 0
+            tasks = parse(self.source)
+            home = Path.home()
+            if self.no_pace or os.environ.get("TASK_NO_PACE"):
+                task_usage.log(home, f"--no-pace: batch {self.repo.name}/{self.source.name} not paced")
+            else:
+                reason, notes = task_usage.batch_gate(home, [task["builder"] for task in tasks])
+                for note in notes:
+                    self.output(note)
+                if reason:
+                    raise Stop(f"usage pacing: {reason} (--no-pace overrides)")
+            self.schedule(tasks)
             self.append("batch: finished")
             return 0
         except (Exception, KeyboardInterrupt) as error:
-            if self.current:
-                self.append(f"{self.current}: stopped: {error}")
-            self.append(f"batch: stopped: {error}")
+            self.stop()
+            self.append(f"batch: stopped: {str(error) or 'interrupted'}")
             return 1
+
+    def gate_slots(self):
+        config = Path.home() / ".config/task/gate.toml"
+        slots = tomllib.loads(read(config)).get("slots", 3)
+        if type(slots) is not int or slots < 1:
+            raise Stop("gate slots must be a positive integer")
+        return slots
+
+    def capacity(self):
+        slots = self.gate_slots()
+        limits = lane_limits(Path.home(), slots)
+        if not (self.no_pace or os.environ.get("TASK_NO_PACE")):  # boost never lifts the 5-hour limits
+            for vendor, cap in task_usage.five_caps(Path.home()).items():
+                limits[vendor] = limits[vendor] if cap is None else min(limits[vendor], cap)
+        return min(slots, max(limits.values())), limits
+
+    def schedule(self, tasks):
+        pending, completed, parked = list(tasks), set(), set()
+        in_file = {name(task["id"]) for task in tasks}
+        consecutive = 0
+        # Each worker owns its per-task state. Only this scheduler writes outcomes.
+        pool = ThreadPoolExecutor(max_workers=self.gate_slots())
+        try:
+            running = {}
+            while pending or running:
+                total, limits = self.capacity()
+                for task in list(pending):
+                    dependency = name(task["after"]) if task["after"] else None
+                    if dependency and dependency not in in_file and dependency not in completed:
+                        merge_record = (Path.home() / ".local/state/task" / self.repo.name /
+                                        dependency / "merge.json")
+                        if merge_record.is_file():
+                            completed.add(dependency)
+                        else:
+                            self.append(f"{task['id']}: not started: after {task['after']} (no merge record)")
+                            parked.add(name(task["id"]))
+                            completed.add(name(task["id"]))
+                            pending.remove(task)
+                            continue
+                    if dependency in parked:
+                        self.append(f"{task['id']}: not started: after {task['after']}")
+                        parked.add(name(task["id"]))
+                        completed.add(name(task["id"]))
+                        pending.remove(task)
+                        continue
+                    if dependency and dependency not in completed:
+                        continue
+                    def current_builder(running_task):
+                        state = (Path.home() / ".local/state/task" / self.repo.name /
+                                 name(running_task["id"]) / "task.json")
+                        return data(state).get("builder", running_task["builder"])
+                    count = sum(current_builder(t) == task["builder"] for t in running.values())
+                    limit = limits[task["builder"]]
+                    if not limit and task.get("tier") in (None, "routine") and any(limits.values()):
+                        limit = 1  # 5-hour exhausted: the lane gate moves a routine task to the vendor with room, or holds it
+                    if len(running) >= total or count >= limit:
+                        continue
+                    pending.remove(task)
+                    if self.stopping.is_set():
+                        raise Stop("batch is stopping")
+                    worker = Batch(self.repo, self.source, self.stopping, task["id"])
+                    running[pool.submit(worker.run_task, task)] = task
+                if not running:
+                    if any(not limits[task["builder"]] for task in pending):  # waiting for a 5-hour reset
+                        if self.stopping.wait(HOLD_SECONDS):
+                            raise Stop("batch is stopping")
+                        continue
+                    if pending:
+                        raise Stop("unresolved after dependencies")
+                    break
+                finished, _ = wait(running, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    task = running.pop(future)
+                    try:
+                        outcome = future.result()
+                    except Exception as error:
+                        self.append(f"{task['id']}: stopped: {error}")
+                        raise
+                    self.append(f"{task['id']}: {outcome}")
+                    completed.add(name(task["id"]))
+                    if outcome.startswith("parked:"):
+                        parked.add(name(task["id"]))
+                        consecutive += 1
+                        if consecutive == 2:
+                            raise Stop("two tasks parked in a row")
+                    else:
+                        consecutive = 0
+        finally:
+            self.stop()
+            pool.shutdown(wait=False, cancel_futures=True)
+
 
 
 def main():
+    def interrupted(signum, frame):
+        raise Stop("interrupted")
+    signal.signal(signal.SIGTERM, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo")
     parser.add_argument("runner_file", type=Path)
+    parser.add_argument("--no-pace", action="store_true", help="start without the usage-pacing check (logged)")
     args = parser.parse_args()
     repo = Path(args.repo).expanduser()
     if not repo.is_absolute():
         repo = Path.home() / "dev_workspace" / repo
-    batch = Batch(repo.resolve(), args.runner_file.resolve())
+    batch = Batch(repo.resolve(), args.runner_file.resolve(), no_pace=args.no_pace)
     try:
         batch.repo = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
         batch.done = batch.repo / ".work" / batch.source.with_suffix(".done").name

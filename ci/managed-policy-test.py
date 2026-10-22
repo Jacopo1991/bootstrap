@@ -240,6 +240,503 @@ spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/a
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
+# Script and recipe controls inspect inert fixture text; no denied command runs.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    def judge(command):
+        return policy.evaluate({"tool_name": "Bash", "cwd": temp,
+                                "tool_input": {"command": command}}, (root,))
+
+    def fixture(name, body):
+        path = root / name
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def fixture_git(*args):
+        return subprocess.run(["git", *args], cwd=root, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    fixture_git("init", "-q", "-b", "main")
+    fixture_git("config", "user.name", "Policy Fixture")
+    fixture_git("config", "user.email", "policy@example.invalid")
+    fixture("justfile", "check:\n    env -i PATH=\"$PATH\" bash ci/lint.sh\n")
+    fixture("Makefile", "check:\n\t$(CC) app.c\n")
+    fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+    (root / "ci").mkdir()
+    fixture("ci/lint.sh", "#!/bin/sh\necho safe\n")
+    fixture("build.js", "console.log('safe');\n")
+    fixture_git("add", ".")
+    fixture_git("commit", "-qm", "base recipes")
+    fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
+    fixture_git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    fixture_git("checkout", "-qb", "lane")
+    for command in ("just check", "make check", "npm run check", "pnpm run check"):
+        assert judge(command), command  # Unchanged is not an execution exemption.
+    assert judge("task check") is None
+    fixture("allowed.sh", "#!/bin/sh\n# Plain commands keep working.\necho safe\npwd\n")
+    fixture("denied.sh", "#!/bin/bash\ngit clone https://example.invalid/repo stolen\n")
+    fixture("nested.sh", "bash denied.sh\n")
+    fixture("sourced.sh", ". ./denied.sh\n")
+    for command in ("bash allowed.sh", "sh -- allowed.sh", "zsh allowed.sh",
+                    "dash -- allowed.sh", "./allowed.sh", str(root / "allowed.sh"),
+                    "source ./allowed.sh", ". ./allowed.sh", "env timeout 3 bash allowed.sh"):
+        assert judge(command) is None, (command, judge(command))
+    for name in ("denied.sh", "nested.sh", "sourced.sh"):
+        for command in (f"bash {name}", f"./{name}", f". ./{name}", f"source ./{name}"):
+            assert judge(command), command
+    for body in ("sudo true\n", "echo ok; git clone x y\n", "bash -c true\n",
+                 "for x in a; do echo x; done\n", "echo $(id)\n", "$PROGRAM\n",
+                 "echo ok\\\n; sudo true\n",
+                 "pushd child\necho safe\n", "hash -p ./denied.sh echo\necho safe\n",
+                 "noglob sudo true\n", "repeat 2 sudo true\n",
+                 ">out sudo true\n",
+                 "f() { sudo true; }\nf\n", "#!/usr/bin/python3\nprint('safe')\n",
+                 ". ./cycle.sh\n"):
+        fixture("cycle.sh", body)
+        assert judge("bash cycle.sh"), body
+    (root / "binary").write_bytes(b"\x7fELF\x00fixture")
+    (root / "alias.sh").symlink_to(root / "denied.sh")
+    fixture("bash", "sudo true\n")
+    fixture("env", "sudo true\n")
+    fixture("timeout", "sudo true\n")
+    fixture("custom-shell.sh", f"#!{root}/bash\necho safe\n")
+    (root / "git-alias").symlink_to("/usr/bin/git")
+    os.mkfifo(root / "fifo")
+    for command in ("bash missing.sh", "./missing.sh", "bash binary", "./binary",
+                    "bash alias.sh", "bash fifo", "sh -s", "bash", "bash --rcfile allowed.sh",
+                    "source allowed.sh", "./bash allowed.sh", "./custom-shell.sh",
+                    "./git-alias clone x y", "./env echo safe", "./timeout 3 echo safe"):
+        assert judge(command), command
+    (root / "child").mkdir()
+    fixture("cd.sh", "cd child\necho safe\n")
+    assert judge("bash cd.sh") is None
+    assert judge(". ./cd.sh")
+    fixture("cd.sh", "cd child\nbash ../denied.sh\n")
+    assert judge("bash cd.sh")
+    for command in ("touch allowed.sh; bash allowed.sh",
+                    "printf safe > allowed.sh; ./allowed.sh",
+                    "cp denied.sh allowed.sh; source ./allowed.sh"):
+        assert judge(command), command
+    with patch.object(policy, "program_text", side_effect=PermissionError):
+        assert judge("bash allowed.sh")
+    fixture("huge.sh", "x" * (policy.PROGRAM_LIMIT + 1))
+    assert judge("./huge.sh")
+    fixture("justfile", "check:\n    git clone https://example.invalid/repo stolen\n")
+    assert judge("just check")
+    fixture_git("add", "justfile")
+    assert judge("just check")  # staged
+    fixture_git("commit", "-qm", "changed recipe")
+    assert judge("just check")  # committed on lane, still changed from merge base
+    fixture("justfile", "check: prep\n    bash allowed.sh\nprep:\n    echo safe\n")
+    assert judge("just check") is None
+    fixture("justfile", "check: prep\n    echo safe\nprep:\n    bash denied.sh\n")
+    assert judge("just check")
+    for body in ("check:\n    just check\n", "import 'extra.just'\ncheck:\n    echo safe\n",
+                 "set shell := ['bash', '-c']\ncheck:\n    echo safe\n",
+                 "check arg:\n    {{arg}}\n", "check:\n    echo `id`\n",
+                 "check:\n    -sudo true\n", "check:\n    @-git clone x y\n",
+                 "check:\n    #!/usr/bin/python3\n    print('safe')\n"):
+        fixture("justfile", body)
+        assert judge("just check"), body
+    fixture("justfile", "check:\n    echo safe\n")
+    for command in ("just --justfile other check", "just --shell evil check",
+                    "just check x=y", "make -f other", "npm run --prefix other check",
+                    "pnpm run --filter other check",
+                    "npm --prefix other run check", "pnpm --dir other run check", "pnpm check",
+                    "JUST_DOTENV_COMMAND=evil just check", "JUST_JUSTFILE=other just check",
+                    "MAKEFLAGS=evil make check", "npm_config_script_shell=evil npm run check"):
+        assert judge(command), command
+    for name, command in ((".env", "just check"), (".npmrc", "npm run check"),
+                          (".pnpmfile.cjs", "pnpm run check")):
+        fixture(name, "fixture=changed\n")
+        assert judge(command), (name, command)
+        (root / name).unlink()
+    fixture("Makefile", "check:\n\techo safe\n")
+    assert judge("make check")  # No partial Make parser.
+    fixture("package.json", '{"scripts":{"check":"echo safe","precheck":"bash denied.sh"}}')
+    for command in ("npm run check", "pnpm run check"):
+        assert judge(command), command
+    fixture("package.json", '{"scripts":{"check":"bash allowed.sh","precheck":"echo ready"}}')
+    for runner in ("npm", "pnpm", "yarn", "bun"):
+        assert judge(f"{runner} run check") is None
+    fixture_git("update-ref", "-d", "refs/remotes/origin/main")
+    assert judge("just check") is None  # Local main is a valid fallback.
+
+    # Assignment controls apply to typed input, env wrappers and judged files.
+    for name in ("CDPATH", "BASH_ENV", "ENV", "PATH", "IFS", "GLOBIGNORE",
+                 "PROMPT_COMMAND", "SHELLOPTS", "ZDOTDIR", "FPATH", "cdpath", "path"):
+        for command in (f"{name}=evil", f"{name}+=evil", f"{name}[0]=evil",
+                        f"{name}=evil bash allowed.sh",
+                        f"env {name}=evil bash allowed.sh"):
+            assert judge(command), command
+        fixture("assignment.sh", f"{name}=evil\n")
+        assert judge("bash assignment.sh"), name
+        assert judge("source ./assignment.sh"), name
+    (root / "sub").mkdir()
+    (root / "evil/sub").mkdir(parents=True)
+    fixture("sub/run.sh", "echo safe\n")
+    fixture("evil/sub/run.sh", "git clone x y\n")
+    fixture("assignment.sh", f"CDPATH={root}/evil\n")
+    for command in (f"CDPATH={root}/evil; cd sub && bash run.sh",
+                    "source ./assignment.sh && cd sub && bash run.sh"):
+        assert judge(command), command
+    # Round 9 PM ruling includes redirect-only segments.
+    assert judge(">out.txt")
+    assert judge(">/dev/null && bash allowed.sh")
+    for command in ("echo hi >/dev/null && bash allowed.sh",
+                    "echo hi 2>/dev/null && bash allowed.sh"):
+        assert judge(command) is None, (command, judge(command))
+    for command in ("bash allowed.sh && bash allowed.sh",
+                    "just check && just check", "echo hi >out.txt && bash allowed.sh",
+                    "touch allowed.sh && . ./allowed.sh"):
+        assert judge(command), command
+    # Package lifecycle and fetch-and-run controls apply across supported runners.
+    for runner in ("npm", "pnpm", "yarn", "bun"):
+        fixture("package.json", '{"scripts":{"preinstall":"bash denied.sh"}}')
+        for action in ("install", "ci", "run check"):
+            assert judge(f"{runner} {action}"), (runner, action)
+        fixture("package.json", '{"scripts":{"check":"echo safe","prepare":"bash allowed.sh"}}')
+        actions = ("install", "ci", "run check") if runner in {"npm", "pnpm"} else (
+            "install", "run check")
+        for action in actions:
+            assert judge(f"{runner} {action}") is None, (runner, action)
+        if runner in {"yarn", "bun"}:
+            for action in ("ci", "test", "list", "update", "check"):
+                assert judge(f"{runner} {action}"), (runner, action)
+        for action in ("exec echo safe", "dlx anything", "x anything", "create anything"):
+            assert judge(f"{runner} {action}"), (runner, action)
+        for action in ("run denied.sh", "run missing", "run"):
+            assert judge(f"{runner} {action}"), (runner, action)
+    assert judge("bun test")
+    assert judge("bunx anything")
+    assert judge("pnpx anything")
+    assert judge("yarnpkg dlx anything")
+    assert judge("yarnpkg run check") is None
+    (root / "node_modules/.bin").mkdir(parents=True)
+    fixture("node_modules/.bin/local-tool", "#!/bin/sh\necho safe\n")
+    assert judge("npx --no-install local-tool") is None
+    assert judge("npx --no local-tool") is None
+    for command in ("npx local-tool", "npx --no-install missing", "npx --yes local-tool",
+                    "npx --no-install --package=other local-tool"):
+        assert judge(command), command
+    fixture("node_modules/.bin/local-tool", "#!/bin/sh\ngit clone x y\n")
+    assert judge("npx --no-install local-tool")
+    print("PASS: recursive scripts and changed recipes denied; allowed scripts and base recipes pass")
+
+# A venv interpreter is an executable, not a script: a regular ELF binary outside every
+# lane-writable root is judged as the command its resolved name says, like the bare form.
+with tempfile.TemporaryDirectory() as temp:
+    import shutil
+    import sys
+    base = Path(temp).resolve()
+    root = base / "worktree"
+    (root / ".work").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
+    real_elf = Path(os.path.realpath(sys.executable))
+    assert real_elf.read_bytes()[:4] == b"\x7fELF", real_elf
+
+    def venv_judge(command):
+        return policy.evaluate({"tool_name": "Bash", "cwd": str(root),
+                                "tool_input": {"command": command}}, (root,))
+
+    def make_elf(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(real_elf, path)
+        path.chmod(0o755)
+        return path
+
+    def make_script(path, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        path.chmod(0o755)
+        return path
+
+    def make_venv(venv):
+        make_elf(venv / "bin/python3.12")
+        (venv / "bin/python").symlink_to("python3.12")
+        return venv
+
+    # The fake lane sits under a temp dir, so lift the temp roots (and the per-run TMPDIR
+    # and scratch anchors) while the venv lives beside the worktree; they are put back for
+    # the temp-root negative controls.
+    def outside_temp():
+        stack = [patch.object(policy, "LANE_TEMP_ROOTS", ()),
+                 patch.object(policy, "scratch_root", return_value=None),
+                 patch.dict(os.environ)]
+        os.environ.pop("TMPDIR", None)
+        return stack
+
+    outside = make_venv(base / "outside-venv")
+    (root / ".venv").symlink_to(outside)
+    make_script(outside / "bin/pytest", "#!/bin/sh\necho safe\n")
+    make_script(outside / "bin/shellcheck", "#!/bin/sh\ngit clone https://example.invalid/r s\n")
+    make_script(outside / "bin/entry", "#!/usr/bin/python3\nprint('safe')\n")
+    fixture_commands = (
+        ".venv/bin/python -m pytest -q",
+        ".venv/bin/python --version",
+        ".venv/bin/python -m catalogue.admission_report x",
+        f"{root}/.venv/bin/python -m x",
+        ".venv/bin/python -m catalogue.admission_report .work/t109/records --decision-packet"
+        " .work/t109/packet-probe/records > .work/t109/log.txt 2>&1; echo done",
+        "TMPDIR=/tmp .venv/bin/python -m pytest -q tests/test_a.py tests/test_b.py",
+        ".venv/bin/python .work/t112/probe_summary.py -v",
+        '.venv/bin/python -m unittest discover -s catalogue -p "test_*.py" 2>&1 | tail -30',
+        "touch marker; .venv/bin/python -m pytest -q",
+    )
+    # Verdicts must equal the bare python3 form, including its denials.
+    denied_forms = (
+        ".venv/bin/python -c 'print(1)'", ".venv/bin/python -m pytest -c conf",
+        "cat x | .venv/bin/python", ".venv/bin/python <<< 'print(1)'",
+        ".venv/bin/python -m pytest > /etc/outside.log",
+    )
+    for command in fixture_commands + denied_forms:
+        bare = command.replace(f"{root}/.venv/bin/python", "python3").replace(".venv/bin/python", "python3")
+        stack = outside_temp()
+        for item in stack:
+            item.start()
+        try:
+            venv_verdict, bare_verdict = venv_judge(command), venv_judge(bare)
+        finally:
+            for item in reversed(stack):
+                item.stop()
+        assert bool(venv_verdict) == bool(bare_verdict), (command, venv_verdict, bare_verdict)
+        assert (command in fixture_commands) == (venv_verdict is None), (command, venv_verdict)
+        if command in denied_forms:
+            assert str(venv_verdict) == str(bare_verdict), (command, venv_verdict, bare_verdict)
+    # Judged by the resolved name, not the link name.
+    (outside / "bin/harmless").symlink_to("python3.12")
+    make_elf(outside / "bin/bash")
+    with patch.object(policy, "LANE_TEMP_ROOTS", ()), patch.object(policy, "scratch_root", return_value=None), \
+            patch.dict(os.environ):
+        os.environ.pop("TMPDIR", None)
+        assert venv_judge(".venv/bin/harmless -m pytest") is None
+        assert venv_judge(".venv/bin/harmless -c 'print(1)'")
+        assert venv_judge(".venv/bin/bash -c true")
+        assert venv_judge("bash -c true")
+        # Text scripts keep being read and judged, exactly as before.
+        assert venv_judge(".venv/bin/pytest -q") is None
+        assert venv_judge(".venv/bin/shellcheck x")
+        assert venv_judge(".venv/bin/entry")
+        # Negative controls: the same interpreter, but where a lane could have put it.
+        make_elf(root / "tool")
+        make_elf(root / ".work/tool")
+        make_elf(root / "bin/tool")
+        for command in ("./tool --version", "bin/tool --version", ".work/tool --version",
+                        f"{root}/tool --version", f"{root}/.work/tool --version"):
+            assert venv_judge(command), command
+        shutil.move(root / "tool", base / "moved-tool")
+        assert venv_judge(f"{base}/moved-tool --version") is None
+        # A venv inside the worktree whose interpreter is inside the worktree stays denied.
+        make_venv(root / "inner-venv")
+        for command in ("inner-venv/bin/python -m x", f"{root}/inner-venv/bin/python --version",
+                        "inner-venv/bin/python3.12 --version"):
+            assert venv_judge(command), command
+        # Writable by others, or not a regular ELF file, is not an executable either.
+        loose = make_elf(base / "loose/python3.12")
+        loose.chmod(0o775)
+        assert venv_judge(f"{loose} --version")
+        make_script(base / "plain/python3.12", "#!/bin/sh\necho safe\n")
+        assert venv_judge(f"{base}/plain/python3.12 --version") is None  # a script, as before
+        make_script(base / "plain/python3.12", "#!/bin/sh\ngit clone x y\n")
+        assert venv_judge(f"{base}/plain/python3.12 --version")
+        (base / "dir-elf").mkdir()
+        assert venv_judge(f"{base}/dir-elf --version")
+    # Under the real temp roots the outside venv is lane-writable, so it is denied again.
+    assert venv_judge(".venv/bin/python --version")
+    assert venv_judge(f"{root}/.venv/bin/python -m x")
+    print("PASS: venv interpreters follow the bare python3 verdict; lane-writable binaries and scripts stay denied")
+
+# Local-only bases, trusted recipes and transitive gate inputs.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    fixture_git("init", "-q", "-b", "main")
+    fixture_git("config", "user.name", "Policy Fixture")
+    fixture_git("config", "user.email", "policy@example.invalid")
+    fixture("justfile", 'check:\n    bash gate.sh\n')
+    fixture("Makefile", "check:\n\tbash gate.sh\n")
+    fixture("package.json", '{"scripts":{"check":"bash gate.sh","prepare":"bash gate.sh"}}')
+    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n")
+    fixture("check.py", "#!/usr/bin/python3\nprint('safe')\n")
+    fixture("child.sh", "#!/bin/sh\necho safe\n")
+    fixture("source.sh", "#!/bin/sh\necho safe\n")
+    fixture("direct.sh", "#!/bin/sh\necho safe\n")
+    (root / "sub").mkdir()
+    fixture("sub/run.sh", "#!/bin/sh\necho safe\n")
+    fixture_git("add", ".")
+    fixture_git("commit", "-qm", "trusted gate")
+    fixture_git("checkout", "-qb", "lane")
+    commands = ("just check", "npm run check", "pnpm run check",
+                "yarn run check", "bun run check", "npm install", "pnpm ci")
+    for command in commands:
+        assert judge(command) is None, (command, judge(command))
+    assert judge("make check")
+    assert judge("task check") is None
+    for script in ("gate.sh", "child.sh"):
+        original = (root / script).read_text()
+        fixture(script, "#!/bin/sh\ngit clone x y\n")
+        for command in commands:
+            assert judge(command), (script, command)
+        fixture_git("add", script)
+        assert judge("just check")  # staged changed script
+        fixture_git("commit", "-qm", "changed script")
+        assert judge("just check")  # committed changed script
+        fixture(script, original)
+    fixture_git("add", ".")
+    fixture_git("commit", "-qm", "restore trusted scripts")
+    fixture("check.py", "#!/usr/bin/python3\nprint('changed')\n")
+    fixture("gate.sh", "#!/bin/sh\npython3 -I check.py\n")
+    assert judge("just check")  # Interpreter flags must not hide changed inputs.
+    fixture("gate.sh", "#!/bin/sh\nbash child.sh\n")
+    fixture("check.py", "#!/usr/bin/python3\nprint('safe')\n")
+    fixture_git("branch", "-m", "main", "master")
+    assert judge("just check") is None  # second local default
+    fixture_git("branch", "-m", "master", "trunk")
+    fixture_git("checkout", "-qb", "source-lane", "trunk")
+    assert judge("just check") is None  # branch creation reflog names trunk
+    fixture_git("checkout", "trunk")
+    fixture_git("checkout", "-qb", "head-lane")
+    assert judge("just check") is None  # Created from HEAD, checkout names trunk
+    fixture_git("branch", "-D", "trunk")
+    reason = judge("just check")
+    assert reason and "No recipe base found" in reason, reason
+    print("PASS: local default/source bases and changed trusted gate inputs")
+
+# Round 4: typed commands, judged files and unchanged recipes share strict checks.
+# All dangerous bodies are inert strings; only the safe positive recipe executes.
+with tempfile.TemporaryDirectory() as temp:
+    root = Path(temp)
+    fixture_git("init", "-q", "-b", "main")
+    fixture_git("config", "user.name", "Policy Fixture")
+    fixture_git("config", "user.email", "policy@example.invalid")
+    (root / "sub").mkdir()
+    (root / "evil" / "sub").mkdir(parents=True)
+    fixture("sub/run.sh", "echo safe\n")
+    fixture("evil/sub/run.sh", "git clone x y\n")
+    bad = (
+        f"printf -v CDPATH {root}/evil; cd sub && bash run.sh",
+        f"read CDPATH <<< {root}/evil; cd sub && bash run.sh",
+        "printf -v target value", "printf -vCDPATH evil", 'printf "$option" target value',
+        "printf >/dev/null -v CDPATH evil", "printf 2>/dev/null -v CDPATH evil",
+        ">/dev/null printf -v CDPATH evil", "2>/dev/null read CDPATH",
+        ">/dev/null cd sub && bash run.sh", "let CDPATH=1",
+        "read target", "read -a target", "mapfile target", "readarray target",
+        "getopts a target", "declare CDPATH=evil", "typeset CDPATH=evil",
+        "local CDPATH=evil", "export CDPATH=evil", "readonly CDPATH=evil",
+        "declare -n target=CDPATH", "hash -p ./evil/bash bash", "hash -r",
+        "enable -f evil.so evil", "alias cd=evil", "shopt -s cdable_vars",
+        "set -o posix; echo safe", "set -o pipefail; echo safe",
+        "builtin printf -v CDPATH evil", "command printf -v CDPATH evil",
+        "cd -P sub && bash run", "cd -- sub && bash run.sh",
+        "pushd sub; bash run.sh", "popd; bash run.sh", 'cd "$target" && bash run.sh',
+        "cd && bash run.sh", "bash run", 'bash "$script"',
+    )
+    for body in bad:
+        assert judge(body), body
+        for wrapper in ("builtin", "command", "command --", "env"):
+            assert judge(f"{wrapper} {body}"), (wrapper, body)
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "unchanged review scenario")
+        assert not policy.recipe_changed(root / "justfile", root)
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
+        assert judge("task check") is None
+    # Round 8: prefixes and branches must not hide printf's assignment option.
+    # Judge inert text only; never execute these state-changing payloads.
+    for body in (
+            "2>/dev/null printf -v X y", "2>&1 printf -v X y",
+            "X=1 2>/dev/null printf -v X y",
+            "if true; then printf -v X y; fi",
+            "if true; then echo safe; else printf -v X y; fi",
+            "if true; then echo safe; elif true; then printf -v X y; fi",
+            "! printf -v X y", "(printf -v X y)", "true && printf -v X y"):
+        assert judge(body), body
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "normalized print negative")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
+    # Round 9: inspect inert leading redirects; never execute the payloads.
+    for body in (
+            "&>/dev/null printf -v X y", "&>> f printf -v X y",
+            "2>/dev/null printf -v X y", ">f echo hi", "<f cat", "<<<x cat",
+            "2>&1 echo hi", "2>>f echo hi", ">&1 echo hi", "2<&1 cat",
+            "<>f cat", ">|f echo hi", "<<x cat",
+            "X=1 2>/dev/null echo hi", "if true; then 2>/dev/null echo hi; fi",
+            "if true; then &>/dev/null printf -v X y; fi"):
+        reason = judge(body)
+        assert reason, body
+        if body != "<<x cat":
+            assert "Leading shell redirections" in reason, (body, reason)
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+    for body in ("echo hi 2>/dev/null", "echo hi 2>&1", "echo hi >f",
+                 "printf '%s' hi &>/dev/null", "printf '%s' hi &>>f"):
+        assert judge(body) is None, (body, judge(body))
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh") is None, body
+    for body in ("run bash sub/run.sh", "python3 check.py", "node build.js"):
+        assert policy.trusted_script_changes(body, temp, root, (root,), 0), body
+    for body in ("echo safe", "printf '%s' safe", "printf '%s' -value", "printf -- -v",
+                 "printf '[%s]\\n' x", "printf '{\"ok\":true}\\n'",
+                 "printf '* ? ~ { } [ ]\\n'", 'printf "[*?~{}]\\n"',
+                 "echo '[*?~{}]'", 'echo "[*?~{}]"',
+                 "cat sub/run.sh", "command -v bash"):
+        assert judge(body) is None, body
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh") is None, body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "unchanged positive print scenario")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner) is None, (runner, body)
+    for body in ("printf [ab]", "printf {a,b}", "printf *", "printf ?", "printf ~"):
+        assert judge(body), body
+    # Round 6: escaped quotes outside quotes cannot hide an unquoted glob.
+    # Inspect these payloads only; never run their redirects or expansions.
+    for body in (r"printf >\' ?v 'PATH' \'", r'printf >\" ?v "PATH" \"',
+                 r"printf <$'\'' ?v PATH \'", r"printf safe\ word",
+                 "printf '%s' < input", "printf '%s' *",
+                 r"echo safe\ word", "echo safe < input"):
+        assert judge(body), body
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "escaped quote printf negative")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
+    # Echo cannot assign, but judged bodies must still reject unquoted globs.
+    for body in (r"echo >\' ?v 'PATH' \'", r'echo >\" ?v "PATH" \"'):
+        fixture("probe.sh", body + "\n")
+        assert judge("bash probe.sh"), body
+        fixture("justfile", "check:\n    " + body + "\n")
+        fixture("package.json", json.dumps({"scripts": {"check": body}}))
+        fixture_git("add", ".")
+        fixture_git("commit", "-qm", "escaped quote echo negative")
+        for runner in ("just check", "npm run check", "pnpm run check"):
+            assert judge(runner), (runner, body)
+    # Round 7 PM ruling: later unquoted globs also fail closed.
+    fixture("justfile", "check:\n    printf '%s\\n' safe\n")
+    fixture_git("add", "justfile")
+    fixture_git("commit", "-qm", "modelled positive recipe")
+    assert judge("just check") is None
+    result = subprocess.run(["just", "check"], cwd=root, check=True, capture_output=True, text=True)
+    assert result.stdout == "safe\n", result
+    print("PASS: Round 4 builtin/cwd controls, unchanged recipes fail closed, task check allowed")
+
 # #76: entering a scratch Git repository must not move the task boundary.
 with tempfile.TemporaryDirectory() as temp:
     base = Path(temp)
@@ -284,9 +781,9 @@ with patch.dict(os.environ, {"GIT_DIR": "/untrusted", "GIT_CONFIG_COUNT": "1", "
 with tempfile.TemporaryDirectory() as temp:
     root = Path(temp)
     for command in (
-            "task merge proj 5", "/usr/local/bin/task review proj 5",
+            "task merge proj 5",
             "python3 /home/agent/dev_workspace/bootstrap/home/dot_local/bin/executable_task close proj 5",
-            "sh /usr/local/bin/task start proj 5", "env task note proj 5 improve x",
+            "env task note proj 5 improve x",
             "task cancel proj 5", "task denials", "task lane proj 5",
             "task review proj 5 --record review.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
@@ -298,6 +795,7 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("task status proj", "task check", "task runner-check proj runner.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     assert policy.evaluate_command("echo see task start for details", temp, root, (root,)) is None
+    assert policy.evaluate_command("sh /usr/local/bin/task start proj 5", temp, root, (root,))
     state_target = str(Path.home() / ".local/state/task/proj/t5/review.json")
     assert policy.evaluate_command(f"printf x > {state_target}", temp, root, (root,))
     assert policy.evaluate({"tool_name": "Write", "cwd": temp,
@@ -489,9 +987,6 @@ with tempfile.TemporaryDirectory() as temp:
         "ls 2> /dev/null",
         "git log 2>&1 | head",
         f"git -C {temp} status --short && sed -n '1,80p' {temp}/file",
-        "set -o pipefail; cat file | tee output",
-        "set -e; set -u; set -o pipefail; cat file | tee /tmp/hook-friction-output",
-        "set -euo pipefail; cat file | tee output",
         "if [ -d .work/context ]; then find .work/context -maxdepth 1 -type f -printf '%f\\n' | sort; else printf 'X\\n'; fi",
         "if test -f file; then cat file; fi",
         "set -eu; if test -f file; then cat file; fi",
@@ -506,6 +1001,9 @@ with tempfile.TemporaryDirectory() as temp:
         "git status && sed -n --in-p 's/a/b/' file",
     )
     denied = (
+        "set -o pipefail; cat file | tee output",
+        "set -e; set -u; set -o pipefail; cat file | tee /tmp/hook-friction-output",
+        "set -euo pipefail; cat file | tee output",
         r"rm -rf a\ 2>/dev/null",
         'rm -rf "a 2">/dev/null',
         r"chmod -R 777 a\ 2>/dev/null",

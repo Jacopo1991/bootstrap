@@ -4,16 +4,19 @@
 The sandbox protects private task state from lanes running as the same Unix user.
 Write capability there determines trust; vendor environment markers do not.
 
-  task start <repo> <id> --builder codex|claude [--refresh] [--no-verify <reason>] [--seed <name>]...
+  task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]... [--override "Jacopo YYYY-MM-DD: <request>"]
   task runner-check <repo> <file>
-  task runner-start <repo> <runner-file> [--llm]
-  task lane <repo> <id> [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost]
+  task runner-start <repo> <runner-file> [--no-pace]
+  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace] [--override "Jacopo YYYY-MM-DD: <request>"]
     Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
     --builder overrides the pinned builder and updates subsequent review routing.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
-  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>]
+  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>] [--no-pace]
+  task usage [--weekly-line]
+    Vendor usage, pace verdict and the usage-pacing policy applied; lane, review and batch starts obey it
+    (exit 4 = held back). --no-pace skips the check for one command and is logged. See README.
   task merge <repo> <id> [--keep] [--override <reason>] [--detach] [--lock-wait <minutes>]
   task cancel <repo> <id>
   task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
@@ -22,6 +25,8 @@ Write capability there determines trust; vendor environment markers do not.
   task status [<repo>]
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
+    Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
+    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; --tier never changes the recorded tier; only --override "Jacopo YYYY-MM-DD: <request>" on task lane or task start (ledgered) permits either. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
   task denials [--days N] [--rule R] [--repo R]
@@ -43,6 +48,7 @@ import hashlib
 import json
 import os
 import re
+import runpy
 import secrets
 import selectors
 import shlex
@@ -58,7 +64,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from task_limits import cli_limit, lane_limit
+import task_usage
+from task_limits import bwrap_denial, cli_limit, lane_limit
+from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
@@ -74,14 +82,134 @@ DISPOSABLE = {".work", ".venv", "node_modules", "__pycache__", ".pytest_cache", 
               "coverage", "target", ".parcel-cache"}
 # .work is removable only after preservation; its outputs are not disposable.
 WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
-               "node_modules", "hermes-home", "fakehome"}
+               "node_modules", "hermes-home", "fakehome", ".pycache", ".mypy_cache",
+               ".ruff_cache", ".cache"}
+
+
+def archive_exclusion(item, info, size=None, errors=None, *, hash_files=True):
+    """Shared no-follow copy/prune rule; hashes are streamed, never buffered whole."""
+    mode = info.st_mode
+    record = {"size": info.st_size if size is None else size}
+    if stat.S_ISLNK(mode):
+        return None
+    if archive_runtime(item, info, errors) or (stat.S_ISREG(mode) and item.suffix == '.pyc'):
+        return dict(record, reason="cache/runtime")
+    if not stat.S_ISREG(mode):
+        return None
+    name = item.name.lower()
+    base = re.sub(r'-(wal|shm|journal)$', '', name)
+    reason = "database" if base.endswith(('.sqlite', '.sqlite3', '.db', '.duckdb')) else None
+    if reason is None and info.st_size > 50 * 1024 ** 2:
+        reason = "file over 50 MB"
+    try:
+        with os.fdopen(os.open(item, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError("file type changed")
+            header = stream.read(16)
+            if header == b'SQLite format 3\0':
+                reason = "database"
+            if reason:
+                if not hash_files:
+                    return dict(record, reason=reason)
+                digest = hashlib.sha256(header)
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+                return dict(record, reason=reason, sha256=digest.hexdigest())
+    except OSError as error:
+        if reason is None:
+            raise
+        return dict(record, reason=reason, **({'sha256': None} if hash_files else {}), error=str(error))
+    return None
+
+
+def prune_evidence_archive(root, apply, report, *, snapshots=None):
+    """Prune archive snapshots, including legacy ones without manifests; never traverse links."""
+    if any(item.is_symlink() for item in (root, *root.parents)) or not root.is_dir():
+        return
+    entries, _, _ = archive_inventory(root)
+    total = 0
+    for snapshot, info in entries:
+        repair = snapshots is not None
+        if (not stat.S_ISDIR(info.st_mode) or
+                (snapshot not in snapshots if repair else len(snapshot.relative_to(root).parts) != 3) or
+                (any(part.startswith('.pending-') for part in snapshot.relative_to(root).parts)
+                 and not (repair and not apply))):
+            continue
+        manifest = snapshot / 'manifest.json'
+        if manifest.is_symlink():
+            report.append(f"archive: cannot prune {snapshot}: symlink manifest")
+            continue
+        try:
+            record = json.loads(manifest.read_text()) if manifest.exists() else {}
+            if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
+                raise ValueError("manifest must be an object with a pruned list")
+            contents, sizes, errors = archive_inventory(manifest.parent)
+            protected = {snapshot, snapshot / '.work', snapshot / 'reports', snapshot / '.work/reports'}
+            _, disposable = oversized_contents(contents, sizes, protected, errors) if repair else (set(), set())
+            for item, error in errors.items():
+                report.append(f"Skipped {item}: {error}")
+            if apply and errors:
+                skipped = record.setdefault('skipped', [])
+                for item, error in errors.items():
+                    entry = {'path': str(item.relative_to(snapshot)), 'reason': error}
+                    if entry not in skipped:
+                        skipped.append(entry)
+                atomic_json(manifest, record)
+            excluded = set()
+            for item, meta in contents:
+                if item == manifest or item == manifest.parent:
+                    continue
+                if item.parent in excluded:
+                    excluded.add(item)
+                    continue
+                try:
+                    removal = archive_exclusion(item, meta, sizes[item], hash_files=apply)
+                except OSError as error:
+                    report.append(f"archive: kept {item}: {error}")
+                    continue
+                if removal is None and item in disposable:
+                    removal = {'size': sizes[item], 'reason': 'directory over 200 MB'}
+                if removal is None or any(path == item or item in path.parents for path in errors):
+                    continue
+                excluded.add(item)
+                total += removal['size']
+                removal.update(path=str(item.relative_to(manifest.parent)), date=utc_now())
+                report.append(f"archive: {'remove' if apply else 'would remove'} {item} ({removal['size']} bytes): {removal['reason']}")
+                if apply:
+                    try:
+                        if stat.S_ISDIR(meta.st_mode):
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                    except OSError as error:
+                        report.append(f"archive: cannot remove {item}: {error}")
+                        continue
+                    record.setdefault('pruned', []).append(removal)
+                    atomic_json(manifest, record)
+            if apply:
+                for item, meta in reversed(contents):
+                    if stat.S_ISDIR(meta.st_mode) and item != manifest.parent:
+                        try:
+                            item.rmdir()
+                        except OSError:
+                            pass
+        except (OSError, ValueError, TypeError) as error:
+            report.append(f"archive: cannot prune {manifest.parent}: {error}")
+    report.append(f"archive: {'removed' if apply else 'would remove'} {total} bytes total")
 
 
 def archive_runtime(item, info, errors=None):
     try:
-        return (item.name in WORK_CACHES or item.name.endswith('.sock') or
-                stat.S_ISSOCK(info.st_mode) or
-                (stat.S_ISDIR(info.st_mode) and (item / 'pyvenv.cfg').is_file()))
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        if item.name in WORK_CACHES or item.name.endswith('.sock') or stat.S_ISSOCK(info.st_mode):
+            return True
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                return stat.S_ISREG((item / 'pyvenv.cfg').lstat().st_mode)
+            except FileNotFoundError:
+                pass
+        return False
     except OSError as error:
         if errors is not None:
             errors[item] = f"cannot inspect: {error}"
@@ -369,10 +497,16 @@ def read_json_object(path):
         return {}
 
 
+def task_tier(text, flag=None):
+    values = re.findall(r"(?im)^Tier:\s*(.*?)\s*$", text)
+    value = flag or (values[0].lower() if values else "routine")
+    if value not in TIERS or (not flag and len(set(values)) > 1):
+        raise Stop("Tier must be routine, hard or design")
+    return value
+
+
 def active_boosts():
-    now = datetime.now(timezone.utc)
-    return {vendor: until for vendor, until in read_json_object(HOME / ".local/state/task/boost.json").items()
-            if vendor in {"claude", "codex"} and plan_time(until) and now < plan_time(until)}
+    return active(HOME)
 
 
 def boost(args):
@@ -401,7 +535,32 @@ def boost(args):
 
 def boost_line():
     active = active_boosts()
-    return "boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items())) if active else ""
+    return ("boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items()))
+            + " (tier routing + batch capacity; routine and reviews unchanged)" if active else "")
+
+
+def usage(args):
+    lines = task_usage.weekly_lines(HOME) if args.weekly_line else task_usage.report(HOME)
+    print("\n".join(lines))
+    return 0
+
+
+def pace_check(args, kind, vendor, tier, task):
+    """Usage-pacing gate for a PM lane or review: the decision, or None under --no-pace."""
+    if args.no_pace or os.environ.get("TASK_NO_PACE"):
+        task_usage.log(HOME, f"--no-pace: {kind} {task.repo.name}/{task.id} not paced")
+        return None
+    decision = task_usage.gate(HOME, kind, vendor, tier, task.repo.name, task.id)
+    print("\n".join(decision["notes"]), end="\n" if decision["notes"] else "")
+    until, vendor = decision["spend"], decision["vendor"]
+    if until and vendor not in active_boosts():
+        path = HOME / ".local/state/task/boost.json"
+        atomic_json(path, {**read_json_object(path), vendor: until})
+        task_usage.log(HOME, f"boost on for {vendor} until {until}: under-used near reset")
+        print(f"pace: {vendor} under-used near its reset; boost on until {until}")
+    if decision["hold"]:
+        print(f"task {kind}: held back by usage pacing: {decision['hold']} (retry later; --no-pace overrides)")
+    return decision
 
 
 def plan_time(value):
@@ -632,9 +791,15 @@ def realign(args):
 
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def criteria_from(text: str):
@@ -806,23 +971,26 @@ def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=
                 continue
             relative = str(item.relative_to(source))
             mode = info.st_mode
+            try:
+                omission = archive_exclusion(item, info, sizes[item], errors) if item != source else None
+            except OSError as error:
+                errors[item] = str(error)
+                excluded.add(item)
+                continue
             reason = None
             if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
                 special.append(relative)
                 reason = "special file"
-            elif item != source and archive_runtime(item, info, errors):
-                reason = "cache/runtime"
+            elif omission:
+                reason = omission['reason']
             elif item in disposable:
                 reason = "directory over 200 MB"
-            elif (stat.S_ISREG(mode) and item.suffix == '.log' and
-                  sizes[item] >= 50 * 1024 ** 2 and not archive_evidence(item, info)):
-                reason = "log over 50 MB"
             if item in errors:
                 excluded.add(item)
                 continue
             if reason:
                 excluded.add(item)
-                skipped.append({"path": relative, "size": sizes[item], "reason": reason})
+                skipped.append(dict(omission or {"size": sizes[item], "reason": reason}, path=relative))
                 continue
             if item in oversized:
                 skipped.append({"path": relative, "size": sizes[item],
@@ -846,7 +1014,8 @@ def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=
                                                 "head": reuse_head or (head.stdout.strip()
                                                                        if not head.returncode else None)})
         if strict and errors:
-            raise OSError("evidence could not be fully read or copied")
+            raise OSError("evidence could not be fully read or copied: " +
+                          "; ".join(f"{item}: {error}" for item, error in errors.items()))
         destination = archive / f"{path.name}-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except (OSError, shutil.Error) as error:
@@ -890,6 +1059,39 @@ def timeout_for(path: Path):
     return int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 
 
+def check_history(path, step):
+    root = HOME / ".local/state/task" / main_repo(path).name
+    rows = []
+    for file in root.glob("*/checks.jsonl") if root.is_dir() else ():
+        try: rows.extend(json.loads(line) for line in file.read_text().splitlines())
+        except (OSError, json.JSONDecodeError): pass
+    return sorted((item for item in rows if item.get("trusted") is True
+                   and item.get("result") == "passed"
+                   and any(record.get("command") == step for record in item.get("steps", []))),
+                  key=lambda item: item.get("time", ""))[-5:]
+
+
+def step_timeout(path, step):
+    configured = timeout_for(path)
+    durations = [record["duration"] for item in check_history(path, step)
+                 for record in item["steps"] if record.get("command") == step
+                 and isinstance(record.get("duration"), (int, float))]
+    return configured, max(configured, 2 * max(durations, default=0)), durations
+
+
+def gate_warning(path):
+    configured = timeout_for(path)
+    rows = check_history(path, ["just", "check"])
+    durations = sorted(record["duration"] for item in rows for record in item["steps"]
+                       if record.get("command") == ["just", "check"])
+    mid = len(durations) // 2
+    median = (durations[mid] if len(durations) % 2 else sum(durations[mid - 1:mid + 1]) / 2) if durations else 0
+    if durations and median > configured * .75:
+        return (f"gate near timeout: median {median:g} s of "
+                f"{configured} s configured; speed up the suite or raise check_timeout")
+    return ""
+
+
 def configured_environment(path, repo=None):
     values = task_config(path).get("env", {})
     return expand_environment(values, path, repo)
@@ -926,6 +1128,40 @@ def gate_variants(path):
         if name in variants:
             raise Stop(".task.toml gate_variant names must be unique.")
         variants[name] = expand_environment(entry.get("env", {}), path)
+    return variants
+
+
+def task_config_at_commit(repo: Path, commit: str):
+    """Read task configuration from the committed tree that would be merged."""
+    try:
+        raw = git(repo, "show", f"{commit}:.task.toml")
+        config = tomllib.loads(raw)
+    except Stop as error:
+        if "does not exist" in str(error) or "Path '" in str(error):
+            config = {}
+        else:
+            raise
+    return config
+
+
+def gate_variants_at_commit(repo: Path, commit: str, worktree: Path):
+    """Read unexpanded gate environment values from the committed result."""
+    config = task_config_at_commit(repo, commit)
+    entries = config.get("gate_variant", [])
+    if not isinstance(entries, list):
+        raise Stop(".task.toml gate_variant must be an array of tables.")
+    variants = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise Stop(".task.toml gate_variant must contain tables.")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise Stop(".task.toml gate_variant requires a simple nonempty name.")
+        if name in variants:
+            raise Stop(".task.toml gate_variant names must be unique.")
+        raw_environment = entry.get("env", {})
+        expand_environment(raw_environment, worktree)  # Validate names and values.
+        variants[name] = raw_environment
     return variants
 
 
@@ -1350,10 +1586,24 @@ def claude_temporary_root():
     return root
 
 
+def lane_temporary_root():
+    override = os.environ.get("TASK_LANE_TEMP_ROOT")
+    return Path(override) if override else Path("/tmp") / f"task-lane-{os.getuid()}"
+
+
 def cleanup_lane_temporary(temporary):
     if not temporary:
         return
     path = Path(temporary)
+    if path.parent == lane_temporary_root():  # The directory advisory_temporary_parent created.
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise Stop("Lane temporary directory must be owned by the user.")
+        shutil.rmtree(path, ignore_errors=True)
+        return
     # Cancellation reads a lane-controlled record; never remove arbitrary paths.
     root = claude_temporary_root()
     if not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
@@ -1376,6 +1626,18 @@ def cleanup_lane_temporary(temporary):
             pass  # An outer lane may finish concurrently.
 
 
+def finalize_lane_record(path, run, state, **fields):
+    # A terminal record is the completion signal to waiters and batch runners.
+    # Cleanup must precede publication, but a cleanup failure must not hide exit.
+    try:
+        cleanup_lane_temporary(run.get("temporary"))
+    except (OSError, Stop) as error:
+        print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
+    finally:
+        run.update(state=state, ended_at=utc_now(), **fields)
+        atomic_json(path, run)
+
+
 def private_claude_lane(path, root):
     if path.parent != root or not re.fullmatch(r"lane-[0-9a-f]{8}", path.name):
         return False
@@ -1387,6 +1649,18 @@ def private_claude_lane(path, root):
             and stat.S_IMODE(info.st_mode) == 0o700)
 
 
+def new_lane_temporary():
+    root = claude_temporary_root()
+    # Nest only in a verified outer lane grant, keeping bridge sockets short.
+    inherited = os.environ.get("TMPDIR")
+    parent = Path(inherited).resolve() if inherited else root
+    parent = next((candidate for candidate in (parent, *parent.parents)
+                   if private_claude_lane(candidate, root)), root)
+    temporary = parent / f"lane-{secrets.token_hex(4)}"
+    temporary.mkdir(mode=0o700)
+    return temporary
+
+
 def lane_environment(task, builder="codex"):
     env = agent_environment()
     env.update(configured_environment(task.path, task.repo))
@@ -1394,14 +1668,7 @@ def lane_environment(task, builder="codex"):
     state.mkdir(parents=True, exist_ok=True)
     env["XDG_STATE_HOME"] = str(state)
     if builder == "claude":
-        root = claude_temporary_root()
-        # Nest only in a verified outer lane grant, keeping bridge sockets short.
-        inherited = os.environ.get("TMPDIR")
-        parent = Path(inherited).resolve() if inherited else root
-        parent = next((candidate for candidate in (parent, *parent.parents)
-                       if private_claude_lane(candidate, root)), root)
-        temporary = parent / f"lane-{secrets.token_hex(4)}"
-        temporary.mkdir(mode=0o700)
+        temporary = new_lane_temporary()
     else:
         temporary = task.path / ".work/tmp"
         if not temporary.resolve().is_relative_to(task.path.resolve()):
@@ -1415,7 +1682,7 @@ def lane_environment(task, builder="codex"):
 
 
 MODELS = {"codex": {"gpt-6-luna": "gpt-6-luna", "gpt-6.1-sol": "gpt-6.1-sol", "gpt-6-astra": "gpt-6-astra"},
-          "claude": {"sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
+          "claude": {"haiku": "haiku", "sonnet": "sonnet", "claude-sonnet-5-5": "sonnet",
                      "opus": "opus", "claude-opus-5-5": "opus",
                      "fable": "fable", "claude-fable-5-1": "fable"}}
 
@@ -1428,6 +1695,15 @@ def resolve_model(builder, model):
 
 
 GATE_LOCK_WAIT = 45
+
+
+def lane_contract_source():
+    for root in (".agents", ".claude"):
+        source = HOME / root / "skills/slim-workflow/lane-contract.md"
+        if source.is_file() and os.access(source, os.R_OK):
+            return source
+    raise Stop("No lane contract: install the slim-workflow skill so ~/.agents/skills/slim-workflow/lane-contract.md "
+               "or ~/.claude/skills/slim-workflow/lane-contract.md exists.")
 
 
 def refresh_context(task):
@@ -1452,16 +1728,16 @@ def refresh_context(task):
         for decision in (task.kb / "backlog/decisions").glob("*.md"):
             if decision.name in text or re.search(r"\b" + re.escape(decision.stem.split(" - ")[0]) + r"\b", text, re.I):
                 sources.append(decision)
-    expected = {source.relative_to(task.kb) for source in sources if source.is_file()}
+    pairs = [(source, source.relative_to(task.kb)) for source in sources if source.is_file()]
+    pairs.append((lane_contract_source(), Path("lane-contract.md")))
+    expected = {relative for _, relative in pairs}
     for target in destination.rglob("*"):
         if target.is_file() and target.relative_to(destination) not in expected:
             target.chmod(0o644)
             target.unlink()
             print(f"Context source removed: {target.relative_to(destination)}")
-    for source in sources:
-        if not source.is_file():
-            continue
-        target = destination / source.relative_to(task.kb)
+    for source, relative in pairs:
+        target = destination / relative
         for parent in reversed(target.relative_to(destination).parents):
             directory = destination / parent
             if directory.is_symlink() or directory.is_file():
@@ -1506,13 +1782,27 @@ def lane(args):
     record = load_record(task)
     refresh_context(task)
     builder = args.builder or record["builder"]
-    model = args.model or ("gpt-6-luna" if builder == "codex" else "sonnet")
+    recorded = record.get("tier", "routine")
+    tier = args.tier or recorded
+    explicit = args.model
+    guards(tier, recorded, explicit, args.override)
+    tier_changed = tier_guard(recorded, args.tier, args.override)
+    decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
+    if decision:
+        if decision["hold"]:
+            return 4
+        explicit = None if decision["vendor"] != builder else explicit
+        builder = decision["vendor"]
+        if decision["cheaper"]:
+            if explicit and explicit != task_usage.CHEAPER[builder]:
+                print(f"pace: {builder} ahead of pace; routine lane uses {task_usage.CHEAPER[builder]}, not {explicit} (--no-pace keeps it)")
+            explicit = task_usage.CHEAPER[builder]
+    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker, args.override, recorded)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
-        upgraded = "gpt-6-astra" if builder == "codex" else "fable"
-        boost_notice = f"boost: {model} -> {upgraded} (until {until})"
-        model = cli_model = upgraded
+        route_kind = 'explicit model' if args.model else ('default routing' if tier == 'routine' else 'tier routing')
+        boost_notice = f"boost: tier {tier}, {builder} -> {model} ({route_kind}; until {until})"
     else:
         boost_notice = ""
     work = path / ".work"
@@ -1528,7 +1818,7 @@ def lane(args):
     final = work / "final.md"
     command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
                 "--output-last-message", str(final), "-"] if builder == "codex" else
-               ["claude", "-p", "--model", cli_model, "--effort", "high",
+               ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", "high",
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
@@ -1545,11 +1835,20 @@ def lane(args):
                 previous = {}
             if previous.get("state") == "running" and pid_alive(previous.get("pid")):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
+            print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            if tier_changed:
+                task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
+                print(f"override recorded: tier {recorded} to {tier} ({args.override})")
+            if guards(tier, recorded, model, args.override):
+                task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
+                print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
-                      "--builder", builder, "--model", model, "--no-boost", "--_worker"]
+                      "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]
+            if args.override:
+                worker.extend(["--override", args.override])
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
@@ -1557,12 +1856,17 @@ def lane(args):
                                          stdin=subprocess.DEVNULL, stdout=log,
                                          stderr=subprocess.STDOUT, start_new_session=True,
                                          close_fds=True)
+            task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
-            if builder != record["builder"]:
-                print(f"Updating task builder from {record['builder']} to {builder}.")
+            if builder != record["builder"] or tier != record.get("tier", "routine"):
+                if builder != record["builder"]:
+                    print(f"Updating task builder from {record['builder']} to {builder}.")
+                if tier != record.get("tier", "routine"):
+                    print(f"Updating task tier to {tier}.")
                 record["builder"] = builder
+                record["tier"] = tier
                 record["revision"] = record_revision(record)
                 atomic_json(task_state(task) / "task.json", record)
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
@@ -1573,10 +1877,10 @@ def lane(args):
     temporary = None
     try:
         environment = lane_environment(task, builder)
+        # Advisory checks use the recorded directory, outside the checkout; Codex lanes get theirs from the same function.
+        run["temporary"] = environment["TMPDIR"] if builder == "claude" else advisory_temporary_parent(path)
+        atomic_json(lane_record, run)
         if builder == "claude":
-            temporary = environment["TMPDIR"]
-            run["temporary"] = temporary
-            atomic_json(lane_record, run)
             settings = work / "claude-settings.json"
             atomic_json(settings, {"sandbox": {"filesystem": {"allowWrite": [
                 environment["TMPDIR"], str(gate_directory().resolve()),
@@ -1586,7 +1890,10 @@ def lane(args):
         with tempfile.TemporaryFile() as source:
             source.write(b"Read the pinned task context in .work/context/ before working.\n\n" + prompt.read_bytes())
             source.seek(0)
-            with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output:
+            with final.open("wb") if builder != "codex" else contextlib.nullcontext() as output, \
+                    (work / "lane.jsonl").open("wb") if builder == "claude" else contextlib.nullcontext() as raw:
+                # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
+                stream = task_usage.ClaudeStream(HOME) if raw else None
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          stdout=subprocess.PIPE if output else None)
                 try:
@@ -1603,23 +1910,29 @@ def lane(args):
                                 if not chunk:
                                     reader.unregister(key.fileobj)
                                     continue
+                                if stream:
+                                    raw.write(chunk)
+                                    raw.flush()
+                                    chunk = stream.feed(chunk).encode()
                                 output.write(chunk)
                                 output.flush()
                                 sys.stdout.buffer.write(chunk)
                                 sys.stdout.buffer.flush()
+                    if stream:
+                        rest = stream.finish().encode()
+                        output.write(rest)
+                        sys.stdout.buffer.write(rest)
+                        sys.stdout.buffer.flush()
                     code = child.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    run.update(state="timed_out", exit_code=None, ended_at=utc_now())
-                    atomic_json(lane_record, run)
-                    cleanup_lane_temporary(temporary)
+                    finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        run.update(state="timed_out" if timed_out else "finished", exit_code=None if timed_out else code, ended_at=utc_now())
-        atomic_json(lane_record, run)
-        cleanup_lane_temporary(temporary)
+        finalize_lane_record(lane_record, run, "timed_out" if timed_out else "finished",
+                             exit_code=None if timed_out else code)
     return code
 
 
@@ -1882,11 +2195,12 @@ def runner_check(args):
     pending = []
     in_text_rules = False
     task_line = re.compile(
-        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude),\s*"
-        r"model\s+([^,\s]+)(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
+        r"(?i)^\s*(?:\d+\.|[-*])\s+([^:\s]+):\s*builder\s+(codex|claude)"
+        r"(?:,\s*model\s+([^,\s]+))?(?:,\s*seed\s+([^,\s]+))?(?:,\s*after:\s*([^,\s]+))?"
         r"(?:\b.*)?$"
     )
-    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|after:|no-verify:)|$)")
+    no_verify_field = re.compile(r"(?i),\s*no-verify:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
+    override_field = re.compile(r"(?i),\s*override:\s*(.*?)(?=,\s*(?:seed\s|tier\s|after:|no-verify:|override:)|$)")
     for number, line in enumerate(Path(args.file).read_text().splitlines(), 1):
         if re.match(r"^\s*```text\s*$", line, re.IGNORECASE):
             in_text_rules = True
@@ -1898,11 +2212,18 @@ def runner_check(args):
         # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
+        override_match = override_field.search(line)
+        line = override_field.sub("", line)
         no_verify_match = no_verify_field.search(line)
-        parsed = task_line.match(no_verify_field.sub("", line))
+        tier_field = re.search(r"(?i),\s*tier\s+([^,\s]+)", line)
+        if tier_field and tier_field[1].lower() not in TIERS:
+            problems.append(f"line {number}: invalid tier {tier_field[1]}")
+        parsed = task_line.match(re.sub(r"(?i),\s*tier\s+[^,\s]+", "", no_verify_field.sub("", line)))
         if parsed:
             task_lines += 1
             ident, builder, model, seed, after = parsed.groups()
+            if override_match and (problem := override_problem(override_match[1], required=True)):
+                problems.append(f"line {number}: {problem}")
             no_verify = no_verify_match[1].strip() if no_verify_match else None
             try:
                 task = Task(repo, ident)
@@ -1911,7 +2232,10 @@ def runner_check(args):
                     pending.append(task.id)
                 if task.number is not None and task.file is None:
                     raise Stop(f"No Backlog.md task {task.id}")
-                resolve_model(builder.lower(), model)
+                if not model and not tier_field:
+                    raise Stop("runner task needs a model or tier")
+                if model:
+                    resolve_model(builder.lower(), model)
                 if no_verify is not None:
                     if not no_verify.strip():
                         raise Stop("no-verify needs a nonempty reason.")
@@ -1959,7 +2283,7 @@ def runner_check(args):
             except (Stop, ValueError, IndexError) as error:
                 problems.append(f"line {number}: {error}")
     if task_lines == 0:
-        problems.append("no task lines found (format: N. <id>: builder <b>, model <m>[, seed <s>][, after: <id>])")
+        problems.append("no task lines found (format: N. <id>: builder <b>, model <m> or tier <t>[, seed <s>][, after: <id>])")
     if (CORTEX / f"cortex-kb-{repo.name}").exists():
         info = plan_info(repo)
         remaining = info["limit"] - len(info["merged"])
@@ -1973,7 +2297,7 @@ def runner_check(args):
 
 
 RUNNER_WRAPPER = '''import pathlib, signal, subprocess, sys
-source, done, log, executable, offset, mode, repo = sys.argv[1:]
+source, done, log, executable, offset, repo = sys.argv[1:]
 child = None
 def stop(signum, frame):
     if child is not None:
@@ -1982,11 +2306,8 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
-    with open(source) as stream:
-        command = ([executable, 'exec', '--dangerously-bypass-approvals-and-sandbox',
-                    '-m', 'gpt-6-luna', '-'] if mode == 'llm' else [executable, repo, source])
-        child = subprocess.Popen(command, stdin=stream if mode == 'llm' else subprocess.DEVNULL)
-        code = child.wait()
+    child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL)
+    code = child.wait()
 finally:
     path = pathlib.Path(done)
     content = path.read_bytes() if path.exists() else b''
@@ -2038,22 +2359,22 @@ def runner_start(args):
         previous = json.loads(record.read_text())
         if previous.get('backend') == 'setsid' and pid_alive(previous.get('pid')):
             raise Stop(f'{unit} is already active (setsid).')
-    binary = 'codex' if args.llm else 'task-batch'
-    executable = shutil.which(binary)
+    executable = shutil.which('task-batch')
     if not executable:
-        raise Stop(f'{binary} is unavailable.')
+        raise Stop('task-batch is unavailable.')
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
     command = [sys.executable, str(wrapper), str(source), str(done),
-               str(log), executable, str(done_offset), 'llm' if args.llm else 'batch', str(repo)]
+               str(log), executable, str(done_offset), str(repo)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
               '--property=KillMode=process',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
-              '--setenv=PATH=' + os.environ.get('PATH', ''), *command]
+              '--setenv=PATH=' + os.environ.get('PATH', ''),
+              *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
         result = subprocess.run(launch, capture_output=True, text=True)
     except FileNotFoundError:
@@ -2064,8 +2385,8 @@ def runner_start(args):
         if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
             raise Stop(f'{unit} is already active.')
         with log.open('a') as output:
-            process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL,
-                                       stdout=output, stderr=output, start_new_session=True)
+            process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                       start_new_session=True, env={**os.environ, "TASK_NO_PACE": "1"} if args.no_pace else None)
         data.update(backend='setsid', pid=process.pid)
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
@@ -2075,6 +2396,14 @@ def runner_start(args):
 
 def start(args):
     repo = resolve_repo(args.repo)
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    with (common / "task-start.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return start_locked(args, repo)
+
+
+def start_locked(args, repo):
+    lane_contract_source()
     ensure_origin_head(repo)
     task = Task(repo, args.id)
     if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
@@ -2086,6 +2415,10 @@ def start(args):
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
     task_text = task.file.read_text() if task.file else ""
+    pinned = read_json_object(task_state(task) / "task.json").get("tier")
+    if pinned and tier_guard(pinned, args.tier, args.override):
+        task_usage.record_override(HOME, repo.name, task.id, "tier change", f"{pinned} to {args.tier}", args.override)
+        print(f"override recorded: tier {pinned} to {args.tier} ({args.override})")
     criteria = criteria_from(task_text)
     verify = verification_from(task_text)
     if task.file and not criteria:
@@ -2174,9 +2507,14 @@ def start(args):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
+        if args.tier and args.tier != record.get("tier", "routine"):
+            record["tier"] = args.tier
+            record["revision"] = record_revision(record)
+            atomic_json(record_path, record)
     else:
         previous_seeds = read_json_object(record_path).get("seeds", []) if record_path.exists() else []
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
+                  "tier": task_tier(task_text, args.tier),
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone"),
@@ -2206,25 +2544,20 @@ def start(args):
     title = f" - {task.title}" if task.title else ""
     print("\nDispatch prompt:\n")
     refresh_context(task)
-    dispatch = ["Context: .work/context/", f"{task.id}{title}",
-                f"Work only in {task.path} on branch {branch}.",
-                "Write and edit files with your edit or apply_patch tool, never shell heredocs or cat >; "
-                "avoid backticks in shell commands."]
+    dispatch = [f"{task.id}{title}", f"Work only in {task.path} on branch {branch}.",
+                "Mandatory read: .work/context/lane-contract.md"]
     if task.file:
         dispatch.append(f"Task: {task.file}")
+    dispatch.append("Acceptance criteria:\n" + ("\n".join(
+        f"- [{'x' if item.get('checked') else ' '}] #{item['number']} {item['text']}"
+        for item in record.get("criteria", [])) or "(PM: none given)"))
+    dispatch.append("Verify:\n" + ("\n".join(f"Verify: `{command}`" for command in record.get("verify", []))
+                                  or "(PM: none given)"))
     brief = task_text or ((work / "request.md").read_text() if (work / "request.md").is_file() else "")
     for heading in ("Read first", "Test against"):
         dispatch.append(f"{heading}:\n{brief_field(brief, heading) or '(PM: none given)'}")
-    dispatch.append("Commit on the branch, then run `task check` from that folder for advisory feedback, "
-          "before reporting. Paste its final summary line (PASS/FAIL plus the log path) under `## Check` "
-          "in `.work/report.md`; a claim like 'tests pass' without that line is not evidence. "
-          "Check the final commit; any later commit needs a new check. The PM's `task merge` "
-          "runs the trusted gate, unless a matching trusted check already passed. A PM may run "
-          "`task check --detach` to prepare that evidence. In chat, reply with three lines: `changed: ...`, "
-          "`verified: ...`, and `not done: ...`, followed by `report written`. "
-          "For long gates, the PM can use `task merge --detach`.")
     dispatch.append(f"The PM writes the approved prompt to {work / 'prompt.md'} and launches the builder with "
-          f"`task lane {args.repo} {task.id}`. Always use `task lane` so builders stay sandboxed.")
+          f"`task lane {args.repo} {task.id}`.")
     dispatch_text = "\n".join(dispatch) + "\n"
     (work / 'dispatch.md').write_text(dispatch_text)
     print(dispatch_text, end="")
@@ -2263,6 +2596,30 @@ def check_log_path(path, state, evidence_name, advisory):
     return destination / Path(evidence_name).with_suffix(".log")
 
 
+def advisory_temporary_parent(path):
+    """The one TMPDIR parent for advisory checks: the lane record's `temporary`, else a per-lane directory
+    under /tmp that is created and recorded. An inherited TMPDIR and `.work` are never used."""
+    record = path / ".work/lane.json"
+    try:
+        run = json.loads(record.read_text())
+    except (OSError, ValueError):
+        run = None
+    recorded = run.get("temporary") if isinstance(run, dict) else None
+    if recorded and Path(recorded).is_dir() and not Path(recorded).resolve().is_relative_to(path.resolve()):
+        return recorded
+    root = lane_temporary_root()
+    root.mkdir(mode=0o700, exist_ok=True)
+    temporary = root / f"{main_repo(path).name}-{path.name}"
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    for owned in (root, temporary):
+        info = owned.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+            raise Stop(f"Lane temporary directory must be an owned directory that others cannot write: {owned}")
+    if isinstance(run, dict):
+        atomic_json(record, dict(run, temporary=str(temporary)))
+    return str(temporary)
+
+
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
               advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
     variants = gate_variants(path)
@@ -2277,8 +2634,9 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         return run_check_matrix(path, base, record, state, evidence_name, display_log,
                                 advisory, pre_commit_all_files, cancelled, variants)
     if advisory:
-        return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
-                               cancelled=cancelled)
+        with tempfile.TemporaryDirectory(prefix="check-", dir=advisory_temporary_parent(path)) as temporary:
+            return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
+                                   gate_environment={"TMPDIR": temporary}, cancelled=cancelled)
     # Do not inherit TMPDIR: callers may point it inside a checkout.
     temporary_root = gate_temporary_root()
     sweep_gate_temporary(temporary_root)
@@ -2300,12 +2658,15 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     destination.mkdir(parents=True, exist_ok=True)
     results = []
     logs = []
+    templates = {entry["name"]: entry.get("env", {})
+                 for entry in task_config(path).get("gate_variant", [])}
     # Reserve the port range once, including for drills without an exclusive slot.
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
-            # Advisory checks need a writable parent inside their lane.
+            # Advisory checks need a writable parent outside the checkout, like the lane's TMPDIR.
             with tempfile.TemporaryDirectory(
-                    prefix="variant-", dir=work if advisory else gate_temporary_root()) as temporary:
+                    prefix="variant-",
+                    dir=advisory_temporary_parent(path) if advisory else gate_temporary_root()) as temporary:
                 gate_environment = dict(environment, TMPDIR=temporary, TASK_GATE_SLOT=str(slot),
                                         TASK_GATE_PORT_BASE=str(20000 + 200 * slot))
                 evidence = []
@@ -2313,7 +2674,8 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                     path, base, record, state, evidence_name, display_log, advisory=advisory,
                     gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
                     cancelled=cancelled, evidence_sink=evidence)
-                results.append(dict(evidence[0], name=name))
+                results.append(dict(evidence[0], name=name, environment=environment,
+                                    environment_template=templates.get(name, {})))
                 logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
                 print(f"variant {name}: {'PASS' if passed else 'FAIL'}")
     log = check_log_path(path, state, evidence_name, advisory)
@@ -2353,7 +2715,6 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         state = None
     log = check_log_path(path, state, evidence_name, advisory)
     passed = True
-    timeout = timeout_for(path)
     configured_env = configured_environment(path)
     run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
@@ -2371,6 +2732,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 raise Stop("Drill interrupted.")
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
+            configured, timeout, durations = step_timeout(path, step)
+            timeout_details = {"configured_timeout": configured, "effective_timeout": timeout,
+                               "history_durations": durations, "history_duration_order": "oldest_to_newest"}
             started = time.monotonic()
             private_index_directory = None
             try:
@@ -2418,10 +2782,11 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     process.wait()
                     if state:
                         set_child_group(state, None)
-                    out.write(f"\nTIMEOUT after {timeout}s\n")
+                    out.write(f"\nTIMEOUT configured={configured}s effective={timeout}s "
+                              f"recent trusted passes (oldest to newest)={durations}\n")
                     out.flush()
                     results.append({"command": step, "exit": None, "duration": round(time.monotonic()-started, 3),
-                                    "timeout": True})
+                                    "timeout": True, **timeout_details})
                     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
                                 "record_revision": record.get("revision") if record else "",
                                 "result": "failed", "steps": results, "time": utc_now(),
@@ -2435,7 +2800,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                         if evidence_name == "check.json":
                             try: task_event(Task(main_repo(path), path.name), "check")
                             except OSError: pass
-                    print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s; see {display_log or log}")
+                    print(f"NOT FINISHED: `{' '.join(step)}` ran over {timeout}s "
+                          f"(configured {configured}s; effective {timeout}s; "
+                          f"recent trusted passes (oldest to newest) {durations}); see {display_log or log}")
                     print(f"FAIL (log: {display_log or log})")
                     return False
             except subprocess.TimeoutExpired:
@@ -2448,7 +2815,8 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             if state:
                 set_child_group(state, None)
             out.write(f"exit {code}\n")
-            results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3)})
+            results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3),
+                            **timeout_details})
             if code:
                 passed = False
                 break
@@ -2696,6 +3064,10 @@ def parse_review_block(block, criteria):
         raise ReviewParseError("review block must contain a full 40-character Commit SHA")
     reviewer = None
     judgment_lines = lines[2:]
+    section = next((i for i, line in enumerate(judgment_lines)
+                    if re.fullmatch(r"(?:#{1,6}\s+)?\**(?:Blocking|Notes)\**:?", line)), None)
+    if section is not None:
+        judgment_lines = judgment_lines[:section]
     reviewer_match = (re.fullmatch(r"Reviewer:\s*(.*)", judgment_lines[0], re.I)
                       if judgment_lines else None)
     if reviewer_match:
@@ -2800,10 +3172,13 @@ def run_reviewer(command, path, prompt_file, reply_file):
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
     atomic_json(run_file, run)
+    # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
+    raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
-        with prompt_file.open() as prompt, reply_file.open("w") as reply, stderr_file.open("w") as errors:
+        with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
                                        stderr=errors, start_new_session=True)
+            task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
                 code = process.wait(timeout=timeout)
                 run.update(state="finished", exit_code=code)
@@ -2819,6 +3194,9 @@ def run_reviewer(command, path, prompt_file, reply_file):
         run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
     finally:
+        if raw != reply_file and raw.is_file():
+            stream = task_usage.ClaudeStream(HOME)
+            reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
@@ -2863,10 +3241,14 @@ def review(args):
     if not args.record:
         reviewer_route = (("claude", "haiku") if record["builder"] == "codex"
                           else ("codex", "gpt-6-luna"))
-        if reviewer_route[0] in active_boosts():
-            reviewer_route = (reviewer_route[0], "opus" if reviewer_route[0] == "claude" else "gpt-6.1-sol")
         if reviewer_route[0] == record["builder"]:
             raise Stop("reviewer vendor must differ from builder")
+        if args.run:
+            decision = pace_check(args, "review", reviewer_route[0], "routine", task)
+            if decision and decision["hold"]:
+                return 4
+            if decision and decision["spend"]:
+                reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
@@ -2929,25 +3311,10 @@ def review(args):
             prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
         else:
             prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
-        prompt.append("Return exactly this final fenced block, with plain text only inside it:")
-        prompt.append(
-            "Verdict FAIL only when a criterion above, or the stated request, is not met, "
-            "or the change breaks something that worked. Everything else is a non-blocking "
-            "note: list it under 'Notes', never as a reason to FAIL."
-        )
-        prompt.append("Split findings into 'Blocking' (each tied to a criterion or a breakage) and 'Notes'.")
-        prompt.append("```review")
-        prompt.append("Verdict: PASS|FAIL")
-        prompt.append("Commit: <full sha>")
-        for item in record["criteria"]:
-            prompt.append(f"#{item['number']} pass|fail|unclear: <one line of evidence>")
-        prompt.append("```")
-        prompt.append(
-            "After the fenced block, list findings under 'Blocking' and 'Notes'. Every "
-            "Blocking finding must identify a named requested criterion or a concrete defect or regression, "
-            "with file:line. Put all other "
-            "observations under Notes."
-        )
+        contract = path / ".work/context/lane-contract.md"
+        prompt.append(f"Mandatory read: {contract if contract.is_file() else lane_contract_source()}. Reply in its review "
+                      "block with the full 40-character Commit sha" + (", then one line per criterion: "
+                      "`#N pass|fail|unclear: <one line of evidence>`." if record["criteria"] else "."))
         if args.append_prompt:
             prompt.append(args.append_prompt)
         prompt_text = "\n".join(prompt) + "\n"
@@ -2959,12 +3326,14 @@ def review(args):
         prompt_file.write_text(prompt_text)
         reply_file.unlink(missing_ok=True)
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
-        if record["builder"] == "codex":
-            command = (f"claude -p {add_dir}--permission-mode dontAsk --model {reviewer_route[1]} --effort high "
-                       "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
-        else:
-            command = (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
-                       f"-m {reviewer_route[1]} -c model_reasoning_effort=high -")
+        def reviewer_command(vendor, model):
+            if vendor == "claude":
+                events = "--output-format stream-json --verbose " if args.run else ""
+                return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {model} --effort high "
+                        "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
+            return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+                    f"-m {model} -c model_reasoning_effort=high -")
+        command = reviewer_command(*reviewer_route)
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
@@ -2976,14 +3345,18 @@ def review(args):
             try:
                 run_reviewer(command, path, prompt_file, reply_file)
             except UsageLimit:
-                if reviewer_route != ("claude", "opus"):
+                if used_fallback:
                     raise
-                print("Boosted Claude reviewer hit a usage limit; retrying once with claude haiku.")
+                previous_route = reviewer_route
+                reviewer_route = (("codex", "gpt-6-luna") if reviewer_route[0] == "claude"
+                                  else ("claude", "haiku"))
+                print(f"{previous_route[0]} reviewer hit a usage limit; retrying once with "
+                      f"{reviewer_route[0]} {reviewer_route[1]}.")
                 used_fallback = True
-                reviewer_route = ("claude", "haiku")
-                atomic_json(state / "review-routing.json", {"vendor": "claude", "model": "haiku",
-                                                            "fallback_from": "opus"})
-                command = command.replace("--model opus ", "--model haiku ", 1)
+                atomic_json(state / "review-routing.json", {
+                    "vendor": reviewer_route[0], "model": reviewer_route[1],
+                    "fallback_from": list(previous_route)})
+                command = reviewer_command(*reviewer_route)
                 run_reviewer(command, path, prompt_file, reply_file)
             head = sha(path, "HEAD")
             try:
@@ -3026,9 +3399,12 @@ def review(args):
             problems.append("no stored reviewer routing; provide --reviewer <vendor> <model>")
         elif routed_reviewer[0].lower() not in {"claude", "codex"} or not routed_reviewer[1].strip():
             problems.append("--reviewer must be <claude|codex> <model>")
+        elif routed_reviewer[1] in TOP_ONLY:
+            problems.append(f"reviews never use {routed_reviewer[1]}; no override applies")
         else:
             routed_reviewer = (routed_reviewer[0].lower(), routed_reviewer[1])
-    if routed_reviewer and routed_reviewer[0].lower() == record["builder"]:
+    if (routed_reviewer and routed_reviewer[0].lower() == record["builder"]
+            and not (args.run and used_fallback)):
         problems.append("reviewer vendor must differ from builder")
     if reviewer and reviewer[0].lower() == record["builder"]:
         print(f"WARNING: reply Reviewer: line names builder vendor '{reviewer[0]}'; using routed reviewer identity.")
@@ -3115,16 +3491,32 @@ def merge_gate(task, path, head):
     return record
 
 
-def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record) -> bool:
-    """Reuse check evidence only when it passed for this head and revision against this base."""
+def can_reuse_lane_check(task: Task, repo: Path, lane_head: str, base: str, record):
+    """Return whether trusted evidence covers the committed merge result."""
     try:
         checked = json.loads((task_state(task) / "check.json").read_text())
     except (OSError, json.JSONDecodeError):
-        return False
-    return (checked.get("trusted") is True and checked.get("result") == "passed"
-            and checked.get("sha") == lane_head
-            and checked.get("record_revision") == record.get("revision")
-            and checked.get("base_sha") == base and is_ancestor(repo, base, lane_head))
+        return False, "trusted lane check record is missing or unreadable"
+    if checked.get("trusted") is not True or checked.get("result") != "passed":
+        return False, "lane check is not trusted and passing"
+    if checked.get("sha") != lane_head:
+        return False, "lane check is for a different head"
+    if checked.get("record_revision") != record.get("revision"):
+        return False, "lane check record revision differs"
+    if not is_ancestor(repo, base, lane_head):
+        return False, "current main is not an ancestor of the checked lane head"
+    try:
+        expected_variants = gate_variants_at_commit(repo, lane_head, task.worktree())
+    except (Stop, OSError, ValueError) as error:
+        return False, f"cannot read committed gate variants: {error}"
+    checked_variants = checked.get("variants", [])
+    if not isinstance(checked_variants, list):
+        return False, "lane check variant evidence is malformed"
+    covered_variants = {item.get("name"): item.get("environment_template", {})
+                        for item in checked_variants if isinstance(item, dict)}
+    if covered_variants != expected_variants:
+        return False, "lane check gate variants or environments differ from committed merge result"
+    return True, "trusted passing check matches committed result, record revision, and variants"
 
 
 def overlap_files(repo: Path, lane_head: str, base: str):
@@ -3263,13 +3655,19 @@ def merge(args):
             fetch(repo)
             base, label = base_commit(repo, default)
             overlap = overlap_files(repo, lane_head, base)
-            if overlap:
+            if overlap and not all(name.endswith(".md") for name in overlap):
                 raise Stop(overlap_message(overlap))
-            if can_reuse_lane_check(task, repo, lane_head, base, record):
-                print("main unchanged since the lane's check; reusing it")
+            if overlap:
+                # A conflict in these files still stops in gate_merge_result.
+                reusable, reuse_reason = False, "main changed only Markdown files this task also changed, so the merge result differs from the checked tree"
+            else:
+                reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
+            if reusable:
+                print(f"reuse decision: reusing trusted lane check: {reuse_reason}")
                 completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
             else:
+                print(f"reuse decision: running full gate because {reuse_reason}")
                 tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
                 if not gate_passed:
                     if not args.override:
@@ -3869,17 +4267,33 @@ def quality_summary(repo):
             f"reviews per merged task {average}")
 
 
+def stale_worktree_lines(repo):
+    """Unmerged worktrees idle past workspace-tidy's limit; reported only, never removed."""
+    tool = Path(__file__).with_name("workspace-tidy")
+    if not tool.is_file():
+        tool = Path(__file__).with_name("executable_workspace-tidy")
+    try:
+        found = runpy.run_path(str(tool), run_name="task_status_tidy")["stale_unmerged"](repo, time.time())
+    except Exception as error:
+        return [f"idle worktree check unavailable: {error}"]
+    return [f"idle worktree: {repo.name} {item['path']} (branch {item['branch']}, idle {item['days']} days, "
+            f"unmerged{item['locked']}): finish, adopt or delete" for item in found]
+
+
 def status(args):
     active = boost_line()
     if active:
         print(active)
     print(f"Gate slots: {gate_slots()}")
+    print(f"Batch lane limits: {lane_limits(HOME, gate_slots())}; total bounded by gate slots")
+    print(task_usage.override_summary(HOME))
     for row in gate_holders():
         print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
     setup_events = read_setup_events(setup_path, setup_warnings)
+    bwrap_lanes = []
     for repo in repos:
         for gate in (repo / ".worktrees").glob(".task-gate-*"):
             print(f"repair available: inspect stale gate worktree {gate}")
@@ -3912,6 +4326,9 @@ def status(args):
                   f"started={service.get('ExecMainStartTimestamp') or data['started_at']} "
                   f"last={lines[-1] if lines else '(no .done line)'}")
         attention = []
+        try: warning = gate_warning(repo)
+        except Stop: warning = ""
+        if warning: attention.append(warning)
         state_root = HOME / ".local/state/task" / repo.name
         for path in sorted((repo / ".worktrees").glob("*")) if (repo / ".worktrees").is_dir() else []:
             if path.name.startswith("."):
@@ -3967,7 +4384,7 @@ def status(args):
                 except (ValueError, TypeError): pass
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
-            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} head={head[:7]} "
+            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} tier={record.get('tier', 'routine') if record else 'routine'} head={head[:7]} "
                   f"{run_label} "
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
@@ -3998,6 +4415,13 @@ def status(args):
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
                 if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
                     attention.append(f"{path.name}: lane {lane_state}{result}")
+                try:
+                    final = [line for line in (path / ".work/final.md").read_text(errors="replace").splitlines()
+                             if line.strip()]
+                except OSError:
+                    final = []
+                if final and bwrap_denial(final[-1]):
+                    bwrap_lanes.append(f"{repo.name}/{path.name}")
             if (state / "exception.json").is_file():
                 attention.append(f"{path.name}: exception")
             if check.get("result") == "failed":
@@ -4023,6 +4447,7 @@ def status(args):
         for request in open_setup_requests(setup_path, repo.name, setup_events):
             attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
                              f"{request.get('text', '')}")
+        attention += stale_worktree_lines(repo)
         improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
         open_count = 0
         if improvements.is_file():
@@ -4032,6 +4457,9 @@ def status(args):
         for item in attention:
             print(f"    {item}")
         print(f"    open improvements: {open_count}")
+    if bwrap_lanes:
+        print("Known warning (setup #11): lane sandbox denies bwrap NETLINK_ROUTE; the trusted check runs "
+              "it, not a blocker: " + ", ".join(bwrap_lanes))
     if args.repo is None:
         visible_repos = {repo.name for repo in repos}
         unlisted = [item for item in open_setup_requests(setup_path, events=setup_events)
@@ -4099,14 +4527,11 @@ def cancel(args):
         try:
             os.killpg(int(lane_run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, PermissionError) as error:
-            lane_run.update(state="interrupted", ended_at=utc_now())
-            atomic_json(lane_path, lane_run)
+            finalize_lane_record(lane_path, lane_run, "interrupted")
             reason = "could not stop (permission denied)" if isinstance(error, PermissionError) else "already stopped"
             print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
             return 0
-        lane_run.update(state="cancelled", ended_at=utc_now())
-        atomic_json(lane_path, lane_run)
-        cleanup_lane_temporary(lane_run.get("temporary"))
+        finalize_lane_record(lane_path, lane_run, "cancelled")
         print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
         return 0
     run_path = task_state(task) / "run.json"
@@ -4178,7 +4603,25 @@ def cancel(args):
 
 def prune_archive(repo, dry_run=False):
     root = HOME / '.local/state/task/archive' / repo.name
+    if any(item.is_symlink() for item in (root, *root.parents)):
+        return
     entries, sizes, errors = archive_inventory(root)
+    records, invalid = {}, set()
+    for manifest, info in entries:
+        if manifest.name != 'manifest.json' or '.work' in manifest.relative_to(root).parts:
+            continue
+        try:
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError('manifest is not a regular file')
+            record = json.loads(manifest.read_text())
+            if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
+                raise ValueError('manifest must be an object with a pruned list')
+            records[manifest.parent] = record
+        except (OSError, ValueError, TypeError) as error:
+            print(f'archive: cannot prune {manifest.parent}: {error}')
+            invalid.add(manifest.parent)
+    entries = [(item, info) for item, info in entries
+               if not any(parent == item or parent in item.parents for parent in invalid)]
     known = {item: info for item, info in entries}
     allocated = {item: info.st_blocks * 512 for item, info in entries}
     for item, _info in reversed(entries):
@@ -4216,7 +4659,7 @@ def prune_archive(repo, dry_run=False):
             if not dry_run:
                 contents, content_sizes, content_errors = archive_inventory(item)
                 manifest = item / 'manifest.json'
-                record = json.loads(manifest.read_text()) if manifest in known else {}
+                record = records.get(item, {})
                 record.setdefault('note', 'finished by repair')
                 record.setdefault('contents', [{'path': str(path.relative_to(item)),
                                   'size': content_sizes.get(path, 0)}
@@ -4231,60 +4674,15 @@ def prune_archive(repo, dry_run=False):
         print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
         if not dry_run:
             shutil.rmtree(item)
-    removed = set()
-    pruned = {}
-    containers = {item.parent for item, _info in entries
-                  if item.name == 'manifest.json' and
-                  '.work' not in item.relative_to(root).parts} | set(finishing)
-    protected = {root} | containers
-    for container in containers:
-        protected.update({container / '.work', container / 'reports', container / '.work/reports'})
-        protected.update(container.parents)
-    _oversized, disposable = oversized_contents(entries, sizes, protected, errors)
-    for item, info in entries:
-        if item in temporary:
-            continue
-        if item.parent in removed:
-            removed.add(item)
-            continue
-        container = next((parent for parent in item.parents if parent in containers), None)
-        if container is None:
-            continue
-        runtime = archive_runtime(item, info, errors)
-        if any(path == item or item in path.parents for path in errors):
-            continue
-        large_log = (stat.S_ISREG(info.st_mode) and item.suffix == '.log' and
-                     info.st_size >= 50 * 1024 ** 2 and not archive_evidence(item, info))
-        # Named runtime trees are removed whole; generic contents preserve evidence.
-        if not (runtime or item in disposable or large_log):
-            continue
-        removed.add(item)
-        freed += allocated.get(item, 0)
-        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
-        if not dry_run:
-            if not stat.S_ISDIR(info.st_mode):
-                item.unlink()
-            else:
-                shutil.rmtree(item)
-            pruned.setdefault(container, []).append(
-                f"pruned: {item.relative_to(container)} {allocated.get(item, 0)}")
-    skipped = {}
-    for item, error in errors.items():
-        print(f"Skipped {item}: {error}")
-        container = next((parent for parent in item.parents if parent in containers), None)
-        if container is not None:
-            skipped.setdefault(container, []).append(
-                {'path': str(item.relative_to(container)), 'reason': error})
-    for container in (set(pruned) | set(skipped)) if not dry_run else ():
-        manifest = container / 'manifest.json'
-        record = json.loads(manifest.read_text())
-        record.setdefault('pruned', []).extend(pruned.get(container, []))
-        existing = record.setdefault('skipped', [])
-        existing.extend(entry for entry in skipped.get(container, []) if entry not in existing)
-        atomic_json(manifest, record)
     if not dry_run:
         for pending, destination in finishing.items():
             pending.rename(destination)
+    report = []
+    snapshots = (set(records) | set(finishing)) - temporary - invalid
+    if not dry_run:
+        snapshots = {finishing.get(item, item) for item in snapshots}
+    prune_evidence_archive(root, not dry_run, report, snapshots=snapshots)
+    print('\n'.join(report))
     print(f"{'Would free' if dry_run else 'Freed'} {freed} bytes.")
 
 
@@ -4382,8 +4780,7 @@ def repair(args):
             except (OSError, ValueError):
                 lane_run = {}
             if lane_run.get("state") == "running" and not pid_alive(lane_run.get("pid")):
-                lane_run.update(state="interrupted", ended_at=utc_now())
-                atomic_json(lane_path, lane_run)
+                finalize_lane_record(lane_path, lane_run, "interrupted")
                 print(f"Repaired interrupted lane: {repo.name}/{task.id}")
             lock = task_state(task) / "run.lock"
             had_lock = lock.exists()
@@ -4585,7 +4982,11 @@ def main(argv=None):
         sub.add_argument("id")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
+        if name in {"start", "lane"}:
+            sub.add_argument("--tier", choices=TIERS, help="task Tier line or routine by default")
         if name == "start":
+            sub.add_argument("--override", metavar="REQUEST", default="",
+                             help="Jacopo's request and date; permits --tier to change the recorded tier (ledgered)")
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
             sub.add_argument("--seed", action="append", default=[], metavar="NAME")
@@ -4593,9 +4994,12 @@ def main(argv=None):
             sub.add_argument("--off-plan", metavar="REASON")
         if name == "lane":
             sub.add_argument("--no-boost", action="store_true")
+            sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
             sub.add_argument("--builder", choices=("codex", "claude"))
-            sub.add_argument("--model", help="Claude aliases sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
+            sub.add_argument("--override", metavar="REQUEST", default="",
+                             help="Jacopo's request and date; permits gpt-6-astra or fable outside its tier (ledgered)")
+            sub.add_argument("--model", help="Claude aliases haiku|sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
             sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
@@ -4613,11 +5017,12 @@ def main(argv=None):
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--request", metavar="FILE")
+            sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--no-check", metavar="REASON", help="record an override of the passing-check prerequisite")
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
-    sub = commands.add_parser("boost")
+    sub = commands.add_parser("boost", help="temporary tier routing and extra batch capacity; reviews unchanged")
     sub.add_argument("action", nargs="?", choices=("off",))
     sub.add_argument("--claude-until")
     sub.add_argument("--codex-until")
@@ -4634,7 +5039,9 @@ def main(argv=None):
     sub = commands.add_parser("runner-start", help="launch a validated, detached batch runner")
     sub.add_argument("repo")
     sub.add_argument("file")
-    sub.add_argument("--llm", action="store_true", help="use the legacy Codex runner for this release")
+    sub.add_argument("--no-pace", action="store_true", help="run the batch without usage pacing (logged)")
+    sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
+    sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
@@ -4722,7 +5129,7 @@ def main(argv=None):
             result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost,
+                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
                       "gate-drill": gate_drill}[args.command](args) or 0
         finally:
             if lock:
@@ -4740,7 +5147,7 @@ def main(argv=None):
     except SystemExit as stop:
         finish_detached(stop.code or 0)
         raise
-    except Stop as stop:
+    except (Stop, RoutingParseError) as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1
