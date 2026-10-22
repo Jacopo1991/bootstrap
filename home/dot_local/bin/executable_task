@@ -87,7 +87,7 @@ WORK_CACHES = {"__pycache__", ".pytest_cache", ".venv", "venv", "uv-cache",
                ".ruff_cache", ".cache"}
 
 
-def archive_exclusion(item, info, size=None, errors=None):
+def archive_exclusion(item, info, size=None, errors=None, *, hash_files=True):
     """Shared no-follow copy/prune rule; hashes are streamed, never buffered whole."""
     mode = info.st_mode
     record = {"size": info.st_size if size is None else size}
@@ -110,6 +110,8 @@ def archive_exclusion(item, info, size=None, errors=None):
             if header == b'SQLite format 3\0':
                 reason = "database"
             if reason:
+                if not hash_files:
+                    return dict(record, reason=reason)
                 digest = hashlib.sha256(header)
                 for chunk in iter(lambda: stream.read(1024 * 1024), b''):
                     digest.update(chunk)
@@ -117,7 +119,7 @@ def archive_exclusion(item, info, size=None, errors=None):
     except OSError as error:
         if reason is None:
             raise
-        return dict(record, reason=reason, sha256=None, error=str(error))
+        return dict(record, reason=reason, **({'sha256': None} if hash_files else {}), error=str(error))
     return None
 
 
@@ -128,7 +130,8 @@ def prune_evidence_archive(root, apply, report):
     entries, _, _ = archive_inventory(root)
     total = 0
     for snapshot, info in entries:
-        if not stat.S_ISDIR(info.st_mode) or len(snapshot.relative_to(root).parts) != 3:
+        if (not stat.S_ISDIR(info.st_mode) or len(snapshot.relative_to(root).parts) != 3
+                or any(part.startswith('.pending-') for part in snapshot.relative_to(root).parts)):
             continue
         manifest = snapshot / 'manifest.json'
         if manifest.is_symlink():
@@ -147,7 +150,7 @@ def prune_evidence_archive(root, apply, report):
                     excluded.add(item)
                     continue
                 try:
-                    removal = archive_exclusion(item, meta, sizes[item])
+                    removal = archive_exclusion(item, meta, sizes[item], hash_files=apply)
                 except OSError as error:
                     report.append(f"archive: kept {item}: {error}")
                     continue
@@ -156,18 +159,14 @@ def prune_evidence_archive(root, apply, report):
                 excluded.add(item)
                 total += removal['size']
                 removal.update(path=str(item.relative_to(manifest.parent)), date=utc_now())
-                report.append(f"archive: {'remove' if apply else 'would remove'} {item} ({removal['size']} bytes)")
+                report.append(f"archive: {'remove' if apply else 'would remove'} {item} ({removal['size']} bytes): {removal['reason']}")
                 if apply:
-                    record.setdefault('pruned', []).append(removal)
-                    # A pre-existing manifest.json.tmp may be a link outside the archive.
-                    with tempfile.NamedTemporaryFile(mode='w', dir=snapshot, delete=False) as stream:
-                        json.dump(record, stream, indent=2, sort_keys=True)
-                        stream.write('\n')
-                    Path(stream.name).replace(manifest)
                     if stat.S_ISDIR(meta.st_mode):
                         shutil.rmtree(item)
                     else:
                         item.unlink()
+                    record.setdefault('pruned', []).append(removal)
+                    atomic_json(manifest, record)
             if apply:
                 for item, meta in reversed(contents):
                     if stat.S_ISDIR(meta.st_mode) and item != manifest.parent:
@@ -773,9 +772,14 @@ def realign(args):
 
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def criteria_from(text: str):
@@ -4583,7 +4587,25 @@ def cancel(args):
 
 def prune_archive(repo, dry_run=False):
     root = HOME / '.local/state/task/archive' / repo.name
+    if any(item.is_symlink() for item in (root, *root.parents)):
+        return
     entries, sizes, errors = archive_inventory(root)
+    records, invalid = {}, set()
+    for manifest, info in entries:
+        if manifest.name != 'manifest.json' or '.work' in manifest.relative_to(root).parts:
+            continue
+        try:
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError('manifest is not a regular file')
+            record = json.loads(manifest.read_text())
+            if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
+                raise ValueError('manifest must be an object with a pruned list')
+            records[manifest.parent] = record
+        except (OSError, ValueError, TypeError) as error:
+            print(f'archive: cannot prune {manifest.parent}: {error}')
+            invalid.add(manifest.parent)
+    entries = [(item, info) for item, info in entries
+               if not any(parent == item or parent in item.parents for parent in invalid)]
     known = {item: info for item, info in entries}
     allocated = {item: info.st_blocks * 512 for item, info in entries}
     for item, _info in reversed(entries):
@@ -4621,7 +4643,7 @@ def prune_archive(repo, dry_run=False):
             if not dry_run:
                 contents, content_sizes, content_errors = archive_inventory(item)
                 manifest = item / 'manifest.json'
-                record = json.loads(manifest.read_text()) if manifest in known else {}
+                record = records.get(item, {})
                 record.setdefault('note', 'finished by repair')
                 record.setdefault('contents', [{'path': str(path.relative_to(item)),
                                   'size': content_sizes.get(path, 0)}
@@ -4655,8 +4677,10 @@ def prune_archive(repo, dry_run=False):
         container = next((parent for parent in item.parents if parent in containers), None)
         if container is None:
             continue
+        if item == container / 'manifest.json':
+            continue
         try:
-            omission = archive_exclusion(item, info, sizes[item], errors)
+            omission = archive_exclusion(item, info, sizes[item], errors, hash_files=not dry_run)
         except OSError as error:
             errors[item] = str(error)
             continue
@@ -4667,14 +4691,16 @@ def prune_archive(repo, dry_run=False):
             continue
         removed.add(item)
         freed += allocated.get(item, 0)
-        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
+        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({sizes[item]} bytes): "
+              f"{omission['reason'] if omission else 'directory over 200 MB'}")
         if not dry_run:
             if not stat.S_ISDIR(info.st_mode):
                 item.unlink()
             else:
                 shutil.rmtree(item)
             pruned.setdefault(container, []).append(
-                f"pruned: {item.relative_to(container)} {allocated.get(item, 0)}")
+                dict(omission or {'size': sizes[item], 'reason': 'directory over 200 MB'},
+                     path=str(item.relative_to(container)), date=utc_now()))
     skipped = {}
     for item, error in errors.items():
         print(f"Skipped {item}: {error}")
@@ -4684,7 +4710,7 @@ def prune_archive(repo, dry_run=False):
                 {'path': str(item.relative_to(container)), 'reason': error})
     for container in (set(pruned) | set(skipped)) if not dry_run else ():
         manifest = container / 'manifest.json'
-        record = json.loads(manifest.read_text())
+        record = records.get(container, {})
         record.setdefault('pruned', []).extend(pruned.get(container, []))
         existing = record.setdefault('skipped', [])
         existing.extend(entry for entry in skipped.get(container, []) if entry not in existing)

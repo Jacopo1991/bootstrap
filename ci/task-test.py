@@ -11,6 +11,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import hashlib
 import json
 import os
 import signal
@@ -3322,12 +3323,76 @@ store.write_text(json.dumps(prs))
         big = snapshot / 'check.log'
         subprocess.run(['truncate', '-s', '51M', str(big)], check=True)
         (snapshot / 'report.md').write_text('keep')
+        outside = self.home / 'outside-manifest'
+        outside.write_text('untouched')
+        (snapshot / 'manifest.json.tmp').symlink_to(outside)
+        for name, record in [('array', []), ('bad-pruned', {'pruned': {}})]:
+            bad = self.work_archives() / name
+            bad.mkdir()
+            (bad / 'manifest.json').write_text(json.dumps(record))
+            (bad / 'copy.db').write_bytes(b'db')
         out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
         self.assertIn(str(big), out)
         self.assertTrue(big.exists())
-        self.raw_task('repair', '--prune-archive', 'proj')
+        out = self.raw_task('repair', '--prune-archive', 'proj')
         self.assertFalse(big.exists())
         self.assertEqual((snapshot / 'report.md').read_text(), 'keep')
+        self.assertEqual(outside.read_text(), 'untouched')
+        row, = json.loads((snapshot / 'manifest.json').read_text())['pruned']
+        self.assertEqual(row['path'], 'check.log')
+        self.assertEqual(row['size'], 51 * 1024 ** 2)
+        digest = hashlib.sha256()
+        for _ in range(51):
+            digest.update(bytes(1024 ** 2))
+        self.assertEqual(row['sha256'], digest.hexdigest())
+        self.assertEqual(row['reason'], 'file over 50 MB')
+        self.assertIsNotNone(__import__('datetime').datetime.fromisoformat(row['date']))
+        for name in ('array', 'bad-pruned'):
+            self.assertTrue((self.work_archives() / name / 'copy.db').exists())
+            self.assertIn('cannot prune ' + str(self.work_archives() / name), out)
+
+    def test_archive_dry_runs_do_not_hash_and_tidy_skips_pending(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        (snapshot / 'manifest.json').write_text('{}')
+        (snapshot / 'copy.db').write_bytes(b'db')
+        subprocess.run(['truncate', '-s', '51M', str(snapshot / 'check.log')], check=True)
+        pending = self.work_archives() / '.pending-active'
+        pending.mkdir()
+        (pending / 'copy.db').write_bytes(b'db')
+        report = []
+        with mock.patch.object(TASK_MODULE.hashlib, 'sha256', side_effect=AssertionError('dry-run hash')), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.prune_evidence_archive(root, False, report)
+            TASK_MODULE.prune_archive(self.repo, dry_run=True)
+        self.assertTrue(any('database' in line and 'copy.db' in line for line in report))
+        TASK_MODULE.prune_evidence_archive(root, True, [])
+        self.assertEqual((pending / 'copy.db').read_bytes(), b'db')
+        self.assertFalse((snapshot / 'copy.db').exists())
+
+    def test_archive_prune_failed_unlink_is_not_recorded(self):
+        root = self.home / '.local/state/task/archive'
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        manifest = snapshot / 'manifest.json'
+        manifest.write_text('{}')
+        database = snapshot / 'copy.db'
+        database.write_bytes(b'db')
+        unlink = Path.unlink
+        def fail_database(path, *args, **kwargs):
+            if path == database:
+                raise PermissionError('fixture unlink denied')
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', fail_database):
+            report = []
+            TASK_MODULE.prune_evidence_archive(root, True, report)
+            with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+                with self.assertRaises(PermissionError):
+                    TASK_MODULE.prune_archive(self.repo)
+        self.assertEqual(json.loads(manifest.read_text()), {})
+        self.assertTrue(database.exists())
+        self.assertTrue(any('fixture unlink denied' in line for line in report))
 
     def test_archive_prune_dry_run_apply_and_symlinks(self):
         root = self.home / '.local/state/task/archive'
@@ -3718,9 +3783,9 @@ store.write_text(json.dumps(prs))
                 self.assertEqual((container / '.work' / name).read_text(), 'keep')
                 self.assertEqual((container / '.work/reports' / name).read_text(), 'keep report')
             record = json.loads((container / 'manifest.json').read_text())
-            self.assertTrue(any(line.startswith('pruned: .work/runtime/data ')
+            self.assertTrue(any(line['path'] == '.work/runtime/data'
                                 for line in record['pruned']))
-            self.assertTrue(any(line.startswith('pruned: .work/t8venv ')
+            self.assertTrue(any(line['path'] == '.work/t8venv'
                                 for line in record['pruned']))
         self.assertEqual(json.loads((finished / 'manifest.json').read_text())['head'], 'original')
         manifest = (finished / 'manifest.json').read_bytes()
