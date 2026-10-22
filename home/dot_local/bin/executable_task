@@ -2353,7 +2353,7 @@ def runner_unit(repo, batch):
 def runner_service(unit):
     try:
         result = subprocess.run(['systemctl', '--user', 'show', unit,
-                                 '--property=ActiveState,ExecMainStartTimestamp,MainPID'],
+                                 '--property=ActiveState,ExecMainStartTimestamp,MainPID,Result'],
                                 capture_output=True, text=True)
         return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
     except OSError:
@@ -2388,6 +2388,7 @@ def runner_start(args):
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
+    log_offset = log.stat().st_size if log.exists() else 0
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
     ready = work / f'runner-{batch}.ready'; ready.unlink(missing_ok=True)
@@ -2395,7 +2396,7 @@ def runner_start(args):
                str(log), executable, str(done_offset), str(repo), str(Path(__file__).resolve().parent), str(ready)]
     launch = ['systemd-run', '--user', '--unit', unit, '--collect',
               '--working-directory', str(repo), '--property=StandardInput=null',
-              '-p', 'ConditionPathExists=!/etc/agent-hold', '-p', f'ConditionPathExists=!{HOME}/.local/state/task/hold',
+              '-p', f'ExecCondition={shlex.quote(str(HOME / ".local/bin/task"))} hold --check',
               '--property=KillMode=process',
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
               '--setenv=PATH=' + os.environ.get('PATH', ''),
@@ -2410,6 +2411,7 @@ def runner_start(args):
         # A failed launch can race another caller; never duplicate an active service.
         if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
             raise Stop(f'{unit} is already active.')
+        refuse_hold()
         with log.open('a') as output:
             process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                        pass_fds=task_lock.descriptors(),
@@ -2418,7 +2420,13 @@ def runner_start(args):
         print('systemd-run --user unavailable; falling back to setsid (new session).')
     atomic_json(record, data)
     deadline = time.monotonic() + 10
-    while not ready.exists() and time.monotonic() < deadline: time.sleep(.02)
+    while not ready.exists() and time.monotonic() < deadline:
+        if data['backend'] == 'systemd' and (runner_service(unit).get('Result') == 'exec-condition' or
+                log.exists() and b'task hold:' in log.read_bytes()[log_offset:]):
+            atomic_json(record, dict(data, result='skipped: hold', finished_at=utc_now()))
+            with done.open('a') as output: output.write('batch: stopped: skipped: hold\n')
+            print(f'{unit}: skipped: hold'); return 1
+        time.sleep(.02)
     if not ready.exists(): raise Stop('Runner did not acquire its process lock; inspect its log before retrying.')
     print(f'{unit}: log={log}')
     return 0
@@ -2780,6 +2788,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
+                refuse_hold()
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
                                            pass_fds=task_lock.descriptors(),
                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -3195,6 +3204,7 @@ def parse_review_reply(text, criteria):
 
 
 def run_reviewer(command, path, prompt_file, reply_file):
+    refuse_hold()
     try:
         timeout = int(os.environ.get("TASK_REVIEW_TIMEOUT", "900"))
     except ValueError:
@@ -3215,6 +3225,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
+            refuse_hold()
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
                                        pass_fds=task_lock.descriptors(),
                                        stderr=errors, start_new_session=True)
@@ -4950,6 +4961,7 @@ def gate_drill(args):
         try:
             if interrupted:
                 raise Stop("Drill interrupted.")
+            refuse_hold()
             return measure(prepare(repo, index, phase), index, phase)
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": 0, "error": str(error)}
@@ -5052,12 +5064,18 @@ def hold_status():
     return '\n'.join(held)
 
 
+def refuse_hold():
+    if held := hold_status(): raise Stop(held)
+
+
 def hold(args):
     path = HOME / '.local/state/task/hold'
+    if args.check: refuse_hold(); return 0
     try:
-        if args.action == 'pull':
+        if args.action:
             holder = (args.holder or os.environ.get('TASK_HOLDER', '')).strip()
             if not holder: raise Stop('Set TASK_HOLDER or pass --holder <name>')
+        if args.action == 'pull':
             if not args.reason: raise Stop('task hold pull requires a reason')
             atomic_json(path, dict(mode='drain', who=holder, why=args.reason, when=utc_now()))
         elif args.action == 'release':
@@ -5145,6 +5163,7 @@ def main(argv=None):
     sub.add_argument('action', nargs='?', choices=('pull', 'release'))
     sub.add_argument('reason', nargs='?')
     sub.add_argument('--holder')
+    sub.add_argument('--check', action='store_true', help='exit nonzero if either hold exists or cannot be inspected')
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")

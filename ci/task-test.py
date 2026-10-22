@@ -45,6 +45,7 @@ TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executab
 HOLD_FIXTURE = Path(audit_state.name) / 'etc/agent-hold'
 HOLD_FIXTURE.parent.mkdir()
 def hold_fixture_source(source):
+    assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
     return source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
 fixture_bin = Path(audit_state.name) / 'bin'
 fixture_bin.mkdir()
@@ -214,6 +215,8 @@ if count == 1:
     reply = os.environ.get('REVIEW_STUB_FIRST_REPLY', reply)
 print(reply, end='', flush=True)
 print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
+if os.environ.get('REVIEW_STUB_HOLD'):
+    (pathlib.Path.home() / '.local/state/task/hold').write_text('hold before reviewer retry')
 time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
 code = os.environ.get('REVIEW_STUB_EXIT', '0')
 sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else code))
@@ -288,7 +291,9 @@ class TaskTool(unittest.TestCase):
             data = json.loads(marker.read_text())
             self.assertEqual((data['mode'], data['who'], data['why']), ('drain', name, 'pause here'))
             datetime.fromisoformat(data['when'])
-            self.raw_task('hold', 'release', env=unnamed)
+            self.assertIn('TASK_HOLDER', self.raw_task('hold', 'release', env=unnamed, code=1))
+            self.assertTrue(marker.exists())
+            self.raw_task('hold', 'release', '--holder', 'named-release', env=unnamed)
             self.assertFalse(marker.exists())
         self.raw_task('hold', 'pull', 'named', '--holder', 'seat', env=unnamed)
         self.raw_task('hold', 'release')
@@ -370,10 +375,170 @@ class TaskTool(unittest.TestCase):
     def test_hold_unit_conditions(self):
         units = ROOT / 'home/dot_config/systemd/user'
         for name in ('workspace-tidy.service',):
-            unit = (units / name).read_text().split('[Service]')[0]
-            self.assertIn('ConditionPathExists=!/etc/agent-hold', unit.splitlines())
-            self.assertIn('ConditionPathExists=!%h/.local/state/task/hold', unit.splitlines())
-        self.assertNotIn('ConditionPathExists', (units / 'task-watch.service').read_text())
+            unit = (units / name).read_text()
+            self.assertNotIn('ConditionPathExists', unit)
+            self.assertIn('ExecCondition=%h/.local/bin/task hold --check', unit.split('[Service]')[1].splitlines())
+        self.assertNotIn('ExecCondition', (units / 'task-watch.service').read_text())
+
+    def test_hold_check_no_holder_and_fail_closed_for_systemd(self):
+        unnamed = dict(self.env)
+        unnamed.pop('TASK_HOLDER')
+        self.raw_task('hold', '--check', env=unnamed)
+        for marker in (HOLD_FIXTURE, self.home / '.local/state/task/hold'):
+            with self.subTest(marker=marker):
+                marker.write_text('hold at admission')
+                self.assertIn(str(marker), self.raw_task('hold', '--check', env=unnamed, code=1))
+                make_read_only(self, marker, 0o000)
+                self.assertIn('cannot read', self.raw_task('hold', '--check', env=unnamed, code=1))
+                restore_access(marker)
+                marker.unlink()
+                marker.symlink_to(self.home / 'missing-marker-target')
+                self.assertIn('not a regular file', self.raw_task('hold', '--check', env=unnamed, code=1))
+                marker.unlink()
+        parent = self.home / '.local/state/task'
+        make_read_only(self, parent, 0o000)
+        self.assertIn('cannot inspect', self.raw_task('hold', '--check', env=unnamed, code=1))
+
+    def test_hold_seam_rejects_missing_or_duplicate_substitution(self):
+        for source in ('Path("/changed/path")', 'Path("/etc/agent-hold")\n' * 2):
+            with self.assertRaisesRegex(AssertionError, 'exactly one'):
+                hold_fixture_source(source)
+
+    def test_hold_direct_helpers_refuse_before_side_effects(self):
+        helpers = [
+            ('executable_task-batch', ['proj', 'missing-runner.md']),
+            ('executable_workspace-tidy', ['--apply']),
+            ('executable_gate-browser', ['--server', 'touch launched', '*.spec.cjs']),
+        ]
+        marker = self.home / '.local/state/task/hold'
+        for path in (HOLD_FIXTURE, marker):
+            path.write_text('direct helper hold')
+            try:
+                for name, args in helpers:
+                    with self.subTest(marker=path, helper=name):
+                        result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin' / name), *args],
+                            cwd=self.home, env=dict(self.env, TASK_GATE_RUN_ID='hold-test'),
+                            capture_output=True, text=True, timeout=10)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn('direct helper hold', result.stdout + result.stderr)
+                        self.assertFalse((self.home / 'launched').exists())
+                        self.assertFalse((self.home / '.local/state/workspace-tidy').exists())
+                        self.assertFalse((self.repo / '.work').exists())
+                # Report-only tidy and the lane browser skip launch nothing.
+                result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin/executable_workspace-tidy')],
+                    env=self.env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                shutil.rmtree(self.home / '.local/state/workspace-tidy')
+            finally:
+                path.unlink()
+
+    def test_hold_pulled_during_gate_slot_wait_prevents_launch(self):
+        wt, _ = self.started()
+        script = self.home / 'during-check.sh'
+        script.write_text(f'#!/bin/sh\ntouch "{self.home}/gate-launched"\n')
+        script.chmod(0o755)
+        (wt / '.task.toml').write_text('exclusive_gate = true\n')
+        self.git(wt, 'add', '.task.toml')
+        self.git(wt, 'commit', '-qm', 'exclusive gate')
+        lock = self.gate_dir / 'agent-task-gate.lock'
+        transcript = self.home / 'waiting-check.log'
+        with lock.open('a') as held, transcript.open('w') as output:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            process = subprocess.Popen([sys.executable, str(TOOL), 'check', 'proj', '5'],
+                cwd=self.home, env=self.env, stdout=output, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 10
+                while 'Waiting for exclusive task gate' not in transcript.read_text():
+                    self.assertIsNone(process.poll(), transcript.read_text())
+                    self.assertLess(time.monotonic(), deadline, transcript.read_text())
+                    time.sleep(.02)
+                self.raw_task('hold', 'pull', 'hold during slot wait')
+                fcntl.flock(held, fcntl.LOCK_UN)
+                self.assertEqual(process.wait(timeout=10), 1)
+            finally:
+                if process.poll() is None: process.kill(); process.wait()
+        self.assertIn('hold during slot wait', transcript.read_text())
+        self.assertFalse((self.home / 'gate-launched').exists())
+        self.assertFalse((self.state() / 'check.json').exists())
+
+    def test_hold_before_reviewer_retry_and_usage_fallback_prevents_second_launch(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.raw_task('check', 'proj', '5')
+        marker = self.home / '.local/state/task/hold'
+        for options in ({}, {'REVIEW_STUB_FIRST_EXIT': '2', 'REVIEW_STUB_REPLY': "You've hit your weekly limit",
+                             'REVIEW_STUB_STDERR': "ERROR: You've hit your usage limit."}):
+            with self.subTest(options=options):
+                (wt / '.work/reviewer-count').unlink(missing_ok=True)
+                output = self.raw_task('review', 'proj', '5', '--run', code=1,
+                    env=dict(self.env, REVIEW_STUB_HOLD='1', **options))
+                self.assertIn('hold before reviewer retry', output)
+                self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+                self.assertFalse((self.state() / 'review.json').exists())
+                if options: self.assertIn('retrying once', output)
+                marker.unlink()
+
+    def test_hold_between_gate_steps_prevents_second_launch(self):
+        task_file = next((self.kb / 'backlog/tasks').iterdir())
+        task_file.write_text(task_file.read_text().replace('Verify: `true`',
+            f'Verify: `touch {self.home}/second-gate-launch`'))
+        wt, _ = self.started()
+        script = self.home / 'during-check.sh'
+        script.write_text(f'#!/bin/sh\n"{TOOL}" hold pull "between gate steps" --holder gate-test\n')
+        script.chmod(0o755)
+        output = self.raw_task('check', 'proj', '5', code=1)
+        self.assertIn('between gate steps', output)
+        log = (self.state() / 'check.log').read_text()
+        self.assertIn('Ran 3 tests', log)
+        self.assertFalse((self.home / 'second-gate-launch').exists())
+
+    def test_hold_runner_skipped_closes_record_and_blocks_setsid_fallback(self):
+        for backend, collected in (('systemd', False), ('systemd', True), ('setsid', False)):
+            with self.subTest(backend=backend, collected=collected):
+                runner = self.runner_fixture(backend)
+                if collected: (self.home / 'service-collected').touch()
+                (self.home / 'pull-before-service').touch()
+                output = self.raw_task('runner-start', 'proj', str(runner), code=1)
+                self.assertNotIn('process lock', output)
+                self.assertFalse((runner.parent / 'runner-call').exists())
+                if backend == 'systemd':
+                    self.assertIn('skipped: hold', output)
+                    data = json.loads(runner.with_suffix('.json').read_text())
+                    self.assertEqual(data['result'], 'skipped: hold')
+                    datetime.fromisoformat(data['finished_at'])
+                    self.assertIn('batch: stopped: skipped: hold', runner.with_suffix('.done').read_text())
+                    self.assertIn('skipped: hold', self.raw_task('status', 'proj'))
+                else:
+                    self.assertIn('service admission hold', output)
+                (self.home / '.local/state/task/hold').unlink()
+                (self.home / 'service-skipped').unlink(missing_ok=True)
+                (self.home / 'service-collected').unlink(missing_ok=True)
+                runner.with_suffix('.json').unlink(missing_ok=True)
+                if collected:
+                    (self.home / 'pull-before-service').unlink()
+                    self.assertNotIn('skipped: hold', self.raw_task('runner-start', 'proj', str(runner)))
+                    self.wait_project_lock_free()
+                    self.assertTrue((runner.parent / 'runner-call').exists())
+                    (runner.parent / 'runner-call').unlink()
+
+    def test_hold_between_drill_phases_prevents_new_launch(self):
+        just = self.home / 'bin/just'
+        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
+            import pathlib, sys
+            assert sys.argv[1:] == ['check']
+            home = pathlib.Path.home()
+            with (home / 'drill-launches').open('a') as output:
+                output.write('launched\\n')
+            (home / '.local/state/task/hold').write_text('hold between drill phases')
+            print('OK')
+            '''))
+        output = self.raw_task('gate-drill', 'proj', code=1)
+        self.assertIn('hold between drill phases', output)
+        self.assertEqual((self.home / 'drill-launches').read_text(), 'launched\n')
+        rows = json.loads(next((self.home / '.local/state/task/gate-drill').glob('*/results.json')).read_text())
+        self.assertEqual(rows[0]['concurrent']['result'], 'passed')
+        self.assertEqual(rows[0]['solo']['result'], 'failed')
+        self.assertEqual(len(self.git(self.repo, 'worktree', 'list').splitlines()), 1)
 
     def test_project_lock_contention_commands_and_read_only_status(self):
         self.started()
@@ -2258,6 +2423,9 @@ class TaskTool(unittest.TestCase):
         from types import SimpleNamespace
         TASK_MODULE.check_plan(SimpleNamespace(kb=self.home / 'absent', number=5))
     def runner_fixture(self, backend='systemd'):
+        installed_task = self.home / '.local/bin/task'
+        installed_task.parent.mkdir(parents=True, exist_ok=True)
+        if not installed_task.exists(): installed_task.symlink_to(TOOL)
         work = self.repo / '.work'
         work.mkdir(exist_ok=True)
         runner = work / 'runner-b1.md'
@@ -2272,13 +2440,24 @@ else:
     print('ActiveState=' + ('active' if (home / 'active').exists() else 'inactive'))
     print('ExecMainStartTimestamp=test-start')
     print('MainPID=' + os.environ.get('FAKE_MAINPID', str(os.getppid())))
+    if not (home / 'service-collected').exists():
+        print('Result=' + ('exec-condition' if (home / 'service-skipped').exists() else 'success'))
 """,
             'systemd-run': """#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, shlex, subprocess, sys
 home = pathlib.Path(os.environ['HOME'])
 (home / 'service-args').write_text(json.dumps(sys.argv[1:]))
+if (home / 'pull-before-service').exists():
+    (home / '.local/state/task/hold').write_text('service admission hold')
 code = int(os.environ.get('SERVICE_EXIT', '0'))
 if not code:
+    condition = next(arg for arg in sys.argv if arg.startswith('ExecCondition='))
+    log = next(arg.split('append:', 1)[1] for arg in sys.argv if arg.startswith('--property=StandardError='))
+    with open(log, 'a') as output:
+        denied = subprocess.run(shlex.split(condition.split('=', 1)[1]), stdout=output, stderr=output).returncode
+    if denied:
+        (home / 'service-skipped').touch()
+        sys.exit(0)
     env = dict(os.environ)
     for arg in sys.argv:
         if arg.startswith('--setenv='):
@@ -2332,10 +2511,10 @@ sys.exit(7)
                                    '--working-directory', str(self.repo), '--property=StandardInput=null'])
         self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
         self.assertIn('--property=KillMode=process', args)
-        for condition in ('ConditionPathExists=!/etc/agent-hold',
-                          f'ConditionPathExists=!{self.home}/.local/state/task/hold'):
-            self.assertEqual(args.count(condition), 1)
-            self.assertEqual(args[args.index(condition) - 1], '-p')
+        condition = f'ExecCondition={self.home}/.local/bin/task hold --check'
+        self.assertEqual(args.count(condition), 1)
+        self.assertEqual(args[args.index(condition) - 1], '-p')
+        self.assertFalse(any('ConditionPathExists' in arg for arg in args))
         self.assertIn('--setenv=TASK_HOLDER=test-seat', args)
         command = args[args.index(sys.executable):]
         self.wait_project_lock_free()
@@ -3672,6 +3851,8 @@ store.write_text(json.dumps(prs))
         socket_root = TASK_MODULE.gate_temporary_root() if socket_test else None
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory(
             dir=socket_root, prefix='s')))
+        # In-process admission checks use the same temporary home as CLI fixtures.
+        self.enterContext(mock.patch.object(TASK_MODULE, 'HOME', self.home))
         def close_project_locks():
             for key in list(TASK_MODULE.task_lock.OWNERS):
                 if Path(key).is_relative_to(self.home):
@@ -3679,6 +3860,7 @@ store.write_text(json.dumps(prs))
         self.addCleanup(close_project_locks)
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
+        (bin_dir / 'task').symlink_to(TOOL)
         for name, body in STUBS.items():
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)

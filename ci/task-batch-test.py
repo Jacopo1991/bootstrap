@@ -31,6 +31,8 @@ STUB = r'''#!/usr/bin/env python3
 import fcntl, json, os, pathlib, subprocess, sys
 from datetime import datetime, timezone
 home = pathlib.Path.home()
+if sys.argv[1:] == ['hold', '--check']:
+    sys.exit(0)
 lock = (home / 'command.lock').open('w')
 try:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
