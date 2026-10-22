@@ -4,6 +4,8 @@ Readings are the vendors' own numbers: the newest Codex rollout `rate_limits` an
 Claude `rate_limit_event` that a recorded lane or review left behind. Nothing here calls a model.
 """
 import json
+import fcntl
+from collections import Counter
 import os
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -524,19 +526,48 @@ def report(home, now=None):
 
 
 def weekly_lines(home, now=None):
-    """One line per vendor for the company STATUS."""
-    now = now or datetime.now(timezone.utc)
-    _, seen, _ = assessments(home, now)
-    state = _json(_dir(home) / "weeks.json")
+    return run_summary(home, 7, now) + [override_summary(home, now)]
+
+
+def run_log(home, run=None, outcome=None, **fields):
+    now = datetime.now(timezone.utc)
+    root = _dir(home).parent
+    reading = readings(home, now).get((run or fields).get("vendor"))
+    reading = json.loads(json.dumps(reading, default=str)) if reading and not reading.get("reason") else None
+    if run is None:
+        run = dict(id=os.urandom(12).hex(), start=now.isoformat(), end=None, plan=os.environ.get("TASK_PLAN"),
+                   effort="high", tier="routine", round=1 + sum(r.get("repo") == fields.get("repo") and r.get("task") == fields.get("task") and r.get("kind") == fields.get("kind") and r.get("outcome") in {"finished", "failed", "interrupted"} for r in map(json.loads, _text(root / "runs.jsonl").splitlines())), ccusage_tokens=None, before=reading) | fields
+        _write(root / "pending-runs" / (run["id"] + ".json"), run)
+        return run
+    terminal = outcome in {"finished", "failed", "interrupted"}
+    after = reading if terminal else run.get("after")
+    before = run.get("before") or {}
+    delta = {k: after[k] - before[k] if after and before.get(k) is not None and after.get(k) is not None and before.get(reset) == after.get(reset) else None
+             for k, reset in (("weekly", "resets_at"), ("five_hour", "five_resets"))}
+    row = dict(run, id=run["id"] if terminal else run["id"] + ":" + outcome, run_id=run["id"], type="run" if terminal else "outcome", end=now.isoformat(), after=after, usage_delta=delta, outcome=outcome, **fields)
+    with (root / "runs.jsonl").open("a+") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        stream.seek(0)
+        if not any(r.get("run_id", r["id"]) == run["id"] and (r["outcome"] in {"finished", "failed", "interrupted"} if terminal else r["outcome"] == outcome) for r in map(json.loads, stream)):
+            stream.write(json.dumps(row) + "\n")
+            stream.flush()
+        if terminal:
+            (root / "pending-runs" / (run["id"] + ".json")).unlink(missing_ok=True)
+
+def run_outcome(home, repo, task, outcome):
+    for row in list(map(json.loads, _text(_dir(home).parent / "runs.jsonl").splitlines())) + [_json(p) for p in (_dir(home).parent / "pending-runs").glob("*.json")]:
+        if row.get("repo") == repo and row.get("task") == task and row.get("outcome") in {None, "finished", "failed", "interrupted"}:
+            run_log(home, row, outcome.split(":", 1)[0], reason=outcome)
+
+def run_summary(home, days=1, now=None):
+    cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=days)).isoformat()
+    rows = list(map(json.loads, _text(_dir(home).parent / "runs.jsonl").splitlines()))
+    ended = {r["id"] for r in rows if r.get("outcome") in {"finished", "failed", "interrupted"}}
+    rows += [dict(_json(p), outcome="unfinished") for p in (_dir(home).parent / "pending-runs").glob("*.json") if p.stem not in ended]
     lines = []
     for vendor in VENDORS:
-        item = seen[vendor]
-        weeks = state.get(vendor, {})
-        key = item["resets_at"].isoformat() if not item["reason"] else max(weeks, default="")
-        week = weeks.get(key, {})
-        ends = f"{_stamp(key).astimezone(CPH):%Y-%m-%d}" if key else "unknown"
-        used = f"{week['used']:.0f} %" if "used" in week else "unknown"
-        five = "".join(f", 5-hour exhausted {when}" for when in week.get("five_exhausted", {}).values())
-        lines.append(f"{vendor} week ending {ends}: used {used}, exhausted {week.get('exhausted') or 'no'}, "
-                     f"lanes held back {len(week.get('held', []))}{five}")
-    return lines + [override_summary(home, now)]
+        found = [r for r in rows if r.get("vendor") == vendor and (r.get("end") or r["start"]) >= cutoff]
+        deltas = [(r.get("usage_delta") or {}).get("weekly") for r in found if r["outcome"] in {"finished", "failed", "interrupted"}]
+        total = sum(d for d in deltas if d is not None) if any(d is not None for d in deltas) else None
+        lines.append(f"{vendor} last {days}d: runs {len({r.get('run_id', r['id']) for r in found})}, weekly usage delta {total}, outcomes {dict(Counter(r['outcome'] for r in found))}")
+    return lines

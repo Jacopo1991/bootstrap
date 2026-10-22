@@ -436,7 +436,8 @@ class Batch:
     def run_task(self, task):
         try:
             return self.task(task)
-        except BaseException:
+        except BaseException as error:
+            task_usage.run_outcome(Path.home(), self.repo.name, data(Path.home() / ".local/state/task" / self.repo.name / name(task["id"]) / "task.json").get("id", task["id"]), f"stopped: {str(error) or 'interrupted'}")
             self.stop()
             raise
 
@@ -541,6 +542,7 @@ class Batch:
                     self.append(f"{task['id']}: {outcome}")
                     completed.add(name(task["id"]))
                     if outcome.startswith("parked:"):
+                        task_usage.run_outcome(Path.home(), self.repo.name, data(Path.home() / ".local/state/task" / self.repo.name / name(task["id"]) / "task.json").get("id", task["id"]), outcome)
                         parked.add(name(task["id"]))
                         consecutive += 1
                         if consecutive == 2:
