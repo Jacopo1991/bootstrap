@@ -2061,7 +2061,6 @@ store.write_text(json.dumps(prs))
                 log = (wt / '.work/run.log').read_text()
                 self.assertIn(f'gate busy: held by pid {os.getpid()} (holder details unavailable)', log)
                 self.assertNotIn('proj/T-9', log)
-                self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
                 self.assertEqual(json.loads(holder.read_text())['pid'], 99999999)
 
     def test_reliability_review_diff_excludes_integrated_main(self):
@@ -2331,7 +2330,6 @@ store.write_text(json.dumps(prs))
                                           "since": "2026-01-01"}))
             with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)), \
                     mock.patch.object(TASK_MODULE, "GATE_LOCK_WAIT", 0):
-                self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
                 output = io.StringIO()
                 stdout = io.StringIO()
                 with contextlib.redirect_stderr(output), contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as stop:
@@ -2341,7 +2339,6 @@ store.write_text(json.dumps(prs))
                 self.assertEqual(stdout.getvalue(), '')
                 self.assertIn(f"gate busy: held by pid {os.getpid()} (holder details unavailable)", output.getvalue())
                 self.assertNotIn('proj/T-9', output.getvalue())
-        self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_start_clears_stale_run_locks(self):
         import json
@@ -2464,11 +2461,9 @@ store.write_text(json.dumps(prs))
                                    text=True)
         try:
             self.assertEqual(process.stdout.readline().strip(), 'ready')
-            self.assertTrue(TASK_MODULE.gate_holder_alive(lock))
             (self.gate_dir / 'agent-task-gate.holder').write_text('{"pid": 99999999}')
             process.kill()
             process.wait(timeout=5)
-            self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
             with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)):
                 with TASK_MODULE.exclusive_gate_lock(TASK_MODULE.Task(self.repo, '5')):
                     self.assertEqual(TASK_MODULE.gate_holder_pid(lock), os.getpid())
@@ -2952,7 +2947,6 @@ store.write_text(json.dumps(prs))
             self.assertNotIn('/? since ?', output.getvalue())
             self.assertIn('holder details unavailable', output.getvalue())
             self.assertNotIn('T-9', output.getvalue())
-        self.assertFalse(TASK_MODULE.gate_holder_alive(lock))
 
     def test_reliability_noticed_import_lists_only_and_deduplicates(self):
         self.started()

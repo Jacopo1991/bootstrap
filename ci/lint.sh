@@ -60,6 +60,8 @@ run python3 ci/workspace-tidy-test.py
 run python3 ci/task-test.py
 run python3 ci/task-usage-test.py
 run python3 ci/task-batch-test.py
+run python3 ci/task-line-budget-test.py
+run python3 ci/task-line-budget.py
 run python3 ci/hook-state-test.py
 run python3 ci/backrest-test.py
 run python3 ci/job-ping-test.py
