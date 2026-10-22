@@ -1049,6 +1049,31 @@ PyPI and about six for npm (its database is about 200 MB).
 
 ## Job monitoring (Healthchecks.io pings)
 
+`task-watch` reads existing records every 15 minutes when the PM enables
+`task-watch.timer` after review. Class definitions live in the
+[company skill, The company thread](https://github.com/Jacopo1991/cortex-core/blob/main/skills/company/SKILL.md).
+Run `task-watch --coverage` for detection and interim company checks. It sends no
+messages and calls no models; the company seat carries findings in its next report.
+The timer is shipped without an enablement symlink.
+
+PMs list live user unit/timer names, one per line (blank lines and `#` comments
+allowed), in `~/.config/task/live-units`. Only those units are inspected.
+Asks are read from `~/cortex/cortex-kb-*/backlog/tasks/*.md`.
+The default report check uses the company `STATUS.md` commit age, with a two-hour
+cadence. The seat may name existing report/collector heartbeat files through
+`~/.config/task/watch-reports.json`, a mapping such as
+`{"seat-report":{"path":"reports/company.md","seconds":7200},"collector":{"path":"reports/collector.json","seconds":3600}}`.
+Paths are relative to home or absolute; `"git":true` uses the file's latest commit
+instead of its modification time. Missing files are findings. Without a collector
+source it remains interim. No new collector, paid-cap, hold or alert schema is inferred.
+
+`~/.local/state/task/watch.jsonl` records opens and closes with class, source, key,
+first_seen and last_seen. `watch-state.json` updates open findings' last_seen on
+every successful scan without repeating ledger lines; cleared findings close once.
+Source errors fail the run without closing prior findings. A lock serializes runs.
+Only watcher state is written. Each run calls the existing `job-ping task-watch`
+with its result (provision `TASK_WATCH_URL` in the usual pings file); coverage is read-only.
+
 Every scheduled job bootstrap manages pings its own Healthchecks.io check when it finishes: the
 check's URL on success, `<URL>/fail` on failure. There is no account in the repository and no URL
 in Git. The founder creates the checks below (the names are the check names; `job-ping` matches a
@@ -1058,6 +1083,7 @@ file; a job whose key is missing skips its ping silently.
 | Check name | Job | Runs | Key in the pings file |
 | --- | --- | --- | --- |
 | `qmd-index` | `qmd-index.timer` (AgentDev) | every 15 minutes | `QMD_INDEX_URL` |
+| `task-watch` | `task-watch.timer` (PM enables after review) | every 15 minutes | `TASK_WATCH_URL` |
 | `osv-db-refresh` | `osv-db-refresh.timer` (AgentDev) | weekly | `OSV_DB_REFRESH_URL` |
 | `gh-skill-update` | `gh-skill-update.timer` (AgentDev) | daily | `GH_SKILL_UPDATE_URL` |
 | `windows-skills-update` | `MachineBootstrap-Skills-Update` task | daily 09:15 | `WINDOWS_SKILLS_UPDATE_URL` |

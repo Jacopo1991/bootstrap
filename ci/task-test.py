@@ -7516,5 +7516,126 @@ Reviewer: claude strict-model
             self.assertNotIn("check=", out)
 
 
+class WatcherTests(unittest.TestCase):
+    def setUp(self):
+        loader = importlib.machinery.SourceFileLoader('watch_fixture', str(TOOL.with_name('executable_task-watch')))
+        self.watch = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(self.watch)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.now = datetime.now(timezone.utc)
+        self.report = self.write('reports/seat.md', 'report')
+        self.write('.config/task/watch-reports.json', json.dumps({'seat-report': {'path': str(self.report), 'seconds': 7200}}))
+        self.readings = mock.patch.object(self.watch.usage, 'readings', return_value={})
+        self.readings.start()
+        self.addCleanup(self.readings.stop)
+
+    def write(self, name, text):
+        path = self.home / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def scan(self):
+        return self.watch.findings(self.home, self.now)
+
+    def test_coverage_per_class_and_interim_sources(self):
+        with mock.patch.object(sys, 'argv', ['task-watch', '--coverage']), contextlib.redirect_stdout(io.StringIO()) as out:
+            self.watch.main()
+        for kind in ('P1', 'P2', 'P3', 'P4', 'P5', 'seat-report', 'collector'):
+            self.assertIn(kind, out.getvalue())
+        for kind in ('P1', 'P3'):
+            self.assertIn(kind + ' interim: company skill check', out.getvalue())
+        self.assertEqual(self.scan(), {})
+
+    def test_p2_existing_readers_reserve_weekly_and_five_hour(self):
+        self.readings.stop()
+        self.write('cortex/cortex-kb-company/policy/usage-pacing.toml', '[spare_resets]\ncodex = 0\n')
+        future = self.now.timestamp() + 5 * 86400
+        path = self.write('.local/state/task/usage/claude.json', json.dumps({'seven_day': {'at': self.now.isoformat(), 'utilization': .76, 'resetsAt': future}}))
+        self.assertIn('P2:claude', self.scan())
+        path.write_text(json.dumps({'seven_day': {'at': self.now.isoformat(), 'utilization': .10, 'resetsAt': future}, 'five_hour': {'at': self.now.isoformat(), 'utilization': 1., 'resetsAt': self.now.timestamp() + 3600}}))
+        self.assertIn('P2:claude', self.scan())
+        path.write_text('{}')
+        self.assertNotIn('P2:claude', self.scan())
+
+    def test_p4_only_registered_units_and_errors_do_not_clear(self):
+        self.write('.config/task/live-units', '# comment\n\nproduct.service\nproduct.timer\n')
+        with mock.patch.object(self.watch, 'command', side_effect=['failed', 'active']) as command:
+            found = self.scan()
+        self.assertEqual(list(found), ['P4:product.service'])
+        self.assertEqual(command.call_args_list[0].args, ('systemctl', '--user', 'show', '--property=ActiveState', '--value', '--', 'product.service'))
+        with mock.patch.object(self.watch, 'command', side_effect=subprocess.TimeoutExpired('systemctl', 20)):
+            with self.assertRaises(subprocess.TimeoutExpired): self.scan()
+
+    def test_p5_company_and_product_asks_yaml_forms(self):
+        for repo, labels in [('company', '[ask]'), ('product', '\n  - "ask"')]:
+            self.write(f'cortex/cortex-kb-{repo}/backlog/tasks/ask.md', f'---\nstatus: To Do\nlabels: {labels}\ndue_date: \'2000-01-01\'\n---\n')
+        self.assertEqual(len(self.scan()), 2)
+        for name, status, due, labels in [('done', 'Done', '2000-01-01', '[ask]'), ('future', 'To Do', '2999-01-01', '[ask]'), ('other', 'To Do', '2000-01-01', '[not-ask]'), ('today', 'To Do', str(self.now.astimezone(self.watch.usage.CPH).date()), '[ask]')]:
+            self.write(f'cortex/cortex-kb-company/backlog/tasks/{name}.md', f'---\nstatus: {status}\nlabels: {labels}\ndue_date: {due}\n---\nlabels: [ask]\n')
+        self.assertEqual(len(self.scan()), 2)
+
+    def test_stale_missing_reports_collector_and_git_commit_age(self):
+        os.utime(self.report, (0, 0))
+        self.assertIn('seat-report:seat-report', self.scan())
+        self.report.unlink()
+        self.assertIn('seat-report:seat-report', self.scan())
+        self.write('.config/task/watch-reports.json', json.dumps({'collector': {'path': 'missing-heartbeat', 'seconds': 3600}}))
+        self.assertIn('collector:collector', self.scan())
+        (self.home / '.config/task/watch-reports.json').unlink()
+        self.write('cortex/cortex-kb-company/STATUS.md', 'report')
+        with mock.patch.object(self.watch, 'command', return_value=str(int(self.now.timestamp() - 7300))) as command:
+            self.assertIn('seat-report:seat-report', self.scan())
+        self.assertIn('--format=%ct', command.call_args.args)
+
+    def test_ledger_open_update_close_reopen_and_source_failure(self):
+        state = self.home / '.local/state/task'
+        os.utime(self.report, (0, 0))
+        with mock.patch.object(Path, 'home', return_value=self.home), mock.patch.object(sys, 'argv', ['task-watch']):
+            self.watch.main()
+            first = json.loads((state / 'watch-state.json').read_text())
+            self.watch.main()
+            second = json.loads((state / 'watch-state.json').read_text())
+            key = 'seat-report:seat-report'
+            self.assertEqual(first[key]['first_seen'], second[key]['first_seen'])
+            self.assertGreaterEqual(second[key]['last_seen'], first[key]['last_seen'])
+            self.assertEqual(len((state / 'watch.jsonl').read_text().splitlines()), 1)
+            with mock.patch.object(self.watch, 'findings', side_effect=ValueError('fixture')):
+                with self.assertRaises(ValueError): self.watch.main()
+            self.assertEqual(json.loads((state / 'watch-state.json').read_text()), second)
+            os.utime(self.report, None)
+            self.watch.main()
+            self.watch.main()
+            os.utime(self.report, (0, 0))
+            self.watch.main()
+        rows = [json.loads(line) for line in (state / 'watch.jsonl').read_text().splitlines()]
+        self.assertEqual([row['status'] for row in rows], ['open', 'closed', 'open'])
+        self.assertTrue(all(row['class'] == 'seat-report' and 'source' in row and 'last_seen' in row for row in rows))
+
+    def test_cli_ping_success_failure_and_write_boundary(self):
+        ping = self.write('.local/bin/job-ping', '#!/bin/sh\nprintf "%s %s\\n" "$1" "$2" >> "$HOME/pings"\n')
+        ping.chmod(0o755)
+        before = {str(p.relative_to(self.home)) for p in self.home.rglob('*') if p.is_file()}
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}
+        tool = TOOL.with_name('executable_task-watch')
+        for expected in (0, 1):
+            if expected: self.write('.config/task/watch-reports.json', '{broken')
+            result = subprocess.run([sys.executable, tool], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertEqual((self.home / 'pings').read_text(), 'task-watch 0\ntask-watch 1\n')
+        added = {str(p.relative_to(self.home)) for p in self.home.rglob('*') if p.is_file()} - before
+        self.assertTrue(all(p == 'pings' or p.startswith('.local/state/task/watch') for p in added), added)
+        subprocess.run([sys.executable, tool, '--coverage'], env=env, check=True, capture_output=True)
+        self.assertEqual((self.home / 'pings').read_text().count('\n'), 2)
+
+    def test_timer_shipped_disabled_and_line_cap(self):
+        units = ROOT / 'home/dot_config/systemd/user'
+        self.assertIn('OnCalendar=*:0/15', (units / 'task-watch.timer').read_text())
+        self.assertFalse((units / 'timers.target.wants/symlink_task-watch.timer').exists())
+        self.assertLessEqual(len(TOOL.with_name('executable_task-watch').read_text().splitlines()), 75)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

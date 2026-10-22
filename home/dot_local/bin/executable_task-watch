@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import fcntl, json, re, runpy, subprocess, sys
+from datetime import datetime, timezone
+from pathlib import Path
+sys.dont_write_bytecode = True
+import task_usage as usage
+COVERAGE = """P1 interim: company skill check (no recorded machine-readable paid cap schema)
+P2 task usage readers and policy: weekly and 5-hour exhaustion/reserve
+P3 interim: company skill check (no product channel feed)
+P4 ~/.config/task/live-units: failed units/timers; secret alerts and other harm interim: company skill check (no retained alert source)
+P5 overdue Backlog asks; hold interim: company skill check (task hold state not present)
+seat-report company STATUS.md commit age (2 hours), or named report file/cadence
+collector interim: company skill check unless a heartbeat file/cadence is named in watch-reports.json"""
+def command(*args):
+    return subprocess.run(args, capture_output=True, text=True, check=True, timeout=20).stdout.strip()
+def findings(home, now):
+    found = {}
+    def add(kind, source, key):
+        found[kind + ':' + key] = dict(class_=kind, source=str(source), key=key)
+    pol = usage.policy(home)
+    for vendor, reading in usage.readings(home, now).items():
+        item = usage.assess(reading, pol, now)
+        if item['verdict'] == usage.EXHAUSTED or item['five'] == usage.FIVE_OUT:
+            add('P2', 'task usage', vendor)
+    units = home / '.config/task/live-units'
+    for unit in units.read_text().splitlines() if units.exists() else []:
+        if unit.strip() and not unit.lstrip().startswith('#'):
+            if command('systemctl', '--user', 'show', '--property=ActiveState', '--value', '--', unit.strip()) == 'failed':
+                add('P4', units, unit.strip())
+    scalar = runpy.run_path(str(Path(__file__).with_name('executable_task')))['frontmatter_value']
+    for path in sorted((home / 'cortex').glob('cortex-kb-*/backlog/tasks/*.md')):
+        text = path.read_text()
+        labels = re.search(r'(?m)^labels:[^\n]*(?:\n[ \t]+[^\n]*)*', text.split('---', 2)[1] if text.startswith('---') else '')
+        labels, due = re.sub(r'(?m)^\s*-\s+', ' ', labels[0][7:]) if labels else '', scalar(text, 'due_date')
+        if 'ask' in labels.replace('[', '').replace(']', '').replace(',', ' ').replace("'", '').replace('"', '').split() and scalar(text, 'status').lower() != 'done':
+            if due and datetime.fromisoformat(due).date() < now.astimezone(usage.CPH).date():
+                add('P5', path, str(path.relative_to(home)))
+    config = home / '.config/task/watch-reports.json'
+    reports = json.loads(config.read_text()) if config.exists() else {'seat-report': {'path': 'cortex/cortex-kb-company/STATUS.md', 'seconds': 7200, 'git': True}}
+    for name, spec in reports.items():
+        path = home / spec['path']
+        stamp = float(command('git', '-C', str(path.parent), 'log', '-1', '--format=%ct', '--', path.name) or 0) if spec.get('git') and path.exists() else path.stat().st_mtime if path.exists() else 0
+        if now.timestamp() - stamp > spec['seconds']:
+            add(name, path, name)
+    return found
+def main():
+    if sys.argv[1:] == ['--coverage']: return print(COVERAGE)
+    home, now = Path.home(), datetime.now(timezone.utc)
+    state = home / '.local/state/task'
+    state.mkdir(parents=True, exist_ok=True)
+    with (state / 'watch.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        found = findings(home, now)
+        snapshot = state / 'watch-state.json'
+        old = json.loads(snapshot.read_text()) if snapshot.exists() else {}
+        with (state / 'watch.jsonl').open('a') as ledger:
+            for key in old.keys() | found.keys():
+                row = dict(found.get(key, old.get(key)), first_seen=old.get(key, {}).get('first_seen', now.isoformat()), last_seen=now.isoformat())
+                row['class'] = row.pop('class_', row.get('class'))
+                if key not in old or key not in found:
+                    ledger.write(json.dumps(dict(row, status='open' if key in found else 'closed')) + '\n')
+                if key in found: found[key] = row
+        temporary = state / 'watch-state.tmp'
+        temporary.write_text(json.dumps(found))
+        temporary.replace(snapshot)
+if __name__ == '__main__':
+    result = 0
+    try: main()
+    except Exception:
+        result = 1
+        print('task-watch: source or ledger unavailable; inspect sources', file=sys.stderr)
+    finally:
+        if '--coverage' not in sys.argv:
+            subprocess.run([str(Path.home() / '.local/bin/job-ping'), 'task-watch', str(result)], check=False)
+    sys.exit(result)
