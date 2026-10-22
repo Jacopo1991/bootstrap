@@ -3388,11 +3388,55 @@ store.write_text(json.dumps(prs))
             report = []
             TASK_MODULE.prune_evidence_archive(root, True, report)
             with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-                with self.assertRaises(PermissionError):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
                     TASK_MODULE.prune_archive(self.repo)
+                self.assertIn('fixture unlink denied', output.getvalue())
         self.assertEqual(json.loads(manifest.read_text()), {})
         self.assertTrue(database.exists())
         self.assertTrue(any('fixture unlink denied' in line for line in report))
+
+    def test_archive_repair_records_first_removal_when_second_fails(self):
+        snapshot = self.work_archives() / 'snapshot'
+        snapshot.mkdir(parents=True)
+        manifest = snapshot / 'manifest.json'
+        manifest.write_text('{}')
+        (snapshot / 'copy.db').write_bytes(b'db')
+        subprocess.run(['truncate', '-s', '51M', str(snapshot / 'check.log')], check=True)
+        unlink, attempted = Path.unlink, []
+        def fail_second(path, *args, **kwargs):
+            if path.parent == snapshot and path.name in ('copy.db', 'check.log'):
+                attempted.append(path)
+                if len(attempted) == 2:
+                    row, = json.loads(manifest.read_text())['pruned']
+                    self.assertEqual(row['path'], attempted[0].name)
+                    raise PermissionError('second removal denied')
+            return unlink(path, *args, **kwargs)
+        with mock.patch.object(Path, 'unlink', fail_second), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            TASK_MODULE.prune_archive(self.repo)
+        self.assertEqual(len(attempted), 2)
+        self.assertFalse(attempted[0].exists())
+        self.assertTrue(attempted[1].exists())
+        row, = json.loads(manifest.read_text())['pruned']
+        self.assertEqual(row['path'], attempted[0].name)
+        self.assertEqual(set(row), {'path', 'size', 'sha256', 'reason', 'date'})
+        self.assertIn('second removal denied', output.getvalue())
+
+    def test_atomic_json_failure_removes_temporary_file(self):
+        directory = self.home / 'atomic-json'
+        directory.mkdir()
+        target = directory / 'manifest.json'
+        target.write_text('{}')
+        for operation in ('serialization', 'replace'):
+            with self.subTest(operation=operation):
+                patch = (mock.patch.object(TASK_MODULE.json, 'dumps', side_effect=ValueError('serialize'))
+                         if operation == 'serialization' else
+                         mock.patch.object(TASK_MODULE.os, 'replace', side_effect=OSError('replace')))
+                with patch, self.assertRaises((ValueError, OSError)):
+                    TASK_MODULE.atomic_json(target, {'new': True})
+                self.assertEqual(list(directory.iterdir()), [target])
+                self.assertEqual(target.read_text(), '{}')
 
     def test_archive_prune_dry_run_apply_and_symlinks(self):
         root = self.home / '.local/state/task/archive'

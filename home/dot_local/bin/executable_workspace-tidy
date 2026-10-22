@@ -550,7 +550,8 @@ def check_codex_orphans(seen: set[Path], report: list[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.epilog = "Archives skip databases, files over 50 MB and caches; report archive pruning, or prune with --apply."
+    parser.epilog = ("Archives skip databases, files over 50 MB and caches; report archive pruning, or prune with --apply. "
+                     "Databases and big files inside caches are included in the cache entry without individual hashes.")
     parser.add_argument("--apply", action="store_true",
                         help="remove finished worktrees and merged branches (otherwise report only)")
     args = parser.parse_args()

@@ -123,15 +123,18 @@ def archive_exclusion(item, info, size=None, errors=None, *, hash_files=True):
     return None
 
 
-def prune_evidence_archive(root, apply, report):
+def prune_evidence_archive(root, apply, report, *, snapshots=None):
     """Prune archive snapshots, including legacy ones without manifests; never traverse links."""
     if any(item.is_symlink() for item in (root, *root.parents)) or not root.is_dir():
         return
     entries, _, _ = archive_inventory(root)
     total = 0
     for snapshot, info in entries:
-        if (not stat.S_ISDIR(info.st_mode) or len(snapshot.relative_to(root).parts) != 3
-                or any(part.startswith('.pending-') for part in snapshot.relative_to(root).parts)):
+        repair = snapshots is not None
+        if (not stat.S_ISDIR(info.st_mode) or
+                (snapshot not in snapshots if repair else len(snapshot.relative_to(root).parts) != 3) or
+                (any(part.startswith('.pending-') for part in snapshot.relative_to(root).parts)
+                 and not (repair and not apply))):
             continue
         manifest = snapshot / 'manifest.json'
         if manifest.is_symlink():
@@ -141,7 +144,18 @@ def prune_evidence_archive(root, apply, report):
             record = json.loads(manifest.read_text()) if manifest.exists() else {}
             if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
                 raise ValueError("manifest must be an object with a pruned list")
-            contents, sizes, _ = archive_inventory(manifest.parent)
+            contents, sizes, errors = archive_inventory(manifest.parent)
+            protected = {snapshot, snapshot / '.work', snapshot / 'reports', snapshot / '.work/reports'}
+            _, disposable = oversized_contents(contents, sizes, protected, errors) if repair else (set(), set())
+            for item, error in errors.items():
+                report.append(f"Skipped {item}: {error}")
+            if apply and errors:
+                skipped = record.setdefault('skipped', [])
+                for item, error in errors.items():
+                    entry = {'path': str(item.relative_to(snapshot)), 'reason': error}
+                    if entry not in skipped:
+                        skipped.append(entry)
+                atomic_json(manifest, record)
             excluded = set()
             for item, meta in contents:
                 if item == manifest or item == manifest.parent:
@@ -154,17 +168,23 @@ def prune_evidence_archive(root, apply, report):
                 except OSError as error:
                     report.append(f"archive: kept {item}: {error}")
                     continue
-                if removal is None:
+                if removal is None and item in disposable:
+                    removal = {'size': sizes[item], 'reason': 'directory over 200 MB'}
+                if removal is None or any(path == item or item in path.parents for path in errors):
                     continue
                 excluded.add(item)
                 total += removal['size']
                 removal.update(path=str(item.relative_to(manifest.parent)), date=utc_now())
                 report.append(f"archive: {'remove' if apply else 'would remove'} {item} ({removal['size']} bytes): {removal['reason']}")
                 if apply:
-                    if stat.S_ISDIR(meta.st_mode):
-                        shutil.rmtree(item)
-                    else:
-                        item.unlink()
+                    try:
+                        if stat.S_ISDIR(meta.st_mode):
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                    except OSError as error:
+                        report.append(f"archive: cannot remove {item}: {error}")
+                        continue
                     record.setdefault('pruned', []).append(removal)
                     atomic_json(manifest, record)
             if apply:
@@ -772,13 +792,14 @@ def realign(args):
 
 def atomic_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        try:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
             stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
-            stream.flush()
-            os.replace(temporary, path)
-        finally:
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
             temporary.unlink(missing_ok=True)
 
 
@@ -4658,66 +4679,15 @@ def prune_archive(repo, dry_run=False):
         print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
         if not dry_run:
             shutil.rmtree(item)
-    removed = set()
-    pruned = {}
-    containers = {item.parent for item, _info in entries
-                  if item.name == 'manifest.json' and
-                  '.work' not in item.relative_to(root).parts} | set(finishing)
-    protected = {root} | containers
-    for container in containers:
-        protected.update({container / '.work', container / 'reports', container / '.work/reports'})
-        protected.update(container.parents)
-    _oversized, disposable = oversized_contents(entries, sizes, protected, errors)
-    for item, info in entries:
-        if item in temporary:
-            continue
-        if item.parent in removed:
-            removed.add(item)
-            continue
-        container = next((parent for parent in item.parents if parent in containers), None)
-        if container is None:
-            continue
-        if item == container / 'manifest.json':
-            continue
-        try:
-            omission = archive_exclusion(item, info, sizes[item], errors, hash_files=not dry_run)
-        except OSError as error:
-            errors[item] = str(error)
-            continue
-        if any(path == item or item in path.parents for path in errors):
-            continue
-        # Named runtime trees are removed whole; generic contents preserve evidence.
-        if not (omission or item in disposable):
-            continue
-        removed.add(item)
-        freed += allocated.get(item, 0)
-        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({sizes[item]} bytes): "
-              f"{omission['reason'] if omission else 'directory over 200 MB'}")
-        if not dry_run:
-            if not stat.S_ISDIR(info.st_mode):
-                item.unlink()
-            else:
-                shutil.rmtree(item)
-            pruned.setdefault(container, []).append(
-                dict(omission or {'size': sizes[item], 'reason': 'directory over 200 MB'},
-                     path=str(item.relative_to(container)), date=utc_now()))
-    skipped = {}
-    for item, error in errors.items():
-        print(f"Skipped {item}: {error}")
-        container = next((parent for parent in item.parents if parent in containers), None)
-        if container is not None:
-            skipped.setdefault(container, []).append(
-                {'path': str(item.relative_to(container)), 'reason': error})
-    for container in (set(pruned) | set(skipped)) if not dry_run else ():
-        manifest = container / 'manifest.json'
-        record = records.get(container, {})
-        record.setdefault('pruned', []).extend(pruned.get(container, []))
-        existing = record.setdefault('skipped', [])
-        existing.extend(entry for entry in skipped.get(container, []) if entry not in existing)
-        atomic_json(manifest, record)
     if not dry_run:
         for pending, destination in finishing.items():
             pending.rename(destination)
+    report = []
+    snapshots = (set(records) | set(finishing)) - temporary - invalid
+    if not dry_run:
+        snapshots = {finishing.get(item, item) for item in snapshots}
+    prune_evidence_archive(root, not dry_run, report, snapshots=snapshots)
+    print('\n'.join(report))
     print(f"{'Would free' if dry_run else 'Freed'} {freed} bytes.")
 
 
