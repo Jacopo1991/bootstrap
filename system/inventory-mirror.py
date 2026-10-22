@@ -214,7 +214,7 @@ def mount_source():
 
 
 def unmount():
-    subprocess.run(["/usr/bin/umount", MOUNT_POINT], check=False, timeout=60,
+    subprocess.run(["/usr/bin/umount", MOUNT_POINT], check=True, timeout=60,
                    stdin=subprocess.DEVNULL)
 
 

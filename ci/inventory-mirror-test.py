@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import stat
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -155,6 +156,28 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("unmount failed", last_error.read_text())  # replaced by this run's failure, not removed
         code, out, err = self.run_main_mounted(NOW, mock.Mock(return_value=None))
+        self.assertEqual((code, out, err), (0, "inventory-mirror: copied\n", ""))
+        self.assertFalse(last_error.exists())
+
+    def test_nonzero_unmount_exit_fails_the_run_and_keeps_last_error(self):
+        # The real unmount() runs; only the umount binary is swapped for a command with a chosen exit status.
+        real_run = subprocess.run
+        last_error = self.latest.parent / "last-error"
+        last_error.parent.mkdir(parents=True, mode=0o700)
+        last_error.write_text("2026-10-02T00:00:00Z earlier failure\n")
+
+        def umount_exiting(status):
+            command = [sys.executable, "-c", f"raise SystemExit({status})"]
+            return lambda argv, **kwargs: real_run(command, **kwargs)
+
+        with mock.patch.object(mirror_module.subprocess, "run", umount_exiting(32)):
+            code, out, err = self.run_main_mounted(NOW, mirror_module.unmount)
+        self.assertEqual((code, out), (1, ""))
+        self.assertRegex(err, r"^inventory-mirror: FAILED: unmount failed: Command .* returned non-zero exit status 32\.\n$")
+        self.assertRegex(last_error.read_text(), r"^2026-10-03T01:30:00Z unmount failed: .* exit status 32\.\n$")
+        self.assertEqual(self.latest.read_bytes(), SNAPSHOT)
+        with mock.patch.object(mirror_module.subprocess, "run", umount_exiting(0)):
+            code, out, err = self.run_main_mounted(NOW, mirror_module.unmount)
         self.assertEqual((code, out, err), (0, "inventory-mirror: copied\n", ""))
         self.assertFalse(last_error.exists())
 
