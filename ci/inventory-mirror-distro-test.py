@@ -16,6 +16,7 @@ TIMER = UNIT_DIR / "inventory-mirror.timer"
 SCRIPT = Path("/opt/machine-bootstrap/current/system/inventory-mirror.py")
 PROJECT_DATA = Path("/home/agent/project-data")
 LATEST = PROJECT_DATA / "inventory/latest.json"
+LAST_ERROR = LATEST.parent / "last-error"
 agent = pwd.getpwnam("agent")
 SNAPSHOT = b'{"schemaVersion":2,"createdAtISO":"2026-10-03T02:30:00+02:00","distros":[]}'
 
@@ -58,12 +59,14 @@ if shutil.which("systemd-analyze"):
 else:
     print("SKIP: systemd-analyze verify (not installed)")
 
-# Mounting Windows files in the shared namespace is refused before any mount.
-refused = run_script()
-assert refused.returncode == 1 and "shared mount namespace" in refused.stderr, refused
-
 existed = PROJECT_DATA.exists()
 try:
+    # Mounting Windows files in the shared namespace is refused before any mount, and the
+    # refusal is left for the agent in last-error until the next successful copy.
+    refused = run_script()
+    assert refused.returncode == 1 and "shared mount namespace" in refused.stderr, refused
+    owned(LAST_ERROR, agent.pw_uid, agent.pw_gid, 0o600)
+    assert "shared mount namespace" in LAST_ERROR.read_text(encoding="utf-8")
     with tempfile.TemporaryDirectory() as temp:
         source = Path(temp) / "latest.json"
         source.write_bytes(SNAPSHOT)
@@ -74,6 +77,7 @@ try:
             owned(LATEST.parent, agent.pw_uid, agent.pw_gid, 0o700)
             owned(LATEST, agent.pw_uid, agent.pw_gid, 0o600)
             assert LATEST.read_bytes() == source.read_bytes()
+            assert not LAST_ERROR.exists(), "a successful copy removes last-error"
             assert [p.name for p in LATEST.parent.iterdir()] == ["latest.json"]
             source.write_bytes(SNAPSHOT.replace(b"02:30", b"03:30"))
         # The agent can read its own copy, and it is the only account that can.
@@ -98,7 +102,7 @@ try:
             result = run_script("--source-file", str(source))
             assert result.returncode == 1 and "latest.json" in result.stderr, result
             assert real.read_bytes() == SNAPSHOT
-            assert [p.name for p in LATEST.parent.iterdir()] == ["latest.json"]
+            assert {p.name for p in LATEST.parent.iterdir()} == {"latest.json", "last-error"}
             LATEST.unlink()
             assert run_script("--source-file", str(source)).returncode == 0
             owned(LATEST, agent.pw_uid, agent.pw_gid, 0o600)

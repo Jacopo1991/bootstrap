@@ -72,7 +72,6 @@ from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits,
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
-CHECK_TIMEOUT = int(os.environ.get("TASK_CHECK_TIMEOUT", "900"))
 GATE_SLOT = ContextVar("gate_slot", default=None)
 GATE_PORT_INDEXES = 227  # 20000 + 200 * 226 + 199 stays below 65536
 SUMMARY = re.compile(r"^(Ran \d+ tests?|OK\b|FAILED\b|=+ .*\b(passed|failed|error)|"
@@ -1392,10 +1391,6 @@ def gate_port_index(path: Path):
         except OSError:
             pass
         os.close(descriptor)
-
-
-def gate_holder_alive(lock_path):
-    return gate_holder_pid(lock_path) is not None
 
 
 def gate_holder_pid(lock_path):
