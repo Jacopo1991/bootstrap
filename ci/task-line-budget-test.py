@@ -13,12 +13,14 @@ with tempfile.TemporaryDirectory() as directory:
         result = subprocess.run([sys.executable, checker, fixture, "3"],
                                 text=True, capture_output=True)
         assert result.returncode == expected, result
-        assert f"{count} lines across 1 local files (budget 3)" in result.stdout, result.stdout
+        assert f"total: {count} lines across 1 local files (budget 3)" in result.stdout, result.stdout
 
     entry = Path(directory) / "executable_task"
-    entry.write_text("import local_extra\nentry\n")
-    (Path(directory) / "local_extra.py").write_text("extra\nextra\nextra\n")
+    entry.write_text("import task_extra\nentry\n")
+    (Path(directory) / "task_extra.py").write_text("extra\nextra\nextra\n")
     result = subprocess.run([sys.executable, checker, entry, "4"],
                             text=True, capture_output=True)
     assert result.returncode == 1, result
     assert "5 lines across 2 local files (budget 4)" in result.stdout, result.stdout
+    assert f"{entry}: 2 lines" in result.stdout, result.stdout
+    assert f"{Path(directory) / 'task_extra.py'}: 3 lines" in result.stdout, result.stdout
