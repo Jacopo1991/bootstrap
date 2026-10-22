@@ -5,11 +5,12 @@ Removes only what is provably finished and nothing else:
 - hand-made worktrees inside a repository (<repo>/.worktrees/<name>, <repo>/.claude/worktrees/<name>)
   that are clean, unlocked, not in use, idle for a day, and whose every commit (HEAD and its
   reflog) is already in the default branch. Ignored rebuildable caches are discarded, their files
-  neither scanned nor copied; .work and every other ignored file (logs, .bash_profile, *.egg-info, ...) are archived first, with
+  neither scanned nor copied; .work and other ignored evidence are archived first, with
   relative paths preserved, under ~/.local/state/task/archive/<repo>/<worktree>/. An ignored
   file that looks like a secret (.env, .env.*, *.pem, *.key, id_rsa*, id_ed25519*, anything
   under secrets/), anywhere including .work and .claude, is never copied and keeps the
-  worktree in place; the size of ignored files is not a condition;
+  worktree in place. Databases, files over 50 MB and caches are skipped and recorded;
+  existing archives are also pruned with --apply (otherwise removals are reported);
 - local branches whose commits, including their reflog, are all in the default branch.
 - Codex app worktrees under `$CODEX_HOME/worktrees` that are clean and whose branch is merged
   or whose detached commit is reachable from a default branch.
@@ -238,13 +239,17 @@ def removal_blocker(path: Path, gitdir: Path, in_use: list[Path],
     return None
 
 
-def archive_work(repo, path, report):
-    """Use task merge's archive implementation before discarding ignored evidence."""
+def archive_helpers():
     tool = Path(__file__).with_name("task")
     if not tool.is_file():
         tool = Path(__file__).with_name("executable_task")
+    return runpy.run_path(str(tool), run_name="workspace_tidy_archive")
+
+
+def archive_work(repo, path, report):
+    """Use task merge's archive implementation before discarding ignored evidence."""
     try:
-        task = runpy.run_path(str(tool), run_name="workspace_tidy_archive")
+        task = archive_helpers()
         task["preserve_work"](repo, path.name, path, strict=True)
     except Exception as error:
         report.append(f"{repo.name}: kept {path}: cannot archive .work: {error}")
@@ -259,13 +264,39 @@ def archive_ignored(repo, path, files, report):
     try:
         base.mkdir(parents=True, exist_ok=True)
         pending = Path(tempfile.mkdtemp(prefix=".pending-", dir=base))
+        task, skipped, excluded = archive_helpers(), [], set()
         for relative in files:
-            target = pending / relative
+            if any(parent in excluded for parent in (relative, *relative.parents)):
+                continue
+            for parent in reversed(relative.parents):
+                if parent == Path('.'):
+                    continue
+                directory = path / parent
+                omission = task['archive_exclusion'](directory, directory.lstat())
+                if omission:
+                    _, sizes, _ = task['archive_inventory'](directory)
+                    skipped.append(dict(omission, path=str(parent), size=sizes[directory]))
+                    excluded.add(parent)
+                    break
+            else:
+                omission = None
+            if omission:
+                continue
+            source = path / relative
+            omission = task['archive_exclusion'](source, source.lstat())
+            if omission:
+                skipped.append(dict(omission, path=str(relative)))
+                continue
+            target = pending / 'ignored' / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             if (path / relative).is_symlink():
                 target.symlink_to(os.readlink(path / relative))
             else:
                 shutil.copy2(path / relative, target)
+        with tempfile.NamedTemporaryFile(mode='w', dir=pending, delete=False) as stream:
+            json.dump({'skipped': skipped}, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+        Path(stream.name).replace(pending / 'manifest.json')
         destination = base / f"{path.name}-ignored-{pending.name.removeprefix('.pending-')}"
         pending.rename(destination)
     except OSError as error:
@@ -519,10 +550,13 @@ def check_codex_orphans(seen: set[Path], report: list[str]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.epilog = ("Archives skip databases, files over 50 MB and caches; report archive pruning, or prune with --apply. "
+                     "Databases and big files inside caches are included in the cache entry without individual hashes.")
     parser.add_argument("--apply", action="store_true",
                         help="remove finished worktrees and merged branches (otherwise report only)")
     args = parser.parse_args()
     now, report, done = time.time(), [], []
+    archive_helpers()['prune_evidence_archive'](HOME / '.local/state/task/archive', args.apply, report)
     in_use = paths_in_use()
     seen_codex = set()
     for repo in repos():
