@@ -23,9 +23,16 @@ def findings(home, now):
             add('P2', 'task usage', vendor)
     units = home / '.config/task/live-units'
     for unit in units.read_text().splitlines() if units.exists() else []:
-        if unit.strip() and not unit.lstrip().startswith('#'):
-            if command('systemctl', '--user', 'show', '--property=ActiveState', '--value', '--', unit.strip()) == 'failed':
-                add('P4', units, unit.strip())
+        unit = unit.strip()
+        if unit and not unit.startswith('#'):
+            props = dict(line.split('=', 1) for line in command('systemctl', '--user', 'show', '--property=LoadState,ActiveState,TriggeredBy,UnitFileState,NextElapseUSecRealtime', '--', unit).splitlines())
+            reason = 'not found' if props.get('LoadState') == 'not-found' else 'failed' if props.get('ActiveState') == 'failed' else ''
+            if not reason and props.get('ActiveState') != 'active' and (unit.endswith('.timer') or unit.endswith('.service') and not props.get('TriggeredBy')): reason = 'inactive'
+            if not reason and unit.endswith('.timer'):
+                reason = 'disabled' if props.get('UnitFileState') != 'enabled' else 'no next run' if props.get('NextElapseUSecRealtime', '') in ('', 'n/a') else ''
+            if reason:
+                add('P4', units, unit)
+                found['P4:' + unit]['detail'] = reason
     tool = Path(__file__).with_name('task')
     scalar = runpy.run_path(str(tool if tool.is_file() else tool.with_name('executable_task')))['frontmatter_value']
     for path in sorted(path for repo in ('company', 'product-harness', 'household-signal-harness', 'madplanner-v2', 'consultancy-website', 'home-energy-lab') for path in (home / 'cortex' / ('cortex-kb-' + repo)).glob('backlog/tasks/*.md')):
