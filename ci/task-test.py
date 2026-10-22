@@ -207,6 +207,159 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
+    def run_rows(self):
+        path = self.home / '.local/state/task/runs.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_run_log_lane_review_merge_and_retry(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', env=dict(self.env, TASK_PLAN='plan-42'))
+        lane = self.wait_for_lane(wt)
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row['kind'], row['task'], row['repo'], row['round']), ('lane', 'T-5', 'proj', 1))
+        self.assertEqual((row['vendor'], row['model'], row['effort'], row['tier']), ('codex', lane['model'], 'high', 'routine'))
+        self.assertEqual((row['plan'], row['outcome'], row['before'], row['ccusage_tokens']), ('plan-42', 'finished', None, None))
+        self.assertIsNotNone(row['start'])
+        self.assertIsNotNone(row['end'])
+        self.assertEqual(row['usage_delta'], {'weekly': None, 'five_hour': None})
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home):
+            TASK_MODULE.task_usage.run_log(self.home, lane['usage_run'], 'finished')
+        self.assertEqual(len(self.run_rows()), 1)
+        self.commit_in(wt, 'b.txt')
+        self.raw_task('check', 'proj', '5')
+        self.stub_reviewers()
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: file exists\n#2 pass: check passed\n'
+        self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply, TASK_PLAN='plan-42'))
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[1]['kind'], rows[1]['vendor'], rows[1]['task'], rows[1]['outcome']), ('review', 'claude', 'T-5', 'finished'))
+        self.task('merge', 'proj', '5', '--keep')
+        rows = self.run_rows()
+        merged = [r for r in rows if r['outcome'] == 'merged']
+        self.assertEqual({r['run_id'] for r in merged}, {r['id'] for r in rows if r['outcome'] == 'finished'})
+        self.assertEqual(len({r['id'] for r in rows}), len(rows))
+        self.assertTrue(all(r['type'] == 'outcome' for r in merged))
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            TASK_MODULE.task_usage.run_outcome(self.home, 'proj', 'T-5', 'merged')
+        self.assertEqual(len(self.run_rows()), 4)
+        self.assertIn("'merged': 1", self.raw_task('status', 'proj'))
+
+    def test_run_log_crash_is_pending_and_status_is_read_only(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', env=dict(self.env, LANE_STUB_RELEASE=str(self.home / 'release')))
+        self.wait_for_lane(wt, finished=False)
+        lane = json.loads((wt / '.work/lane.json').read_text())
+        os.killpg(lane['pid'], signal.SIGKILL)
+        self.assertEqual(self.run_rows(), [])
+        pending = self.home / '.local/state/task/pending-runs' / (lane['usage_run']['id'] + '.json')
+        before = pending.read_bytes()
+        self.assertIn("'unfinished': 1", self.raw_task('status', 'proj'))
+        self.assertEqual(pending.read_bytes(), before)
+        self.assertEqual(self.run_rows(), [])
+
+    def test_run_log_pm_start_end_and_manual_review_retry(self):
+        env = dict(self.env, TASK_VENDOR='codex', TASK_MODEL='gpt-6.1-sol', TASK_EFFORT='high', TASK_PLAN='pm-plan')
+        self.raw_task('note', 'proj', '-', 'pm-run', 'start', env=env)
+        self.raw_task('note', 'proj', '-', 'pm-run', 'start', env=env)
+        self.assertIn("'unfinished': 1", self.raw_task('status', 'proj'))
+        self.raw_task('note', 'proj', '-', 'pm-run', 'end', env=env)
+        self.raw_task('note', 'proj', '-', 'pm-run', 'end', env=env)
+        self.assertEqual(len(self.run_rows()), 1)
+        self.assertEqual((self.run_rows()[0]['kind'], self.run_rows()[0]['plan']), ('pm', 'pm-plan'))
+        wt, _ = self.started()
+        self.raw_task('review', 'proj', '5')
+        reply = self.home / 'manual-review.md'
+        reply.write_text(f"Verdict: PASS\nCommit: {self.git(wt, 'rev-parse', 'HEAD')}\n#1 pass: yes\n#2 pass: yes\n")
+        for _ in range(2):
+            self.raw_task('review', 'proj', '5', '--record', str(reply))
+        self.assertEqual(len(self.run_rows()), 2)
+
+    def test_run_log_usage_resets_failures_outcomes_and_concurrent_retry(self):
+        usage = TASK_MODULE.task_usage
+        now = datetime.now(timezone.utc)
+        reset = now + __import__('datetime').timedelta(days=3)
+        reading = dict(vendor='codex', reason='', weekly=10, five_hour=20, resets_at=reset, five_resets=reset)
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(usage, 'readings', return_value={'codex': reading}):
+            run = usage.run_log(self.home, repo='proj', task='T-5', kind='lane', vendor='codex', model='gpt-6.1-sol')
+            reading.update(weekly=13, five_hour=24)
+            errors = []
+            def finish():
+                try:
+                    usage.run_log(self.home, run, 'failed', reason='exit', exit_code=2)
+                except Exception as error:
+                    errors.append(error)
+            threads = [threading.Thread(target=finish) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(len(self.run_rows()), 1)
+            self.assertEqual(self.run_rows()[0]['usage_delta'], {'weekly': 3, 'five_hour': 4})
+            usage.run_outcome(self.home, 'proj', 'T-5', 'parked: repeated failure')
+            usage.run_outcome(self.home, 'proj', 'T-5', 'stopped: time cap')
+            self.assertEqual(self.run_rows()[-1]['reason'], 'stopped: time cap')
+            self.assertIn('weekly usage delta 3', usage.run_summary(self.home)[1])
+            self.assertIn('weekly usage delta 3', usage.weekly_lines(self.home)[1])
+            run = usage.run_log(self.home, repo='proj', task='T-5', kind='lane', vendor='codex')
+            reading.update(weekly=1, five_hour=1, resets_at=reset + __import__('datetime').timedelta(days=7), five_resets=reset + __import__('datetime').timedelta(hours=5))
+            usage.run_log(self.home, run, 'interrupted', reason='cancelled')
+            self.assertEqual(self.run_rows()[-1]['usage_delta'], {'weekly': None, 'five_hour': None})
+
+    def test_run_log_runner_park_stop_and_pm_failure(self):
+        loader = importlib.machinery.SourceFileLoader('run_log_batch_test', str(TOOL.with_name('executable_task-batch')))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        self.started()
+        usage = TASK_MODULE.task_usage
+        source = self.home / 'batch.md'
+        source.write_text('test batch')
+        runner = module.Batch(self.repo, source)
+        task = dict(id='5', builder='codex', after=None)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            run = usage.run_log(self.home, repo='proj', task='T-5', kind='lane', vendor='codex')
+            usage.run_log(self.home, run, 'failed')
+            with mock.patch.object(module.Batch, 'task', return_value='parked: repeated failure'), \
+                    mock.patch.object(module.Batch, 'capacity', return_value=(1, dict(codex=1, claude=1))):
+                runner.schedule([task])
+            self.assertEqual(self.run_rows()[-1]['outcome'], 'parked')
+            self.assertEqual(self.run_rows()[-1]['run_id'], run['id'])
+            with mock.patch.object(module.Batch, 'task', side_effect=module.Stop('time cap')):
+                with self.assertRaisesRegex(module.Stop, 'time cap'):
+                    runner.run_task(task)
+            self.assertEqual(self.run_rows()[-1]['outcome'], 'stopped')
+        env = dict(self.env, TASK_VENDOR='claude', TASK_MODEL='sonnet', TASK_EFFORT='high')
+        self.raw_task('note', 'proj', '-', 'pm-run', 'start', env=env)
+        self.raw_task('note', 'proj', '-', 'pm-run', 'end', 'failed', 'time cap', env=env)
+        self.assertEqual((self.run_rows()[-1]['outcome'], self.run_rows()[-1]['reason']), ('failed', 'end failed time cap'))
+
+    def test_run_log_daily_weekly_cutoffs_and_unfinished_stop(self):
+        usage = TASK_MODULE.task_usage
+        now = datetime.now(timezone.utc)
+        rows = [dict(id=str(days), vendor='codex', start=(now - __import__('datetime').timedelta(days=days)).isoformat(),
+                     end=(now - __import__('datetime').timedelta(days=days)).isoformat(), outcome='finished',
+                     usage_delta={'weekly': 2}) for days in (0, 2, 8)]
+        log = self.home / '.local/state/task/runs.jsonl'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text('\n'.join(map(json.dumps, rows)) + '\n')
+        self.assertIn('runs 1, weekly usage delta 2', usage.run_summary(self.home, now=now)[1])
+        self.assertIn('runs 2, weekly usage delta 4', usage.weekly_lines(self.home, now)[1])
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            run = usage.run_log(self.home, repo='proj', task='crashed', kind='lane', vendor='codex')
+            usage.run_outcome(self.home, 'proj', 'crashed', 'stopped: time cap')
+        summary = self.raw_task('status', 'proj')
+        self.assertIn("'unfinished': 1", summary)
+        self.assertIn("'stopped': 1", summary)
+        self.assertFalse(any(r['id'] == run['id'] and r['outcome'] == 'finished' for r in self.run_rows()))
+
     def test_adaptive_check_timeout_uses_trusted_passes_only(self):
         repo = self.home / 'dev_workspace/proj'
         worktree = repo / '.worktrees/t1'
@@ -4686,7 +4839,7 @@ store.write_text(json.dumps(prs))
                 self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
             self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
-                                            "--output-last-message", str(wt / ".work/final.md"), "-"])
+                                            "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
             self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
                                  name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
             self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
@@ -4986,8 +5139,8 @@ store.write_text(json.dumps(prs))
                          "pace: on", "codex: weekly used 40 %", SPARE_HELD):
             self.assertIn(expected, out)
         lines = self.raw_task("usage", "--weekly-line").splitlines()
-        self.assertRegex(lines[0], r"^claude week ending \d{4}-\d\d-\d\d: used 50 %, exhausted no, lanes held back 0$")
-        self.assertRegex(lines[1], r"^codex week ending \d{4}-\d\d-\d\d: used 40 %, exhausted no, lanes held back 0$")
+        self.assertEqual(lines[0], "claude last 7d: runs 0, weekly usage delta None, outcomes {}")
+        self.assertEqual(lines[1], "codex last 7d: runs 0, weekly usage delta None, outcomes {}")
 
     def test_usage_policy_file_override_changes_the_verdict(self):
         self.readings(claude=(60, 84))
@@ -5019,7 +5172,7 @@ store.write_text(json.dumps(prs))
         self.assertIn("held back by usage pacing: claude is ahead of pace; only madplanner-v2 gets new lanes", out)
         self.assertFalse((wt / ".work/lane.json").exists())
         self.assertIn("held lane proj/T-5", self.pace_log())
-        self.assertIn("lanes held back 1", self.raw_task("usage", "--weekly-line"))
+        self.assertIn("claude last 7d: runs 1", self.raw_task("usage", "--weekly-line"))
         self.raw_task("lane", "proj", "5", "--no-pace")
         self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
         self.assertIn("--no-pace: lane proj/T-5 not paced", self.pace_log())
@@ -5884,8 +6037,9 @@ store.write_text(json.dumps(prs))
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         self.assertIn("Worktree:", prompt.read_text())
-        self.assertEqual(__import__("json").loads((self.state() / "review-routing.json").read_text()),
-                         {"vendor": "claude", "model": "haiku"})
+        routing = json.loads((self.state() / "review-routing.json").read_text())
+        self.assertEqual({k: routing[k] for k in ('vendor', 'model')}, {"vendor": "claude", "model": "haiku"})
+        self.assertEqual(routing['usage_run']['kind'], 'review')
         self.assertTrue(prompt.read_text().endswith(
             f"Mandatory read: {wt / '.work/context/lane-contract.md'}. Reply in its review block with the "
             "full 40-character Commit sha, then one line per criterion: "

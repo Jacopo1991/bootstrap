@@ -313,17 +313,17 @@ class Usage(unittest.TestCase):
                          "5 min old", "week elapsed 50 %", "pace: on", "reserve 25 %", "codex: unknown ("):
             self.assertIn(expected, text)
 
-    def test_weekly_line_counts_held_back_lanes_and_the_exhaustion_day(self):
+    def test_weekly_line_counts_runs_instead_of_pacing_holds(self):
         self.claude(80, 84)
         usage.gate(self.home, "lane", "claude", "hard", "proj", "t1", NOW)
         usage.gate(self.home, "lane", "claude", "hard", "proj", "t1", NOW)  # same lane again: counted once
         usage.gate(self.home, "review", "claude", "routine", "proj", "t2", NOW)
         lines = usage.weekly_lines(self.home, NOW)
-        self.assertEqual(lines[0], "claude week ending 2026-10-24: used 80 %, exhausted Tue 2026-10-20, lanes held back 2")
-        self.assertEqual(lines[1], "codex week ending unknown: used unknown, exhausted no, lanes held back 0")
+        self.assertEqual(lines[0], "claude last 7d: runs 0, weekly usage delta None, outcomes {}")
+        self.assertEqual(lines[1], "codex last 7d: runs 0, weekly usage delta None, outcomes {}")
         self.claude(30, 20)  # the next reading, in a later week: its own counters
         later = usage.weekly_lines(self.home, NOW)[0]
-        self.assertEqual(later, "claude week ending 2026-10-21: used 30 %, exhausted no, lanes held back 0")
+        self.assertEqual(later, lines[0])
 
     def test_weekly_line_lists_this_weeks_model_overrides_only(self):
         self.assertEqual(usage.weekly_lines(self.home, NOW)[-1], "model overrides, last 7 days: 0")
@@ -475,7 +475,7 @@ class Usage(unittest.TestCase):
         self.five("codex", 95)
         self.assertEqual(usage.five_caps(self.home, NOW), {"claude": 0, "codex": 0})
 
-    def test_usage_shows_the_five_hour_verdict_reset_and_the_weekly_line_the_exhaustion(self):
+    def test_usage_shows_five_hour_verdict_while_weekly_line_reads_runs(self):
         event = json.loads((FIXTURES / "claude-5h-event.json").read_text())  # the real 2026-10-21 event: 100 % at 20:10 reset
         at = datetime.fromtimestamp(1792606200, timezone.utc) - timedelta(hours=1)
         usage.record_claude(self.home, event, at)
@@ -484,10 +484,9 @@ class Usage(unittest.TestCase):
         self.assertIn("5-hour: 5h-exhausted, resets at 2026-10-21 18:10 UTC / 2026-10-21 20:10 Europe/Copenhagen", text)
         self.assertIn("no new lanes or reviews on claude until the reset", text)
         self.assertEqual(usage.weekly_lines(self.home, at)[0],
-                         "claude week ending 2026-10-24: used 38 %, exhausted no, lanes held back 0, "
-                         "5-hour exhausted Wed 2026-10-21 19:10")
-        usage.weekly_lines(self.home, at + timedelta(minutes=20))  # same window again: recorded once
-        self.assertEqual(usage.weekly_lines(self.home, at)[0].count("5-hour exhausted"), 1)
+                         "claude last 7d: runs 0, weekly usage delta None, outcomes {}")
+        self.assertEqual(usage.weekly_lines(self.home, at + timedelta(minutes=20))[0],
+                         usage.weekly_lines(self.home, at)[0])
         self.five("claude", 30, week=38)
         self.assertIn("5-hour: ok", "\n".join(usage.report(self.home, NOW)))
 
