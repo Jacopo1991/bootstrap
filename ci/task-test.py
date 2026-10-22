@@ -232,7 +232,7 @@ class TaskTool(unittest.TestCase):
         api = TASK_MODULE.task_lock
         with mock.patch.dict(os.environ, TASK_HOLDER='seat-env'):
             self.assertEqual(api.acquire(self.home, self.repo)['holder'], 'seat-env')
-        api.release(self.home, self.repo)
+        api.release(self.home, self.repo, holder='seat-env')
         first = api.acquire(self.home, self.repo, 'seat-a', ttl=120)
         original = first['taken_at']
         api.acquire(self.home, self.repo, 'seat-a', ttl=120)
@@ -246,7 +246,7 @@ class TaskTool(unittest.TestCase):
         (self.repo / 'a.txt').write_text('changed\n')
         self.git(self.repo, 'add', 'a.txt')
         self.git(self.repo, 'commit', '-qm', 'source changed')
-        api.release(self.home, self.repo)
+        api.release(self.home, self.repo, holder='seat-a')
         with contextlib.redirect_stdout(io.StringIO()) as out:
             api.acquire(self.home, self.repo, 'seat-b', revision=self.git(self.repo, 'rev-parse', 'HEAD'))
         self.assertIn('Sources changed', out.getvalue())
@@ -299,9 +299,64 @@ class TaskTool(unittest.TestCase):
         self.assertIn('held by unknown', self.raw_task('lock', 'proj'))
         with self.assertRaises(TASK_MODULE.task_lock.LockBusy):
             TASK_MODULE.task_lock.acquire(self.home, self.repo, 'seat-a')
-        self.raw_task('lock', 'proj', '--release', code=1)
+        self.assertIn('held by unknown', self.raw_task('lock', 'proj', '--release', code=1))
         self.raw_task('lock', 'proj', '--release', '--force')
         self.assertFalse(target.exists())
+
+    def test_project_lock_release_requires_recorded_holder(self):
+        api = TASK_MODULE.task_lock
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                self.raw_task('lock', 'proj', '--holder', 'seat-a')
+                before = api.path(self.home, self.repo).read_text()
+                args = ('--holder', 'seat-b') if explicit else ()
+                output = self.raw_task('lock', 'proj', '--release', *args,
+                                       env=dict(self.env, TASK_HOLDER='seat-a' if explicit else 'seat-b'), code=1)
+                self.assertIn('held by seat-a', output)
+                self.assertIn('--release --force', output)
+                self.assertEqual(api.path(self.home, self.repo).read_text(), before)
+                self.assertIn('seat-a', self.raw_task('lock', 'proj'))
+                args = ('--holder', 'seat-a') if explicit else ()
+                self.raw_task('lock', 'proj', '--release', *args,
+                              env=dict(self.env, TASK_HOLDER='seat-b' if explicit else 'seat-a'))
+                self.assertIn('free', self.raw_task('lock', 'proj'))
+
+    def test_project_lock_release_without_identity_and_forced_recovery(self):
+        api = TASK_MODULE.task_lock
+        unnamed = dict(self.env)
+        unnamed.pop('TASK_HOLDER')
+        for held in (False, True):
+            with self.subTest(held=held):
+                if held: self.raw_task('lock', 'proj', '--holder', 'seat-a')
+                before = api.read(self.home, self.repo)
+                for identity in (None, '', '   '):
+                    env = unnamed if identity is None else dict(unnamed, TASK_HOLDER=identity)
+                    self.assertIn('TASK_HOLDER', self.raw_task('lock', 'proj', '--release', env=env, code=1))
+                    self.assertEqual(api.read(self.home, self.repo), before)
+                self.raw_task('lock', 'proj', '--release', '--force', env=unnamed)
+                self.assertIn('free', self.raw_task('lock', 'proj'))
+
+    def test_project_lock_release_free_lock_is_noop(self):
+        api = TASK_MODULE.task_lock
+        self.raw_task('lock', 'proj', '--release', '--holder', 'seat-b')
+        self.assertIsNone(api.read(self.home, self.repo))
+        data = api.acquire(self.home, self.repo, 'seat-a')
+        for fields in ({'released': True}, {'expires_epoch': 0}, {'process': True}):
+            with self.subTest(fields=fields):
+                api.write(self.home, self.repo, dict(data, **fields))
+                self.raw_task('lock', 'proj', '--release', '--holder', 'seat-b')
+                self.assertTrue(api.free(api.read(self.home, self.repo)))
+
+    def test_project_lock_release_refuses_running_work_even_with_force(self):
+        self.lock_process('seat-a')
+        api = TASK_MODULE.task_lock
+        before = api.path(self.home, self.repo).read_text()
+        for holder in ('seat-a', 'seat-b'):
+            for args in ((), ('--force',)):
+                with self.subTest(holder=holder, args=args):
+                    output = self.raw_task('lock', 'proj', '--release', '--holder', holder, *args, code=1)
+                    self.assertIn('Work is still running', output)
+                    self.assertEqual(api.path(self.home, self.repo).read_text(), before)
 
     def test_project_lock_identity_invalid_arguments_and_simultaneous_take(self):
         unnamed = dict(self.env)
@@ -8057,6 +8112,12 @@ class WatcherTests(unittest.TestCase):
     def scan(self):
         return self.watch.findings(self.home, self.now)
 
+    def unit_properties(self, **overrides):
+        props = dict(LoadState='loaded', ActiveState='active', TriggeredBy='',
+                     UnitFileState='enabled', NextElapseUSecRealtime='Thu 2026-10-22 14:01:00 CEST')
+        props.update(overrides)
+        return '\n'.join(f'{key}={value}' for key, value in props.items())
+
     def test_coverage_per_class_and_interim_sources(self):
         with mock.patch.object(sys, 'argv', ['task-watch', '--coverage']), contextlib.redirect_stdout(io.StringIO()) as out:
             self.watch.main()
@@ -8078,13 +8139,80 @@ class WatcherTests(unittest.TestCase):
         self.assertNotIn('P2:claude', self.scan())
 
     def test_p4_only_registered_units_and_errors_do_not_clear(self):
-        self.write('.config/task/live-units', '# comment\n\nproduct.service\nproduct.timer\n')
-        with mock.patch.object(self.watch, 'command', side_effect=['failed', 'active']) as command:
+        self.write('.config/task/live-units', '  # comment\n\n product.service \nproduct.timer\n')
+        with mock.patch.object(self.watch, 'command', side_effect=[self.unit_properties(ActiveState='failed'), self.unit_properties()]) as command:
             found = self.scan()
         self.assertEqual(list(found), ['P4:product.service'])
-        self.assertEqual(command.call_args_list[0].args, ('systemctl', '--user', 'show', '--property=ActiveState', '--value', '--', 'product.service'))
+        self.assertEqual(command.call_count, 2)
+        for call, unit in zip(command.call_args_list, ('product.service', 'product.timer')):
+            self.assertEqual(call.args, ('systemctl', '--user', 'show', '--property=LoadState,ActiveState,TriggeredBy,UnitFileState,NextElapseUSecRealtime', '--', unit))
         with mock.patch.object(self.watch, 'command', side_effect=subprocess.TimeoutExpired('systemctl', 20)):
             with self.assertRaises(subprocess.TimeoutExpired): self.scan()
+
+    def test_p4_service_timer_and_missing_unit_health(self):
+        cases = [
+            ('simple.service', {}, None),
+            ('simple.service', {'ActiveState': 'inactive'}, 'inactive'),
+            ('simple.service', {'ActiveState': 'failed'}, 'failed'),
+            ('oneshot.service', {'ActiveState': 'inactive', 'TriggeredBy': 'product.timer'}, None),
+            ('oneshot.service', {'ActiveState': 'failed', 'TriggeredBy': 'product.timer'}, 'failed'),
+            ('triggered.service', {'ActiveState': 'inactive', 'TriggeredBy': 'product.socket'}, None),
+            ('product.timer', {}, None),
+            ('product.timer', {'ActiveState': 'failed'}, 'failed'),
+            ('product.timer', {'ActiveState': 'inactive'}, 'inactive'),
+            ('product.timer', {'UnitFileState': 'disabled'}, 'disabled'),
+            ('product.timer', {'UnitFileState': 'enabled-runtime'}, 'disabled'),
+            ('product.timer', {'NextElapseUSecRealtime': ''}, 'no next run'),
+            ('product.timer', {'NextElapseUSecRealtime': 'n/a'}, 'no next run'),
+            ('missing.service', {'LoadState': 'not-found', 'ActiveState': 'inactive'}, 'not found'),
+            ('missing.timer', {'LoadState': 'not-found', 'ActiveState': 'inactive'}, 'not found'),
+        ]
+        for unit, props, reason in cases:
+            with self.subTest(unit=unit, props=props):
+                self.write('.config/task/live-units', unit + '\n')
+                with mock.patch.object(self.watch, 'command', return_value=self.unit_properties(**props)) as command:
+                    found = self.scan()
+                command.assert_called_once()
+                if reason:
+                    self.assertEqual(list(found), ['P4:' + unit])
+                    self.assertEqual(found['P4:' + unit]['detail'], reason)
+                else:
+                    self.assertEqual(found, {})
+
+    def test_p4_fake_systemctl_reason_updates_and_recovery_close(self):
+        self.write('.config/task/live-units', 'product.timer\n')
+        properties = self.write('unit-properties', self.unit_properties(UnitFileState='disabled'))
+        systemctl = self.write('bin/systemctl', '#!/bin/sh\nprintf "%s\\n" "$*" >> "$HOME/unit-calls"\ncat "$HOME/unit-properties"\n')
+        systemctl.chmod(0o755)
+        ping = self.write('.local/bin/job-ping', '#!/bin/sh\nexit 0\n')
+        ping.chmod(0o755)
+        env = dict(HOME=str(self.home), PATH=f'{systemctl.parent}:/usr/bin:/bin',
+                   PYTHONDONTWRITEBYTECODE='1', TASK_HOLDER='watcher-test')
+        state = self.home / '.local/state/task'
+        first_seen = None
+        for props, reason in [({'UnitFileState': 'disabled'}, 'disabled'),
+                              ({'UnitFileState': 'disabled'}, 'disabled'),
+                              ({'NextElapseUSecRealtime': ''}, 'no next run'), ({}, None), ({}, None)]:
+            properties.write_text(self.unit_properties(**props))
+            result = subprocess.run([sys.executable, TOOL.with_name('executable_task-watch')],
+                                    cwd=self.home, env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            snapshot = json.loads((state / 'watch-state.json').read_text())
+            if reason:
+                self.assertEqual(list(snapshot), ['P4:product.timer'])
+                row = snapshot['P4:product.timer']
+                self.assertEqual(row['detail'], reason)
+                first_seen = first_seen or row['first_seen']
+                self.assertEqual(row['first_seen'], first_seen)
+            else:
+                self.assertEqual(snapshot, {})
+        rows = [json.loads(line) for line in (state / 'watch.jsonl').read_text().splitlines()]
+        self.assertEqual([row['status'] for row in rows], ['open', 'closed'])
+        self.assertEqual([row['detail'] for row in rows], ['disabled', 'no next run'])
+        self.assertTrue(all(row['key'] == 'product.timer' and row['class'] == 'P4' for row in rows))
+        calls = (self.home / 'unit-calls').read_text().splitlines()
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(call.endswith('-- product.timer') for call in calls))
 
     def test_p5_company_and_product_asks_yaml_forms(self):
         for repo, labels in [('company', '[ask]'), ('product-harness', '\n  - "ask"')]:
@@ -8214,7 +8342,7 @@ class WatcherTests(unittest.TestCase):
         units = ROOT / 'home/dot_config/systemd/user'
         self.assertIn('OnCalendar=*:0/15', (units / 'task-watch.timer').read_text())
         self.assertFalse((units / 'timers.target.wants/symlink_task-watch.timer').exists())
-        self.assertLessEqual(len(TOOL.with_name('executable_task-watch').read_text().splitlines()), 75)
+        self.assertLessEqual(len(TOOL.with_name('executable_task-watch').read_text().splitlines()), 85)
 
 
 if __name__ == "__main__":

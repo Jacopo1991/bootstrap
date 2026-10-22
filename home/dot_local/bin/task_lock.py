@@ -1,4 +1,4 @@
-"""Same-seat processes share flock; chat leases use TTL. Any PM may release after work exits."""
+"""Same-seat processes share flock; chat leases use TTL. Only the holder releases, unless forced."""
 import fcntl, json, math, os, subprocess, time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -67,14 +67,18 @@ def acquire(home, repo, holder=None, ttl=120, revision=None):
         write(home, repo, data)
         if revision: OWNERS[key] = (OWNERS[key][0], data['token'])
         return read(home, repo)
-def release(home, repo, force=False):
+def release(home, repo, force=False, holder=None):
     with guarded(home, repo):
         if active({'_file': str(path(home, repo).with_name('.lock.process'))}): raise refusal(repo, 'Work is still running; cancel it before releasing ownership')
         d = read(home, repo)
         if d and d.get('invalid'):
             if not force: raise refusal(repo, 'Lock held by unknown')
             path(home, repo).unlink()
-        elif d: d['released'] = True; write(home, repo, d)
+        else:
+            name = holder or os.environ.get('TASK_HOLDER', '').strip()
+            if not force and (not name or not name.strip()): raise refusal(repo, 'Set TASK_HOLDER or pass --holder <name>')
+            if not force and d and not free(d) and d['holder'] != name: raise refusal(repo, f"held by {d['holder']} since {d['taken_at']}")
+            if d: d['released'] = True; write(home, repo, d)
         print(f'Released lock for {Path(repo).name}.')
 def display(d, now=None):
     try:
@@ -89,7 +93,7 @@ def verify(home, repo):
         d = inspect(home, repo, os.environ.get('TASK_HOLDER'))
         if not d or free(d) or d['token'] != OWNERS.get(str(path(home, repo)), (None, None))[1]: raise refusal(repo, 'Lock ownership changed before publication')
 def configure(commands):
-    sub = commands.add_parser('lock', help='show/take lock; --release is an administrative PM override')
+    sub = commands.add_parser('lock', help='show/take lock; --release requires the holder or --force')
     sub.add_argument('repo'); sub.add_argument('--holder'); sub.add_argument('--ttl', type=float)
     sub.add_argument('--release', action='store_true'); sub.add_argument('--force', action='store_true')
 def requires_pm(args): return args.command == 'lock' and (args.release or args.holder is not None or args.ttl is not None)
@@ -101,7 +105,7 @@ def before_work(args, home, resolve_repo):
             with guarded(home, repo): inspect(home, repo, os.environ['TASK_HOLDER'])
 def command(args, home, resolve_repo):
     repo = resolve_repo(args.repo)
-    if args.release: release(home, repo, args.force)
+    if args.release: release(home, repo, args.force, args.holder)
     elif args.holder is not None or args.ttl is not None: print(f"{repo.name}: {display(acquire(home, repo, args.holder, args.ttl if args.ttl is not None else 120))}")
     else: print(f'{repo.name}: {display(read(home, repo))}')
 def atomic_write(path, data): raise LockBusy('Lock dependencies not initialized')
