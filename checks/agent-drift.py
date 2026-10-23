@@ -18,7 +18,7 @@ import tomllib
 
 EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
                      "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just",
-                     "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
+                     "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "package-cap-check",
                      "verify-enable", "gate-browser", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch",
                      "task-watch", "job-ping", "agentdev-shell-mcp"}
 VERSION_COMMANDS = {

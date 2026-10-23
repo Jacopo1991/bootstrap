@@ -7,7 +7,7 @@ set -euo pipefail
 
 [ $# -eq 1 ] || { echo "usage: pre-commit-enable <checkout>" >&2; exit 2; }
 config="$(cd -- "$(dirname -- "$0")/../share/bootstrap/pre-commit" && pwd)/pre-commit-config.yaml"
-for tool in pre-commit gitleaks lychee osv-scanner; do
+for tool in pre-commit gitleaks lychee osv-scanner package-cap-check; do
   command -v "$tool" >/dev/null || { echo "$tool is not on PATH; run the bootstrap install first" >&2; exit 1; }
 done
 repo=$(git -C "$1" rev-parse --show-toplevel)

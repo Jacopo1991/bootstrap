@@ -10,6 +10,10 @@ done
 real_osv="${XDG_CACHE_HOME:-$HOME/.cache}/osv-scalibr"
 tmp=$(mktemp -d)
 trap 'chmod -R u+w "$tmp"; rm -rf "$tmp"' EXIT
+# The package cap gate command and its policy file come from this checkout, as chezmoi and install.sh place them.
+mkdir -p "$tmp/bin"
+ln -s "$ROOT/home/dot_local/bin/executable_package-cap-check" "$tmp/bin/package-cap-check"
+export PATH="$tmp/bin:$PATH" PACKAGE_CAPS_FILE="$ROOT/system/agent-policy/package-caps.toml"
 export HOME="$tmp/home" XDG_CACHE_HOME="$tmp/home/.cache" PRE_COMMIT_HOME="$tmp/home/.cache/pre-commit"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 mkdir -p "$HOME"
@@ -86,6 +90,36 @@ if [ -f "$real_osv/PyPI/all.zip" ]; then
   osv_checked=1
 fi
 
+# Package caps: a capped package above its cap, unpinned, or as a refused image tag is blocked
+# in any tracked manifest; the allowed pin and tag pass (the lockfile hook sees no requirements file).
+printf 'services:\n  proxy:\n    image: ghcr.io/berriai/litellm:main-latest\n' > "$repo/compose.yaml"
+git -C "$repo" add compose.yaml
+blocked "compose file with a refused litellm image tag"
+grep -q "package-cap-check" "$tmp/out"
+grep -q "compose.yaml:3: image tag main-latest is refused" "$tmp/out"
+printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm\n' > "$repo/Dockerfile"
+git -C "$repo" add Dockerfile
+blocked "Dockerfile installing litellm without a pin"
+grep -q "Dockerfile:2: litellm must be pinned exactly" "$tmp/out"
+printf '[project]\nname = "demo"\ndependencies = ["litellm>=1.100"]\n' > "$repo/pyproject.toml"
+git -C "$repo" add pyproject.toml
+blocked "pyproject range without a lock file"
+grep -q "pyproject.toml:3: litellm has a version range" "$tmp/out"
+printf '[project]\nname = "demo"\ndependencies = ["litellm==1.106.2"]\n' > "$repo/pyproject.toml"
+printf 'services:\n  proxy:\n    image: ghcr.io/berriai/litellm:v1.106.2-stable\n' > "$repo/compose.yaml"
+printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm==1.106.2\n' > "$repo/Dockerfile"
+git -C "$repo" add pyproject.toml compose.yaml Dockerfile
+git -C "$repo" commit -q -m "Allowed litellm pin and image tag" >"$tmp/out" 2>&1 || { cat "$tmp/out"; echo "FAIL: allowed litellm pin refused"; exit 1; }
+# A tracked manifest that drifts above the cap blocks every later commit, not only its own.
+printf '[project]\nname = "demo"\ndependencies = ["litellm==1.107.0"]\n' > "$repo/pyproject.toml"
+git -C "$repo" add pyproject.toml
+git -C "$repo" commit -q -m "Above the cap" --no-verify >/dev/null 2>&1
+printf '# Unrelated\n' > "$repo/docs/unrelated.md"
+git -C "$repo" add docs/unrelated.md
+blocked "unrelated change while a tracked manifest is above the cap"
+grep -q "pyproject.toml:3: litellm 1.107.0 is above the cap 1.106.2" "$tmp/out"
+git -C "$repo" reset -q --hard HEAD~1
+
 # pre-commit-enable never overwrites a different existing config.
 chmod -R u+w "$PRE_COMMIT_HOME"
 other="$tmp/other"
@@ -96,4 +130,4 @@ if bash "$enable" "$other" >/dev/null 2>&1; then echo "FAIL: existing config ove
 [ ! -e "$other/.git/hooks/pre-commit" ]
 if bash "$enable" "$tmp/not-a-repo" >/dev/null 2>&1; then echo "FAIL: non-repository accepted"; exit 1; fi
 [ $osv_checked = 1 ] || echo "NOTE: no offline PyPI database at $real_osv; advisory control skipped (run osv-db-refresh)"
-echo "PASS: pre-commit gate blocks a secret, a broken link and an unscanned lockfile; clean change in ${elapsed}s; pre-commit-enable installs without overwriting"
+echo "PASS: pre-commit gate blocks a secret, a broken link, an unscanned lockfile and a capped package; clean change in ${elapsed}s; pre-commit-enable installs without overwriting"

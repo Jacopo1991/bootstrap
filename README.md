@@ -964,6 +964,8 @@ nothing is fetched at commit time and it works inside the agent sandbox:
   `requirements*.txt`, Cargo, `go.mod`, Composer, Bundler) with `--offline`, against the
   databases in `~/.cache/osv-scalibr`. A lockfile whose ecosystem has no offline
   database fails closed.
+- **package-cap-check** on every tracked Python manifest, lock file, Dockerfile and compose
+  file, against the package caps below.
 
 A change without lockfiles takes about a second. A lockfile adds about one second for
 PyPI and about six for npm (its database is about 200 MB).
@@ -1012,6 +1014,41 @@ PyPI and about six for npm (its database is about 200 MB).
   stamps only a full success. With osv-scanner and the offline npm database installed,
   it also checks that the exception passes the lock until it expires, that an expired
   copy blocks it and that the lock without the exception is blocked.
+
+### Package caps (the litellm lock rule)
+
+`system/agent-policy/package-caps.toml` is the one policy file for packages that must stay
+at or below a known-good version, with an exact pin, everywhere. Its first entry is
+`litellm`: cap `1.106.2` (PyPI, and the `ghcr.io/berriai/litellm` / `berriai/litellm`
+images), because `litellm==1.107.0` on PyPI and the `v1.107.0`, `latest`, `main-latest`
+and `main-stable` image tags were compromised on 2026-10-21 with credential-stealing
+malware (source: the [LiteLLM security incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
+It is enforced in two places, both offline:
+
+- **The gate, in every repository:** the `package-caps` hook of the standard pre-commit
+  config runs `package-cap-check` (`~/.local/bin`, from `home/dot_local/bin`) on every
+  commit. It fails when any tracked `requirements*.txt`, `constraints*.txt`,
+  `pyproject.toml`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, Dockerfile (also `RUN pip
+  install` lines) or compose file names a capped package above its cap, without an exact
+  `==` pin (a range in `pyproject.toml` passes only when a `uv.lock` or `poetry.lock` next
+  to it pins an allowed version), or as an image that is untagged, `latest`, `main-*` or
+  above the cap. Run `package-cap-check` by hand in a checkout to check a whole repository;
+  it reads `/usr/local/lib/agent-policy/package-caps.toml` (`--policy` or
+  `PACKAGE_CAPS_FILE` override it) and fails closed without it.
+- **The agent policy hook:** `pre_tool_use.py` reads the root-owned copy next to it once per
+  call and denies `pip install`, `uv pip install`, `uv add`, `uv tool install`, `pipx
+  install` and `poetry add` of a capped package without an exact allowed pin
+  (`litellm==1.106.2` or lower passes), and `docker pull` / `docker run` of its images
+  without an allowed version tag. The denial names the rule and the policy file.
+
+`install.sh` installs the file root-owned into `/usr/local/lib/agent-policy/` with the
+hook scripts. To cap another package, add one `[packages.<pypi-name>]` table with
+`max_version`, `images`, `reason`, `source` and `added`; nothing else changes. Existing
+repositories get the hook when their `.pre-commit-config.yaml` is replaced with the
+standard one (`pre-commit-enable` refuses to overwrite a differing file). Tests:
+`ci/package-caps-test.py` (every format, allowed and refused, policy file parsed once),
+the package cap block of `ci/managed-policy-test.py` (every install form allowed and
+denied) and `ci/pre-commit-test.sh` (the hook inside a real commit).
 
 ## Skills, prompt reminders and the minutes watchdog
 

@@ -16,7 +16,7 @@ spec.loader.exec_module(drift)
 
 expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
-            "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "verify-enable", "gate-browser",
+            "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "package-cap-check", "verify-enable", "gate-browser",
             "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
             "task-watch", "agentdev-shell-mcp"}
 assert drift.EXPECTED_BINARIES == expected

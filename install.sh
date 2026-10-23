@@ -47,7 +47,7 @@ sudo chmod -R go-w "$public_source"
 policy_dir=/usr/local/lib/agent-policy
 [[ ! -L $policy_dir ]] || { echo "Refusing symlinked $policy_dir." >&2; exit 1; }
 sudo install -d -o root -g root -m 0755 "$policy_dir"
-for script in pre_tool_use.py context_reminder.py; do
+for script in pre_tool_use.py context_reminder.py package-caps.toml; do
   policy_temp=$(sudo mktemp "$policy_dir/.agent-policy.XXXXXX")
   sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"
   sudo mv -f -- "$policy_temp" "$policy_dir/$script"
