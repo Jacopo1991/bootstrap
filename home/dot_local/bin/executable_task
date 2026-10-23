@@ -572,6 +572,47 @@ def plan_time(value):
         return None
 
 
+def plan_budget(ident, fields=None, clear=None, reserve=True):
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", ident): raise ValueError("invalid id")
+        plan = tomllib.loads((CORTEX / "cortex-kb-company/plans" / f"{ident}.toml").read_text())
+        expiry = plan_time(str(plan["expires"]))
+        if plan["id"] != ident or not expiry or expiry.utcoffset().total_seconds() != 0: raise ValueError("id or UTC expiry")
+        if set(plan["points"]) != set(task_usage.VENDORS) or not all(type(n) is int and n >= 0 for n in plan["points"].values()): raise ValueError("nonnegative integer points per vendor required")
+        if not isinstance(plan["allowed"], dict) or not all(isinstance(v, list) and all(isinstance(t, str) for t in v) for v in plan["allowed"].values()): raise ValueError("allowed must map repositories to task lists")
+        root = HOME / ".local/state/task"; log = root / "runs.jsonl"
+        if clear: require_pm(argparse.Namespace(command="plan-budget"))
+        if fields or clear: root.mkdir(parents=True, exist_ok=True)
+        with (log.open("a+" if fields or clear else "r") if log.exists() or fields or clear else contextlib.nullcontext(None)) as stream:
+            if stream: fcntl.flock(stream, fcntl.LOCK_EX if fields or clear else fcntl.LOCK_SH); stream.seek(0)
+            rows = [json.loads(line) for line in stream] if stream else []
+            rows += [json.loads(p.read_text()) for p in (root / "pending-runs").glob("*.json") if not any(r.get("run_id", r["id"]) == p.stem for r in rows if r.get("type") == "run")]
+            rows = [r for r in rows if r.get("plan") == ident]; used = {v: len({(r.get("repo"), r.get("task"), r.get("round"), r.get("kind")) for r in rows if r.get("vendor") == v}) for v in task_usage.VENDORS}
+            last, disabled = {}, set()
+            for row in rows:
+                kind, outcome = row.get("kind"), row.get("outcome")
+                if outcome == "cleared": disabled.discard(kind); last.pop(kind, None)
+                elif outcome in {"finished", "failed", "interrupted"}:
+                    if outcome in {"failed", "interrupted"} and last.get(kind) == outcome: disabled.add(kind)
+                    last[kind] = outcome
+            if clear:
+                stream.write(json.dumps(dict(id=secrets.token_hex(12), plan=ident, kind=clear, outcome="cleared", start=utc_now(), type="control")) + "\n"); return
+            if fields:
+                if datetime.now(timezone.utc) >= expiry: raise Stop(f"Plan {ident}: expired")
+                allowed = plan["allowed"].get(fields["repo"], [])
+                if "*" not in allowed and any(t.lower() not in [a.lower() for a in allowed] for t in fields.get("tasks", [fields["task"]])): raise Stop(f"Plan {ident}: outside allowed work")
+                if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
+                matching = [r for r in rows if all(r.get(k) == fields[k] for k in ("repo", "task", "kind")) and r.get("type") != "outcome"]
+                fields.setdefault("round", 1 + sum(r.get("outcome") in {"finished", "failed", "interrupted"} for r in matching))
+                prior = next((r for r in matching if r.get("round") == fields["round"]), None)
+                if prior and reserve: return prior
+                if used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
+                return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
+        return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(disabled)}"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Stop(f"Missing or malformed plan/log {ident}: {error}") from error
+def budget_run(**fields):
+    return plan_budget(os.environ["TASK_PLAN"], fields) if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, **fields)
 def decision_content(text):
     """Ignore only the frontmatter status field."""
     lines = text.splitlines()
@@ -1848,10 +1889,12 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            model_override = guards(tier, recorded, model, args.override)
+            usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier)
             if tier_changed:
                 task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
                 print(f"override recorded: tier {recorded} to {tier} ({args.override})")
-            if guards(tier, recorded, model, args.override):
+            if model_override:
                 task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
@@ -1869,7 +1912,7 @@ def lane(args):
                                          close_fds=True)
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                                      "usage_run": task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier),
+                                      "usage_run": usage_run,
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
             if builder != record["builder"] or tier != record.get("tier", "routine"):
@@ -2306,6 +2349,7 @@ def runner_check(args):
         print("\n".join(problems))
         return 1
     print(f"runner file OK ({task_lines} tasks)")
+    args.plan_tasks = sorted(seen_tasks)
     return 0
 
 
@@ -2382,6 +2426,7 @@ def runner_start(args):
         raise Stop('task-batch is unavailable.')
     holder = os.environ['TASK_HOLDER']
     task_lock.work(HOME, repo)
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=batch, tasks=args.plan_tasks, kind="runner-start", vendor=os.environ.get("TASK_VENDOR", "codex")), reserve=False)
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
@@ -2396,6 +2441,7 @@ def runner_start(args):
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
               '--setenv=PATH=' + os.environ.get('PATH', ''),
               '--setenv=TASK_HOLDER=' + holder,
+              *(['--setenv=TASK_PLAN=' + os.environ['TASK_PLAN']] if os.environ.get('TASK_PLAN') else []),
               *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
         result = subprocess.run(launch, capture_output=True, text=True)
@@ -2425,7 +2471,9 @@ def start(args):
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     with (common / "task-start.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return start_locked(args, repo)
+        try: return start_locked(args, repo)
+        finally:
+            if getattr(args, "usage_run", None): task_usage.run_log(HOME, args.usage_run, "failed" if sys.exc_info()[0] else "finished")
 
 
 def start_locked(args, repo):
@@ -2494,6 +2542,7 @@ def start_locked(args, repo):
     if task.path.exists():
         task.worktree()
         task_lock.work(HOME, repo, sha(task.path, "HEAD"))
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
         print(f"{task.path} already exists.")
     else:
         default = default_branch(repo)
@@ -2501,8 +2550,7 @@ def start_locked(args, repo):
         branch, remote_only = task.existing_branch()
         if branch and remote_only:
             task_lock.work(HOME, repo, sha(repo, f"origin/{branch}"))
-            git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
-            print(f"Created {task.path} on {branch}, from origin's existing branch.")
+            create, source = ["--track", "-b", branch, str(task.path), f"origin/{branch}"], f"{branch}, from origin's existing branch"
         elif branch:
             for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
                 lines = block.splitlines()
@@ -2514,14 +2562,15 @@ def start_locked(args, repo):
                     raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
                                f"move or free that worktree before `task start` can adopt it at {task.path}.")
             task_lock.work(HOME, repo, sha(repo, branch))
-            git(repo, "worktree", "add", "-q", str(task.path), branch)
-            print(f"Created {task.path} on the existing branch {branch}.")
+            create, source = [str(task.path), branch], f"the existing branch {branch}"
         else:
             base, label = base_commit(repo, default)
             branch = task.branch_name()
             task_lock.work(HOME, repo, base)
-            git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
-            print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
+            create, source = ["--no-track", "-b", branch, str(task.path), base], f"{branch} from {label} {base[:7]}"
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
+        git(repo, "worktree", "add", "-q", *create)
+        print(f"Created {task.path} on {source}.")
     seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
     exclude(task.path, ".work/")
@@ -3205,7 +3254,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
     run_file = reply_file.with_name("review-run.json")
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
-    usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
+    usage_run = budget_run(repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
     atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
@@ -4338,6 +4387,11 @@ def stale_worktree_lines(repo):
 
 def status(args):
     print("\n".join(task_usage.run_summary(HOME)))
+    for path in sorted((CORTEX / "cortex-kb-company/plans").glob("*.toml")):
+        try:
+            line = plan_budget(path.stem)
+            if datetime.now(timezone.utc) < plan_time(str(tomllib.loads(path.read_text())["expires"])): print(line)
+        except (Stop, OSError, ValueError, KeyError, TypeError): print(f"plan {path.stem}: malformed")
     active = boost_line()
     if active:
         print(active)
@@ -5039,6 +5093,7 @@ def main(argv=None):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
         sub.add_argument("id")
+        if name in {"start", "lane", "review"}: sub.add_argument("--plan")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
         if name in {"start", "lane"}:
@@ -5099,6 +5154,9 @@ def main(argv=None):
     sub.add_argument("repo")
     sub.add_argument("file")
     sub.add_argument("--no-pace", action="store_true", help="run the batch without usage pacing (logged)")
+    sub.add_argument("--plan")
+    sub = commands.add_parser("plan-budget")
+    sub.add_argument("id"); sub.add_argument("--clear")
     task_lock.configure(commands)
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
@@ -5123,6 +5181,7 @@ def main(argv=None):
     sub.add_argument("--rule")
     sub.add_argument("--repo")
     args = parser.parse_args(argv)
+    if getattr(args, "plan", None): os.environ["TASK_PLAN"] = args.plan
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
     global GATE_LOCK_WAIT
@@ -5191,6 +5250,7 @@ def main(argv=None):
                       "review": review, "cancel": cancel, "note": note, "status": status,
                       "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
                       "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
+                      "plan-budget": lambda a: print(plan_budget(a.id, clear=a.clear)) if not a.clear else plan_budget(a.id, clear=a.clear),
                       "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo),
                       "gate-drill": gate_drill}[args.command](args) or 0
         finally:
