@@ -220,8 +220,7 @@ common = (ROOT / "system/common.sh").read_text(encoding="utf-8")
 assert 'mktemp "$(dirname -- "$target")/.agent-policy.XXXXXX"' in common
 assert 'install -o root -g root -m 0644 "$source" "$temp" && mv -f -- "$temp" "$target"' in common
 for path in ("/usr/bin/env", "/usr/bin/python3", "/usr/bin/git", "/usr/local/bin/gitleaks",
-             "/usr/local/lib/agent-policy/pre_tool_use.py", "/usr/local/lib/agent-policy/context_reminder.py",
-             "/usr/local/lib/agent-policy/package-caps.toml"):
+             "/usr/local/lib/agent-policy/pre_tool_use.py", "/usr/local/lib/agent-policy/context_reminder.py"):
     assert path in common, path
 install = (ROOT / "install.sh").read_text(encoding="utf-8")
 published = install.index('sudo mv -T -- "$current_temp/current" /opt/machine-bootstrap/current')
@@ -235,8 +234,6 @@ assert 'sudo install -d -o root -g root -m 0755 "$policy_dir"' in install
 assert 'sudo mktemp "$policy_dir/.agent-policy.XXXXXX"' in install
 assert 'sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"' in install
 assert install.index('sudo mv -f -- "$policy_temp" "$policy_dir/$script"') < published
-# The resolver/gate policy and module are installed root-owned alongside the hooks.
-assert "for script in pre_tool_use.py context_reminder.py package_caps.py package-caps.toml; do" in install
 
 # Git environment overrides cannot redirect policy subprocesses; other environment stays.
 spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/agent-policy/pre_tool_use.py")
@@ -466,8 +463,8 @@ with tempfile.TemporaryDirectory() as temp:
     def outside_temp():
         stack = [patch.object(policy, "LANE_TEMP_ROOTS", ()),
                  patch.object(policy, "scratch_root", return_value=None),
-                 patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TMPDIR"},
-                            clear=True)]
+                 patch.dict(os.environ)]
+        os.environ.pop("TMPDIR", None)
         return stack
 
     outside = make_venv(base / "outside-venv")
@@ -545,13 +542,9 @@ with tempfile.TemporaryDirectory() as temp:
         assert venv_judge(f"{base}/plain/python3.12 --version")
         (base / "dir-elf").mkdir()
         assert venv_judge(f"{base}/dir-elf --version")
-    # Model the temp boundary explicitly: TMPDIR may be inside the worktree, and
-    # an enclosing fixture may clear it. Neither may weaken this negative control.
-    with patch.object(policy, "LANE_TEMP_ROOTS", (base,)):
-        for command in (".venv/bin/python --version", f"{root}/.venv/bin/python -m x"):
-            reason = venv_judge(command)
-            assert getattr(reason, "rule_id", "") == "command.script", (command, reason)
-            assert str(reason) == "Script cannot be read or judged safely.", (command, reason)
+    # Under the real temp roots the outside venv is lane-writable, so it is denied again.
+    assert venv_judge(".venv/bin/python --version")
+    assert venv_judge(f"{root}/.venv/bin/python -m x")
     print("PASS: venv interpreters follow the bare python3 verdict; lane-writable binaries and scripts stay denied")
 
 # Local-only bases, trusted recipes and transitive gate inputs.

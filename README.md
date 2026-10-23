@@ -1202,8 +1202,9 @@ PyPI and about six for npm (its database is about 200 MB).
 ### Package caps (the litellm lock rule)
 
 `system/agent-policy/package-caps.toml` caps `litellm` at `1.106.2`, with exact
-pins or upper bounds for PyPI and pinned tags for the
-`ghcr.io/berriai/litellm` / `berriai/litellm` images.
+pins or upper bounds for PyPI and pinned tags for images naming `litellm`,
+including `ghcr.io/berriai/litellm` / `berriai/litellm`. The text rule applies
+to any image repository with that package token, regardless of registry.
 Version `1.107.0` and the affected floating image tags were compromised on
 2026-10-21 ([incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
 The rule rests on resolver constraints plus the offline repository gate:
@@ -1218,11 +1219,13 @@ The rule rests on resolver constraints plus the offline repository gate:
   build dependency resolution is not probed.
 
 - **Gate:** every standard pre-commit config runs `package-cap-check` over tracked
-  requirements/constraints (`.txt`/`.in`), all `*.in` files, pyproject, uv/Poetry/Pipenv/PDM locks,
+  requirements/constraints (`.txt`/`.in`, including files under `requirements/`
+  and `constraints/` directories), all `*.in` files, pyproject, uv/Poetry/Pipenv/PDM locks,
   Dockerfiles, compose YAML, setup metadata and PEP 723 scripts. Bootstrap uses
   `python3 ci/package-cap-check.py` with its checkout's policy before installation.
-  Lock files read only the capped package's own resolved version and fail above
-  the cap. Every scanned non-lock file uses the same text rule: each whole-token
+  Lock files are always parsed, even without capped names; a malformed lock fails
+  closed. Capped entries must resolve at or below the cap and use registry sources;
+  git, path and URL sources fail. Every scanned non-lock file uses the same text rule: each whole-token
   capped name needs an allowed exact pin (`litellm==1.106.2`,
   `litellm[proxy]==1.104.0`, `litellm = "==1.106.2"`), an upper bound at or below
   the cap (`litellm<=1.106.2`, `litellm[proxy]<=1.104.0`, including quoted forms),
@@ -1232,9 +1235,12 @@ The rule rests on resolver constraints plus the offline repository gate:
   `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository.
   A version must end the word; quote or escape concatenation after a safe version
   prefix is refused.
-  Letters, digits, `_`, `.` and `-` join tokens, so `langchain-litellm` is ignored.
+  Letters, digits, `_`, `.` and `-` join tokens, so `langchain-litellm` and
+  `litellm-proxy` are ignored. The exception is `litellm-` followed by a digit:
+  wheel and sdist filenames in URLs, paths and install lines count, and their
+  complete filename version must be at or below the cap.
   Comments and heredocs count; manifest/shell/YAML syntax, variables, requirement
-  includes and `dockerfile:` references are not interpreted. Files without a
+  includes and `dockerfile:` references are not interpreted. Non-lock files without a
   whole-token capped name are never parsed further. Violations report the file
   and line; unapproved image digests and local versions still fail. Resolver
   constraints still cap transitive installs. The installed command requires the

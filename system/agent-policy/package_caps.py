@@ -15,12 +15,14 @@ import os
 import tomllib
 
 try:
+    from packaging.utils import parse_sdist_filename, parse_wheel_filename
     from packaging.version import InvalidVersion, Version
 except ModuleNotFoundError:
     # The isolated constraint generator cannot see user site-packages. Older bootstrap
     # installs carry packaging inside the distro's root-owned setuptools.
     sys.path.extend(['/usr/lib/python3/dist-packages',
                      '/usr/lib/python3/dist-packages/pkg_resources/_vendor'])
+    from packaging.utils import parse_sdist_filename, parse_wheel_filename
     from packaging.version import InvalidVersion, Version
 
 REQUIREMENTS = re.compile(r'^(?:requirements|constraints).*\.(?:txt|in)$', re.I)
@@ -82,7 +84,7 @@ class Cap:
 
     def version_reason(self, version: str | None) -> str | None:
         if version is None:
-            return f'{self.name} must be pinned exactly (==) at or below {self.max_version}'
+            return f'{self.name} needs an exact pin (==) or upper bound (<=) at or below {self.max_version}'
         key = version_key(version)
         if key is None:
             return f'{self.name} {version} is not an allowed exact version (cap {self.max_version}; local builds refused)'
@@ -130,30 +132,43 @@ class Checker:
         return next((n for n, row in enumerate(text.splitlines(), 1) if name.lower() in row.lower()), 1)
 
     def lock_file(self, path: Path) -> None:
-        """Read only each capped package's own resolved version, not dependencies.
+        """Read each capped package's own resolved version and source.
 
         uv, Poetry and PDM use [[package]]; Pipenv keys entries by package name.
-        No manifest lookup, source evaluation or lock compatibility walk is needed.
+        No manifest lookup or lock compatibility walk is needed.
         """
         text = path.read_text(encoding='utf-8')
         if path.name.lower() == 'pipfile.lock':
             data = json.loads(text)
-            entries = ((name, entry.get('version') if isinstance(entry, dict) else None)
+            entries = ((name, entry if isinstance(entry, dict) else {})
                        for section in ('default', 'develop')
                        for name, entry in data.get(section, {}).items())
         else:
             data = tomllib.loads(text)
-            entries = ((entry.get('name'), entry.get('version'))
+            entries = ((entry.get('name'), entry)
                        for entry in data.get('package', []) if isinstance(entry, dict))
-        for name, version in entries:
+        for name, entry in entries:
             if not isinstance(name, str) or normalize(name) not in self.caps:
                 continue
             cap = self.caps[normalize(name)]
+            version = entry.get('version')
             if path.name.lower() == 'pipfile.lock':
                 version = version[2:] if isinstance(version, str) and version.startswith('==') else None
             reason = cap.version_reason(version)
             if reason:
                 self.error(path, self.line_of(text, name), reason)
+            # uv uses source.registry; Poetry uses source.type=legacy for indexes.
+            # PDM and Pipenv put direct-reference fields on the package itself.
+            source = entry.get('source')
+            registry = (isinstance(source, dict) and (
+                set(source) == {'registry'} and isinstance(source['registry'], str) or
+                path.name.lower() == 'poetry.lock' and source.get('type') == 'legacy'
+                and set(source) <= {'type', 'url', 'reference'}))
+            if (source is not None and not registry or
+                    any(key in entry for key in ('git', 'hg', 'svn', 'bzr', 'path', 'file',
+                                                  'url', 'directory', 'editable'))):
+                self.error(path, self.line_of(text, name),
+                           f'{cap.name} has a non-registry or unrecognized lock source; registry resolution required')
 
     def pinned_text(self, path: Path, text: str) -> None:
         """Require an allowed pin, upper bound or tag for every whole-token name.
@@ -162,9 +177,24 @@ class Checker:
         No manifest/shell/YAML parsing, expansion or referenced-file resolution.
         """
         for cap in self.caps.values():
-            pattern = r'(?<![A-Za-z0-9_.-])' + re.escape(cap.name) + r'(?![A-Za-z0-9_.-])'
+            pattern = (r'(?<![A-Za-z0-9_.-])' + re.escape(cap.name) +
+                       r'(?=-[0-9]|[^A-Za-z0-9_.-]|$)')
             for match in re.finditer(pattern, text, re.I | re.ASCII):
                 line = text.count('\n', 0, match.start()) + 1
+                if re.match(r'-[0-9]', text[match.end():]):
+                    # Distribution filenames are versions too. Parse the entire
+                    # filename with packaging, never a numeric prefix of it.
+                    tail = re.match(r'''-[^\s"'`,;\[\]{}()<>|&\\/?#]+''', text[match.end():])[0]
+                    filename = match[0] + tail
+                    try:
+                        parsed = (parse_wheel_filename(filename) if filename.endswith('.whl')
+                                  else parse_sdist_filename(filename))
+                        reason = cap.version_reason(str(parsed[1]))
+                    except ValueError:
+                        reason = f'{cap.name} distribution filename cannot be evaluated safely'
+                    if reason:
+                        self.error(path, line, reason)
+                    continue
                 # Read the entire adjacent value, never an allowed prefix of it.
                 pin = re.match(
                     r'''(?:\[[A-Za-z0-9_,. -]+\])?(?:==|<=)(?P<version>[^\s"'`,;\[\]{}()<>|&\\]+)'''
@@ -193,6 +223,8 @@ class Checker:
             if name in {'uv.lock', 'poetry.lock', 'pipfile.lock', 'pdm.lock'}:
                 self.lock_file(path)
             elif (REQUIREMENTS.match(name) or path.suffix.lower() == '.in' or
+                  path.suffix.lower() == '.txt' and any(
+                      part.lower() in {'requirements', 'constraints'} for part in path.parent.parts) or
                   name in {'pyproject.toml', 'setup.cfg', 'setup.py'} or
                   re.fullmatch(r'dockerfile(?:\..*)?|.*\.dockerfile|(?:docker-)?compose.*\.y.*ml', name)):
                 self.pinned_text(path, path.read_text(encoding='utf-8'))

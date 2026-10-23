@@ -102,11 +102,11 @@ grep -q "compose.yaml:3: image tag main-latest is refused" "$tmp/out"
 printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm\n' > "$repo/Dockerfile"
 git -C "$repo" add Dockerfile
 blocked "Dockerfile installing litellm without a pin"
-grep -qF "Dockerfile:2: litellm must be pinned exactly (==) at or below 1.106.2" "$tmp/out"
+grep -qF "Dockerfile:2: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2" "$tmp/out"
 printf '[project]\nname = "demo"\ndependencies = ["litellm>=1.100"]\n' > "$repo/pyproject.toml"
 git -C "$repo" add pyproject.toml
 blocked "pyproject range without a lock file"
-grep -qF "pyproject.toml:3: litellm must be pinned exactly (==) at or below 1.106.2" "$tmp/out"
+grep -qF "pyproject.toml:3: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2" "$tmp/out"
 printf '[project]\nname = "demo"\ndependencies = ["litellm==1.106.2"]\n' > "$repo/pyproject.toml"
 printf 'services:\n  proxy:\n    image: ghcr.io/berriai/litellm:v1.106.2-stable\n' > "$repo/compose.yaml"
 printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm==1.106.2\n' > "$repo/Dockerfile"
