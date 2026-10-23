@@ -206,6 +206,41 @@ class Manifests(unittest.TestCase):
         self.refused("Pipfile.lock", '{"default": {}, "develop": {"litellm": {"version": "==1.107.0"}}}', "above the cap")
         self.refused("Pipfile.lock", '{"default": {"litellm": {"git": "https://example.invalid", "ref": "main"}}}', "pinned exactly")
 
+    def test_repository_gate_caps_transitive_locks_without_direct_declarations(self):
+        # Existing projects may have no workspace resolver constraints. The gate
+        # must still reject a transitive resolution in every supported lock format.
+        self.write('pyproject.toml', '[project]\nname="demo"\ndependencies=["parent-package"]\n')
+        for name, template in (
+            ('uv.lock', '[[package]]\nname="parent-package"\nversion="1.0"\ndependencies=[{name="litellm"}]\n[[package]]\nname="litellm"\nversion="VERSION"\n'),
+            ('poetry.lock', '[[package]]\nname="parent-package"\nversion="1.0"\n[package.dependencies]\nlitellm="*"\n[[package]]\nname="litellm"\nversion="VERSION"\n'),
+            ('Pipfile.lock', '{"default":{"parent-package":{"version":"==1.0"},"litellm":{"version":"==VERSION"}}}'),
+        ):
+            for version, expected in (('1.106.2', 0), ('1.107.0', 1)):
+                with self.subTest(lock=name, version=version):
+                    self.write(name, template.replace('VERSION', version))
+                    subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
+                    code, output = self.run_check()
+                    self.assertEqual(code, expected, output)
+                    if expected:
+                        self.assertIn(f'{name}:', output)
+                        self.assertIn('litellm 1.107.0 is above the cap 1.106.2', output)
+            (self.repo / name).unlink()
+            subprocess.run(['git', '-C', str(self.repo), 'add', '-u'], check=True)
+
+    def test_gate_parses_policy_once_for_the_entire_repository(self):
+        self.write('requirements.txt', 'litellm==1.106.2\n')
+        self.write('uv.lock', '[[package]]\nname="litellm"\nversion="1.106.2"\n')
+        self.write('compose.yaml', 'services: {proxy: {image: "berriai/litellm:v1.106.2"}}\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
+        with patch.object(check, 'load_policy', wraps=check.load_policy) as load, \
+                patch.object(tomllib, 'loads', wraps=tomllib.loads) as parse:
+            code, output = self.run_check()
+        self.assertEqual(code, 0, output)
+        self.assertIn('3 manifest(s)', output)
+        load.assert_called_once_with(POLICY)
+        policy_parses = [call for call in parse.call_args_list if call.args[0] == POLICY.read_text()]
+        self.assertEqual(len(policy_parses), 1)
+
     def test_dockerfiles(self):
         self.write("requirements.txt", "requests==2.32.0\n")
         self.write("deploy/requirements.txt", "requests==2.32.0\n")

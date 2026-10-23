@@ -235,7 +235,7 @@ assert 'sudo install -d -o root -g root -m 0755 "$policy_dir"' in install
 assert 'sudo mktemp "$policy_dir/.agent-policy.XXXXXX"' in install
 assert 'sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"' in install
 assert install.index('sudo mv -f -- "$policy_temp" "$policy_dir/$script"') < published
-# The package cap policy file is installed root-owned next to the hook that reads it.
+# The resolver/gate policy and module are installed root-owned alongside the hooks.
 assert "for script in pre_tool_use.py context_reminder.py package_caps.py package-caps.toml; do" in install
 
 # Git environment overrides cannot redirect policy subprocesses; other environment stays.
@@ -1091,124 +1091,6 @@ with tempfile.TemporaryDirectory() as audit_temp:
         assert {row["rule_id"] for row in rows} == {"hook.input", "hook.error", "test.command", "permission.policy"}
         assert all(row["rule_id"] and row["reason"] and "command" in row for row in rows)
         assert all("fixture" not in row["command"] for row in rows)
-# --- Package caps: capped packages install only with an exact allowed pin -----------------
-with tempfile.TemporaryDirectory() as temp:
-    cap_root = Path(temp)
-    subprocess.run(["git", "init", "-q", "-b", "main", temp], check=True)
-    (cap_root / 'requirements.txt').write_text('litellm==1.106.2\n')
-
-    def cap_judge(command):
-        with patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TASK_WORKTREE"}, clear=True):
-            return policy.evaluate({"tool_name": "Bash", "cwd": temp,
-                                    "tool_input": {"command": command}}, (cap_root,))
-
-    assert policy.PACKAGE_CAPS_FILE == ROOT / "system/agent-policy/package-caps.toml"
-    policy._package_caps = None
-    with patch.object(policy.tomllib, "loads", wraps=policy.tomllib.loads) as loads:
-        for command in ("pip install litellm==1.106.2", "pip install litellm", "docker pull ghcr.io/berriai/litellm",
-                        "uv add litellm==1.104.0", "ls"):
-            cap_judge(command)
-        assert loads.call_count == 1, loads.call_count  # the policy file is parsed once per process
-    allowed_installs = (
-        "pip install litellm==1.106.2", "pip3 install 'litellm[proxy]==1.104.2'", "pip install -U litellm==1.106.2 requests",
-        "python -m pip install litellm==1.106.2", "python3 -m pip install --no-cache-dir litellm==1.106.1",
-        "uv pip install litellm==1.106.2", "uv pip install -r requirements.txt", "uv add litellm==1.106.2",
-        "uv add --dev 'litellm==1.106.2'", "uv tool install litellm==1.106.2", "pipx install litellm==1.106.2",
-        "poetry add litellm==1.106.2", "poetry add litellm@1.106.2", "poetry add 'litellm@==1.104.0'",
-        "pip install requests", "pip install litellm-proxy-extras", "env pip install litellm==1.106.2",
-        "timeout 60 pip install litellm==1.106.2", "pip install litellm==1.106.2 > install.log",
-        "docker pull ghcr.io/berriai/litellm:v1.106.2-stable", "docker pull berriai/litellm:v1.104.0",
-        "docker run --rm -p 4000:4000 ghcr.io/berriai/litellm:v1.106.2 --config config.yaml",
-        "docker image pull docker.io/berriai/litellm:v1.106.2", "docker pull postgres:latest",
-        "podman run ghcr.io/berriai/litellm:v1.106.2", "docker run --rm alpine:latest true")
-    for command in allowed_installs:
-        reason = cap_judge(command)
-        assert reason is None, (command, reason)
-    denied_installs = (
-        "pip install litellm", "pip install litellm==1.107.0", "pip install 'litellm>=1.100'", "pip install litellm~=1.106.0",
-        "pip install 'litellm[proxy]'", "pip3 install -U litellm", "pip install requests litellm", "pip install litellm==1.106.*",
-        "pip install LiteLLM==1.106.3", "python -m pip install litellm", "python3.12 -m pip install litellm==1.107.0rc1",
-        "uv pip install litellm", "uv pip install litellm==1.107.0", "uv add litellm", "uv add 'litellm>=1.100,<1.108'",
-        "uv add --dev litellm", "uv tool install litellm", "uv tool install litellm==1.107.0", "pipx install litellm",
-        "pipx install litellm==1.107.0", "poetry add litellm", "poetry add litellm@latest", "poetry add 'litellm@^1.100'",
-        "poetry add litellm@1.107.0", "env pip install litellm", "timeout 60 uv add litellm", "pip install litellm > install.log",
-        "docker pull ghcr.io/berriai/litellm", "docker pull ghcr.io/berriai/litellm:latest", "docker pull ghcr.io/berriai/litellm:main-latest",
-        "docker pull ghcr.io/berriai/litellm:main-stable", "docker pull ghcr.io/berriai/litellm:main-v1.106.2-stable",
-        "docker pull ghcr.io/berriai/litellm:v1.107.0", "docker pull ghcr.io/berriai/litellm:v1.107.0-stable", "docker pull berriai/litellm",
-        "docker pull docker.io/berriai/litellm:latest", "docker pull ghcr.io/berriai/litellm@sha256:0123",
-        "docker run --rm -p 4000:4000 ghcr.io/berriai/litellm:latest --config config.yaml", "docker run -d ghcr.io/berriai/litellm",
-        "docker image pull ghcr.io/berriai/litellm:main-latest", "docker container run ghcr.io/berriai/litellm:v1.107.0",
-        "docker create ghcr.io/berriai/litellm:latest", "podman pull ghcr.io/berriai/litellm:latest", "nerdctl run berriai/litellm")
-    for command in denied_installs:
-        reason = cap_judge(command)
-        assert getattr(reason, "rule_id", "") == "package.cap", (command, reason)
-        assert "Package cap rule for litellm" in reason and "package-caps.toml" in reason, reason
-        assert "1.106.2" in reason, reason
-    for command in (
-        'pip -q install litellm==1.107.0', 'python -I -m pip install litellm',
-        'uv -q pip install litellm', 'pip install "$DEP"',
-        'pip install ./litellm-1.107.0-py3-none-any.whl',
-        'pip install https://example.invalid/litellm-1.107.0-py3-none-any.whl',
-        'pip install git+https://example.invalid/litellm',
-        'pip install "litellm @ git+https://example.invalid/repo"',
-        'uv sync', 'uv lock', 'uv run --with litellm app.py', 'uvx litellm',
-        'pipx run litellm', 'poetry install', 'conda install litellm==1.106.2',
-        'mamba install litellm', 'micromamba install litellm',
-        'pip install litellm==1.106.2+custom', 'pip install litellm==1.106.2.post1',
-        'docker pull berriai/litellm:v1.106.2.post1',
-        'docker pull berriai/litellm:v1.106.2+custom',
-        'docker pull berriai/litellm:v1.106.2@sha256:' + 'a' * 64,
-        'pip install -r https://example.invalid/requirements.txt',
-        'pip install -c missing.txt litellm==1.106.2',
-    ):
-        reason = cap_judge(command)
-        assert getattr(reason, 'rule_id', '') == 'package.cap', (command, reason)
-    for command in ('pip -q install litellm==1.106.2', 'python -I -m pip install litellm==1.106.2',
-                    'uv -q pip install litellm==1.104.0',
-                    'pip install ./litellm-1.106.2-py3-none-any.whl',
-                    'pip install https://example.invalid/litellm-1.106.2-py3-none-any.whl'):
-        assert cap_judge(command) is None, (command, cap_judge(command))
-    (cap_root / 'requirements.txt').write_text('-r nested.txt\n')
-    for body in ('litellm==1.107.0\n', '-c requirements.txt\n', '-r missing.txt\n'):
-        (cap_root / 'nested.txt').write_text(body)
-        reason = cap_judge('uv pip install -r requirements.txt')
-        assert getattr(reason, 'rule_id', '') == 'package.cap', (body, reason)
-    (cap_root / 'nested.txt').write_text('litellm==1.104.0\n')
-    assert cap_judge('pip install -rrequirements.txt') is None
-    # In a lane session the container boundary still comes first; the package rule stays behind it.
-    with patch.dict(os.environ, {"TASK_WORKTREE": temp}):
-        lane = policy.evaluate({"tool_name": "Bash", "cwd": temp,
-                                "tool_input": {"command": "docker pull ghcr.io/berriai/litellm:latest"}}, (cap_root,))
-    assert getattr(lane, "rule_id", "") == "container.lane_boundary", lane
-    # A missing or malformed policy file fails closed for install commands only, and is also read once.
-    for body in (None, "[packages]\n", "[packages.litellm]\nmax_version = 'latest'\n", "not toml ["):
-        policy._package_caps = None
-        broken = cap_root / "caps.toml"
-        if body is None:
-            broken.unlink(missing_ok=True)
-        else:
-            broken.write_text(body)
-        with patch.object(policy, "PACKAGE_CAPS_FILE", broken):
-            for command in ("pip install litellm==1.106.2", "pip install requests", "docker pull alpine:3"):
-                reason = cap_judge(command)
-                assert getattr(reason, "rule_id", "") == "package.cap" and "missing or unreadable" in reason, (body, command, reason)
-            assert cap_judge("ls") is None and cap_judge("pip list") is None and cap_judge("docker ps") is None, body
-    policy._package_caps = None
-    # The deployed command line reads the policy file next to the hook (repo copy here).
-    with tempfile.TemporaryDirectory() as hook_temp:
-        hook_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")} | {
-            "HOME": hook_temp, "AGENT_POLICY_STATE_DIR": str(Path(hook_temp) / "state")}
-        for command, decision in (("pip install litellm", "deny"), ("pip install litellm==1.106.2", None)):
-            event = {"hook_event_name": "PreToolUse", "tool_name": "Bash",
-                     "tool_input": {"command": command}, "cwd": str(ROOT)}
-            result = subprocess.run(pre_argv, input=json.dumps(event), capture_output=True, text=True,
-                                    cwd=ROOT, env=hook_env, check=True, timeout=30)
-            output = json.loads(result.stdout) if result.stdout.strip() else {}
-            assert output.get("hookSpecificOutput", {}).get("permissionDecision") == decision, (command, result.stdout)
-        entry = json.loads((Path(hook_temp) / "state/denials.jsonl").read_text().splitlines()[-1])
-        assert entry["rule_id"] == "package.cap" and entry["category"] == "pip", entry
-print("PASS: package cap rule denies unpinned or above-cap litellm installs and refused image tags, policy file read once")
-
 compile_check = 'python3 -I -X pycache_prefix="$tmp/pycache" -m compileall -q "$ROOT/system/agent-policy"'
 assert install.index(compile_check) < install.index('sudo install -d -m 0755 "$public_source"')
 

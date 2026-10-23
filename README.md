@@ -1023,7 +1023,7 @@ at or below a known-good version, with an exact pin, everywhere. Its first entry
 images), because `litellm==1.107.0` on PyPI and the `v1.107.0`, `latest`, `main-latest`
 and `main-stable` image tags were compromised on 2026-10-21 with credential-stealing
 malware (source: the [LiteLLM security incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
-Enforcement uses resolver constraints plus the offline gate and agent hook:
+Enforcement uses resolver constraints plus the offline repository gate:
 
 - **Resolver constraints:** `install.sh` generates
   `/usr/local/lib/agent-policy/constraints.txt` from the policy. For the agent user,
@@ -1038,8 +1038,8 @@ Enforcement uses resolver constraints plus the offline gate and agent hook:
   `build-constraint-dependencies` into the new code repository's `pyproject.toml`.
   The project probe proves runtime conflicts for all three commands. Existing
   projects need a separate PM task to add those workspace keys. Until then, their
-  project resolution has only the gate and hook guards. `pipx`, Poetry, conda/mamba
-  and container images also have only the gate and hook guards; no resolver
+  project resolution has only the gate guard. `pipx`, Poetry, conda/mamba
+  and container images also have only the gate guard; no resolver
   constraint mechanism is installed for them.
 
 - **The gate, in every repository:** the `package-caps` hook of the standard pre-commit
@@ -1059,16 +1059,10 @@ Enforcement uses resolver constraints plus the offline gate and agent hook:
   releases) fail. Run `package-cap-check` by hand in a checkout to check a whole
   repository; the installed command reads only
   `/usr/local/lib/agent-policy/package-caps.toml` and fails closed without it.
-- **The agent policy hook:** `pre_tool_use.py` reads the root-owned copy next to it once per
-  call and denies `pip install`, `uv pip install`, `uv add`, `uv tool install`, `pipx
-  install` and `poetry add` of a capped package without an exact allowed pin
-  (`litellm==1.106.2` or lower passes), and `docker pull` / `docker run` of its images
-  without an allowed version tag. It checks global options, recursive local
-  requirements/constraints files and verifiable wheel versions, and refuses
-  unresolved expansions, remote includes and unverifiable sources. Agent commands
-  for `uv lock`/`sync`/`run`, `uvx`, `pipx run`, `poetry install` and conda/mamba are
-  refused when their resolution cannot be checked. The denial names the rule and
-  the policy file; lane container commands remain blocked by the container rule.
+
+The agent policy hook keeps its ordinary command rules, so `uv sync` is allowed.
+The gate checks tracked dependency declarations and locks; for paths without
+resolver constraints, it does not prevent an ad hoc install before a commit.
 
 `install.sh` installs the file root-owned into `/usr/local/lib/agent-policy/` with the
 hook scripts. To cap another package, add one `[packages.<pypi-name>]` table with
@@ -1076,9 +1070,9 @@ hook scripts. To cap another package, add one `[packages.<pypi-name>]` table wit
 regenerate constraints. Existing
 repositories get the hook when their `.pre-commit-config.yaml` is replaced with the
 standard one (`pre-commit-enable` refuses to overwrite a differing file). Tests:
-`ci/package-caps-test.py` (every format, allowed and refused, policy file parsed once),
-the package cap block of `ci/managed-policy-test.py` (every install form allowed and
-denied), `ci/package-cap-resolver-test.py` (the per-path synthetic-wheel probes),
+`ci/package-caps-test.py` (every format, allowed and refused, policy parsed once per run),
+`ci/managed-policy-test.py` and `ci/agent-config-test.py` (ordinary hook behavior),
+`ci/package-cap-resolver-test.py` (the per-path synthetic-wheel probes),
 and `ci/pre-commit-test.sh` (the hook inside a real commit).
 
 ## Skills, prompt reminders and the minutes watchdog

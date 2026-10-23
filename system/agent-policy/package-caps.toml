@@ -1,12 +1,13 @@
 # Package version caps: the one policy file for packages that must stay at or below a
 # known-good version, with an exact pin, everywhere.
 #
-# Enforced in two places, both reading this file:
+# Enforced by resolver constraints and the repository gate:
+# - install.sh generates constraints.txt for pip and UV_CONSTRAINT; new-project
+#   generates workspace [tool.uv] constraints from the same policy;
 # - the shared pre-commit gate of every repository (`package-cap-check`, next to gitleaks
 #   and osv-scanner): requirements*.txt, constraints*.txt, pyproject.toml, uv.lock,
 #   poetry.lock, Pipfile.lock, Dockerfiles and compose files;
-# - the agent policy hook (`pre_tool_use.py`): pip/uv/pipx/poetry installs and
-#   docker pull/run of the listed images.
+# Installer commands have no package-specific agent-policy hook rule.
 #
 # install.sh installs it root-owned as /usr/local/lib/agent-policy/package-caps.toml.
 # To cap another package, add one [packages.<pypi-name>] table with the same keys.

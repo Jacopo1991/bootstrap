@@ -119,7 +119,7 @@ git -C "$repo" commit -q -m "Above the cap" --no-verify >/dev/null 2>&1
 printf '# Unrelated\n' > "$repo/docs/unrelated.md"
 git -C "$repo" add docs/unrelated.md
 blocked "unrelated change while a tracked manifest is above the cap"
-grep -q "pyproject.toml:3: litellm 1.107.0 is above the cap 1.106.2" "$tmp/out"
+grep -q "pyproject.toml:1: litellm 1.107.0 is above the cap 1.106.2" "$tmp/out"
 git -C "$repo" reset -q --hard HEAD~1
 
 # pre-commit-enable never overwrites a different existing config.

@@ -1,4 +1,4 @@
-"""Offline package-cap rules shared by the managed hook and repository gate.
+"""Offline package-cap rules for resolver constraints and the repository gate.
 
 Only callers supply paths. Production callers anchor policy/module paths to the
 root-owned installation; there is deliberately no environment policy override.
@@ -22,7 +22,7 @@ try:
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
     from packaging.version import InvalidVersion, Version
 except ModuleNotFoundError:
-    # The isolated system hook cannot see user site-packages. Older bootstrap
+    # The isolated constraint generator cannot see user site-packages. Older bootstrap
     # installs carry packaging inside the distro's root-owned setuptools.
     sys.path.extend(['/usr/lib/python3/dist-packages',
                      '/usr/lib/python3/dist-packages/pkg_resources/_vendor'])
@@ -495,8 +495,7 @@ class Checker:
         return True
 
 
-# The hook already splits shells, unwraps env/timeout and supplies argv. These
-# helpers only interpret installer options in that argv, never parse another shell.
+# Dockerfile RUN checks supply argv to these gate-only installer helpers.
 GLOBAL_VALUES = {'--python', '-p', '--directory', '--project', '--config-file', '--color',
                  '--cache-dir', '--log', '--proxy', '--timeout', '--retries', '--cert', '--client-cert'}
 FLAGS = {'-q', '--quiet', '-v', '--verbose', '--offline', '--no-progress', '--no-cache',

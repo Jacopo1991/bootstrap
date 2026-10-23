@@ -53,7 +53,8 @@ for script in pre_tool_use.py context_reminder.py package_caps.py package-caps.t
   sudo mv -f -- "$policy_temp" "$policy_dir/$script"
 done
 # Generate resolver constraints once from the validated, root-owned policy.
-sudo /usr/bin/python3 -I "$policy_dir/package_caps.py" --emit-constraints > "$tmp/constraints.txt"
+# The installed policy/module are world-readable; generate the user-owned temporary output.
+/usr/bin/python3 -I "$policy_dir/package_caps.py" --emit-constraints > "$tmp/constraints.txt"
 sudo install -o root -g root -m 0644 "$tmp/constraints.txt" "$policy_dir/constraints.txt"
 current_temp=$(sudo mktemp -d /opt/machine-bootstrap/.current.XXXXXX)
 sudo ln -s "$public_source" "$current_temp/current"

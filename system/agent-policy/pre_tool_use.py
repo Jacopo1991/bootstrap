@@ -17,7 +17,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tomllib
 from datetime import datetime, timezone
 
 HOST_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe",
@@ -1250,70 +1249,6 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
     return expressions
 
 
-# Installer operands use the same version, schema and file checks as the gate.
-# The shell has already been parsed by evaluate_command; no second shell parser.
-PACKAGE_CAPS_FILE = Path(__file__).resolve().parent / "package-caps.toml"
-_package_caps = None
-_caps_module = None
-
-
-def cap_module():
-    global _caps_module
-    if _caps_module is None:
-        import importlib.util
-        path = Path(__file__).resolve().with_name("package_caps.py")
-        spec = importlib.util.spec_from_file_location("agent_package_caps", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _caps_module = module
-    return _caps_module
-
-
-def package_caps():
-    """Parse the root-owned policy once per hook process, including failures."""
-    global _package_caps
-    if _package_caps is None:
-        try:
-            _package_caps = cap_module().load_policy(PACKAGE_CAPS_FILE)
-        except (OSError, ValueError, TypeError, ImportError):
-            _package_caps = (f"The package cap policy file {PACKAGE_CAPS_FILE} is missing or unreadable "
-                             "(bootstrap system/agent-policy/package-caps.toml, installed by install.sh); "
-                             "package installs and image pulls stay blocked until it is installed.")
-    return _package_caps
-
-
-def package_cap_reason(tokens: list[str], executable: str, cwd: str) -> str | None:
-    words = [executable, *tokens[1:]]
-    installers = {"pip", "pip3", "uv", "uvx", "pipx", "poetry", "conda", "mamba", "micromamba"}
-    python_pip = re.fullmatch(r"python[0-9.]*", executable) and "-m" in words and "pip" in words
-    images = executable in CONTAINER_CLIS and any(w in {"pull", "run", "create"} for w in words[1:])
-    if executable not in installers and not python_pip and not images:
-        return None
-    # Read-only inspection does not require a package policy.
-    if len(words) > 1 and words[1] in {"list", "show", "freeze", "check", "ps", "--version", "--help", "-h"}:
-        return None
-    caps = package_caps()
-    if isinstance(caps, str):
-        return caps
-    reason = cap_module().install_reason(words, Path(cwd), caps)
-    if not reason and images:
-        for word in words[1:]:
-            if "$" in word:
-                reason = "unresolved image reference refused"
-                break
-            for cap in caps.values():
-                reason = cap.image_reason(word)
-                if reason:
-                    break
-            if reason:
-                break
-    if reason:
-        names = ", ".join(f"{c.name}<={c.max_version}" for c in caps.values())
-        return (f"Package cap rule for {names} (policy file {PACKAGE_CAPS_FILE}, "
-                f"bootstrap system/agent-policy/package-caps.toml): {reason}")
-    return None
-
-
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
     """Block host execution and real Windows path arguments, not gh prose."""
     if ((tokens[0] != "[" and SHELL_EXPANSION.search(tokens[0])) or executable in HOST_NAMES | HOST_OPS
@@ -2411,9 +2346,6 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     reason = recipe_reason(tokens, cwd, root, approved_roots, depth)
     if reason:
         return Denial("command.recipe", reason)
-    reason = package_cap_reason(tokens, executable, cwd)
-    if reason:
-        return Denial("package.cap", reason)
     args = [t for t in tokens[1:] if not t.startswith("-")]
     targets: list[str] = []
     inspected: list[str] = []
