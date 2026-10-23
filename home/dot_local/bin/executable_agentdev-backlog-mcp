@@ -70,6 +70,7 @@ try {
   const configPath = join(repo, 'backlog/config.yml');
   const config = readFileSync(configPath, 'utf8');
   let remoteDisabled = false;
+  let branchesDisabled = false;
   for (const line of config.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
@@ -82,8 +83,11 @@ try {
     }
     if (key === 'auto_commit' && value.toLowerCase() === 'true') refuse(`auto_commit enabled in ${configPath}`);
     if (key === 'remote_operations') remoteDisabled = /^false(?:\s+#.*)?$/i.test(value);
+    if (key === 'check_active_branches') branchesDisabled = /^false(?:\s+#.*)?$/i.test(value);
   }
   if (!remoteDisabled) refuse(`remote_operations must be explicitly false in ${configPath}`);
+  // Recent local branches are outside this scan; 1.53.0 parses their task frontmatter too.
+  if (!branchesDisabled) refuse(`check_active_branches must be explicitly false in ${configPath}`);
   for (const path of files.filter(path => path.endsWith('.md'))) {
     const content = readFileSync(path, 'utf8').replace(/^\uFEFF/, '');
     if (!content.startsWith('---')) continue;

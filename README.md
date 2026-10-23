@@ -891,7 +891,9 @@ inside AgentDev as `agent` over stdio, like qmd and the shell connector.
 - **Callbacks and git:** before starting, the launcher rejects project `onStatusChange` or
   `on_status_change` commands and task-frontmatter callbacks throughout `backlog/`, including
   drafts, completed and archived tasks. It rejects `auto_commit: true` and requires
-  `remote_operations: false` explicitly, because remote operations default to on. It reads
+  `remote_operations: false` explicitly, because remote operations default to on. It also requires
+  `check_active_branches: false`: recent local branches are outside the startup scan, and 1.53.0
+  can evaluate JavaScript task frontmatter while reading those branches. It reads
   `backlog/config.yml` using the scalar rules in the pinned
   [1.53.0 config parser](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/src/file-system/operations.ts)
   and decodes task YAML with the already locked `yaml` package; non-YAML frontmatter engines

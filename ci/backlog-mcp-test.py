@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,7 +80,8 @@ class LauncherTests(unittest.TestCase):
     def make_repo(self, name, base=None):
         repo = (base or self.home / "cortex") / name
         (repo / "backlog").mkdir(parents=True)
-        (repo / "backlog/config.yml").write_text("project_name: test\nremote_operations: false\n")
+        (repo / "backlog/config.yml").write_text(
+            "project_name: test\nremote_operations: false\ncheck_active_branches: false\n")
         return repo
 
     def start(self, *args, **extra):
@@ -231,8 +234,29 @@ class LauncherTests(unittest.TestCase):
             with self.subTest(setting=setting):
                 config.write_text("project_name: test\n" + setting + "\n")
                 self.assertIn(reason, self.assert_refused("cortex-kb-company").stderr)
-        config.write_text("project_name: test\nremote_operations: false\nauto_commit: false\non_status_change: ''\n")
+        config.write_text("project_name: test\nremote_operations: false\ncheck_active_branches: false\n"
+                          "auto_commit: false\non_status_change: ''\n")
         self.assertEqual(self.start("cortex-kb-company").returncode, 0)
+
+    def test_active_branch_checks_must_be_explicitly_disabled_on_every_launch(self):
+        repo = self.make_repo("cortex-kb-company")
+        config = repo / "backlog/config.yml"
+        base = "project_name: test\nremote_operations: false\n"
+        for setting in ("", "check_active_branches: true", "check_active_branches: TRUE",
+                        "checkActiveBranches: false", "check_active_branches: 'false'",
+                        "check_active_branches: false\ncheck_active_branches: true"):
+            with self.subTest(setting=setting):
+                config.write_text(base + setting + "\n")
+                self.assertIn("check_active_branches must be explicitly false",
+                              self.assert_refused("cortex-kb-company").stderr)
+        for setting in ("check_active_branches: false", "  check_active_branches: FALSE # offline",
+                        "check_active_branches: true\ncheck_active_branches: false"):
+            with self.subTest(setting=setting):
+                config.write_text(base + setting + "\n")
+                self.assertEqual(self.start("cortex-kb-company").returncode, 0)
+        config.write_text(base)
+        self.assertIn("check_active_branches must be explicitly false",
+                      self.assert_refused("cortex-kb-company").stderr)
 
     def test_repository_without_its_own_backlog_config_is_refused(self):
         # The server would walk up and serve the parent's project instead.
@@ -262,6 +286,51 @@ class LauncherTests(unittest.TestCase):
 class RealServerTests(unittest.TestCase):
     """The pinned server over stdio through the launcher, in a throwaway home and project."""
 
+    def mcp_calls(self, home, calls):
+        """Send read-only calls through the real launcher, with bounded response waits."""
+        server = subprocess.Popen(["bash", str(LAUNCHER), "cortex-kb-company"],
+                                  env=launcher_env(home), cwd=home, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def send(message):
+            server.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+            server.stdin.flush()
+
+        def response(request_id):
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if not select.select([server.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+                    break
+                line = server.stdout.readline()
+                self.assertTrue(line, "MCP server closed stdout")
+                message = json.loads(line)
+                if message.get("id") == request_id:
+                    return message
+            self.fail(f"MCP request {request_id} timed out")
+
+        try:
+            send({"id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "backlog-adversarial-test", "version": "1"}}})
+            self.assertIn("result", response(1))
+            send({"method": "notifications/initialized"})
+            replies = []
+            for request_id, (name, arguments) in enumerate(calls, 2):
+                send({"id": request_id, "method": "tools/call",
+                      "params": {"name": name, "arguments": arguments}})
+                replies.append(response(request_id))
+            return replies
+        finally:
+            server.stdin.close()
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=5)
+            server.stdout.close()
+            server.stderr.close()
+
     def test_probe_lists_the_page_tools_and_task_list_writes_nothing(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
@@ -280,6 +349,53 @@ class RealServerTests(unittest.TestCase):
             for key in ("autoCommit", "remoteOperations", "checkActiveBranches"):
                 run(backlog + ["config", "set", key, "false"])
             run(backlog + ["task", "create", "Probe task", "--plain"])
+            docs = repo / "backlog/docs"
+            docs.mkdir(exist_ok=True)
+            (docs / "doc-1 - probe.md").write_text("---\nid: doc-1\ntitle: Probe document\n---\nSafe document\n")
+
+            # The branch-only task must never reach gray-matter's JavaScript engine. No
+            # malicious task exists in the working tree scanned by the launcher.
+            run(git + ["add", "-A"])
+            run(git + ["commit", "-q", "-m", "safe baseline"])
+            original_branch = subprocess.run(git + ["branch", "--show-current"], env=env,
+                                             capture_output=True, text=True, check=True).stdout.strip()
+            run(git + ["checkout", "-q", "-b", "unsafe-local-branch"])
+            branch_task = repo / "backlog/tasks/task-999 - branch-only.md"
+            marker = home / "branch-frontmatter-executed"
+            branch_task.write_text("---javascript\n(() => { require('fs').writeFileSync("
+                                   + json.dumps(str(marker)) + ", 'executed'); return {id: 'TASK-999', "
+                                   "title: 'Branch only', status: 'To Do'}; })()\n---\nBranch task\n")
+            run(git + ["add", "-A"])
+            run(git + ["commit", "-q", "-m", "branch-only JavaScript task"])
+            run(git + ["checkout", "-q", original_branch])
+            self.assertFalse(branch_task.exists())
+            blob = subprocess.run(git + ["show", "unsafe-local-branch:" + str(branch_task.relative_to(repo))],
+                                  env=env, capture_output=True, text=True, check=True).stdout
+            self.assertTrue(blob.startswith("---javascript\n"))
+            config = repo / "backlog/config.yml"
+            safe_config = config.read_text()
+            for setting in ("", "check_active_branches: true\n"):
+                with self.subTest(branch_setting=setting):
+                    config.write_text(re.sub(r"^check_active_branches:.*\n?", "", safe_config,
+                                             flags=re.M) + setting)
+                    refused = subprocess.run(["bash", str(LAUNCHER), "cortex-kb-company"], env=env,
+                                             stdin=subprocess.DEVNULL, capture_output=True,
+                                             text=True, timeout=30)
+                    self.assertNotEqual(refused.returncode, 0)
+                    self.assertEqual(refused.stdout, "")
+                    self.assertIn("check_active_branches must be explicitly false", refused.stderr)
+                    self.assertFalse(marker.exists())
+            config.write_text(safe_config)
+
+            # Existing files make these real escape attempts, rather than missing-path tests.
+            outside = home / "outside"
+            outside.mkdir()
+            sentinel = "OUTSIDE_BACKLOG_MUST_NOT_BE_RETURNED"
+            for kind in ("task", "doc"):
+                (outside / f"{kind}-888.md").write_text(
+                    f"---\nid: {kind}-888\ntitle: Outside fixture\nstatus: To Do\n---\n{sentinel}\n")
+            # This alias is outside backlog/, so startup scanning cannot mask ID validation.
+            (repo / "escape").symlink_to(outside, target_is_directory=True)
             run(git + ["add", "-A"])
             run(git + ["commit", "-q", "-m", "probe project"])
             result = subprocess.run([sys.executable, str(PROBE), str(LAUNCHER), "cortex-kb-company"],
@@ -287,6 +403,23 @@ class RealServerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("PASS: ", result.stdout)
             self.assertIn("task_list answered", result.stdout)
+            calls = [("task_view", {"id": "TASK-1"}), ("document_view", {"id": "doc-1"}),
+                     ("task_list", {}), ("task_view", {"id": "TASK-999"})]
+            for tool, kind in (("task_view", "task"), ("document_view", "doc")):
+                ids = (f"../../../../outside/{kind}-888.md", str(outside / f"{kind}-888.md"),
+                       f"../../escape/{kind}-888.md", str(repo / f"escape/{kind}-888.md"))
+                calls.extend((tool, {"id": identifier}) for identifier in ids)
+            replies = self.mcp_calls(home, calls)
+            for reply in replies[:3]:
+                self.assertIn("result", reply, reply)
+                self.assertFalse(reply["result"].get("isError"), reply)
+            for (tool, arguments), reply in zip(calls[3:], replies[3:]):
+                with self.subTest(tool=tool, arguments=arguments):
+                    self.assertTrue("error" in reply or reply.get("result", {}).get("isError"), reply)
+                    self.assertNotIn(sentinel, json.dumps(reply))
+            self.assertFalse(marker.exists(), "branch frontmatter was evaluated")
+            for path in outside.iterdir():
+                self.assertIn(sentinel, path.read_text())
             status = subprocess.run(git + ["status", "--porcelain", "--untracked-files=all"], env=env,
                                     capture_output=True, text=True, check=True).stdout
             self.assertEqual(status, "")
