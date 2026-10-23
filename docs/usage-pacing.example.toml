@@ -33,3 +33,27 @@ codex = 10
 [spare_resets]
 claude = 0
 codex = 1
+
+# Risk is independent of builder-routing tier. Unknown review keys are refused.
+# Patterns use the whole repository-relative path; '*' in a pattern can span '/'.
+# Each configured repository list replaces its built-in list; other repos retain defaults.
+[review]
+high_paths = { "*" = ["policy/**"], bootstrap = ["system/agent-policy/**", "system/*managed*", "system/codex-requirements.toml", "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml", "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*", "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"] }
+
+[review.low]
+max_rounds = 2
+extra_rounds = 1
+
+# Reviewer model keyed by builder vendor; the reviewer uses the other vendor.
+[review.normal]
+codex = "haiku"
+claude = "gpt-6-luna"
+max_rounds = 3
+extra_rounds = 1
+
+[review.high]
+codex = "haiku"
+claude = "gpt-6-luna"
+max_rounds = 3
+extra_rounds = 1
+red_team_model = "gpt-6.1-sol"
