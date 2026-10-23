@@ -199,6 +199,79 @@ class Usage(unittest.TestCase):
         self.assertIn("pace: under-used-near-reset", text)
         self.assertIn("spend before the reset", text)
 
+    def test_boost_threshold_policy_default_override_and_validation(self):
+        self.assertEqual(usage.policy(self.home)["boost_five_hour_max"], 50)
+        path = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
+        path.parent.mkdir(parents=True)
+        for value in (0, 35.5, 100):
+            path.write_text(f"boost_five_hour_max = {value}\n")
+            self.assertEqual(usage.policy(self.home)["boost_five_hour_max"], value)
+        for value in ("-1", "101", "true", '"50"', "nan", "inf"):
+            with self.subTest(value=value):
+                path.write_text(f"boost_five_hour_max = {value}\n")
+                with self.assertRaisesRegex(ValueError, "invalid boost_five_hour_max"):
+                    usage.policy(self.home)
+        path.write_text("boost_five_hour_max = 35.5\n")
+        self.claude(40, 30, five=.36)
+        self.assertIn("36 % ≥ 35.5 %", usage.boost_pauses(self.home, NOW)["claude"])
+
+    def test_automatic_boost_requires_room_in_an_existing_five_hour_window(self):
+        for vendor in usage.VENDORS:
+            for five, age, allowed in ((49.9, 0, True), (50, 0, False), (62, 0, False), (10, 46, False)):
+                with self.subTest(vendor=vendor, five=five, age=age):
+                    self.five(vendor, five, week=40, left=30, age=timedelta(minutes=age))
+                    self.busy(vendor, at=NOW - timedelta(minutes=30), pid=DEAD)
+                    decision = usage.gate(self.home, "review", vendor, "routine", "proj", "t1", NOW)
+                    self.assertEqual(bool(decision["spend"]), allowed)
+                    self.assertEqual(vendor not in usage.boost_pauses(self.home, NOW), allowed)
+        self.claude(40, 30, five_left=timedelta(hours=-1))
+        self.codex(json.dumps({'timestamp': NOW.isoformat(), 'payload': {'rate_limits': {
+            'primary': {'used_percent': 40, 'window_minutes': 10080,
+                        'resets_at': epoch(NOW + timedelta(hours=30))}}}}) + '\n')
+        self.assertEqual(usage.gate(self.home, "lane", "claude", "hard", "proj", "t1", NOW)["spend"], "")
+        self.assertIn("no current 5-hour reading", usage.boost_pauses(self.home, NOW)["claude"])
+        self.assertEqual(usage.gate(self.home, "lane", "codex", "hard", "proj", "t1", NOW)["spend"],
+                         (NOW + timedelta(hours=30)).isoformat())
+        self.assertNotIn("codex", usage.boost_pauses(self.home, NOW))
+
+    def test_boost_stale_rule_matches_warning_band_after_idle_and_lanes(self):
+        for vendor in usage.VENDORS:
+            self.five(vendor, 10, age=timedelta(minutes=46), week=40, left=30)
+            self.busy(vendor, at=NOW - timedelta(hours=1), pid=DEAD)
+            self.assertEqual(self.verdict(vendor)["boost_pause"], "")  # no lane since reading
+            self.assertTrue(usage.gate(self.home, "lane", vendor, "hard", "p", "t", NOW)["spend"])
+            self.busy(vendor, at=NOW - timedelta(minutes=30), pid=DEAD)
+            self.assertTrue(self.verdict(vendor)["stale"])
+            self.assertIn("stale", usage.boost_pauses(self.home, NOW)[vendor])
+            self.assertEqual(usage.gate(self.home, "lane", vendor, "hard", "p", "t", NOW)["spend"], "")
+            self.five(vendor, 10, age=timedelta(minutes=44))
+            self.assertEqual(self.verdict(vendor)["boost_pause"], "")
+        # A new weekly event changes the warning band's age too; boost uses exactly that rule.
+        self.claude(40, 30, age=timedelta(minutes=46))
+        usage.record_claude(self.home, {"rate_limit_info": {"rateLimitType": "seven_day", "utilization": .4,
+                            "resetsAt": epoch(NOW + timedelta(hours=30))}}, NOW)
+        self.assertFalse(self.verdict()["stale"])
+        self.assertNotIn("claude", usage.boost_pauses(self.home, NOW))
+
+    def test_usage_reports_pause_without_claiming_boost_is_on(self):
+        self.claude(40, 30, five=.62)
+        text = "\n".join(usage.report(self.home, NOW))
+        self.assertIn("boost paused: claude 5-hour 62 % ≥ 50 %", text)
+        self.assertNotIn("boost on until", text)
+
+    def test_usage_pause_requires_a_saved_or_automatic_boost(self):
+        self.claude(50, 84, five=.62)
+        self.assertNotIn("boost paused:", "\n".join(usage.report(self.home, NOW)))
+        path = self.home / ".local/state/task/boost.json"
+        path.write_text(json.dumps({"codex": "2099-01-01T00:00:00+00:00"}))
+        self.assertNotIn("boost paused:", "\n".join(usage.report(self.home, NOW)))
+        path.write_text(json.dumps({"claude": "2099-01-01T00:00:00+00:00"}))
+        self.assertIn("boost paused: claude", "\n".join(usage.report(self.home, NOW)))
+        path.write_text(json.dumps({"claude": "2000-01-01T00:00:00+00:00"}))
+        self.assertNotIn("boost paused:", "\n".join(usage.report(self.home, NOW)))
+        self.claude(40, 30, five=.62)
+        self.assertIn("boost paused: claude", "\n".join(usage.report(self.home, NOW)))
+
     def release_policy(self):
         policy = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
         policy.parent.mkdir(parents=True)
@@ -333,15 +406,15 @@ class Usage(unittest.TestCase):
                          "model overrides, last 7 days: 1 (proj/T-2 gpt-6-astra on hard at "
                          f"{(NOW - timedelta(days=1)).isoformat(timespec='seconds')}: Jacopo 2026-10-20)")
 
-    def five(self, vendor, five, age=timedelta(minutes=5), week=50):
+    def five(self, vendor, five, age=timedelta(minutes=5), week=50, left=84):
         """Fixture reading with the 5-hour window at `five` percent: claude through its state file, codex through a rollout."""
         if vendor == "claude":
-            return self.claude(week, 84, five=five / 100, age=age)
+            return self.claude(week, left, five=five / 100, age=age)
         line = json.loads((FIXTURES / "codex-rollout-sample.jsonl").read_text().splitlines()[0])
         line["timestamp"] = (NOW - age).isoformat()
         line["payload"]["rate_limits"] = {
             "primary": {"used_percent": five, "window_minutes": 300, "resets_at": epoch(NOW + FIVE_LEFT)},
-            "secondary": {"used_percent": week, "window_minutes": 10080, "resets_at": epoch(NOW + timedelta(hours=84))}}
+            "secondary": {"used_percent": week, "window_minutes": 10080, "resets_at": epoch(NOW + timedelta(hours=left))}}
         self.codex(json.dumps(line) + "\n")
 
     def busy(self, vendor, at=NOW, pid=None):
