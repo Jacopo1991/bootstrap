@@ -24,8 +24,7 @@ ALLOWED = ["cortex-kb-company", "cortex-kb-product-harness", "cortex-kb-househol
            "cortex-kb-madplanner-v2", "cortex-kb-consultancy-website", "cortex-kb-home-energy-lab",
            "cortex-kb-hermes", "cortex-kb-historical-ingestion", "cortex-kb-linkedin-ops", "cortex-kb-orw"]
 PRIVATE = ["cortex-kb-typo3-dkm", "cortex-kb-customer-harness", "cortex-kb-photo-organizer"]
-PAGE_TOOLS = ["task_view", "task_list", "task_search", "task_create", "task_edit",
-              "document_view", "document_update"]
+PAGE_TOOLS = ["task_view", "task_list", "task_search", "document_view"]
 # Records how the launcher started it, then exits (stdin is closed in these tests).
 STUB_SERVER = """#!/bin/sh
 printf '%s\\n' "$PWD" "$@" > "$HOME/stub-start.txt"
@@ -309,8 +308,13 @@ class AppBlockTests(unittest.TestCase):
         section = readme.split("### Backlog.md MCP for the Claude app", 1)[1].split("\n### ", 1)[0]
         blocks = re.findall(r"```json\n(.*?)```", section, re.S)
         self.assertEqual(blocks, [app_block(launcher_allowlist())])
-        for tool in PAGE_TOOLS:
-            self.assertIn(f"`{tool}`", section)
+        page_policy = section.split("**What the page may call:**", 1)[1]
+        manifest = page_policy.split("Backlog.md 1.53.0", 1)[0]
+        self.assertEqual(re.findall(r"`([^`]+)`", manifest), PAGE_TOOLS)
+        self.assertIn("Write tools stay out of the page manifest unless Jacopo later approves a server-side guard.",
+                      " ".join(manifest.split()))
+        self.assertIn("any other Claude app chat with these servers connected sees every Backlog.md tool",
+                      " ".join(page_policy.split()))
         for text in ("1.53.0", "archive", "delete", "git history", "claude-app-mcp.json"):
             self.assertIn(text, section)
 

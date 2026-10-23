@@ -14,8 +14,7 @@ import sys
 import time
 
 # The Company Control Room page's capability manifest: the only tools it may call.
-PAGE_TOOLS = ("task_view", "task_list", "task_search", "task_create", "task_edit",
-              "document_view", "document_update")
+PAGE_TOOLS = ("task_view", "task_list", "task_search", "document_view")
 launcher = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / ".local/bin/agentdev-backlog-mcp")
 repo = sys.argv[2] if len(sys.argv) > 2 else "cortex-kb-company"
 server = subprocess.Popen(["bash", launcher, repo], stdin=subprocess.PIPE, stdout=subprocess.PIPE,

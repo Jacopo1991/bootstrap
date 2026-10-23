@@ -901,10 +901,11 @@ inside AgentDev as `agent` over stdio, like qmd and the shell connector.
   selects `backlog.config.yml`, or `backlog/config.yml` / `config.yaml`, or `.backlog/config.yml`
   / `config.yaml`; it has no user-level Backlog config layer. This launcher requires its own
   `backlog/config.yml` and rejects the root override, so no parent or alternate config is used.
-- **What the page may call:** the page's capability manifest names the only tools it may call:
-  `task_view`, `task_list`, `task_search`, `task_create`, `task_edit`, `document_view` and
-  `document_update`. Backlog.md 1.53.0 has no tool filter, so that manifest, enforced by the
-  Claude app, is the allowlist for the page. Its enforcement is proven only by the live probe
+- **What the page may call:** the page's capability manifest grants read-only access only:
+  `task_view`, `task_list`, `task_search` and `document_view`. Write tools stay out of the page
+  manifest unless Jacopo later approves a server-side guard. Backlog.md 1.53.0 has no tool filter,
+  so that manifest, enforced by the Claude app, is the allowlist for the page. Its enforcement
+  is proven only by the live probe
   through the page/platform, including refused calls outside the manifest; the stdio probe
   below checks server availability and cannot prove that platform boundary.
   It covers the page only: any other Claude app chat
