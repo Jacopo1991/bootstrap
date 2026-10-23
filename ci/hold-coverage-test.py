@@ -241,7 +241,7 @@ class Coverage(unittest.TestCase):
                 events.append('launch')
                 return subprocess.CompletedProcess(args, 0, stdout='query\n', stderr='')
             namespace = dict(subprocess=SimpleNamespace(run=transport, CompletedProcess=subprocess.CompletedProcess,
-                                                        TimeoutExpired=subprocess.TimeoutExpired), Path=Path,
+                                                        TimeoutExpired=subprocess.TimeoutExpired, DEVNULL=subprocess.DEVNULL), Path=Path,
                              Stop=RuntimeError, admit=admit, shlex=shlex, re=re)
             exec(compile(wrappers, filename, 'exec'), namespace)
             for helper in helpers:
