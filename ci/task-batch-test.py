@@ -78,6 +78,7 @@ if cmd == 'start':
         state.mkdir(parents=True)
         save(state / 'task.json', dict(base_sha=git(wt, 'rev-parse', 'HEAD'), branch=name,
              builder=options[options.index('--builder') + 1], revision='revision', criteria=[],
+             risk=entry.get('risk', 'normal'),
              tier=options[options.index('--tier') + 1] if '--tier' in options else 'routine'))
     if '--seed' in options:
         import shutil
@@ -126,6 +127,11 @@ elif cmd == 'lane':
         if entry.get('report'):
             (work / 'report.md').write_text('## What changed\nMerged main\n\n## How I verified\nTests\n')
     elif not entry.get('unfinished'):
+        if entry.get('high_path'):
+            target = wt / entry['high_path']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('Changed rules')
+            git(wt, 'add', entry['high_path'])
         (wt / 'result').write_text(str(index))
         git(wt, 'add', 'result')
         git(wt, 'commit', '--allow-empty', '-m', entry.get('subject', 'Implement task'))
@@ -160,6 +166,11 @@ elif cmd == 'review':
     print(entry.get('output', 'Verdict: FAIL (stdout is not authoritative)'))
 elif cmd == 'merge':
     save(state / 'merge.json', dict(head=git(wt, 'rev-parse', 'HEAD')))
+elif cmd == 'redteam':
+    assert '--brief' in options
+    brief = pathlib.Path(options[options.index('--brief') + 1])
+    assert 'Request: implement one' in brief.read_text()
+    save(state / 'redteam.json', dict(commit=git(wt, 'rev-parse', 'HEAD')))
 print(entry.get('output', 'OK'))
 '''
 
@@ -414,6 +425,25 @@ class BatchTest(unittest.TestCase):
         self.assertNotIn('<id>', prompt['prompt'])
         self.assertIn('60.0', prompt['args'])
         self.assertFalse(self.source.with_suffix('.done').exists())
+
+    def test_low_skips_review_and_high_runs_redteam_after_review(self):
+        source = self.source.read_text()
+        for risk in ('low', 'high'):
+            with self.subTest(risk=risk):
+                self.scenario({'start': [{'risk': risk}]})
+                self.source.write_text(source.replace('one:', risk + ':'))
+                self.assertIn(risk + ': merged', self.run_batch())
+                commands = [c[0] for c in self.calls() if len(c) > 2 and c[2] == risk]
+                self.assertEqual(commands, ['start', 'lane', 'wait', 'check'] +
+                                 ([] if risk == 'low' else ['review', 'redteam']) + ['merge'])
+
+    def test_forced_high_path_and_redteam_failure_stop_before_merge(self):
+        self.scenario({'start': [{'risk': 'low'}], 'lane': [{'high_path': 'skills/company/SKILL.md'}],
+                       'redteam': [{'code': 1, 'output': 'red-team failed'}]})
+        self.assertIn('red-team failed', self.run_batch(1))
+        self.assertEqual(len(self.calls('review')), 1)
+        self.assertEqual(len(self.calls('redteam')), 1)
+        self.assertFalse(self.calls('merge'))
 
     def test_resume_committed_work_skips_start_and_lane(self):
         for command in (['start', '--builder', 'codex'],

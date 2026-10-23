@@ -148,6 +148,7 @@ class Usage(unittest.TestCase):
         self.assertEqual(defaults["low"], dict(max_rounds=2, extra_rounds=1))
         self.assertEqual(defaults["normal"], dict(codex="haiku", claude="gpt-6-luna", max_rounds=3, extra_rounds=1))
         self.assertEqual(defaults["high"]["red_team_model"], "gpt-6.1-sol")
+        self.assertEqual(defaults["high"]["red_team_model_claude"], "sonnet")
         self.assertIn("system/agent-policy/**", defaults["high_paths"]["bootstrap"])
         self.assertIn("home/dot_local/share/bootstrap/agent-policy/**", defaults["high_paths"]["bootstrap"])
         self.assertNotIn("home/dot_local/bin/executable_task", defaults["high_paths"]["bootstrap"])
@@ -155,12 +156,13 @@ class Usage(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text('[review]\nhigh_paths = { proj = ["rails/**"] }\n'
                         '[review.normal]\ncodex = "sonnet"\nmax_rounds = 4\n'
-                        '[review.high]\nred_team_model = "gpt-6-luna"\n')
+                        '[review.high]\nred_team_model = "gpt-6-luna"\nred_team_model_claude = "haiku"\n')
         found = usage.policy(self.home)["review"]
         self.assertEqual(found["normal"], dict(codex="sonnet", claude="gpt-6-luna", max_rounds=4, extra_rounds=1))
         self.assertEqual(found["high"]["red_team_model"], "gpt-6-luna")
+        self.assertEqual(found["high"]["red_team_model_claude"], "haiku")
         self.assertEqual(found["high_paths"]["proj"], ["rails/**"])
-        self.assertEqual(found["high_paths"]["*"], ["policy/**"])
+        self.assertEqual(found["high_paths"]["*"], defaults["high_paths"]["*"])
         self.assertEqual(usage.DEFAULTS["review"]["normal"]["max_rounds"], 3)
 
     def test_review_policy_rejects_unknown_keys_and_invalid_types(self):
@@ -168,7 +170,8 @@ class Usage(unittest.TestCase):
         path.parent.mkdir(parents=True)
         for text in ('review = 1', '[review]\nbogus = {}', '[review.normal]\nbogus = 1',
                      '[review.low]\ncodex = "haiku"', '[review.normal]\nmax_rounds = 0',
-                     '[review.high]\nmax_rounds = true', '[review.low]\nextra_rounds = -1',
+                     '[review.high]\nmax_rounds = true', '[review.high]\nred_team_model_claude = 3',
+                     '[review.low]\nextra_rounds = -1',
                      '[review.high]\nextra_rounds = 1.5', '[review.normal]\ncodex = ""',
                      '[review.normal]\nclaude = "x; touch file"', '[review.high]\nred_team_model = 3',
                      '[review]\nhigh_paths = []', '[review]\nhigh_paths = { proj = [1] }',

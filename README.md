@@ -552,13 +552,15 @@ one-line reason. Change it later with `task risk <repo> <id> low` or
 `task risk <repo> <id> high --reason "safety boundary"`; changes enter the override ledger.
 Refresh preserves risk. `task status` shows both risk and builder tier.
 
-| Risk | Required checks | Default build/fix rounds | Extra rounds per exception |
+| Risk | Required checks | Default build/fix rounds | Total extra rounds per task |
 | --- | --- | --- | --- |
 | low | Trusted check; review commands refused; merge needs no review or report | 2 | 1 |
 | normal | Trusted check and one cheap other-vendor review | 3 | 1 |
 | high | Trusted check, other-vendor review and red-team at the reviewed commit | 3 | 1 |
 
-Low risk also refuses `review --record`; its merge skips report and criteria checks.
+Low risk also refuses `review --record`; its merge skips report and criteria checks,
+and close ticks the pinned criteria without review evidence. The batch runner skips
+low-tier review and runs a red-team after a high-tier review, before merge.
 
 Normal reviews stay cheap even in boost or with `review --run --final`. Manual
 Opus, Fable and other deeper reviews are refused outside high risk. High keeps the
@@ -570,20 +572,24 @@ At check, review and merge, changed paths in `main...HEAD` matching `review.high
 force high risk; attempting to lower it names the matching path and refuses.
 Patterns apply to the whole repository-relative path, with `*` matching any part;
 the `"*"` repository entry applies everywhere. Defaults cover every repo's `policy/**`,
+skill rules and references, agent instructions, `INTENT.md` and decision records,
 and bootstrap's agent-policy hook/rule tables, managed settings, Codex sandbox/rules,
 hold script/markers, boundary checks, Git credential settings and gitleaks config.
 The task executable itself is excluded. The complete paths are in the example policy.
 
-`task redteam <repo> <id> --brief FILE` runs read-only Codex at high effort,
-records output in private task state for that commit, and appears in status.
+`task redteam <repo> <id> --brief FILE` runs the other vendor at high effort,
+using Sonnet for a Codex builder and gpt-6.1-sol for a Claude builder by default.
+It prepends `~/cortex/cortex-core/skills/company/references/red-team-brief.md` when
+present, records that fact, vendor, model and output for the commit, and appears in status.
 It refuses low and normal risk. High-risk merge requires that output at the reviewed
 head, or `task merge ... --no-redteam "reason"` (ledgered after a successful merge
 that passes the remaining gate); ordinary `--override`
-does not waive this rule.
+does not waive this rule. High-tier close requires current review and red-team evidence.
 
-`task lane ... --extra-round "small contained fix"` grants the policy's extra rounds
-when the limit is reached; it refuses the flag below the limit. Round counts persist
-across `start --refresh`, as do the ledgered extra grants.
+`task lane ... --extra-round "small contained fix"` grants one extra round when the
+limit is reached; it refuses the flag below the limit. Total grants are capped at
+the policy's `extra_rounds` per task. Round counts persist across `start --refresh`,
+as do the ledgered extra grants.
 `task lane ... --effort low|medium|high` forwards effort to either vendor and records
 it; default is high.
 
@@ -591,7 +597,8 @@ The company usage-pacing TOML also accepts `[review]`: `high_paths` maps reposit
 names (or `"*"`) to pattern lists. `[review.low]` accepts positive-integer `max_rounds`
 and nonnegative-integer `extra_rounds`; `[review.normal]` and `[review.high]` also
 accept `codex` and `claude` reviewer model names, keyed by builder vendor.
-`[review.high]` additionally accepts `red_team_model` (default `gpt-6.1-sol`).
+`[review.high]` additionally accepts `red_team_model` for Codex (default `gpt-6.1-sol`)
+and `red_team_model_claude` for Claude (default `sonnet`).
 Missing keys use built-in defaults; per-repository high-path lists replace their
 defaults. Unknown keys and malformed values are refused. Risk enforcement fails
 closed on invalid policy, while usage pacing reports its existing defaults fallback.
