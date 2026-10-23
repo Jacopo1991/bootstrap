@@ -30,7 +30,7 @@ DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0
             "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
             "boost_five_hour_max": 50,
             "review": {"high_paths": {"*": ["policy/**"], "bootstrap": [
-                "system/agent-policy/**", "system/*managed*", "system/codex-requirements.toml",
+                "system/agent-policy/**", "home/dot_local/share/bootstrap/agent-policy/**", "system/*managed*", "system/codex-requirements.toml",
                 "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml",
                 "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*",
                 "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"]},
@@ -393,10 +393,10 @@ def log(home, text, now=None):
         pass
 
 
-def record_override(home, repo, task, model, tier, text, now=None):
+def record_override(home, repo, task, model, tier, text, now=None, **fields):
     """Append a policy exception or risk change to the shared overrides ledger."""
     entry = dict(time=(now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
-                 repo=repo, task=task, model=model, tier=tier, override=text)
+                 repo=repo, task=task, model=model, tier=tier, override=text, **fields)
     directory = _dir(home)
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "overrides.jsonl").open("a") as stream:
@@ -411,7 +411,8 @@ def override_summary(home, now=None):
         for line in (_dir(home) / "overrides.jsonl").read_text().splitlines():
             entry = json.loads(line)
             if _stamp(entry["time"]) >= since:
-                found.append(f"{entry['repo']}/{entry['task']} {entry['model']} on {entry['tier']} "
+                label = f"risk {entry['old_risk']} to {entry['risk']}" if entry.get("kind") == "risk_change" else entry.get("kind") or entry['model']
+                found.append(f"{entry['repo']}/{entry['task']} {label} on {entry['tier']} "
                              f"at {entry['time']}: {entry['override']}")
     except (OSError, ValueError, KeyError, TypeError):
         pass

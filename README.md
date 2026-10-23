@@ -558,6 +558,8 @@ Refresh preserves risk. `task status` shows both risk and builder tier.
 | normal | Trusted check and one cheap other-vendor review | 3 | 1 |
 | high | Trusted check, other-vendor review and red-team at the reviewed commit | 3 | 1 |
 
+Low risk also refuses `review --record`; its merge skips report and criteria checks.
+
 Normal reviews stay cheap even in boost or with `review --run --final`. Manual
 Opus, Fable and other deeper reviews are refused outside high risk. High keeps the
 existing boost routing: hard builder tier or explicit `--final` selects the deeper
@@ -575,11 +577,13 @@ The task executable itself is excluded. The complete paths are in the example po
 `task redteam <repo> <id> --brief FILE` runs read-only Codex at high effort,
 records output in private task state for that commit, and appears in status.
 It refuses low and normal risk. High-risk merge requires that output at the reviewed
-head, or `task merge ... --no-redteam "reason"` (ledgered); ordinary `--override`
+head, or `task merge ... --no-redteam "reason"` (ledgered after a successful merge
+that passes the remaining gate); ordinary `--override`
 does not waive this rule.
 
 `task lane ... --extra-round "small contained fix"` grants the policy's extra rounds
-when the limit is reached; the grant is ledgered and survives refresh.
+when the limit is reached; it refuses the flag below the limit. Round counts persist
+across `start --refresh`, as do the ledgered extra grants.
 `task lane ... --effort low|medium|high` forwards effort to either vendor and records
 it; default is high.
 
@@ -689,6 +693,8 @@ Trust comes from sandbox capability: `task` probes write access to
 and unsandboxed runner can write it and produce trusted evidence. Sandboxed
 Codex and Claude Code builders cannot: their checks remain advisory, and commands
 that mutate PM state refuse with “run this from the PM shell or a batch runner”.
+Always launch builders via `task lane`. Sessions that cannot write
+`~/.local/state/task` are advisory lanes.
 The hook permits PM task command routes; its other rules remain in force.
 `task lane` and plain `task review` are PM/runner-only too: lane dispatch starts
 a builder, and review preparation writes private routing and prompt records.
@@ -759,14 +765,13 @@ PH_PRODUCT_DIR = "{worktree}/.work/fake"
 
 When variants are declared, these are the runs; add an empty variant to include
 the base configuration. With no variants, the gate runs once as before.
-Checks, merge gates and gate drills all run the matrix. Advisory lane checks
+Checks and merge gates run the matrix. Advisory lane checks
 also accept `task check --variant fake`; trusted checks always run every variant.
 The combined check log labels each run, and JSON evidence and history include
 per-variant results. `task status` lists variant names.
 
 Advisory lane checks write `.work/check.log`. Trusted checks write `check.log`
-in the task's state directory; merge gates write `gate-check.log` there and
-drills write `drill-check.log` in their evidence directory. They leave the lane
+in the task's state directory; merge gates write `gate-check.log` there. They leave the lane
 log untouched. Check JSON and history record the log path and summary; status
 and review prompts identify the corresponding trusted or advisory log.
 Merge and published-merge repair preserve the trusted `check.log` in state

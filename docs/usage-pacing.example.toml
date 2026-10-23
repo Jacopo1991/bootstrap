@@ -38,7 +38,7 @@ codex = 1
 # Patterns use the whole repository-relative path; '*' in a pattern can span '/'.
 # Each configured repository list replaces its built-in list; other repos retain defaults.
 [review]
-high_paths = { "*" = ["policy/**"], bootstrap = ["system/agent-policy/**", "system/*managed*", "system/codex-requirements.toml", "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml", "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*", "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"] }
+high_paths = { "*" = ["policy/**"], bootstrap = ["system/agent-policy/**", "home/dot_local/share/bootstrap/agent-policy/**", "system/*managed*", "system/codex-requirements.toml", "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml", "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*", "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"] }
 
 [review.low]
 max_rounds = 2
