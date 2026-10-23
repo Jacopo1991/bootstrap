@@ -1038,11 +1038,16 @@ The rule rests on resolver constraints plus the offline repository gate:
   `python3 ci/package-cap-check.py` with its checkout's policy before installation.
   It checks only capped names, follows readable local includes, and checks pins,
   sources and manifest/lock consistency. Pyproject ranges need an adjacent allowed
-  lock pin. Capped image tags must be explicit allowed versions; unresolved capped
-  references, unapproved digests and local versions fail. A Dockerfile RUN segment
-  or compose command mentioning a capped name must be a readable exact install;
-  wrappers such as `sh -c`, `env` and `xargs` fail closed. Unrelated dependencies,
-  options and images are ignored. The installed command requires the root-owned
+  lock pin. Files named `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
+  `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository, use a
+  text rule: every whole-token capped name must be immediately followed by an
+  allowed exact pin (`litellm==1.106.2`) or image tag (`litellm:v1.106.2`).
+  Letters, digits, `_`, `.` and `-` join tokens, so `langchain-litellm` is ignored.
+  Comments and heredocs count; shell/YAML syntax, variables and `dockerfile:`
+  references are not interpreted. Violations report the file and line;
+  unapproved image digests and local versions still fail. Remote or missing
+  requirements includes naming no capped package are ignored; resolver constraints
+  still cap the actual install. The installed command requires the root-owned
   policy at `/usr/local/lib/agent-policy/package-caps.toml`.
 
 `pipx`, Poetry, conda/mamba, images and existing uv projects without workspace

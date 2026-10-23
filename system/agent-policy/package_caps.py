@@ -10,7 +10,6 @@ import argparse
 import json
 from pathlib import Path
 import re
-import shlex
 import sys
 import subprocess
 import os
@@ -113,17 +112,6 @@ class Cap:
         if not match or version_key(match[1]) is None:
             return f'image tag {tag} is refused; cap v{self.max_version}'
         return self.version_reason(match[1])
-
-    def image_reason(self, reference: str) -> str | None:
-        name, tag = image_name(reference)
-        if name not in self.images:
-            return None
-        reason = self.tag_reason(tag)
-        if reason:
-            return reason
-        if '@' in reference and reference.split('@', 1)[1] not in self.approved_digests:
-            return f'image digest is not approved in policy (cap {self.max_version})'
-        return None
 
 
 def load_policy(path: Path) -> dict[str, Cap]:
@@ -388,98 +376,30 @@ class Checker:
                     if req.url or str(req.specifier) not in {f'<={cap.max_version}', f'=={cap.max_version}'}:
                         self.error(path, 1, f'{name}: unverified uv {key} rule')
 
-    @staticmethod
-    def interpolate(reference: str, variables: dict[str, str]) -> str:
-        pattern = r'\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)'
-        def replace(match):
-            name = match[1] or match[3]
-            value = variables.get(name, match[2])
-            return value if value is not None else match[0]
-        # Do not consult the invoking process environment.
-        return re.sub(pattern, replace, reference)
+    def container_text(self, path: Path) -> None:
+        """Require an immediate allowed pin/tag for every whole-token policy name.
 
-    def image(self, path: Path, line: int, reference: str, variables=None) -> None:
-        reference = self.interpolate(reference, variables or {})
-        if '$' in reference:
-            if mentions_cap(reference, self.caps):
-                self.error(path, line, 'unresolved capped image reference refused')
-            return
+        Dockerfile and compose syntax, including comments, is deliberately text:
+        no shell/YAML parsing, variable expansion or referenced-file resolution.
+        """
+        text = path.read_text(encoding='utf-8')
         for cap in self.caps.values():
-            reason = cap.image_reason(reference)
-            if reason:
-                self.error(path, line, reason)
-
-    def dockerfile(self, path: Path) -> None:
-        variables: dict[str, str] = {}
-        for number, text in self.logical_lines(path):
-            words = shlex.split(text, comments=True)
-            if not words:
-                continue
-            verb = words.pop(0).upper()
-            if verb == 'ARG' and words:
-                name, _, value = words[0].partition('=')
-                if value:
-                    variables[name] = self.interpolate(value, variables)
-            elif verb == 'FROM':
-                operands = [w for w in words if not w.startswith('--')]
-                if operands:
-                    self.image(path, number, operands[0], variables)
-            elif verb == 'RUN':
-                body = text.strip()[3:].strip()
-                self.command(path, number, json.loads(body) if body.startswith('[') else body)
-
-    def command(self, path: Path, line: int, value: str | list[str]) -> None:
-        # Quoted wrapper bodies stay one operand, so they cannot masquerade as
-        # a directly readable install. No attempt to execute/unwrap shell code.
-        if isinstance(value, str):
-            lexer = shlex.shlex(value, posix=True, punctuation_chars=';&|')
-            lexer.whitespace_split = True
-            lexer.commenters = ''  # Preserve VCS URL fragments such as #egg=litellm.
-            segments, current = [], []
-            for word in lexer:
-                if word in {'&&', '||', ';', '|'}:
-                    segments.append(current)
-                    current = []
+            pattern = r'(?<![A-Za-z0-9_.-])' + re.escape(cap.name) + r'(?![A-Za-z0-9_.-])'
+            for match in re.finditer(pattern, text, re.I | re.ASCII):
+                line = text.count('\n', 0, match.start()) + 1
+                # Read the entire adjacent value, never an allowed prefix of it.
+                pin = re.match(r'''(==|:)([^\s"'`,;\[\]{}()<>|&\\]+)''', text[match.end():])
+                if pin is None:
+                    reason = cap.version_reason(None)
+                elif pin[1] == '==':
+                    reason = cap.version_reason(pin[2])
                 else:
-                    current.append(word)
-            segments.append(current)
-        else:
-            segments = [value]
-        for tokens in segments:
-            reason = install_reason(tokens, path.parent, self.caps)
-            if reason:
-                self.error(path, line, reason)
-
-    def compose(self, path: Path) -> None:
-        import yaml
-        data = yaml.safe_load(path.read_text(encoding='utf-8'))
-        visited = set()
-        def visit(value):
-            if isinstance(value, (dict, list)):
-                if id(value) in visited:
-                    return
-                visited.add(id(value))
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if key == 'image':
-                        if isinstance(item, str):
-                            self.image(path, self.line_of(path.read_text(), item), item)
-                        else:
-                            self.error(path, 1, 'invalid image reference')
-                    elif key == 'dockerfile' and isinstance(item, str):
-                        target = path.parent / item
-                        if target.is_file():
-                            self.dockerfile(target)
-                        else:
-                            self.error(path, 1, 'referenced Dockerfile unavailable')
-                    elif key in {'command', 'entrypoint'} and isinstance(item, (str, list)):
-                        self.command(path, 1, item)
-                    else:
-                        visit(item)
-            elif isinstance(value, list):
-                for item in value:
-                    visit(item)
-        visit(data)
+                    tag, separator, digest = pin[2].partition('@')
+                    reason = cap.tag_reason(tag)
+                    if not reason and separator and digest not in cap.approved_digests:
+                        reason = f'image digest is not approved in policy (cap {cap.max_version})'
+                if reason:
+                    self.error(path, line, reason)
 
     def check(self, path: Path) -> bool:
         name = path.name.lower()
@@ -493,15 +413,8 @@ class Checker:
                 self.toml_lock(path)
             elif name == 'pipfile.lock':
                 self.pipfile_lock(path)
-            elif re.fullmatch(r'(?:dockerfile|containerfile)(?:\..+)?|.+\.(?:dockerfile|containerfile)', name):
-                self.dockerfile(path)
-            elif path.suffix.lower() in {'.yml', '.yaml'}:
-                # Arbitrary compose filenames: structural detection, not a name regex.
-                text = path.read_text(encoding='utf-8')
-                if 'compose' in name or re.search(r'\bservices\s*:', text):
-                    self.compose(path)
-                else:
-                    return False
+            elif re.fullmatch(r'dockerfile(?:\..*)?|.*\.dockerfile|(?:docker-)?compose.*\.y.*ml', name):
+                self.container_text(path)
             elif name == 'setup.cfg':
                 config = configparser.ConfigParser(interpolation=None)
                 config.read(path)
@@ -524,103 +437,7 @@ class Checker:
                 return False
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
             self.error(path, 1, f'cannot evaluate manifest: {error}')
-        # YAML errors do not derive from ValueError.
-        except Exception as error:
-            self.error(path, 1, f'cannot parse manifest: {error}')
         return True
-
-
-# Dockerfile RUN checks supply argv to these gate-only installer helpers.
-GLOBAL_VALUES = {'--python', '-p', '--directory', '--project', '--config-file', '--color',
-                 '--cache-dir', '--log', '--proxy', '--timeout', '--retries', '--cert', '--client-cert'}
-INSTALL_VALUES = {'--index-url', '-i', '--extra-index-url', '--find-links', '-f', '--trusted-host',
-                  '--python', '-p', '--cache-dir', '--group', '--only', '--extras', '--extra',
-                  '--target', '-t', '--prefix', '--root', '--platform', '--python-version',
-                  '--implementation', '--abi', '--keyring-provider', '--link-mode'}
-
-
-def strip_globals(words: list[str]) -> list[str] | None:
-    words = words[:]
-    while words and words[0].startswith('-'):
-        word = words.pop(0)
-        key = word.split('=', 1)[0]
-        if key in GLOBAL_VALUES:
-            if '=' not in word:
-                if not words:
-                    return None
-                words.pop(0)
-    return words
-
-
-def install_reason(tokens: list[str], cwd: Path, caps: dict[str, Cap]) -> str | None:
-    if not tokens:
-        return None
-    mentioned = mentions_cap(' '.join(tokens), caps)
-    unreadable = 'capped package command must be a readable exact install' if mentioned else None
-    executable = Path(tokens[0]).name
-    rest = tokens[1:]
-    if re.fullmatch(r'python[0-9.]*', executable):
-        while rest and rest[0] in {'-I', '-s', '-E', '-B', '-u'}:
-            rest = rest[1:]
-        if rest[:2] != ['-m', 'pip']:
-            return unreadable
-        executable, rest = 'pip', rest[2:]
-    installers = {'pip', 'pip3', 'uv', 'uvx', 'pipx', 'poetry', 'conda', 'mamba', 'micromamba'}
-    if executable not in installers:
-        return unreadable
-    rest = strip_globals(rest)
-    if rest is None:
-        return unreadable
-    if executable in {'conda', 'mamba', 'micromamba'}:
-        return unreadable
-    if executable == 'uvx':
-        return unreadable
-    if not rest:
-        return unreadable
-    sub = rest.pop(0)
-    if executable == 'uv' and sub in {'pip', 'tool'}:
-        rest = strip_globals(rest)
-        if not rest:
-            return unreadable
-        sub = rest.pop(0)
-    if (executable == 'uv' and sub in {'sync', 'run', 'lock'}) or (executable == 'poetry' and sub == 'install') or (executable == 'pipx' and sub == 'run'):
-        return unreadable
-    if sub not in {'install', 'add', 'inject', 'compile', 'sync'}:
-        return unreadable
-    checker = Checker(caps)
-    path = cwd / '<install>'
-    index = 0
-    verified = False
-    while index < len(rest):
-        word = rest[index]
-        key, equal, value = word.partition('=')
-        include = key in {'-r', '-c', '--requirement', '--constraint', '--constraints', '--build-constraint', '--build-constraints', '--with-requirements'}
-        if not include and re.match(r'^-[rc].+', word):
-            include, key, equal, value = True, word[:2], '=', word[2:]
-        if include or key in INSTALL_VALUES:
-            if not equal:
-                index += 1
-                if index >= len(rest):
-                    return unreadable
-                value = rest[index]
-            if include:
-                checker.include(path, 1, value)
-            elif mentions_cap(value, caps):
-                return unreadable
-        elif word == '--':
-            pass
-        elif word.startswith('-'):
-            if mentions_cap(word, caps):
-                return unreadable
-        else:
-            if executable == 'poetry' and '@' in word and '://' not in word:
-                name, version = word.split('@', 1)
-                word = name + '==' + version.removeprefix('==')
-            verified = checker.requirement(path, 1, word) or verified
-        index += 1
-    if checker.findings:
-        return checker.findings[0]
-    return None if verified else unreadable
 
 
 def repository_files(root: Path) -> list[Path]:
