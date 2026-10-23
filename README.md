@@ -572,8 +572,9 @@ so `task runner-start` too) apply the verdict:
 | `under-used-near-reset` | spend before the reset: when the 5-hour reading permits boost, `task boost` for that vendor is switched on until its weekly reset (stronger models by tier and extra capacity for already queued work, logged). Hard-tier reviews and explicit `--final` rounds use the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
 
 Manual and automatic boosts pause per vendor at or above `boost_five_hour_max` (default 50 %).
-A missing 5-hour reading or one older than 45 minutes also pauses boost, including when Codex
-has no 5-hour window in its readings. Normal routing and capacity apply, and no new automatic
+A missing 5-hour reading, or one older than 45 minutes while the vendor's lanes ran since it,
+also pauses boost for a vendor with a 5-hour window. A vendor without one (Codex today) keeps
+its weekly rules. Normal routing and capacity apply to paused boosts, and no new automatic
 boost starts. `task usage` and `task status` explain a saved boost's pause. Its expiry stays saved,
 so a fresh reading below the threshold resumes it automatically until that expiry. `--no-pace`
 does not bypass this boost limit.

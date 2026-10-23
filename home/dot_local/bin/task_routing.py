@@ -1,8 +1,8 @@
 """Shared builder routing and boost capacity policy (no runtime side effects)."""
 import json
 import re
-from datetime import date, datetime, timezone
-from task_usage import boost_pauses
+from datetime import date
+from task_usage import boost_pauses, saved_boosts
 
 TIERS = ("routine", "hard", "design")
 ROUTING = {
@@ -59,21 +59,7 @@ def policy(home):
 
 
 def active(home, paused=None):
-    path = home / ".local/state/task/boost.json"
-    try:
-        values = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    result = {}
-    if not isinstance(values, dict):
-        return result
-    for vendor, until in values.items():
-        try:
-            when = datetime.fromisoformat(until.replace("Z", "+00:00"))
-            if vendor in ROUTING and when.tzinfo and datetime.now(timezone.utc) < when:
-                result[vendor] = until
-        except (ValueError, AttributeError):
-            pass
+    result = saved_boosts(home)
     for vendor, reason in boost_pauses(home).items() if result else ():
         if vendor in result:
             del result[vendor]

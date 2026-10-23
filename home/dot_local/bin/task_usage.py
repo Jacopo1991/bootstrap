@@ -6,6 +6,8 @@ Claude `rate_limit_event` that a recorded lane or review left behind. Nothing he
 import json
 import fcntl
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 import os
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -22,6 +24,7 @@ EXHAUSTED = "exhausted-automated-share"
 FIVE_OUT, FIVE_WARN = "5h-exhausted", "5h-warning"
 FIVE_BAND = 15  # points below the 5-hour limit where only one lane or review may run
 STALE = timedelta(minutes=45)
+_ASSESSMENTS = ContextVar("usage_assessments", default=None)
 DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0, "codex": 1},
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
             "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
@@ -280,25 +283,36 @@ def _five(reading, pol, now, ran):
             "stale": stale, "missing": missing, "five_reserve": reserve}
 
 
-def boost_pause(reading, pol, now):
-    """Fail closed on missing or old 5-hour readings, independently of weekly reserve release."""
-    used, at = reading.get("five_hour"), reading.get("five_at") or reading.get("at")
-    if used is None:
+def boost_pause(reading, pol, five):
+    """Use the warning band's missing/stale rule only for vendors with a 5-hour window."""
+    if not reading["has_five"]:
+        return ""
+    used = reading.get("five_hour")
+    if five["missing"]:
         reason = "no current 5-hour reading"
-    elif not at or now - at > STALE:
+    elif five["stale"]:
         reason = "5-hour reading stale"
     else:
-        reason = f"5-hour {used:g} % ≥ {pol['boost_five_hour_max']:g} %" if used >= pol["boost_five_hour_max"] else ""
+        reason = f"5-hour {used:g} % ≥ {pol['boost_five_hour_max']:g} %" if used is not None and used >= pol["boost_five_hour_max"] else ""
     return f"boost paused: {reading['vendor']} {reason}" if reason else ""
 
 
 def boost_pauses(home, now=None):
-    now = now or datetime.now(timezone.utc)
-    try:
-        pol = policy(home)
-    except ValueError:
-        pol = DEFAULTS
-    return {vendor: reason for vendor, item in readings(home, now).items() if (reason := boost_pause(item, pol, now))}
+    return {vendor: item["boost_pause"] for vendor, item in assessments(home, now or datetime.now(timezone.utc))[1].items()
+            if item["boost_pause"]}
+
+
+def saved_boosts(home):
+    """Unexpired saved boosts, including any paused by the current usage assessment."""
+    result = {}
+    for vendor, until in _json(home / ".local/state/task/boost.json").items():
+        try:
+            when = _stamp(until)
+            if vendor in VENDORS and when.tzinfo and datetime.now(timezone.utc) < when:
+                result[vendor] = until
+        except (ValueError, AttributeError, TypeError):
+            pass
+    return result
 
 
 def assess(reading, pol, now, ran=False):
@@ -312,8 +326,9 @@ def assess(reading, pol, now, ran=False):
     spare = pol["spare_resets"][vendor] > 0
     left = None if reading["reason"] else (reading["resets_at"] - now) / timedelta(hours=1)
     released = left is not None and left <= pol["under_use_hours"]
-    result = dict(reading, spare=spare, released=released, boost_pause=boost_pause(reading, pol, now),
-                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), **_five(reading, pol, now, ran))
+    five = _five(reading, pol, now, ran)
+    result = dict(reading, spare=spare, released=released, boost_pause=boost_pause(reading, pol, five),
+                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), **five)
     if reading["reason"]:
         return dict(result, verdict="unknown")
     elapsed = min(100.0, max(0.0, 100 * (1 - left / (WEEK / timedelta(hours=1)))))
@@ -395,8 +410,21 @@ def note(home, found, now, held=None):
         pass
 
 
+@contextmanager
+def command_readings():
+    """Share one lazy assessment per HOME for command decisions; run logging still reads afresh."""
+    token = _ASSESSMENTS.set({})
+    try:
+        yield
+    finally:
+        _ASSESSMENTS.reset(token)
+
+
 def assessments(home, now):
     """Policy and one assessment per vendor, plus warnings; a broken policy file falls back to defaults."""
+    cache = _ASSESSMENTS.get()
+    if cache is not None and home in cache:
+        return cache[home]
     notes = []
     try:
         pol = policy(home)
@@ -415,6 +443,8 @@ def assessments(home, now):
             notes.append(f"pace warning: {vendor} has no current 5-hour reading; "
                          "treated as the 5-hour warning band (one lane or review at a time)")
         note(home, found, now)
+    if cache is not None:
+        cache[home] = pol, seen, notes
     return pol, seen, notes
 
 
@@ -525,9 +555,11 @@ def report(home, now=None):
     """Lines for `task usage`."""
     now = now or datetime.now(timezone.utc)
     pol, seen, lines = assessments(home, now)
+    lines = list(lines)
+    boosts = saved_boosts(home)
     for vendor in VENDORS:
         item = seen[vendor]
-        if item["boost_pause"]:
+        if item["boost_pause"] and (vendor in boosts or item["verdict"] == "under-used-near-reset"):
             lines.append(item["boost_pause"])
         effect = {FIVE_OUT: f"no new lanes or reviews on {vendor} until the reset; routine lanes move to the other vendor if it has room",
                   FIVE_WARN: f"at most one lane or review of {vendor} at a time, machine-wide, {running(home, vendor)} running now"

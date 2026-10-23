@@ -5192,12 +5192,13 @@ def main(argv=None):
             signal.signal(signal.SIGTERM, handle_interruption)
         result = 1
         try:
-            result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
-                      "review": review, "cancel": cancel, "note": note, "status": status,
-                      "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
-                      "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo),
-                      "gate-drill": gate_drill}[args.command](args) or 0
+            with task_usage.command_readings():
+                result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
+                          "review": review, "cancel": cancel, "note": note, "status": status,
+                          "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
+                          "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
+                          "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo),
+                          "gate-drill": gate_drill}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"

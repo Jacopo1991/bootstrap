@@ -1533,6 +1533,8 @@ class TaskTool(unittest.TestCase):
                                        (10, 46, False), (10, 0, True)):
                 with self.subTest(vendor=vendor, five=five, age=age):
                     self.readings(**{vendor: (40, 84)}, five=five, age=timedelta(minutes=age))
+                    if age:
+                        TASK_MODULE.task_usage.claim(self.home, vendor, 'lane', 2 ** 22 + 7)
                     self.assertEqual(vendor in active(self.home), allowed)
                     self.assertEqual(lane_limits(self.home, 3)[vendor], 3 if allowed else 1)
                     self.assertIn(other, active(self.home))
@@ -1547,7 +1549,11 @@ class TaskTool(unittest.TestCase):
                 data.pop('five_hour')
                 state.write_text(json.dumps(data))
             else:
+                # A window seen recently but missing from the newest event still fails closed.
+                rollout = next((self.home / '.codex/sessions').rglob('rollout-*.jsonl'))
+                prior = rollout.read_text()
                 self.readings(codex=(40, 84))
+                rollout.write_text(prior + rollout.read_text())
             self.assertNotIn(vendor, active(self.home))
             self.assertIn(f'boost paused: {vendor} no current 5-hour reading', self.task('boost'))
             self.readings(**{vendor: (40, 84)}, five=10)
@@ -1565,18 +1571,52 @@ class TaskTool(unittest.TestCase):
                     ('routine', False, 10, 0, normal), ('design', False, 10, 0, normal),
                     ('hard', False, 10, 0, deeper), ('routine', True, 10, 0, deeper),
                     ('hard', False, 50, 0, normal), ('routine', True, 62, 0, normal),
-                    ('hard', True, 10, 46, normal)):
+                    ('hard', True, 10, 46, normal),
+                    *([('hard', False, None, 0, deeper), ('routine', True, None, 0, deeper)] if vendor == 'codex' else [])):
                 with self.subTest(builder=builder, tier=tier, final=final, five=five, age=age):
                     self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier,
                               '--override', 'Jacopo 2026-10-23: test tiers')
                     self.raw_task('check', 'proj', '5')
                     self.readings(**{vendor: (40, 84)}, five=five, age=timedelta(minutes=age))
+                    if age:
+                        TASK_MODULE.task_usage.claim(self.home, vendor, 'lane', 2 ** 22 + 7)
                     head = self.git(wt, 'rev-parse', 'HEAD')
                     reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
                     self.raw_task('review', 'proj', '5', '--run', '--no-pace', *(['--final'] if final else []),
                                   env=dict(self.env, REVIEW_STUB_REPLY=reply))
                     metadata = json.loads((self.state() / 'review.json').read_text())
                     self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, expected))
+
+    def test_codex_boost_without_a_five_hour_window_routes_and_starts_automatically(self):
+        from task_routing import active, route, lane_limits
+        self.readings(codex=(40, 30))
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        self.assertIn('codex', active(self.home))
+        self.assertEqual(route(self.home, 'codex', 'design'), 'gpt-6-astra')
+        self.assertEqual(lane_limits(self.home, 3)['codex'], 3)
+        self.assertNotIn('boost paused: codex', self.task('usage'))
+        self.task('boost', 'off')
+        wt, out = self.pace_lane(builder='codex', recorded=('--tier', 'design'))
+        self.assertIn('pace: codex under-used near its reset; boost on until', out)
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+
+    def test_command_reads_usage_once_for_boost_routing_and_refreshes_next_command(self):
+        usage = TASK_MODULE.task_usage
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00',
+                  '--codex-until', '2099-01-01T00:00:00+00:00')
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(usage, 'read_claude', wraps=usage.read_claude) as claude, \
+                mock.patch.object(usage, 'read_codex', wraps=usage.read_codex) as codex:
+            for five in (10, 62):
+                self.readings(claude=(40, 84), codex=(40, 84), five=five)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(TASK_MODULE.main(['status', str(self.repo)]), 0)
+                self.assertEqual('boost paused: claude' in output.getvalue(), five == 62)
+                self.assertEqual('boost paused: codex' in output.getvalue(), five == 62)
+            self.assertEqual((claude.call_count, codex.call_count), (2, 2))
 
     def test_above_threshold_does_not_start_automatic_boost_and_usage_explains(self):
         self.readings(claude=(40, 30), five=62)
