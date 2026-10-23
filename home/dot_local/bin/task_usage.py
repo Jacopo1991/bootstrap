@@ -6,6 +6,8 @@ Claude `rate_limit_event` that a recorded lane or review left behind. Nothing he
 import json
 import fcntl
 from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 import os
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -22,9 +24,37 @@ EXHAUSTED = "exhausted-automated-share"
 FIVE_OUT, FIVE_WARN = "5h-exhausted", "5h-warning"
 FIVE_BAND = 15  # points below the 5-hour limit where only one lane or review may run
 STALE = timedelta(minutes=45)
+_ASSESSMENTS = ContextVar("usage_assessments", default=None)
 DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0, "codex": 1},
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
-            "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": []}
+            "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
+            "boost_five_hour_max": 50,
+            "review": {"high_paths": {"*": ["policy/**"], "bootstrap": [
+                "system/agent-policy/**", "system/*managed*", "system/codex-requirements.toml",
+                "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml",
+                "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*",
+                "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"]},
+                "low": {"max_rounds": 2, "extra_rounds": 1},
+                "normal": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1},
+                "high": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1,
+                         "red_team_model": "gpt-6.1-sol"}}}
+
+
+def review_policy(value, result):
+    if not isinstance(value, dict) or value.keys() - result.keys():
+        raise ValueError("invalid review keys")
+    for tier, fields in value.items():
+        if not isinstance(fields, dict) or tier != "high_paths" and fields.keys() - result[tier].keys():
+            raise ValueError(f"invalid review.{tier}")
+        for key, item in fields.items():
+            valid = (isinstance(item, list) and all(isinstance(p, str) and p.strip() for p in item)
+                     if tier == "high_paths" else
+                     type(item) is int and item >= (1 if key == "max_rounds" else 0)
+                     if key in {"max_rounds", "extra_rounds"} else
+                     isinstance(item, str) and item.replace("-", "").replace(".", "").replace("_", "").isalnum())
+            if not valid:
+                raise ValueError(f"invalid review.{tier}.{key}")
+        result[tier].update(fields)
 
 
 def _json(path):
@@ -71,7 +101,13 @@ def policy(home):
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"{path}: {error}")
     for key, value in raw.items():
-        if key in ("reserve", "spare_resets"):
+        if key == "review":
+            try:
+                review_policy(value, result[key])
+            except ValueError as error:
+                raise ValueError(f"{path}: {error}") from error
+            valid = True
+        elif key in ("reserve", "spare_resets"):
             valid = isinstance(value, dict) and all(
                 name in VENDORS and _number(item, 100 if key == "reserve" else None) for name, item in value.items())
             result[key].update(value if valid else {})
@@ -79,7 +115,7 @@ def policy(home):
             valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             result[key] = value if valid else result[key]
         else:
-            valid = key in DEFAULTS and _number(value)
+            valid = key in DEFAULTS and _number(value, 100 if key == "boost_five_hour_max" else None)
             result[key] = value if valid else result.get(key)
         if not valid:
             raise ValueError(f"{path}: invalid {key}")
@@ -162,9 +198,10 @@ def read_claude(home, now):
     state = _json(_dir(home) / "claude.json")
     try:
         week, five = state["seven_day"], state.get("five_hour") or {}
-        return _reading("claude", _stamp(week["at"]), week["utilization"] * 100, _epoch(week["resetsAt"]),
+        reading = _reading("claude", _stamp(week["at"]), week["utilization"] * 100, _epoch(week["resetsAt"]),
                         five["utilization"] * 100 if five else None,
                         _epoch(five["resetsAt"]) if five else None, now)
+        return dict(reading, five_at=_stamp(five["at"]) if five else None)
     except (KeyError, TypeError, ValueError):
         return _unknown("claude", "no rate_limit_event recorded yet (a recorded Claude lane or review writes one)", True)
 
@@ -278,6 +315,38 @@ def _five(reading, pol, now, ran):
             "stale": stale, "missing": missing, "five_reserve": reserve}
 
 
+def boost_pause(reading, pol, five):
+    """Use the warning band's missing/stale rule only for vendors with a 5-hour window."""
+    if not reading["has_five"]:
+        return ""
+    used = reading.get("five_hour")
+    if five["missing"]:
+        reason = "no current 5-hour reading"
+    elif five["stale"]:
+        reason = "5-hour reading stale"
+    else:
+        reason = f"5-hour {used:g} % ≥ {pol['boost_five_hour_max']:g} %" if used is not None and used >= pol["boost_five_hour_max"] else ""
+    return f"boost paused: {reading['vendor']} {reason}" if reason else ""
+
+
+def boost_pauses(home, now=None):
+    return {vendor: item["boost_pause"] for vendor, item in assessments(home, now or datetime.now(timezone.utc))[1].items()
+            if item["boost_pause"]}
+
+
+def saved_boosts(home):
+    """Unexpired saved boosts, including any paused by the current usage assessment."""
+    result = {}
+    for vendor, until in _json(home / ".local/state/task/boost.json").items():
+        try:
+            when = _stamp(until)
+            if vendor in VENDORS and when.tzinfo and datetime.now(timezone.utc) < when:
+                result[vendor] = until
+        except (ValueError, AttributeError, TypeError):
+            pass
+    return result
+
+
 def assess(reading, pol, now, ran=False):
     """Add spare/limit and the pace verdict to a reading (see `task usage` for the meanings).
 
@@ -289,8 +358,9 @@ def assess(reading, pol, now, ran=False):
     spare = pol["spare_resets"][vendor] > 0
     left = None if reading["reason"] else (reading["resets_at"] - now) / timedelta(hours=1)
     released = left is not None and left <= pol["under_use_hours"]
-    result = dict(reading, spare=spare, released=released,
-                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), **_five(reading, pol, now, ran))
+    five = _five(reading, pol, now, ran)
+    result = dict(reading, spare=spare, released=released, boost_pause=boost_pause(reading, pol, five),
+                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), **five)
     if reading["reason"]:
         return dict(result, verdict="unknown")
     elapsed = min(100.0, max(0.0, 100 * (1 - left / (WEEK / timedelta(hours=1)))))
@@ -324,7 +394,7 @@ def log(home, text, now=None):
 
 
 def record_override(home, repo, task, model, tier, text, now=None):
-    """Append one model-rule override (a top model outside its tier) to the overrides ledger."""
+    """Append a policy exception or risk change to the shared overrides ledger."""
     entry = dict(time=(now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
                  repo=repo, task=task, model=model, tier=tier, override=text)
     directory = _dir(home)
@@ -372,8 +442,21 @@ def note(home, found, now, held=None):
         pass
 
 
+@contextmanager
+def command_readings():
+    """Share one lazy assessment per HOME for command decisions; run logging still reads afresh."""
+    token = _ASSESSMENTS.set({})
+    try:
+        yield
+    finally:
+        _ASSESSMENTS.reset(token)
+
+
 def assessments(home, now):
     """Policy and one assessment per vendor, plus warnings; a broken policy file falls back to defaults."""
+    cache = _ASSESSMENTS.get()
+    if cache is not None and home in cache:
+        return cache[home]
     notes = []
     try:
         pol = policy(home)
@@ -392,6 +475,8 @@ def assessments(home, now):
             notes.append(f"pace warning: {vendor} has no current 5-hour reading; "
                          "treated as the 5-hour warning band (one lane or review at a time)")
         note(home, found, now)
+    if cache is not None:
+        cache[home] = pol, seen, notes
     return pol, seen, notes
 
 
@@ -450,7 +535,10 @@ def gate(home, kind, vendor, tier, repo, key, now=None):
         if kind == "lane" and top and top != repo:
             out["hold"] = f"{vendor} is ahead of pace; only {top} gets new lanes"
     if not out["hold"] and found["verdict"] == "under-used-near-reset":
-        out["spend"] = found["resets_at"].isoformat()
+        if found["boost_pause"]:
+            notes.append(found["boost_pause"])
+        else:
+            out["spend"] = found["resets_at"].isoformat()
     if out["hold"]:
         note(home, seen[vendor], now, f"{repo}/{key}")
         log(home, f"held {kind} {repo}/{key}: {out['hold']}", now)
@@ -488,8 +576,9 @@ def _applied(vendor, item, pol, top):
         EXHAUSTED: f"{used_up}: no new lanes or reviews on {vendor}; routine lanes move to the other vendor if it has room",
         "ahead": f"{reserve}; routine lanes use {CHEAPER[vendor]}, no new batch starts on its own, "
                  f"new lanes only for {top or 'the top-priority repo with work'}",
-        "under-used-near-reset": f"{reserve}; spend before the reset: boost on until it ends (stronger models on queued work), "
-                                 f"deeper reviews ({DEEPER[vendor]}), then the research backlog: "
+        "under-used-near-reset": f"{reserve}; spend before the reset: "
+                                 f"{item['boost_pause'] or 'boost on until it ends (stronger models on queued work)'}; "
+                                 f"deeper reviews ({DEEPER[vendor]}) only for high risk in boost for hard tasks or --final rounds; research backlog: "
                                  f"{', '.join(pol['research_backlog']) or 'none named'}",
     }.get(item["verdict"], f"{reserve}; normal")
 
@@ -498,8 +587,12 @@ def report(home, now=None):
     """Lines for `task usage`."""
     now = now or datetime.now(timezone.utc)
     pol, seen, lines = assessments(home, now)
+    lines = list(lines)
+    boosts = saved_boosts(home)
     for vendor in VENDORS:
         item = seen[vendor]
+        if item["boost_pause"] and (vendor in boosts or item["verdict"] == "under-used-near-reset"):
+            lines.append(item["boost_pause"])
         effect = {FIVE_OUT: f"no new lanes or reviews on {vendor} until the reset; routine lanes move to the other vendor if it has room",
                   FIVE_WARN: f"at most one lane or review of {vendor} at a time, machine-wide, {running(home, vendor)} running now"
                   }.get(item["five"], "normal")

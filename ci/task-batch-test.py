@@ -200,6 +200,7 @@ class BatchTest(unittest.TestCase):
         self.assertIn('[one] OK', result.stdout)
 
     def test_stop_and_interrupt_report_before_inflight_worker_finishes(self):
+        self.boost_readings()
         for interruption in (False, True):
             with self.subTest(interruption=interruption):
                 config = self.home / '.config/task'
@@ -261,10 +262,7 @@ class BatchTest(unittest.TestCase):
         state = self.home / '.local/state/task'
         state.mkdir(parents=True)
         boost = state / 'boost.json'
-        now = datetime.now(timezone.utc)  # claude has a 5-hour window, so boost needs a fresh reading below the warning band
-        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
-            'five_hour': {'utilization': 0.2, 'resetsAt': int(now.timestamp() + 7200)},
-            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        self.boost_readings()
         for vendor in ('codex', 'claude'):
             for boosted, slots, expected in ((False, 3, 1), (True, 3, 3), (True, 2, 2), (True, 1, 1)):
                 with self.subTest(vendor=vendor, boosted=boosted, slots=slots):
@@ -307,7 +305,7 @@ class BatchTest(unittest.TestCase):
         boost.write_text(json.dumps({'claude': '2099-01-01T00:00:00+00:00'}))
         now = datetime.now(timezone.utc)
         runner = batch_module.Batch(self.repo, self.source)
-        for five, expected in ((0.5, 3), (0.65, 1), (0.8, 0)):  # claude reserve 25: warning from 60 %, exhausted from 75 %
+        for five, expected in ((0.49, 3), (0.5, 1), (0.65, 1), (0.8, 0)):  # boost pauses from 50 %, exhausted from 75 %
             with self.subTest(five=five):
                 task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
                     'five_hour': {'utilization': five, 'resetsAt': int(now.timestamp() + 5 * 3600)},
@@ -336,7 +334,19 @@ class BatchTest(unittest.TestCase):
             return 'merged'
         with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module.Batch, 'task', execute):
             runner.schedule(tasks)
-        self.assertEqual(state['maximum'], 1)  # boosted for three, held to one by the warning band
+        self.assertEqual(state['maximum'], 1)  # boost paused and warning band limits this vendor to one
+
+    def boost_readings(self):
+        """Both vendors need fresh 5-hour room before a fixture boost can add capacity or models."""
+        now = datetime.now(timezone.utc)
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.2, 'resetsAt': int(now.timestamp() + 7200)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        path = self.home / '.codex/sessions/rollout-boost-fixture.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'timestamp': now.isoformat(), 'payload': {'rate_limits': {
+            'primary': {'used_percent': 20, 'window_minutes': 300, 'resets_at': int(now.timestamp() + 7200)},
+            'secondary': {'used_percent': 30, 'window_minutes': 10080, 'resets_at': int(now.timestamp() + 84 * 3600)}}}}) + '\n')
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
@@ -582,6 +592,7 @@ class BatchTest(unittest.TestCase):
     def test_tier_only_fix_rounds_preserve_routing(self):
         state = self.home / '.local/state/task'
         state.mkdir(parents=True)
+        self.boost_readings()
         for vendor in ('claude', 'codex'):
             for boosted in (False, True):
                 for tier in ('routine', 'hard', 'design'):
