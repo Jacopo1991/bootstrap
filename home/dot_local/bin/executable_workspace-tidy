@@ -65,6 +65,9 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
                           timeout=120, stdin=subprocess.DEVNULL)
 
 
+def admit(): subprocess.run([str(HOME / '.local/bin/task'), 'hold', '--check'], check=True)
+
+
 def repos() -> list[Path]:
     """Main checkouts directly under ~/dev_workspace and ~/cortex."""
     found = []
@@ -301,6 +304,7 @@ def archive_ignored(repo, path, files, report):
         pending.rename(destination)
     except OSError as error:
         if pending:
+            admit()
             shutil.rmtree(pending, ignore_errors=True)
         report.append(f"{repo.name}: kept {path}: cannot archive ignored files: {error}")
         return None
@@ -356,6 +360,7 @@ def tidy_codex_worktree(repo: Path, entry: dict, path: Path, refs: list[str], ap
         if (source.exists() or source.is_symlink()) and not archive_work(repo, path, report):
             return
         # The blocker checked all changes; --force also discards disposable session files.
+        admit()
         result = git(repo, "worktree", "remove", "--force", str(path))
         if result.returncode == 0:
             done.append(f"{repo.name}: removed finished Codex worktree {path} ({label})")
@@ -460,6 +465,7 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
             if ignored and not saved:
                 continue
             # The blocker checked all changes; --force also discards disposable session files.
+            admit()
             result = git(repo, "worktree", "remove", "--force", str(path))
             if result.returncode == 0:
                 kept = f"; archived {len(ignored)} ignored files to {saved}" if saved else ""
@@ -480,6 +486,7 @@ def tidy_repo(repo: Path, apply: bool, now: float, in_use: list[Path], report: l
             report.append(f"{repo.name}: merged branch {short} would be deleted")
             continue
         # Safe: the tip and every commit in the branch's reflog are reachable from a default ref.
+        admit()
         result = git(repo, "branch", "-D", short)
         if result.returncode == 0:
             done.append(f"{repo.name}: deleted merged branch {short}")
@@ -555,9 +562,9 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true",
                         help="remove finished worktrees and merged branches (otherwise report only)")
     args = parser.parse_args()
-    if args.apply and subprocess.run(['task', 'hold', '--check']).returncode: return 1
+    if args.apply: admit()
     now, report, done = time.time(), [], []
-    archive_helpers()['prune_evidence_archive'](HOME / '.local/state/task/archive', args.apply, report)
+    archive_helpers()['prune_evidence_archive'](HOME / '.local/state/task/archive', args.apply, report, admit=admit)
     in_use = paths_in_use()
     seen_codex = set()
     for repo in repos():
@@ -581,4 +588,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try: sys.exit(main())
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f'workspace-tidy: refused: hold: {error}', file=sys.stderr); sys.exit(1)

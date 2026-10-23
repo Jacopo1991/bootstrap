@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from hold_fixture import install_checker
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "home/dot_local/bin/executable_workspace-tidy"
@@ -46,8 +47,9 @@ def age(path: Path):
 def tidy_environment(home):
     bin_dir = home / 'bin'
     bin_dir.mkdir(exist_ok=True)
+    install_checker(home)
     task = bin_dir / 'task'
-    task.write_text('#!/bin/sh\n[ "$*" = "hold --check" ]\n')
+    task.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
     task.chmod(0o755)
     env = dict(os.environ, HOME=str(home), PATH=f"{bin_dir}:{os.environ['PATH']}",
                GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")

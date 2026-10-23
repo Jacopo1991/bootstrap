@@ -126,6 +126,10 @@ def git(repo, *args):
     return result.stdout.strip()
 
 
+def admit():
+    if subprocess.run([str(Path.home() / '.local/bin/task'), 'hold', '--check']).returncode: raise Stop('refused: hold')
+
+
 def blocking(text):
     """Keep recorded blocking evidence, excluding commit hashes and optional notes."""
     section = re.search(r"(?ims)^\s*(?:#{1,6}\s*)?(?:\*\*)?Blocking(?:\*\*)?\s*:?\s*\n"
@@ -205,6 +209,7 @@ class Batch:
                 if self.stopping.is_set():
                     raise Stop("batch is stopping")
                 self.output("+ " + shlex.join(argv))
+                admit()
                 child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, pass_fds=task_lock.descriptors())
             with child:
                 while True:
@@ -564,7 +569,8 @@ def main():
     parser.add_argument("runner_file", type=Path)
     parser.add_argument("--no-pace", action="store_true", help="start without the usage-pacing check (logged)")
     args = parser.parse_args()
-    if subprocess.run(['task', 'hold', '--check']).returncode: return 1
+    try: admit()
+    except (Stop, OSError) as error: print(f'task-batch: {error}', file=sys.stderr); return 1
     repo = Path(args.repo).expanduser()
     if not repo.is_absolute():
         repo = Path.home() / "dev_workspace" / repo

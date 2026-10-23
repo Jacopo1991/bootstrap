@@ -41,11 +41,11 @@ def main():
     parser.add_argument("--port-offset", type=int, default=0)
     parser.add_argument("specs", nargs="+", help="quoted spec globs, relative to project root")
     args = parser.parse_args()
-    if subprocess.run(['task', 'hold', '--check']).returncode: return 1
     server = runner = None
     out = None
     status = 1
     try:
+        admit()
         base = int(os.environ["TASK_GATE_PORT_BASE"])
         if not (0 <= args.port_offset < 200 and 1024 <= base <= 65336):
             raise ValueError("invalid gate port base or offset (0..199)")
@@ -91,6 +91,7 @@ def main():
             "  });\n"
             "});\n" + "\n".join(f"require({json.dumps(p)});" for p in specs) + "\n")
         with (out / "server.log").open("w") as log:
+            admit()
             server = subprocess.Popen(["bash", "-c", args.server], env=env,
                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -112,11 +113,12 @@ def main():
                 if time.monotonic() >= deadline:
                     raise ValueError("server readiness timed out")
                 time.sleep(0.1)
+            admit()
             runner = subprocess.Popen([str(playwright), "test", "--config",
                                        str(out / "playwright.config.cjs")],
                                       env=env, start_new_session=True)
             status = runner.wait()
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"gate-browser: {exc}", file=sys.stderr)
     finally:
         stop(runner)
@@ -127,6 +129,9 @@ def main():
 
 def interrupted(signum, frame):
     raise KeyboardInterrupt
+
+
+def admit(): subprocess.run([str(Path.home() / '.local/bin/task'), 'hold', '--check'], check=True)
 
 
 if __name__ == "__main__":

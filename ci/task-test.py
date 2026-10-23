@@ -410,6 +410,10 @@ class TaskTool(unittest.TestCase):
             ('executable_workspace-tidy', ['--apply']),
             ('executable_gate-browser', ['--server', 'touch launched', '*.spec.cjs']),
         ]
+        shadow = self.home / 'bin/task'
+        shadow.unlink()
+        shadow.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
+        shadow.chmod(0o755)
         marker = self.home / '.local/state/task/hold'
         for path in (HOLD_FIXTURE, marker):
             path.write_text('direct helper hold')
@@ -424,6 +428,7 @@ class TaskTool(unittest.TestCase):
                         self.assertFalse((self.home / 'launched').exists())
                         self.assertFalse((self.home / '.local/state/workspace-tidy').exists())
                         self.assertFalse((self.repo / '.work').exists())
+                        self.assertFalse((self.home / 'hostile-checker-used').exists())
                 # Report-only tidy and the lane browser skip launch nothing.
                 result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin/executable_workspace-tidy')],
                     env=self.env, capture_output=True, text=True, timeout=10)
@@ -431,6 +436,25 @@ class TaskTool(unittest.TestCase):
                 shutil.rmtree(self.home / '.local/state/workspace-tidy')
             finally:
                 path.unlink()
+
+    def test_hold_helpers_refuse_when_absolute_checker_is_missing(self):
+        (self.home / '.local/bin/task').unlink()
+        shadow = self.home / 'bin/task'
+        shadow.unlink()
+        shadow.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
+        shadow.chmod(0o755)
+        helpers = [('executable_task-batch', ['proj', 'missing.md']),
+                   ('executable_workspace-tidy', ['--apply']),
+                   ('executable_gate-browser', ['--server', 'touch launched', '*.spec.cjs'])]
+        for helper, args in helpers:
+            result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin' / helper), *args],
+                cwd=self.home, env=dict(self.env, TASK_GATE_RUN_ID='fixture'),
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(str(self.home / '.local/bin/task'), result.stderr)
+        self.assertFalse((self.home / 'hostile-checker-used').exists())
+        self.assertFalse((self.home / 'launched').exists())
+        self.assertFalse((self.home / '.local/state/workspace-tidy').exists())
 
     def test_hold_pulled_during_gate_slot_wait_prevents_launch(self):
         wt, _ = self.started()
@@ -461,6 +485,80 @@ class TaskTool(unittest.TestCase):
         self.assertFalse((self.home / 'gate-launched').exists())
         self.assertFalse((self.state() / 'check.json').exists())
 
+    def test_hold_pulled_while_lane_worker_waits_on_lane_lock(self):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('Do the task.\n')
+        ready = self.home / 'waiting-lane-lock'
+        script = self.home / 'lane-worker.py'
+        script.write_text(textwrap.dedent(f'''\
+            import fcntl, json, os, pathlib, runpy
+            module = runpy.run_path({str(TOOL)!r})
+            work = pathlib.Path({str(work)!r})
+            (work / 'lane.json').write_text(json.dumps(dict(pid=os.getpid(), state='running')))
+            original = fcntl.flock
+            def flock(stream, flags):
+                if getattr(stream, 'name', '') == str(work / 'lane.lock'):
+                    pathlib.Path({str(ready)!r}).touch()
+                return original(stream, flags)
+            fcntl.flock = flock
+            raise SystemExit(module['main'](['lane', 'proj', '5', '--_worker', '--no-boost']))
+            '''))
+        transcript = self.home / 'waiting-lane.log'
+        with (work / 'lane.lock').open('a') as lock, transcript.open('w') as output:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = subprocess.Popen([sys.executable, str(script)], cwd=wt, env=self.env,
+                                       stdout=output, stderr=subprocess.STDOUT)
+            try:
+                self.wait_runner_file(ready)
+                self.assertIsNone(process.poll())
+                self.raw_task('hold', 'pull', 'hold during lane lock wait')
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(process.wait(timeout=10), 1, transcript.read_text())
+            finally:
+                if process.poll() is None: process.kill(); process.wait()
+        self.assertIn('refused: hold', transcript.read_text())
+        self.assertFalse((work / 'model-call.json').exists())
+        self.assertEqual(json.loads((work / 'lane.json').read_text())['state'], 'refused: hold')
+
+    def test_hold_during_last_merge_gate_step_prevents_all_publication(self):
+        last = self.home / 'last-gate-step.sh'
+        last.write_text(f'#!/bin/sh\n"{self.home}/.local/bin/task" hold pull "last merge gate step" --holder gate\n')
+        task_file = next((self.kb / 'backlog/tasks').iterdir())
+        task_file.write_text(task_file.read_text().replace('Verify: `true`', f'Verify: `bash {last}`'))
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        before = self.git(self.repo, 'rev-parse', 'main')
+        real_git = shutil.which('git')
+        wrapper = self.home / 'bin/git'
+        wrapper.write_text(f'#!/bin/sh\nfor arg do\ncase "$arg" in push|commit-tree) '
+                           f'echo "$arg" >> "{self.home}/publication";; esac\ndone\nexec "{real_git}" "$@"\n')
+        wrapper.chmod(0o755)
+        gh = self.home / 'bin/gh'
+        gh.write_text('#!/bin/sh\ncase "$1 $2" in "pr create"|"pr merge") '
+                      'touch "$HOME/publication";; esac\nexit 0\n')
+        for backend in ('remote', 'github', 'local'):
+            with self.subTest(backend=backend):
+                if backend == 'github':
+                    origin = self.home / 'github-origin.git'
+                    self.git(self.home, 'clone', '-q', '--bare', str(self.origin), str(origin))
+                    self.git(self.repo, 'remote', 'set-url', 'origin', str(origin))
+                elif backend == 'local':
+                    self.git(self.repo, 'remote', 'remove', 'origin')
+                output = self.raw_task('merge', 'proj', '5', code=1)
+                self.assertIn('last merge gate step', output)
+                self.assertIn('PASS', output)
+                self.assertFalse((self.home / 'publication').exists())
+                self.assertEqual(self.git(self.repo, 'rev-parse', 'main'), before)
+                self.assertFalse((self.state() / 'merge.json').exists())
+                gate = json.loads((self.state() / 'gate-check.json').read_text())
+                self.assertEqual(gate['steps'][-1]['command'], ['bash', '-c', f'bash {last}'])
+                self.assertTrue(all(step['exit'] == 0 for step in gate['steps']))
+                if backend != 'local': self.assertEqual(self.git(origin if backend == 'github' else self.origin, 'rev-parse', 'main'), before)
+                (self.home / '.local/state/task/hold').unlink()
+
     def test_hold_before_reviewer_retry_and_usage_fallback_prevents_second_launch(self):
         self.stub_reviewers()
         wt, _ = self.started()
@@ -475,8 +573,27 @@ class TaskTool(unittest.TestCase):
                 self.assertIn('hold before reviewer retry', output)
                 self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
                 self.assertFalse((self.state() / 'review.json').exists())
+                run = json.loads((self.state() / 'review-run.json').read_text())
+                self.assertEqual(run['state'], 'refused: hold')
+                runs = self.home / '.local/state/task/runs.jsonl'
+                self.assertFalse(any(row.get('kind') == 'review' and row['outcome'] == 'interrupted'
+                                     for row in map(json.loads, runs.read_text().splitlines())))
                 if options: self.assertIn('retrying once', output)
                 marker.unlink()
+
+    def test_hold_at_first_reviewer_action_records_refusal_without_a_run(self):
+        wt, _ = self.started()
+        prompt, reply = wt / '.work/review-prompt.md', wt / '.work/review-response.md'
+        prompt.write_text('Review the task.\n')
+        marker = self.home / '.local/state/task/hold'
+        marker.write_text('hold at reviewer admission')
+        with mock.patch.object(TASK_MODULE.subprocess, 'Popen') as launch, \
+                mock.patch.object(TASK_MODULE.task_usage, 'run_log') as usage:
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'refused: hold'):
+                TASK_MODULE.run_reviewer('codex exec -m gpt-6-luna', wt, prompt, reply)
+            launch.assert_not_called()
+            usage.assert_not_called()
+        self.assertEqual(json.loads((wt / '.work/review-run.json').read_text())['state'], 'refused: hold')
 
     def test_hold_between_gate_steps_prevents_second_launch(self):
         task_file = next((self.kb / 'backlog/tasks').iterdir())
@@ -3916,6 +4033,9 @@ store.write_text(json.dumps(prs))
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
         (bin_dir / 'task').symlink_to(TOOL)
+        installed = self.home / '.local/bin/task'
+        installed.parent.mkdir(parents=True)
+        installed.symlink_to(TOOL)
         for name, body in STUBS.items():
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)

@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from unittest import mock
 from policy_test_env import isolate_policy_environment
+from hold_fixture import install_checker
 
 isolate_policy_environment()
 
@@ -31,8 +32,6 @@ STUB = r'''#!/usr/bin/env python3
 import fcntl, json, os, pathlib, subprocess, sys
 from datetime import datetime, timezone
 home = pathlib.Path.home()
-if sys.argv[1:] == ['hold', '--check']:
-    sys.exit(0)
 lock = (home / 'command.lock').open('w')
 try:
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -344,6 +343,7 @@ class BatchTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
+        install_checker(self.home)
         self.repo = self.home / 'dev_workspace/proj'
         self.repo.mkdir(parents=True)
         self.env = dict(HOME=str(self.home), PATH=os.environ['PATH'], TASK_HOLDER='batch-test',

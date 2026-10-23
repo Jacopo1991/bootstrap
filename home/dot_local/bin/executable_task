@@ -126,8 +126,9 @@ def archive_exclusion(item, info, size=None, errors=None, *, hash_files=True):
     return None
 
 
-def prune_evidence_archive(root, apply, report, *, snapshots=None):
+def prune_evidence_archive(root, apply, report, *, snapshots=None, admit=None):
     """Prune archive snapshots, including legacy ones without manifests; never traverse links."""
+    admit = admit or globals()['admit']
     if any(item.is_symlink() for item in (root, *root.parents)) or not root.is_dir():
         return
     entries, _, _ = archive_inventory(root)
@@ -182,8 +183,10 @@ def prune_evidence_archive(root, apply, report, *, snapshots=None):
                 if apply:
                     try:
                         if stat.S_ISDIR(meta.st_mode):
+                            admit()
                             shutil.rmtree(item)
                         else:
+                            admit()
                             item.unlink()
                     except OSError as error:
                         report.append(f"archive: cannot remove {item}: {error}")
@@ -194,6 +197,7 @@ def prune_evidence_archive(root, apply, report, *, snapshots=None):
                 for item, meta in reversed(contents):
                     if stat.S_ISDIR(meta.st_mode) and item != manifest.parent:
                         try:
+                            admit()
                             item.rmdir()
                         except OSError:
                             pass
@@ -1523,9 +1527,14 @@ def detached(args, task, path):
     run_id = secrets.token_hex(16)
     env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive),
                TASK_RUN_ID=run_id)
-    child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
+    try:
+        admit()
+        child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                              close_fds=True)
+    except Stop:
+        lock.unlink(missing_ok=True)
+        atomic_json(run_path, dict(command=args.command, state='refused: hold', ended_at=utc_now())); raise
     atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
                            "task_run_id": run_id,
                            "state": "running", "started_at": started, "ended_at": "",
@@ -1865,6 +1874,7 @@ def lane(args):
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
             with (work / "lane.log").open("wb") as log:
+                admit()
                 child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
                                          pass_fds=task_lock.descriptors(),
                                          stdin=subprocess.DEVNULL, stdout=log,
@@ -1887,7 +1897,7 @@ def lane(args):
             print(f"Started sandboxed {builder} lane (pid {child.pid}); "
                   f"see {work / 'lane.log'} and {final}; track it with `task status`.")
             return 0
-    code = 1
+    code, result = 1, "finished"
     timed_out = False
     temporary = None
     try:
@@ -1909,6 +1919,7 @@ def lane(args):
                     (work / "lane.jsonl").open("wb") if builder == "claude" else contextlib.nullcontext() as raw:
                 # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
                 stream = task_usage.ClaudeStream(HOME) if raw else None
+                admit()
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          pass_fds=task_lock.descriptors(),
                                          stdout=subprocess.PIPE if output else None)
@@ -1944,10 +1955,12 @@ def lane(args):
                     timed_out = True
                     finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
+    except Stop:
+        result = "refused: hold"; raise
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        finalize_lane_record(lane_record, run, "timed_out" if timed_out else "finished",
+        finalize_lane_record(lane_record, run, "timed_out" if timed_out else result,
                              exit_code=None if timed_out else code)
     return code
 
@@ -2072,6 +2085,7 @@ def prepare_environment(repo: Path, path: Path):
                       "--no-deps", "-e", str(path)]]
             for number, step in enumerate(steps):
                 try:
+                    admit()
                     result = subprocess.run(step, cwd=path, capture_output=True, text=True)
                 except FileNotFoundError:
                     print("warning: uv is not installed; the worktree has no .venv.")
@@ -2327,6 +2341,8 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
+    def admit(): subprocess.run([str(pathlib.Path.home() / '.local/bin/task'), 'hold', '--check'], check=True)
+    admit()
     child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL, pass_fds=task_lock.descriptors())
     code = child.wait()
 finally:
@@ -2403,6 +2419,7 @@ def runner_start(args):
               '--setenv=TASK_HOLDER=' + holder,
               *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
+        admit()
         result = subprocess.run(launch, capture_output=True, text=True)
     except FileNotFoundError:
         result = None
@@ -2411,8 +2428,8 @@ def runner_start(args):
         # A failed launch can race another caller; never duplicate an active service.
         if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
             raise Stop(f'{unit} is already active.')
-        refuse_hold()
         with log.open('a') as output:
+            admit()
             process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                        pass_fds=task_lock.descriptors(),
                                        start_new_session=True, env={**os.environ, "TASK_HOLDER": holder, **({"TASK_NO_PACE": "1"} if args.no_pace else {})})
@@ -2788,7 +2805,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
-                refuse_hold()
+                admit()
                 process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
                                            pass_fds=task_lock.descriptors(),
                                            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -2981,12 +2998,14 @@ def update_local_default(repo, default, commit, *, allow_plan_changes=False):
         if f"branch refs/heads/{default}" in lines:
             holder = path
     if holder is None:
+        admit()
         result = run_git(repo, "update-ref", f"refs/heads/{default}", commit, old or "")
         return f"local {default} updated" if result.returncode == 0 else \
             f"local {default} not updated: {result.stderr.strip()}"
     dirty = knowledge_checkout_dirty(holder) if allow_plan_changes else git(holder, "status", "--porcelain")
     if dirty:
         return f"local {default} not updated in {holder}: it has uncommitted changes"
+    admit()
     result = run_git(holder, "merge", "-q", "--ff-only", commit)
     if result.returncode:
         return f"local {default} not updated in {holder}: {result.stderr.strip()}"
@@ -3019,6 +3038,7 @@ def sync_dependencies_after_merge(repo: Path, old_head: str, new_head: str, upda
         return
     if recipe and recipe.returncode == 0:
         try:
+            admit()
             result = subprocess.run(["just", "sync"], cwd=repo, capture_output=True,
                                     text=True, timeout=timeout_for(repo))
         except (FileNotFoundError, subprocess.TimeoutExpired) as error:
@@ -3204,7 +3224,6 @@ def parse_review_reply(text, criteria):
 
 
 def run_reviewer(command, path, prompt_file, reply_file):
-    refuse_hold()
     try:
         timeout = int(os.environ.get("TASK_REVIEW_TIMEOUT", "900"))
     except ValueError:
@@ -3218,17 +3237,19 @@ def run_reviewer(command, path, prompt_file, reply_file):
         argv.pop(0)
     run_file = reply_file.with_name("review-run.json")
     stderr_file = reply_file.with_name("review-stderr.log")
-    run = {"builder": argv[0], "state": "running", "exit_code": None}
-    usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
-    atomic_json(run_file, run)
+    run = {"builder": argv[0], "state": "refused: hold", "exit_code": None}
+    usage_run = None
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
-            refuse_hold()
+            admit()
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
                                        pass_fds=task_lock.descriptors(),
                                        stderr=errors, start_new_session=True)
+            run["state"] = "running"
+            usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
+            atomic_json(run_file, run)
             task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
                 code = process.wait(timeout=timeout)
@@ -3249,7 +3270,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
-        task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
+        if usage_run: task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
@@ -3631,6 +3652,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
     exclude(repo, ".worktrees/")
     git(repo, "worktree", "add", "-q", "--detach", str(gate), base)
     try:
+        admit()
         result = run_git(gate, "merge", "--no-edit", "--no-ff", lane_head)
         if result.returncode:
             conflicts = git(gate, "diff", "--name-only", "--diff-filter=U").splitlines()
@@ -3749,9 +3771,11 @@ def merge(args):
                 continue
             if on_github(repo):
                 task_lock.verify(HOME, repo)
+                admit()
                 git(repo, "push", "-q", "origin", f"{lane_head}:refs/heads/{branch}")
                 pr = open_pr(repo, branch)
                 if not pr:
+                    admit()
                     gh(repo, "pr", "create", "--head", branch, "--base", default,
                        "--title", f"{task.id}{title}" if task.title else task.id,
                        "--body", (path / ".work/report.md").read_text())
@@ -3765,6 +3789,7 @@ def merge(args):
                     print(f"{label} moved before PR merge; re-gating against the new tip.")
                     continue
                 task_lock.verify(HOME, repo)
+                admit()
                 gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", lane_head)
                 completed_step(task, "published")
                 try:
@@ -3788,10 +3813,12 @@ def merge(args):
                 print(f"Merged PR #{pr} ({pr_merge_commit[:7]}) from reviewed head {lane_head[:7]}.")
             else:
                 task_lock.verify(HOME, repo)
+                admit()
                 commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
                              "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
                 if has_origin(repo):
                     task_lock.verify(HOME, repo)
+                    admit()
                     pushed = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
                     if pushed.returncode:
                         fetch(repo)
@@ -3885,6 +3912,7 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
     command = ["backlog", "task", "edit", task.id, "-s", status, "--final-summary", summary]
     for number in criteria:
         command += ["--check-ac", number]
+    admit()
     result = subprocess.run(command, cwd=kb, capture_output=True, text=True)
     if result.returncode:
         raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
@@ -4074,6 +4102,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         head = sha(path, "HEAD")
 
     kept = f" Close worktree kept at {path} for the resume."
+    admit()
     pushed = run_git(path, "push", "-q", "-u", "origin", branch)
     if pushed.returncode:
         raise Stop(f"Close branch {branch} at {head[:7]} remains locally at {path}; push failed: {pushed.stderr.strip()}. Rerun `task close` to resume.")
@@ -4085,6 +4114,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
     existing = close_pr(repo, branch)
     if not existing:
         try:
+            admit()
             gh(repo, "pr", "create", "--head", branch, "--base", default,
                "--title", f"Close {task.id}: {task.title}", "--body", summary)
         except Stop as error:
@@ -4096,6 +4126,7 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         print(f"Opened close PR #{existing['number']}.")
     pr = str(existing["number"])
     try:
+        admit()
         gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
     except Stop as error:
         raise Stop(f"Close PR #{pr} for branch {branch} at {head[:7]} remains open; merge failed: {error}. Rerun `task close` to resume.{kept}")
@@ -4961,7 +4992,6 @@ def gate_drill(args):
         try:
             if interrupted:
                 raise Stop("Drill interrupted.")
-            refuse_hold()
             return measure(prepare(repo, index, phase), index, phase)
         except (Stop, OSError) as error:
             return {"result": "failed", "duration": 0, "error": str(error)}
@@ -5046,42 +5076,38 @@ def hold_status():
     held = []
     for path, release in ((JACOPO_HOLD, 'Jacopo: sudo agent-hold release'),
                           (HOME / '.local/state/task/hold', 'task hold release')):
-        try:
-            mode = path.lstat().st_mode
-        except FileNotFoundError:
-            continue
-        except OSError as error:
-            detail = f'cannot inspect: {error}'
+        try: mode = path.lstat().st_mode
+        except FileNotFoundError: continue
+        except OSError as error: detail = f'cannot inspect: {error}'
         else:
             try:
                 if not stat.S_ISREG(mode): raise OSError('not a regular file')
                 with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
                     if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise OSError('not a regular file')
                     detail = stream.read().strip()
-            except (OSError, UnicodeError) as error:
-                detail = f'cannot read: {error}'
+            except (OSError, UnicodeError) as error: detail = f'cannot read: {error}'
         held.append(f'{path}: held (drain) {detail}\nRelease: {release}')
     return '\n'.join(held)
 
 
-def refuse_hold():
-    if held := hold_status(): raise Stop(held)
+def admit():
+    if held := hold_status():
+        if ACTIVE_FOREGROUND_TASK:
+            path = run_record_path(ACTIVE_FOREGROUND_TASK)
+            atomic_json(path, read_json_object(path) | dict(state='refused: hold', ended_at=utc_now()))
+        raise Stop('refused: hold\n' + held)
 
 
 def hold(args):
     path = HOME / '.local/state/task/hold'
-    if args.check: refuse_hold(); return 0
-    try:
-        if args.action:
-            holder = (args.holder or os.environ.get('TASK_HOLDER', '')).strip()
-            if not holder: raise Stop('Set TASK_HOLDER or pass --holder <name>')
-        if args.action == 'pull':
-            if not args.reason: raise Stop('task hold pull requires a reason')
-            atomic_json(path, dict(mode='drain', who=holder, why=args.reason, when=utc_now()))
-        elif args.action == 'release':
-            path.unlink(missing_ok=True)
-    except OSError as error:
-        raise Stop(f'{path}: {error}') from error
+    if args.check: admit(); return 0
+    if args.action:
+        holder = (args.holder or os.environ.get('TASK_HOLDER', '')).strip()
+        if not holder: raise Stop('Set TASK_HOLDER or pass --holder <name>')
+    if args.action == 'pull':
+        if not args.reason: raise Stop('task hold pull requires a reason')
+        atomic_json(path, dict(mode='drain', who=holder, why=args.reason, when=utc_now()))
+    elif args.action == 'release': path.unlink(missing_ok=True)
     print(hold_status() or 'no hold')
 
 
@@ -5188,10 +5214,8 @@ def main(argv=None):
     sub.add_argument("--repo")
     args = parser.parse_args(argv)
     if args.command in HOLD_WORK_COMMANDS or args.command == 'review' and args.run or args.command == 'plan' and args.sign:
-        held = hold_status()
-        if held:
-            print(f'task {args.command}: {held}', file=sys.stderr)
-            return 1
+        try: admit()
+        except Stop as error: print(f'task {args.command}: {error}', file=sys.stderr); return 1
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
     global GATE_LOCK_WAIT
@@ -5279,7 +5303,7 @@ def main(argv=None):
     except SystemExit as stop:
         finish_detached(stop.code or 0)
         raise
-    except (Stop, RoutingParseError, task_lock.LockBusy) as stop:
+    except (Stop, RoutingParseError, task_lock.LockBusy, OSError) as stop:
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1

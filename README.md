@@ -726,11 +726,14 @@ the filesystem and sandbox provide the write boundary.
 Existence holds work; the text is for people. Unreadable or nonregular markers also hold work.
 
 The only mode is drain: a step already launched finishes; nothing new launches, including
-retries and fallbacks. New work-changing `task` commands refuse, with fresh checks after
-gate-slot waits, before reviewer launches and between drill phases.
+retries and fallbacks. Each builder, reviewer, gate step, runner and publication action
+checks admission immediately before starting, after any lock or slot wait. A hold pulled
+during the last gate step prevents publication. Workspace-tidy checks before every deletion;
+gate-browser checks before launching its server and again before Playwright.
 Runner units and workspace-tidy use `ExecCondition=` with the installed `task hold --check`:
 it needs no holder and succeeds only when both markers are absent and inspectable.
-Direct task-batch, gate-browser launches and workspace-tidy --apply check it at entry too;
+Direct task-batch, gate-browser launches and workspace-tidy --apply call the installed
+`~/.local/bin/task hold --check` by absolute path; a missing checker refuses work.
 workspace-tidy pauses because it deletes worktrees and branches.
 Checks (attached or detached) run gates, and repair changes work state, so both refuse.
 Status, usage, boost, lock display and hold inspection remain available.
