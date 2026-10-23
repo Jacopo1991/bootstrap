@@ -532,21 +532,25 @@ class TaskTool(unittest.TestCase):
             pending = self.home / '.local/state/task/pending-runs'
             self.assertEqual(len(list(pending.glob('*.json'))), 1)
             api.task_usage.run_log(self.home, first, 'finished')
-            self.assertEqual(api.budget_run(**fields)['id'], first['id'])
+            retry = api.budget_run(**fields)
+            self.assertNotEqual(retry['id'], first['id'])
+            api.task_usage.run_log(self.home, retry, 'finished')
             for number in (2, 3):
                 run = api.budget_run(**dict(fields, commit=f'head-{number}'))
                 api.task_usage.run_log(self.home, run, 'finished')
-            self.assertEqual(len(self.run_rows()), 3)
+            self.assertEqual(len(self.run_rows()), 4)
             with self.assertRaisesRegex(api.Stop, 'codex points exhausted'):
                 api.budget_run(**dict(fields, commit='head-4'))
-            self.assertEqual(api.budget_run(**fields)['id'], first['id'], 'duplicate stays free at the limit')
+            retry = api.budget_run(**fields)
+            api.task_usage.run_log(self.home, retry, 'finished')
+            self.assertEqual(len({r['id'] for r in self.run_rows()}), 5, 'every invocation keeps its own outcome')
             before = {p: p.read_bytes() for p in (self.home / '.local/state/task').rglob('*') if p.is_file()}
             self.assertIn('codex used 3 left 0', api.plan_budget('chain'))
             self.raw_task('plan-budget', 'chain')
             self.raw_task('usage', '--weekly-line')
             self.raw_task('status', 'proj')
             self.assertEqual(before, {p: p.read_bytes() for p in (self.home / '.local/state/task').rglob('*') if p.is_file()})
-            self.assertEqual(len(self.run_rows()), 3, 'reporting never adds draws or refills')
+            self.assertEqual(len(self.run_rows()), 5, 'reporting never adds draws or refills')
 
     def test_plan_budget_pending_vendor_kind_scope_and_expiry(self):
         plan = self.budget_fixture(points=1, allowed={'proj': ['T-5']})
@@ -624,7 +628,7 @@ class TaskTool(unittest.TestCase):
         self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
         self.raw_task('lane', 'proj', '5', '--plan', 'chain')
         self.wait_for_lane(wt)
-        self.assertEqual(len(self.run_rows()), 2, 'completed start and same-commit lane stay free at the limit')
+        self.assertEqual(len(self.run_rows()), 4, 'completed start and same-commit lane keep separate free attempts')
         self.commit_in(wt, 'b.txt')
         self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
         self.raw_task('check', 'proj', '5')
@@ -686,7 +690,8 @@ class TaskTool(unittest.TestCase):
         rows = self.run_rows()
         self.assertEqual([r['outcome'] for r in rows], ['failed'])
         self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
-        self.assertEqual(self.run_rows(), rows)
+        self.assertEqual([r['outcome'] for r in self.run_rows()], ['failed', 'finished'])
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
     def test_plan_budget_lane_and_review_keys_follow_commits(self):
         wt, _ = self.started()
@@ -701,8 +706,8 @@ class TaskTool(unittest.TestCase):
             for _ in range(2):
                 self.raw_task('lane', 'proj', '5', '--plan', 'chain')
                 self.wait_for_lane(wt)
-            self.assertEqual(len(self.run_rows()), number + 1)
-        self.assertEqual([r['commit'] for r in self.run_rows()], heads)
+            self.assertEqual(len(self.run_rows()), 2 * (number + 1))
+        self.assertEqual([r['commit'] for r in self.run_rows()], [h for h in heads for _ in range(2)])
         self.stub_reviewers()
         review_heads = []
         for number in range(2):
@@ -716,8 +721,8 @@ class TaskTool(unittest.TestCase):
                 self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
                               env=dict(self.env, REVIEW_STUB_REPLY=reply))
             rows = [r for r in self.run_rows() if r['kind'] == 'review']
-            self.assertEqual(len(rows), number + 1)
-        self.assertEqual([r['commit'] for r in rows], review_heads)
+            self.assertEqual(len(rows), 2 * (number + 1))
+        self.assertEqual([r['commit'] for r in rows], [h for h in review_heads for _ in range(2)])
         self.assertIn('codex used 2 left 0', self.raw_task('plan-budget', 'chain'))
         self.assertIn('claude used 2 left 0', self.raw_task('plan-budget', 'chain'))
 
@@ -735,10 +740,245 @@ class TaskTool(unittest.TestCase):
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
         self.assertEqual(json.loads((self.state() / 'review.json').read_text())['reviewer'], 'codex')
         rows = self.run_rows()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0]['kind'], rows[0]['commit'], rows[0]['vendor']), ('review', head, 'claude'))
-        self.assertIn('claude used 1 left 0', self.raw_task('plan-budget', 'chain'))
-        self.assertIn('codex used 0 left 1', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual([(r['kind'], r['commit'], r['vendor'], r['outcome']) for r in rows],
+                         [('review', head, 'claude', 'failed'), ('review', head, 'codex', 'finished')])
+        self.assertNotEqual(rows[0]['id'], rows[1]['id'])
+        self.assertEqual(rows[1]['replaces'], rows[0]['id'])
+        self.assertIn('claude used 0 left 1', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_same_commit_failures_are_separate_attempts_and_trip_breaker(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        for _ in range(2):
+            self.raw_task('lane', 'proj', '5', '--plan', 'chain',
+                          env=dict(self.env, LANE_STUB_EXIT='1'))
+            self.assertEqual(self.wait_for_lane(wt)['exit_code'], 1)
+        rows = self.run_rows()
+        self.assertEqual([r['outcome'] for r in rows], ['failed', 'failed'])
+        self.assertEqual(len({r['id'] for r in rows}), 2)
+        self.assertEqual(len({r['commit'] for r in rows}), 1)
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('lane disabled', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
+        self.assertEqual(self.run_rows(), rows)
+        self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+
+    def test_plan_budget_cancelled_attempts_keep_outcomes_and_trip_breaker(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        release = self.home / 'release-cancelled-model'
+        self.addCleanup(release.touch)
+        for _ in range(2):
+            (wt / '.work/model-call.json').unlink(missing_ok=True)
+            self.raw_task('lane', 'proj', '5', '--plan', 'chain', env=dict(self.env, LANE_STUB_RELEASE=str(release)))
+            self.wait_for_lane(wt, finished=False)
+            run = json.loads((wt / '.work/lane.json').read_text())['usage_run']
+            reservation = self.home / '.local/state/task/pending-runs' / (run['id'] + '.json')
+            self.assertTrue(json.loads(reservation.read_text())['invoked'])
+            self.raw_task('cancel', 'proj', '5')
+            self.wait_project_lock_free()
+        rows = self.run_rows()
+        self.assertEqual([r['outcome'] for r in rows], ['interrupted', 'interrupted'])
+        self.assertEqual(len({r['id'] for r in rows}), 2)
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('lane disabled', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
+        self.assertEqual(self.run_rows(), rows)
+
+    def test_plan_budget_vendor_change_requires_and_charges_executing_vendor(self):
+        wt, _ = self.started()
+        plan = self.budget_fixture(points=1)
+        plan.write_text(plan.read_text().replace('codex = 1', 'codex = 0'))
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--plan', 'chain')
+        self.wait_for_lane(wt)
+        self.assertIn('codex points exhausted', self.raw_task('lane', 'proj', '5', '--builder', 'codex', '--plan', 'chain', code=1))
+        self.assertEqual(len(self.run_rows()), 1)
+        self.budget_fixture(points=1)
+        for _ in range(2):
+            self.raw_task('lane', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+            self.wait_for_lane(wt)
+        self.assertEqual([r['vendor'] for r in self.run_rows()], ['claude', 'codex', 'codex'])
+        self.assertIn('claude used 1 left 0; codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_fallback_refused_for_zero_points_keeps_primary_charge(self):
+        wt, _ = self.started()
+        plan = self.budget_fixture(points=1)
+        plan.write_text(plan.read_text().replace('codex = 1', 'codex = 0'))
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        self.assertIn('codex points exhausted', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1,
+                      env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit", REVIEW_STUB_FIRST_EXIT='2')))
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual([(r['vendor'], r['outcome']) for r in self.run_rows()], [('claude', 'failed')])
+        self.assertIn('claude used 1 left 0; codex used 0 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_start_binding_inherits_and_rejects_cli_and_environment_conflicts(self):
+        self.budget_fixture(points=10)
+        output = self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        wt = self.repo / '.worktrees/t5'
+        self.assertIn('task lane proj T-5`', output)
+        record = json.loads((self.state() / 'task.json').read_text())
+        self.assertEqual(record['plan'], 'chain')
+        self.assertEqual(record['revision'], TASK_MODULE.record_revision(record))
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5')  # another shell, with no TASK_PLAN
+        self.wait_for_lane(wt)
+        self.raw_task('check', 'proj', '5')
+        self.stub_reviewers()
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        runner = self.runner_fixture()
+        runner.write_text('1. 5: builder codex, model gpt-6-luna\n')
+        self.raw_task('runner-start', 'proj', str(runner))
+        self.wait_project_lock_free()
+        self.assertIn('--setenv=TASK_PLAN=chain', json.loads((self.home / 'service-args').read_text()))
+        self.assertEqual([r['plan'] for r in self.run_rows()], ['chain'] * 3)
+        rows = self.run_rows()
+        commands = [('start', 'proj', '5', '--builder', 'codex'), ('lane', 'proj', '5'),
+                    ('review', 'proj', '5', '--run'), ('runner-start', 'proj', str(runner))]
+        for command in commands:
+            for extra, env in ((('--plan', 'other'), self.env), ((), dict(self.env, TASK_PLAN='other')),
+                               (('--plan', 'chain'), dict(self.env, TASK_PLAN='other'))):
+                with self.subTest(command=command, extra=extra):
+                    self.assertIn('Conflicting plan', self.raw_task(*command, *extra, env=env, code=1))
+                    self.assertEqual(self.run_rows(), rows)
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
+
+    def test_plan_budget_lane_rechecks_expiry_scope_and_breaker_at_model_spawn(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        worker = self.home / 'delayed-worker.py'
+        launcher = self.home / 'delayed-launch.py'
+        launcher.write_text(textwrap.dedent(f'''\
+            import runpy, subprocess, sys
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            original = subprocess.Popen
+            def spawn(argv, *args, **kwargs):
+                if '--_worker' in argv: argv = [sys.executable, {str(worker)!r}, *argv[2:]]
+                return original(argv, *args, **kwargs)
+            with mock.patch.object(subprocess, 'Popen', side_effect=spawn):
+                sys.exit(api['main'](['lane', 'proj', '5', '--plan', 'chain', '--no-pace', '--no-boost']))
+        '''))
+        for rule in ('expired', 'outside allowed', 'lane disabled'):
+            with self.subTest(rule=rule):
+                plan = self.budget_fixture(points=10)
+                log = self.home / '.local/state/task/runs.jsonl'
+                log.unlink(missing_ok=True)
+                for pending in log.parent.glob('pending-runs/*.json'): pending.unlink()
+                mutation = {
+                    'expired': 'plan.write_text(plan.read_text().replace(\'expires = "\', \'expires = "2000-01-01T00:00:00Z" # \'))',
+                    'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
+                    'lane disabled': "\n".join([
+                        "for number in range(2):",
+                        "    run = api['budget_run'](repo='proj', task='seed-' + str(number), kind='lane', vendor='codex')",
+                        "    api['task_usage'].run_log(api['HOME'], run, 'failed')",
+                    ]),
+                }[rule]
+                worker.write_text(textwrap.dedent(f'''\
+                    import runpy, sys
+                    from pathlib import Path
+                    from unittest import mock
+                    api = runpy.run_path({str(TOOL)!r})
+                    original = api['lane_environment']
+                    plan = Path({str(plan)!r})
+                    def delayed(*args):
+                        environment = original(*args)
+                ''') + textwrap.indent(mutation, '    ') + '\n    return environment\n' +
+                    "with mock.patch.dict(api['lane'].__globals__, lane_environment=delayed):\n    sys.exit(api['main'](sys.argv[1:]))\n")
+                result = subprocess.run([sys.executable, str(launcher)], env=self.env, cwd=self.home, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                run = self.wait_for_lane(wt)
+                self.wait_project_lock_free()
+                self.assertIn(rule, (wt / '.work/lane.log').read_text())
+                self.assertFalse((wt / '.work/model-call.json').exists())
+                self.assertFalse(run['usage_run'].get('invoked', False))
+                self.assertEqual(len(self.run_rows()), 2 if rule == 'lane disabled' else 0)
+                pending = list(log.parent.glob('pending-runs/*.json'))
+                self.assertEqual(len(pending), 1, 'refusal preserves the existing reservation without a new attempt')
+                self.assertFalse(json.loads(pending[0].read_text()).get('invoked', False))
+
+    def test_plan_budget_review_rechecks_reservation_before_spawn(self):
+        wt, _ = self.started()
+        plan = self.budget_fixture(points=1)
+        self.stub_reviewers()
+        prompt = self.state() / 'review-prompt.md'
+        prompt.write_text('review')
+        reply = self.state() / 'review-response.md'
+        with self.budget_environment() as api:
+            original = api.atomic_json
+            def delayed(path, data):
+                original(path, data)
+                if path.name == 'review-run.json':
+                    plan.write_text(plan.read_text().replace('expires = "', 'expires = "2000-01-01T00:00:00Z" # '))
+            with mock.patch.object(api, 'atomic_json', side_effect=delayed):
+                with self.assertRaisesRegex(api.Stop, 'expired'):
+                    api.run_reviewer('claude -p --model haiku', wt, prompt, reply)
+        self.assertFalse((wt / '.work/reviewer-call.json').exists())
+        self.assertEqual(self.run_rows(), [])
+        pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(json.loads(pending[0].read_text()).get('invoked', False))
+
+    def test_plan_budget_concurrent_reviews_cannot_share_files_or_reservation(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        first = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run', '--plan', 'chain'],
+                                 env=dict(self.env, REVIEW_STUB_REPLY=reply, REVIEW_STUB_DELAY='1'),
+                                 cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_runner_file(wt / '.work/reviewer-call.json')
+            before = {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()}
+            self.assertIn('Review already running', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1))
+            self.assertEqual(before, {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()})
+            output, errors = first.communicate(timeout=10)
+            self.assertEqual(first.returncode, 0, output + errors)
+        finally:
+            if first.poll() is None: first.kill(); first.communicate()
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual(len(self.run_rows()), 1)
+
+    def test_plan_budget_file_points_and_lifetime_bounds(self):
+        now = datetime.now(timezone.utc)
+        class Clock(datetime):
+            @staticmethod
+            def now(tz): return now
+        path = self.budget_fixture(points=200, expires=(now + timedelta(days=31)).isoformat())
+        valid = path.read_text()
+        state = self.home / '.local/state/task'
+        before = {p: p.read_bytes() for p in state.rglob('*') if p.is_file()}
+        with self.budget_environment() as api, mock.patch.object(api, 'datetime', Clock):
+            self.assertIn('codex used 0 left 200', api.plan_budget('chain'))
+            path.write_text(valid + '#' * (16384 - len(valid.encode())))
+            self.assertIn('left 200', api.plan_budget('chain'))
+            for invalid, message in (
+                (path.read_text() + '#', '16 KiB'),
+                (valid.replace('codex = 200', 'codex = 201'), 'between 0 and 200'),
+                (valid.replace((now + timedelta(days=31)).isoformat(), (now + timedelta(days=31, seconds=1)).isoformat()), '31 days'),
+                (f'created = "{(now - timedelta(seconds=1)).isoformat()}"\n' + valid, '31 days'),
+                ('created = "bad"\n' + valid, '31 days'),
+            ):
+                with self.subTest(message=message):
+                    path.write_text(invalid)
+                    with self.assertRaisesRegex(api.Stop, message): api.plan_budget('chain')
+                    with self.assertRaisesRegex(api.Stop, message):
+                        api.budget_run(repo='proj', task='docs', kind='lane', vendor='codex')
+            path.write_text(f'created = "{now.isoformat()}"\n' + valid)
+            self.assertIn('left 200', api.plan_budget('chain'))
+        self.assertEqual(before, {p: p.read_bytes() for p in state.rglob('*') if p.is_file()})
 
     def test_plan_budget_manual_review_prompt_and_record_never_carry_plan(self):
         wt, _ = self.started()
@@ -761,10 +1001,8 @@ class TaskTool(unittest.TestCase):
         self.assertIn('claude used 0 left 0', self.raw_task('plan-budget', 'chain'))
         self.assertEqual(list(pending[0].parent.glob('*.json')), [])
 
-    def test_plan_budget_no_plan_start_and_lane_match_main(self):
-        # Run main and this build through the same probes, using only this temporary HOME.
-        baseline = self.home / 'main-task'
-        baseline.write_text(self.git(ROOT, 'show', 'main:home/dot_local/bin/executable_task'))
+    def test_plan_budget_no_plan_start_and_lane_match_fixed_traces(self):
+        # Fixed main traces keep this regression check effective after merge.
         wt, _ = self.started()
         self.stub_models()
         probe = self.home / 'no-plan-probe.py'
@@ -806,7 +1044,7 @@ class TaskTool(unittest.TestCase):
                 Path({str(self.home / 'events.json')!r}).write_text(json.dumps(events))
         '''))
         traces = {}
-        for source, tool in (('main', baseline), ('build', TOOL)):
+        for source, tool in (('build', TOOL),):
             for mode in ('start', 'success', 'crash', 'guard'):
                 if mode == 'start':
                     command = ['start', 'proj', f'no-plan-{source}', '--builder', 'codex']
@@ -832,8 +1070,14 @@ class TaskTool(unittest.TestCase):
                     record['tier'] = 'routine'
                     record['revision'] = TASK_MODULE.record_revision(record)
                     (self.state() / 'task.json').write_text(json.dumps(record))
-        for mode in ('start', 'success', 'crash', 'guard'):
-            self.assertEqual(traces['build', mode], traces['main', mode], mode)
+        expected = {
+            'start': ['check_plan', 'seed_worktree', 'prepare_environment', 'refresh_context'],
+            'success': ['refresh_context', 'guards', 'tier_guard', 'override', 'guards', 'archive_lane_final', 'spawn', 'run_log'],
+            'crash': ['refresh_context', 'guards', 'tier_guard', 'override', 'guards', 'archive_lane_final', 'spawn'],
+            'guard': ['refresh_context', 'guards', 'tier_guard', 'override', 'guards'],
+        }
+        for mode, expected_trace in expected.items():
+            self.assertEqual(traces['build', mode], expected_trace, mode)
         success = traces['build', 'success']
         self.assertLess(success.index('override'), success.index('archive_lane_final'))
         self.assertLess(success.index('archive_lane_final'), success.index('spawn'))
@@ -876,10 +1120,12 @@ class TaskTool(unittest.TestCase):
             fields = dict(repo='proj', task='docs', kind='lane', vendor='codex', commit='first')
             run = api.budget_run(**fields)
             api.task_usage.run_log(self.home, run, 'finished')
-            self.assertEqual(api.budget_run(**fields)['id'], run['id'])
+            retry = api.budget_run(**fields)
+            self.assertNotEqual(retry['id'], run['id'])
+            api.task_usage.run_log(self.home, retry, 'finished')
             with self.assertRaisesRegex(api.Stop, 'points exhausted'):
                 api.budget_run(**dict(fields, commit='second'))
-            self.assertEqual(len(self.run_rows()), 1)
+            self.assertEqual(len(self.run_rows()), 2)
 
     def test_plan_budget_runner_launch_and_inheritance(self):
         wt, _ = self.started()
