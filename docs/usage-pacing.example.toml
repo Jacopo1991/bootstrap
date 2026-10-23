@@ -15,8 +15,11 @@ ahead_margin = 10
 under_use_percent = 60
 under_use_hours = 36
 
+# Boost pauses at or above this 5-hour used percent, or with missing/stale readings.
+boost_five_hour_max = 50
+
 # Pre-approved research the PM may spend left-over allowance on (third in line after stronger
-# models on queued work and deeper other-vendor reviews). `task` never creates tasks from it.
+# models on queued work and deeper hard/final other-vendor reviews). `task` never creates tasks from it.
 research_backlog = []
 
 # Percent of the weekly allowance kept for Jacopo's own use. Automated lanes and reviews stop

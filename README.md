@@ -524,8 +524,9 @@ text is refused. Each use is appended to
 these models, override or not.
 `--no-boost` disables boosted tier
 routing, while Codex hard remains gpt-6.1-sol.
-The launch notice explains the decision. Reviews keep their usual cheap models
-and usage-limit handling regardless of boost.
+The launch notice explains the decision. In boost, hard-tier reviews and rounds explicitly
+marked with `task review <repo> <id> --run --final` use Claude opus or Codex gpt-6.1-sol.
+Other reviews keep their usual cheap models; no round is inferred to be final.
 Usage limits retry once on the other reviewer vendor and record its actual
 identity. If that fallback uses the builder's vendor, the batch stops for an
 independent review; the merge gate still requires the other vendor.
@@ -568,7 +569,14 @@ so `task runner-start` too) apply the verdict:
 | `on`, `under`, unknown | unchanged (unknown prints a warning) |
 | `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna) even when `--model` names another one (only `--no-pace`, logged, keeps it); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
 | `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
-| `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+| `under-used-near-reset` | spend before the reset: when the 5-hour reading permits boost, `task boost` for that vendor is switched on until its weekly reset (stronger models by tier and extra capacity for already queued work, logged). Hard-tier reviews and explicit `--final` rounds use the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+
+Manual and automatic boosts pause per vendor at or above `boost_five_hour_max` (default 50 %).
+A missing 5-hour reading or one older than 45 minutes also pauses boost, including when Codex
+has no 5-hour window in its readings. Normal routing and capacity apply, and no new automatic
+boost starts. `task usage` and `task status` explain a saved boost's pause. Its expiry stays saved,
+so a fresh reading below the threshold resumes it automatically until that expiry. `--no-pace`
+does not bypass this boost limit.
 
 The 5-hour window is a second pace input per vendor with the same reserves (it ignores spare resets,
 which only refill the weekly window). The reserve shrinks with the time left in the window: reserve ×
@@ -617,7 +625,7 @@ The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
 A missing file or key means the built-in defaults; an invalid file is reported and the defaults apply.
 [`docs/usage-pacing.example.toml`](docs/usage-pacing.example.toml) shows every key at its default:
 `[reserve]` (claude 25, codex 10), `[spare_resets]` (claude 0, codex 1), `priority`, `ahead_margin` (10),
-`under_use_percent` (60), `under_use_hours` (36) and `research_backlog`.
+`under_use_percent` (60), `under_use_hours` (36), `boost_five_hour_max` (50, percent 0–100) and `research_backlog`.
 
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and

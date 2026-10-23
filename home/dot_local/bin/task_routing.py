@@ -2,6 +2,7 @@
 import json
 import re
 from datetime import date, datetime, timezone
+from task_usage import boost_pauses
 
 TIERS = ("routine", "hard", "design")
 ROUTING = {
@@ -57,7 +58,7 @@ def policy(home):
     return result, extra
 
 
-def active(home):
+def active(home, paused=None):
     path = home / ".local/state/task/boost.json"
     try:
         values = json.loads(path.read_text())
@@ -73,6 +74,11 @@ def active(home):
                 result[vendor] = until
         except (ValueError, AttributeError):
             pass
+    for vendor, reason in boost_pauses(home).items() if result else ():
+        if vendor in result:
+            del result[vendor]
+            if paused is not None:
+                paused[vendor] = reason
     return result
 
 

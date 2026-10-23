@@ -24,7 +24,8 @@ FIVE_BAND = 15  # points below the 5-hour limit where only one lane or review ma
 STALE = timedelta(minutes=45)
 DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0, "codex": 1},
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
-            "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": []}
+            "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
+            "boost_five_hour_max": 50}
 
 
 def _json(path):
@@ -79,7 +80,7 @@ def policy(home):
             valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             result[key] = value if valid else result[key]
         else:
-            valid = key in DEFAULTS and _number(value)
+            valid = key in DEFAULTS and _number(value, 100 if key == "boost_five_hour_max" else None)
             result[key] = value if valid else result.get(key)
         if not valid:
             raise ValueError(f"{path}: invalid {key}")
@@ -162,9 +163,10 @@ def read_claude(home, now):
     state = _json(_dir(home) / "claude.json")
     try:
         week, five = state["seven_day"], state.get("five_hour") or {}
-        return _reading("claude", _stamp(week["at"]), week["utilization"] * 100, _epoch(week["resetsAt"]),
+        reading = _reading("claude", _stamp(week["at"]), week["utilization"] * 100, _epoch(week["resetsAt"]),
                         five["utilization"] * 100 if five else None,
                         _epoch(five["resetsAt"]) if five else None, now)
+        return dict(reading, five_at=_stamp(five["at"]) if five else None)
     except (KeyError, TypeError, ValueError):
         return _unknown("claude", "no rate_limit_event recorded yet (a recorded Claude lane or review writes one)", True)
 
@@ -278,6 +280,27 @@ def _five(reading, pol, now, ran):
             "stale": stale, "missing": missing, "five_reserve": reserve}
 
 
+def boost_pause(reading, pol, now):
+    """Fail closed on missing or old 5-hour readings, independently of weekly reserve release."""
+    used, at = reading.get("five_hour"), reading.get("five_at") or reading.get("at")
+    if used is None:
+        reason = "no current 5-hour reading"
+    elif not at or now - at > STALE:
+        reason = "5-hour reading stale"
+    else:
+        reason = f"5-hour {used:g} % ≥ {pol['boost_five_hour_max']:g} %" if used >= pol["boost_five_hour_max"] else ""
+    return f"boost paused: {reading['vendor']} {reason}" if reason else ""
+
+
+def boost_pauses(home, now=None):
+    now = now or datetime.now(timezone.utc)
+    try:
+        pol = policy(home)
+    except ValueError:
+        pol = DEFAULTS
+    return {vendor: reason for vendor, item in readings(home, now).items() if (reason := boost_pause(item, pol, now))}
+
+
 def assess(reading, pol, now, ran=False):
     """Add spare/limit and the pace verdict to a reading (see `task usage` for the meanings).
 
@@ -289,7 +312,7 @@ def assess(reading, pol, now, ran=False):
     spare = pol["spare_resets"][vendor] > 0
     left = None if reading["reason"] else (reading["resets_at"] - now) / timedelta(hours=1)
     released = left is not None and left <= pol["under_use_hours"]
-    result = dict(reading, spare=spare, released=released,
+    result = dict(reading, spare=spare, released=released, boost_pause=boost_pause(reading, pol, now),
                   limit=100 - (0 if spare or released else pol["reserve"][vendor]), **_five(reading, pol, now, ran))
     if reading["reason"]:
         return dict(result, verdict="unknown")
@@ -450,7 +473,10 @@ def gate(home, kind, vendor, tier, repo, key, now=None):
         if kind == "lane" and top and top != repo:
             out["hold"] = f"{vendor} is ahead of pace; only {top} gets new lanes"
     if not out["hold"] and found["verdict"] == "under-used-near-reset":
-        out["spend"] = found["resets_at"].isoformat()
+        if found["boost_pause"]:
+            notes.append(found["boost_pause"])
+        else:
+            out["spend"] = found["resets_at"].isoformat()
     if out["hold"]:
         note(home, seen[vendor], now, f"{repo}/{key}")
         log(home, f"held {kind} {repo}/{key}: {out['hold']}", now)
@@ -488,8 +514,9 @@ def _applied(vendor, item, pol, top):
         EXHAUSTED: f"{used_up}: no new lanes or reviews on {vendor}; routine lanes move to the other vendor if it has room",
         "ahead": f"{reserve}; routine lanes use {CHEAPER[vendor]}, no new batch starts on its own, "
                  f"new lanes only for {top or 'the top-priority repo with work'}",
-        "under-used-near-reset": f"{reserve}; spend before the reset: boost on until it ends (stronger models on queued work), "
-                                 f"deeper reviews ({DEEPER[vendor]}), then the research backlog: "
+        "under-used-near-reset": f"{reserve}; spend before the reset: "
+                                 f"{item['boost_pause'] or 'boost on until it ends (stronger models on queued work)'}; "
+                                 f"deeper reviews ({DEEPER[vendor]}) only in boost for hard tasks or --final rounds; research backlog: "
                                  f"{', '.join(pol['research_backlog']) or 'none named'}",
     }.get(item["verdict"], f"{reserve}; normal")
 
@@ -500,6 +527,8 @@ def report(home, now=None):
     pol, seen, lines = assessments(home, now)
     for vendor in VENDORS:
         item = seen[vendor]
+        if item["boost_pause"]:
+            lines.append(item["boost_pause"])
         effect = {FIVE_OUT: f"no new lanes or reviews on {vendor} until the reset; routine lanes move to the other vendor if it has room",
                   FIVE_WARN: f"at most one lane or review of {vendor} at a time, machine-wide, {running(home, vendor)} running now"
                   }.get(item["five"], "normal")

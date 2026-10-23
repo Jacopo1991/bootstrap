@@ -13,7 +13,7 @@ Write capability there determines trust; vendor environment markers do not.
     --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
       Defaults: gpt-6-luna for codex; sonnet for claude.
   task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
-  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>] [--no-pace]
+  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run [--final] | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>] [--no-pace]
   task usage [--weekly-line]
     Vendor usage, pace verdict and the usage-pacing policy applied; lane, review and batch starts obey it
     (exit 4 = held back). --no-pace skips the check for one command and is logged. See README.
@@ -25,7 +25,7 @@ Write capability there determines trust; vendor environment markers do not.
   task status [<repo>]
   task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
   task boost off [--claude] [--codex]
-    Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
+    Boost enables tier routing, extra batch capacity and deeper hard/final reviews below the 5-hour threshold.
     Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; --tier never changes the recorded tier; only --override "Jacopo YYYY-MM-DD: <request>" on task lane or task start (ledgered) permits either. Configure ~/.config/task/routing.json to override the table.
   task repair [<repo>]
   task wait <repo> <id> [--max <minutes>]
@@ -535,9 +535,11 @@ def boost(args):
 
 
 def boost_line():
-    active = active_boosts()
-    return ("boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items()))
-            + " (tier routing + batch capacity; routine and reviews unchanged)" if active else "")
+    paused = {}
+    boosts = active(HOME, paused)
+    lines = (["boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(boosts.items()))
+              + " (tier routing + batch capacity; deeper hard/final reviews)"] if boosts else [])
+    return "\n".join(lines + list(paused.values()))
 
 
 def usage(args):
@@ -3246,6 +3248,8 @@ def run_reviewer(command, path, prompt_file, reply_file):
 
 
 def review(args):
+    if args.final and not args.run:
+        raise Stop("--final requires --run")
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
     path = task.worktree()
@@ -3284,7 +3288,7 @@ def review(args):
             decision = pace_check(args, "review", reviewer_route[0], "routine", task)
             if decision and decision["hold"]:
                 return 4
-            if decision and decision["spend"]:
+            if reviewer_route[0] in active_boosts() and (record.get("tier") == "hard" or args.final):
                 reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
@@ -5075,13 +5079,14 @@ def main(argv=None):
             mode.add_argument("--run", action="store_true",
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
+            sub.add_argument("--final", action="store_true", help="mark this run as the task's final review round")
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--no-check", metavar="REASON", help="record an override of the passing-check prerequisite")
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
-    sub = commands.add_parser("boost", help="temporary tier routing and extra batch capacity; reviews unchanged")
+    sub = commands.add_parser("boost", help="temporary tier routing, extra batch capacity and deeper hard/final reviews")
     sub.add_argument("action", nargs="?", choices=("off",))
     sub.add_argument("--claude-until")
     sub.add_argument("--codex-until")
