@@ -4,7 +4,6 @@ import argparse
 import contextlib
 from contextlib import contextmanager
 from contextvars import ContextVar
-from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import fnmatch
 import hashlib
@@ -924,9 +923,9 @@ def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
 
 
-def risk_context(task, path, record):
+def risk_context(task, path, record, policy=None):
     try:
-        policy = task_usage.policy(HOME)["review"]
+        policy = policy if policy is not None else task_usage.policy(HOME)["review"]
     except ValueError as error:
         raise Stop(str(error)) from error
     patterns = policy["high_paths"].get("*", []) + policy["high_paths"].get(task.repo.name, [])
@@ -950,7 +949,8 @@ def change_risk(task, path, record, risk, reason):
     record.update(risk=risk, risk_reason=reason or "")
     record["revision"] = record_revision(record)
     atomic_json(task_state(task) / "task.json", record)
-    task_usage.record_override(HOME, task.repo.name, task.id, "risk change", f"{old} to {risk}", reason or "PM risk choice")
+    task_usage.record_override(HOME, task.repo.name, task.id, None, record.get("tier", "routine"),
+                               reason or "PM risk choice", kind="risk_change", old_risk=old, risk=risk)
 
 
 def risk(args):
@@ -972,15 +972,29 @@ def redteam(args):
     state = task_state(task)
     output = state / f"redteam-{head}.md"
     task_lock.work(HOME, task.repo, head)
-    (state / "redteam.json").unlink(missing_ok=True)
-    output.unlink(missing_ok=True)
-    with Path(args.brief).open("rb") as brief:
-        result = subprocess.run(["codex", "exec", "--sandbox", "read-only", "-m", policy["red_team_model"],
+    temporary = output.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        brief = Path(args.brief).read_text(encoding="utf-8")
+        if not brief.strip():
+            raise Stop("risk high: --brief must contain nonempty UTF-8 text")
+        codex = shutil.which("codex")
+        if not codex:
+            raise Stop("risk high: codex is not available on PATH")
+        result = subprocess.run([codex, "exec", "--sandbox", "read-only", "-m", policy["red_team_model"],
                                  "-c", "model_reasoning_effort=high", "--skip-git-repo-check", "-C", str(path),
-                                 "-o", str(output), "-"], cwd=path, stdin=brief, env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
-    if result.returncode or not output.is_file() or not output.read_text().strip() or sha(path, "HEAD") != head:
-        raise Stop("risk high: red-team failed or head changed; no output recorded")
-    atomic_json(state / "redteam.json", dict(commit=head, output=str(output), time=utc_now()))
+                                 "-o", str(temporary), "-"], cwd=path, input=brief, text=True, encoding="utf-8",
+                                env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
+        if result.returncode or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
+            raise Stop("risk high: red-team failed or head changed; no output recorded")
+        temporary.replace(output)
+        atomic_json(state / "redteam.json", dict(commit=head, output=str(output), time=utc_now()))
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+        raise Stop(f"risk high: red-team failed: {error}") from error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as error:
+            raise Stop(f"risk high: cannot clean red-team temporary output: {error}") from error
     print(f"Red-team recorded at {head}: {output}")
 
 
@@ -1892,6 +1906,8 @@ def lane(args):
             extra = rounds.get("extra", 0)
             if args.extra_round is not None and not args.extra_round.strip():
                 raise Stop(f"risk {risk}: --extra-round needs a nonempty reason")
+            if args.extra_round is not None and used < limits["max_rounds"] + extra:
+                raise Stop(f"risk {risk}: --extra-round is allowed only when the round limit is reached")
             if used >= limits["max_rounds"] + extra:
                 if not args.extra_round or not limits["extra_rounds"]:
                     raise Stop(f"risk {risk}: maximum {limits['max_rounds'] + extra} build/fix rounds; use --extra-round REASON")
@@ -2718,7 +2734,7 @@ def advisory_temporary_parent(path):
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-              advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
+              advisory=False, variant=None):
     variants = gate_variants(path)
     configured_environment(path)  # Validate the base even when a variant overrides it.
     if variant is not None:
@@ -2729,11 +2745,11 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         variants = {variant: variants[variant]}
     if variants:
         return run_check_matrix(path, base, record, state, evidence_name, display_log,
-                                advisory, pre_commit_all_files, cancelled, variants)
+                                advisory, variants)
     if advisory:
         with tempfile.TemporaryDirectory(prefix="check-", dir=advisory_temporary_parent(path)) as temporary:
             return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
-                                   gate_environment={"TMPDIR": temporary}, cancelled=cancelled)
+                                   gate_environment={"TMPDIR": temporary})
     # Do not inherit TMPDIR: callers may point it inside a checkout.
     temporary_root = gate_temporary_root()
     sweep_gate_temporary(temporary_root)
@@ -2743,12 +2759,11 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
                            "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
             return run_check_steps(path, base, record, state, evidence_name, display_log,
-                                   gate_environment=environment, pre_commit_all_files=pre_commit_all_files,
-                                   cancelled=cancelled)
+                                   gate_environment=environment)
 
 
 def run_check_matrix(path, base, record, state, evidence_name, display_log,
-                     advisory, pre_commit_all_files, cancelled, variants):
+                     advisory, variants):
     work = path / ".work"
     work.mkdir(exist_ok=True)
     destination = work if advisory else (state or task_state(Task(main_repo(path), path.name)))
@@ -2757,7 +2772,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     logs = []
     templates = {entry["name"]: entry.get("env", {})
                  for entry in task_config(path).get("gate_variant", [])}
-    # Reserve the port range once, including for drills without an exclusive slot.
+    # Reserve the port range once for the whole matrix.
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
             # Advisory checks need a writable parent outside the checkout, like the lane's TMPDIR.
@@ -2769,8 +2784,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                 evidence = []
                 passed = run_check_steps(
                     path, base, record, state, evidence_name, display_log, advisory=advisory,
-                    gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
-                    cancelled=cancelled, evidence_sink=evidence)
+                    gate_environment=gate_environment, evidence_sink=evidence)
                 results.append(dict(evidence[0], name=name, environment=environment,
                                     environment_template=templates.get(name, {})))
                 logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
@@ -2790,16 +2804,10 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
 
 
 def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-                    advisory=False, gate_environment=None, pre_commit_all_files=False, cancelled=None,
-                    evidence_sink=None):
-    """Run the repository's gate in <path>; return True when it passes.
-
-    pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
-    has no base) it checks every file instead of being skipped.
-    """
+                    advisory=False, gate_environment=None, evidence_sink=None):
+    """Run the repository's gate; pre-commit checks the commits since <base>."""
     if not advisory and gate_environment is None:
-        return run_check(path, base, record, state, evidence_name, display_log,
-                         pre_commit_all_files=pre_commit_all_files, cancelled=cancelled)
+        return run_check(path, base, record, state, evidence_name, display_log)
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
@@ -2819,14 +2827,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         steps = [["just", "check"]]
         if record:
             steps.extend([["bash", "-c", command] for command in record.get("verify", [])])
-        if (path / ".pre-commit-config.yaml").exists():
-            if pre_commit_all_files:
-                steps.append(["pre-commit", "run", "--all-files"])
-            elif base:
-                steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
+        if base and (path / ".pre-commit-config.yaml").exists():
+            steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
         for step in steps:
-            if cancelled and cancelled():
-                raise Stop("Drill interrupted.")
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
             configured, timeout, durations = step_timeout(path, step)
@@ -2849,29 +2852,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 if state:
                     set_child_group(state, process.pid)
                 try:
-                    if cancelled is None:
-                        code = process.wait(timeout=timeout)
-                    else:
-                        deadline = time.monotonic() + timeout
-                        while True:
-                            if cancelled():
-                                try:
-                                    os.killpg(process.pid, signal.SIGTERM)
-                                    time.sleep(0.2)
-                                    # Descendants may survive even if the leader exits.
-                                    os.killpg(process.pid, signal.SIGKILL)
-                                except ProcessLookupError:
-                                    pass
-                                process.wait()
-                                if state:
-                                    set_child_group(state, None)
-                                raise Stop("Drill interrupted.")
-                            try:
-                                code = process.wait(timeout=min(0.1, max(0, deadline - time.monotonic())))
-                                break
-                            except subprocess.TimeoutExpired:
-                                if time.monotonic() >= deadline:
-                                    raise
+                    code = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
@@ -3753,15 +3734,17 @@ def merge(args):
     if args.no_redteam is not None and not args.no_redteam.strip():
         raise Stop(f"risk {risk}: --no-redteam requires a nonempty reason")
     redteam = read_json_object(archive / "redteam.json")
-    if risk == "high" and (redteam.get("commit") != lane_head or not Path(redteam.get("output", "")).is_file() or not Path(redteam["output"]).read_text().strip()):
+    redteam_waived = risk == "high" and (redteam.get("commit") != lane_head or not Path(redteam.get("output", "")).is_file() or not Path(redteam["output"]).read_text().strip())
+    if redteam_waived:
         if not args.no_redteam:
             raise Stop("risk high: merge requires red-team output at the reviewed head or --no-redteam REASON")
-        task_usage.record_override(HOME, repo.name, task.id, "no red-team", risk, args.no_redteam)
+    requirements_passed, gate_passed = True, True
     try:
         record = merge_gate(task, path, lane_head)
     except Stop as error:
         if not args.override:
             raise
+        requirements_passed = False
         atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
                                                    "missing_gate": True,
                                                    "waived": [{"step": item, "reason": args.override}
@@ -3786,6 +3769,7 @@ def merge(args):
             else:
                 reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
             if reusable:
+                gate_passed = True
                 print(f"reuse decision: reusing trusted lane check: {reuse_reason}")
                 completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
@@ -3878,6 +3862,9 @@ def merge(args):
     task_lock.verify(HOME, repo)
     atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit,
                                         "time": datetime.now(timezone.utc).isoformat()})
+    if redteam_waived and requirements_passed and gate_passed:
+        task_usage.record_override(HOME, repo.name, task.id, None, record.get("tier", "routine"),
+                                   args.no_redteam, kind="no_redteam", risk=risk, commit=lane_head)
     task_usage.run_outcome(HOME, repo.name, task.id, "merged")
     try:
         review = json.loads((archive / "review.json").read_text())
@@ -4419,6 +4406,9 @@ def stale_worktree_lines(repo):
 
 
 def status(args):
+    policy, _, notes = task_usage.assessments(HOME, datetime.now(timezone.utc))
+    for warning in notes:
+        print(warning)
     print("\n".join(task_usage.run_summary(HOME)))
     active = boost_line()
     if active:
@@ -4529,7 +4519,7 @@ def status(args):
                 except (ValueError, TypeError): pass
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
-            risk, _, forced = risk_context(task, path, record)
+            risk, _, forced = risk_context(task, path, record, policy["review"])
             redteam = read_json_object(state / "redteam.json")
             print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} tier={record.get('tier', 'routine') if record else 'routine'} risk={risk} head={head[:7]} "
                   f"{run_label} "
@@ -4752,91 +4742,6 @@ def cancel(args):
     return 0
 
 
-def prune_archive(repo, dry_run=False):
-    root = HOME / '.local/state/task/archive' / repo.name
-    if any(item.is_symlink() for item in (root, *root.parents)):
-        return
-    entries, sizes, errors = archive_inventory(root)
-    records, invalid = {}, set()
-    for manifest, info in entries:
-        if manifest.name != 'manifest.json' or '.work' in manifest.relative_to(root).parts:
-            continue
-        try:
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError('manifest is not a regular file')
-            record = json.loads(manifest.read_text())
-            if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
-                raise ValueError('manifest must be an object with a pruned list')
-            records[manifest.parent] = record
-        except (OSError, ValueError, TypeError) as error:
-            print(f'archive: cannot prune {manifest.parent}: {error}')
-            invalid.add(manifest.parent)
-    entries = [(item, info) for item, info in entries
-               if not any(parent == item or parent in item.parents for parent in invalid)]
-    known = {item: info for item, info in entries}
-    allocated = {item: info.st_blocks * 512 for item, info in entries}
-    for item, _info in reversed(entries):
-        if item != root:
-            allocated[item.parent] = allocated.get(item.parent, 0) + allocated[item]
-    # Temporary snapshots are handled whole, before finished-archive filtering.
-    try:
-        live_gate = bool(gate_holders())
-    except FileNotFoundError:
-        live_gate = False
-    temporary, freed, finishing = set(), 0, {}
-    for item, info in entries:
-        if item.parent in temporary:
-            temporary.add(item)
-            continue
-        if not stat.S_ISDIR(info.st_mode):
-            continue
-        pending = item.name.startswith('.pending-')
-        gate = gate_worktree_match(item.name)
-        if not pending and not gate:
-            continue
-        if any(path == item or item in path.parents for path in errors):
-            continue
-        if gate and live_gate:
-            temporary.add(item)
-            continue
-        if pending and not any(
-                sibling.parent == item.parent and stat.S_ISDIR(sibling_info.st_mode) and
-                not sibling.name.startswith('.') and
-                stat.S_ISREG(known[sibling / 'manifest.json'].st_mode)
-                for sibling, sibling_info in entries if sibling / 'manifest.json' in known):
-            destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
-            print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
-            finishing[item] = destination
-            if not dry_run:
-                contents, content_sizes, content_errors = archive_inventory(item)
-                manifest = item / 'manifest.json'
-                record = records.get(item, {})
-                record.setdefault('note', 'finished by repair')
-                record.setdefault('contents', [{'path': str(path.relative_to(item)),
-                                  'size': content_sizes.get(path, 0)}
-                                 for path, _info in contents if path != item])
-                record.setdefault('skipped', []).extend(
-                    {'path': str(path.relative_to(item)), 'reason': error}
-                    for path, error in content_errors.items())
-                atomic_json(manifest, record)
-            continue
-        temporary.add(item)
-        freed += allocated.get(item, 0)
-        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
-        if not dry_run:
-            shutil.rmtree(item)
-    if not dry_run:
-        for pending, destination in finishing.items():
-            pending.rename(destination)
-    report = []
-    snapshots = (set(records) | set(finishing)) - temporary - invalid
-    if not dry_run:
-        snapshots = {finishing.get(item, item) for item in snapshots}
-    prune_evidence_archive(root, not dry_run, report, snapshots=snapshots)
-    print('\n'.join(report))
-    print(f"{'Would free' if dry_run else 'Freed'} {freed} bytes.")
-
-
 def repair_published(task, base):
     if task.path.exists() and not real_worktree(task.repo, task.path):
         print(f"{task.path}: not a worktree; left as is")
@@ -4909,9 +4814,6 @@ def repair(args):
     repos = [resolve_repo(args.repo)] if args.repo else sorted(
         p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     for repo in repos:
-        if getattr(args, 'prune_archive', False):
-            prune_archive(repo, args.dry_run)
-            continue
         prune_stale_gate_worktrees(repo)
         try:
             fetch(repo)
@@ -4967,167 +4869,11 @@ def wait_task(args):
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
-def prune_drill_worktrees(repo):
-    for path in (repo / ".worktrees").glob(".*drill-*"):
-        old = re.fullmatch(r"\.task-drill-\d{19}-(\d+)-\d+-(concurrent|solo)", path.name)
-        new = re.fullmatch(r"\.drill-[0-9a-f]{6}-\d+-(group|solo)", path.name)
-        if not old and not new:
-            continue
-        owner = path / ".work/drill.pid"
-        pid = old.group(1) if old else owner.read_text().strip() if owner.is_file() else ""
-        if pid.isdigit() and pid_alive(pid):
-            continue
-        result = run_git(repo, "worktree", "remove", "--force", str(path))
-        if result.returncode:
-            raise Stop(f"Cannot remove drill worktree {path}: {result.stderr}")
-
-
-def gate_drill(args):
-    """Measure real cross-repository clashes without consuming gate slots."""
-    repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
-    for repo in repos:
-        prune_drill_worktrees(repo)
-    cli_seeds = {repo: [] for repo in repos}
-    for value in args.seed:
-        repo_name, separator, name = value.partition(":")
-        if not separator or not name:
-            raise Stop("gate-drill --seed requires <repo>:<name>.")
-        repo = resolve_repo(repo_name)
-        if repo not in cli_seeds:
-            raise Stop(f"Seed repository {repo_name} is not in this drill.")
-        cli_seeds[repo].append(name)
-    for repo in repos: task_lock.work(HOME, repo)
-    archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
-    archive.mkdir(parents=True)
-    run_name = secrets.token_hex(3)
-    worktrees = []
-    interrupted = False
-
-    def interrupt(signum, frame):
-        nonlocal interrupted
-        interrupted = True
-
-    previous_handlers = {sig: signal.signal(sig, interrupt)
-                         for sig in (signal.SIGTERM, signal.SIGINT)}
-
-    def prepare(repo, index, phase):
-        parent = repo / ".worktrees"
-        parent.mkdir(exist_ok=True)
-        mode = "solo" if phase == "solo" else "group"
-        path = parent / f".drill-{run_name}-{index}-{mode}"
-        base, _ = base_commit(repo, default_branch(repo))
-        git(repo, "worktree", "add", "-q", "--detach", str(path), base)
-        worktrees.append((repo, path))
-        (path / ".work").mkdir(exist_ok=True)
-        (path / ".work/drill.pid").write_text(str(os.getpid()))
-        prepare_environment(repo, path)
-        names = task_config(path).get("drill_seeds", [])
-        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
-            raise Stop(".task.toml drill_seeds must be a list of seed names.")
-        names = list(dict.fromkeys(names + cli_seeds[repo]))
-        for name in names:
-            try:
-                seed_source(repo, name)
-            except Stop as error:
-                if str(error).startswith("Seed does not exist:"):
-                    raise Stop(f"missing seed {name}") from None
-                raise
-        seed_worktree(repo, path, names)
-        return path
-
-    def prepare_measure(repo, index, phase):
-        try:
-            if interrupted:
-                raise Stop("Drill interrupted.")
-            return measure(prepare(repo, index, phase), index, phase)
-        except (Stop, OSError) as error:
-            return {"result": "failed", "duration": 0, "error": str(error)}
-        except ValueError:
-            return {"result": "failed", "duration": 0, "error": f"Cannot read drill inputs for {repo}."}
-
-    def measure(path, index, phase):
-        # Drill runs hold no slot; run_check reserves a free port index above the slots.
-        # The full default gate runs: `just check`, then pre-commit over all files when the
-        # repository has a pre-commit config (a drill has no base range to check).
-        token = GATE_SLOT.set(None)
-        started = time.monotonic()
-        try:
-            passed = run_check(path, "", state=archive / f"{index}-{phase}",
-                               evidence_name="drill-check.json", pre_commit_all_files=True,
-                               cancelled=lambda: interrupted)
-            return {"result": "passed" if passed else "failed",
-                    "duration": round(time.monotonic() - started, 3)}
-        except (Stop, OSError) as error:
-            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
-                    "error": str(error)}
-        except ValueError:
-            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
-                    "error": f"Cannot read drill inputs in {path}."}
-        finally:
-            GATE_SLOT.reset(token)
-
-    rows = []
-    try:
-        with ThreadPoolExecutor(max_workers=len(repos)) as pool:
-            futures = [pool.submit(prepare_measure, repo, index, "concurrent")
-                       for index, repo in enumerate(repos)]
-            concurrent = [future.result() for future in futures]
-        if interrupted:
-            raise Stop("Drill interrupted.")
-        for index, (repo, result) in enumerate(zip(repos, concurrent)):
-            row = {"repo": repo.name, "concurrent": result,
-                   "solo": prepare_measure(repo, index, "solo"), "verdict": "ok"}
-            if row["solo"]["result"] != "passed":
-                row["verdict"] = "failing-alone"
-            elif result["result"] != "passed":
-                row["verdict"] = "clash"
-            rows.append(row)
-            if interrupted:
-                raise Stop("Drill interrupted.")
-        table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
-        for row in rows:
-            def cell(result):
-                return f"{result['result']} ({result['duration']})" if result else "-"
-            table.append(f"{row['repo']} | {cell(row['concurrent'])} | {cell(row['solo'])} | {row['verdict']}")
-            for phase in ("concurrent", "solo"):
-                if row[phase] and row[phase].get("error"):
-                    table.append(f"  {phase}: {row[phase]['error']}")
-        table.append("Summary:")
-        for row in rows:
-            solo = "PASS" if row["solo"]["result"] == "passed" else "FAIL"
-            together = "PASS" if row["concurrent"]["result"] == "passed" else "FAIL"
-            note = " (pre-existing failure, not a concurrency clash)" if row["verdict"] == "failing-alone" else ""
-            table.append(f"{row['repo']}: solo: {solo}, together: {together}, verdict: {row['verdict']}{note}")
-        atomic_json(archive / "results.json", rows)
-        (archive / "results.txt").write_text("\n".join(table) + "\n")
-        print("\n".join(table), flush=True)
-        print(f"Drill evidence: {archive}")
-        return int(any(row["verdict"] != "ok" for row in rows))
-    finally:
-        try:
-            errors = []
-            for repo, path in reversed(worktrees):
-                result = run_git(repo, "worktree", "remove", "--force", str(path))
-                if result.returncode:
-                    errors.append(f"Cannot remove drill worktree {path}: {result.stderr}")
-            if errors:
-                raise Stop("\n".join(errors))
-            if interrupted:
-                raise Stop("Drill interrupted.")
-        finally:
-            for sig, handler in previous_handlers.items():
-                signal.signal(sig, handler)
-
-
 def main(argv=None):
     global ACTIVE_FOREGROUND_TASK
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    sub = commands.add_parser("gate-drill", help="PM-only concurrent full-gate clash drill")
-    sub.add_argument("repos", nargs="+")
-    sub.add_argument("--seed", action="append", default=[], metavar="REPO:NAME",
-                     help="copy main checkout .work/NAME into each drill worktree; adds to .task.toml drill_seeds")
     for name in ("start", "lane", "merge", "close", "review", "cancel", "wait", "risk", "redteam"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
@@ -5220,8 +4966,6 @@ def main(argv=None):
     sub.add_argument("repo", nargs="?")
     sub = commands.add_parser("repair", help="explicitly repair stale task state and gate worktrees")
     sub.add_argument("repo", nargs="?")
-    sub.add_argument("--prune-archive", action="store_true")
-    sub.add_argument("--dry-run", action="store_true")
     sub = commands.add_parser("denials")
     sub.add_argument("--days", type=int, default=30)
     sub.add_argument("--rule")
@@ -5235,7 +4979,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start", "gate-drill"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -5296,8 +5040,7 @@ def main(argv=None):
                           "review": review, "risk": risk, "redteam": redteam, "cancel": cancel, "note": note, "status": status,
                           "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
                           "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
-                          "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo),
-                          "gate-drill": gate_drill}[args.command](args) or 0
+                          "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo)}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"
