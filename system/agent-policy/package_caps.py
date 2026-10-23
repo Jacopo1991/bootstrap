@@ -57,7 +57,8 @@ def image_name(reference: str) -> tuple[str, str | None]:
 class Cap:
     def __init__(self, name: str, table: dict):
         if not isinstance(table, dict) or set(table) - {
-                'max_version', 'images', 'reason', 'source', 'added', 'approved_digests'}:
+                'max_version', 'images', 'reason', 'source', 'added', 'approved_digests',
+                'allowed_names'}:
             raise ValueError(f'{name}: invalid policy keys/table')
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name):
             raise ValueError('invalid package name')
@@ -80,6 +81,15 @@ class Cap:
                 not re.fullmatch(r'sha256:[a-f0-9]{64}', d) for d in digests):
             raise ValueError(f'{name}: invalid approved_digests')
         self.images, self.approved_digests = set(images), set(digests)
+        names = table.get('allowed_names', {})
+        if not isinstance(names, dict) or any(
+                not isinstance(other, str) or
+                not re.fullmatch(r'[a-z0-9][a-z0-9._-]*', other) or
+                self.name not in other or normalize(other) == self.name or
+                not isinstance(reason, str) or not reason.strip()
+                for other, reason in names.items()):
+            raise ValueError(f'{name}: allowed_names must map other package names to reasons')
+        self.allowed_names = names
         self.reason, self.source = table['reason'], table['source']
 
     def version_reason(self, version: str | None) -> str | None:
@@ -171,51 +181,65 @@ class Checker:
                            f'{cap.name} has a non-registry or unrecognized lock source; registry resolution required')
 
     def pinned_text(self, path: Path, text: str) -> None:
-        """Require an allowed pin, upper bound or tag for every whole-token name.
+        """Every capped-name substring must belong to a complete allowed form.
 
         All non-lock formats, including comments, use the same literal rule.
         No manifest/shell/YAML parsing, expansion or referenced-file resolution.
         """
         for cap in self.caps.values():
-            pattern = (r'(?<![A-Za-z0-9_.-])' + re.escape(cap.name) +
-                       r'(?=-[0-9]|[^A-Za-z0-9_.-]|$)')
-            for match in re.finditer(pattern, text, re.I | re.ASCII):
-                line = text.count('\n', 0, match.start()) + 1
-                if re.match(r'-[0-9]', text[match.end():]):
-                    # Distribution filenames are versions too. Parse the entire
-                    # filename with packaging, never a numeric prefix of it.
-                    tail = re.match(r'''-[^\s"'`,;\[\]{}()<>|&\\/?#]+''', text[match.end():])[0]
-                    filename = match[0] + tail
-                    try:
-                        parsed = (parse_wheel_filename(filename) if filename.endswith('.whl')
-                                  else parse_sdist_filename(filename))
-                        reason = cap.version_reason(str(parsed[1]))
-                    except ValueError:
-                        reason = f'{cap.name} distribution filename cannot be evaluated safely'
-                    if reason:
-                        self.error(path, line, reason)
+            name = re.escape(cap.name)
+            value = r'''[^\s"'`,;\[\]{}()<>|&\\]+'''
+            operator = r'[ \t]*(?:==|<=)[ \t]*'
+            extras = r'(?:\[[A-Za-z0-9_,. -]+\])?'
+            # Boundaries constrain allowed forms; they never filter occurrences.
+            requirement = r'(?<![A-Za-z0-9_./:@$+-])' + name + extras
+            forms = [
+                ('version', requirement + operator + '(' + value + ')'),
+                ('version', requirement + r'''["']?[ \t]*=[ \t]*["']''' +
+                 operator + '(' + value + ')'),
+                ('table', requirement + r'''["']?[ \t]*=[ \t]*\{[ \t]*version[ \t]*=[ \t]*["']''' +
+                 operator + '(' + value + ')' + r'''["'][ \t]*''' +
+                 r'''(?:,[ \t]*extras[ \t]*=[ \t]*\[[A-Za-z0-9_,. "'-]*\][ \t]*)?\}'''),
+                ('image', r'(?<![A-Za-z0-9_./:+@-])(?:[A-Za-z0-9_.:-]+/)*' +
+                 name + ':(' + value + ')'),
+                ('distribution', r'(?<![A-Za-z0-9_.-])(' + name +
+                 r'''-[0-9][^\s"'`,;\[\]{}()<>|&\\/?#]+)'''),
+            ]
+            spans = []
+            for kind, pattern in forms:
+                for candidate in re.finditer(pattern, text, re.I | re.ASCII):
+                    token = candidate[1]
+                    if kind == 'distribution':
+                        # Parse the entire filename, never a numeric prefix.
+                        try:
+                            parsed = (parse_wheel_filename(token) if token.lower().endswith('.whl')
+                                      else parse_sdist_filename(token))
+                            reason = cap.version_reason(str(parsed[1]))
+                        except ValueError:
+                            reason = f'{cap.name} distribution filename cannot be evaluated safely'
+                    elif kind == 'image':
+                        tag, separator, digest = token.partition('@')
+                        reason = cap.tag_reason(tag)
+                        if not reason and separator and digest not in cap.approved_digests:
+                            reason = f'image digest is not approved in policy (cap {cap.max_version})'
+                    else:
+                        reason = cap.version_reason(token)
+                    if not re.match(r'''["'\])}]*(?:\s|$|[,;<>|&])''', text[candidate.end():]):
+                        reason = 'version token does not end the word; quote/escape concatenation refused'
+                    spans.append((candidate.start(), candidate.end(), reason))
+            for other in cap.allowed_names:
+                for candidate in re.finditer(r'(?<![A-Za-z0-9_.-])' + re.escape(other) +
+                                             r'(?![A-Za-z0-9_.-])', text, re.I | re.ASCII):
+                    spans.append((candidate.start(), candidate.end(), None))
+            for occurrence in re.finditer(name, text, re.I | re.ASCII):
+                containing = [reason for start, end, reason in spans
+                              if start <= occurrence.start() and occurrence.end() <= end]
+                # An occurrence is allowed only by an explicitly recognized form.
+                if containing and None in containing:
                     continue
-                # Read the entire adjacent value, never an allowed prefix of it.
-                pin = re.match(
-                    r'''(?:\[[A-Za-z0-9_,. -]+\])?(?:==|<=)(?P<version>[^\s"'`,;\[\]{}()<>|&\\]+)'''
-                    r'''|:(?P<tag>[^\s"'`,;\[\]{}()<>|&\\]+)'''
-                    r'''|[ \t]*=[ \t]*["'](?:==|<=)(?P<assigned>[^\s"'`,;\[\]{}()<>|&\\]+)''',
-                    text[match.end():])
-                if pin is None:
-                    reason = cap.version_reason(None)
-                elif not re.match(r'''["'\])}]*(?:\s|$|[,;<>|&])''', text[match.end() + pin.end():]):
-                    # Quotes/escapes can concatenate a safe prefix into a different
-                    # version. A closing delimiter must actually end the word.
-                    reason = 'version token does not end the word; quote/escape concatenation refused'
-                elif pin['version'] or pin['assigned']:
-                    reason = cap.version_reason(pin['version'] or pin['assigned'])
-                else:
-                    tag, separator, digest = pin['tag'].partition('@')
-                    reason = cap.tag_reason(tag)
-                    if not reason and separator and digest not in cap.approved_digests:
-                        reason = f'image digest is not approved in policy (cap {cap.max_version})'
-                if reason:
-                    self.error(path, line, reason)
+                reason = containing[0] if containing else cap.version_reason(None)
+                line = text.count('\n', 0, occurrence.start()) + 1
+                self.error(path, line, f'{reason}; occurrence {occurrence[0]!r}')
 
     def check(self, path: Path) -> bool:
         name = path.name.lower()

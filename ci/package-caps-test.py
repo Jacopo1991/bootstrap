@@ -41,7 +41,8 @@ class PolicyFile(unittest.TestCase):
         self.assertIn("2026-10-21", litellm.reason)
         self.assertEqual(litellm.source, "https://docs.litellm.ai/blog/security-incident-oct-21-2026")
         raw = tomllib.loads(POLICY.read_text())
-        self.assertEqual(set(raw["packages"]["litellm"]), {"max_version", "images", "reason", "source", "added"})
+        self.assertEqual(set(raw["packages"]["litellm"]), {"max_version", "images", "reason", "source", "added", "allowed_names"})
+        self.assertEqual(set(litellm.allowed_names), {'langchain-litellm'})
 
     def test_another_package_is_one_table(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -58,7 +59,7 @@ class PolicyFile(unittest.TestCase):
         self.assertNotIn('python3-yaml=', (ROOT / 'system/apt-base.lock').read_text())
         readme = (ROOT / 'README.md').read_text().split('### Package caps (the litellm lock rule)', 1)[1]
         self.assertIn('Lock files are always parsed, even without capped names; a malformed lock fails\n  closed.', readme)
-        self.assertIn('any image repository with that package token, regardless of registry.', readme)
+        self.assertIn('any image repository with that package name, regardless of registry.', readme)
 
     def test_gate_config_runs_the_check_on_every_commit(self):
         text = GATE_CONFIG.read_text()
@@ -177,7 +178,7 @@ class Manifests(unittest.TestCase):
                     '.', './wheel', 'git+https://example.invalid/repo#egg=',
                     'git+https://example.invalid/repo#egg=numpy',
                     'https://example.invalid/innocent.whl', 'https://[', 'numpy==$VERSION',
-                    'numpy', 'litellm-extra>=9', './other_litellm-9-py3-none-any.whl')
+                    'numpy')
         for name in ('requirements-dev.txt', 'constraints.in'):
             for example in examples:
                 with self.subTest(name=name, example=example):
@@ -186,6 +187,10 @@ class Manifests(unittest.TestCase):
                     self.allowed(name, example + '\nlitellm==1.106.2\n')
         self.refused('requirements.txt', '--editable git+https://example.invalid/repo#egg=litellm\n',
                      'exact pin (==) or upper bound (<=)')
+        for example in ('litellm-extra>=9', './other_litellm-9-py3-none-any.whl'):
+            for name in ('requirements-dev.txt', 'constraints.in'):
+                self.refused(name, example + '\n')
+                self.refused(name, example + '\nlitellm==1.106.2\n')
 
     def test_uncapped_installer_arguments_are_ignored(self):
         for args in ('--timeout 100 numpy', '--no-compile numpy', '--unknown-flag numpy',
@@ -213,7 +218,7 @@ class Manifests(unittest.TestCase):
         self.allowed("pyproject.toml", '[project]\nname = "x"\n[project.optional-dependencies]\nproxy = ["litellm[proxy]==1.104.2"]\n')
         self.allowed("pyproject.toml", '[dependency-groups]\ndev = ["litellm==1.106.2", {include-group = "test"}]\ntest = ["pytest"]\n')
         self.allowed("pyproject.toml", '[tool.poetry.dependencies]\npython = "^3.12"\nlitellm = "==1.106.2"\n')
-        self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = {version = "==1.104.0", extras = ["proxy"]}\n')
+        self.allowed("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = {version = "==1.104.0", extras = ["proxy"]}\n')
         self.refused("pyproject.toml", '[project]\nname = "x"\ndependencies = ["litellm==1.107.0"]\n', "above the cap")
         self.refused("pyproject.toml", '[project]\ndependencies = ["litellm>=1.100"]\n', "exact pin (==) or upper bound (<=)")
         self.refused("pyproject.toml", '[project]\ndependencies = ["litellm"]\n', "exact pin (==) or upper bound (<=)")
@@ -305,7 +310,9 @@ class Manifests(unittest.TestCase):
                      'dependencies=["litellm==1.106.2"]}]\n')
 
     def test_absolute_workspace_exclusion_without_capped_names_is_ignored(self):
-        text = '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["' + str(self.repo / 'packages/excluded') + '"]\n'
+        # A lane's own absolute path can contain the capped name (litellm-allow).
+        # Keep this fixture uncapped, as its regression specifically requires.
+        text = '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["/fixture/packages/excluded"]\n'
         self.write('pyproject.toml', text)
         self.write('packages/member/pyproject.toml', '[project]\nname="member"\ndependencies=["numpy"]\n')
         subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
@@ -333,6 +340,42 @@ class Manifests(unittest.TestCase):
             # Invalid format syntax and uncapped joined names are never parsed.
             self.allowed(name, prefix + '[[{ not valid syntax: langchain-litellm\n')
             self.refused(name, prefix + 'litellm[proxy]:v1.106.2\n', 'exact pin (==) or upper bound (<=)')
+
+    def test_allowlist_forms_in_every_non_lock_format(self):
+        for name in ('requirements.txt', 'constraints.in', 'dependencies.in', 'pyproject.toml',
+                     'setup.cfg', 'setup.py', 'script.py', 'Dockerfile', 'compose.yaml'):
+            prefix = '# /// script\n' if name == 'script.py' else ''
+            for form in ('litellm == 1.106.2', '"LiteLLM[proxy] <= 1.104.0"',
+                         "'litellm == 1.106.2'", 'litellm = "== 1.106.2"',
+                         'litellm = {version = "==1.106.2"}',
+                         '"litellm" = {version = "<=1.104.0", extras = ["proxy"]}',
+                         'ghcr.io/berriai/litellm:v1.106.2-stable',
+                         'berriai/litellm:litellm_stable_release_branch-v1.106.2-stable',
+                         './litellm-1.106.2-py3-none-any.whl', 'litellm-1.104.0.tar.gz',
+                         'langchain-litellm', 'LANGCHAIN-LITELLM>=9'):
+                with self.subTest(name=name, form=form):
+                    self.allowed(name, prefix + form + '\n')
+            for unknown in ('litellm.git', 'git+https://github.com/BerriAI/litellm.git',
+                            'litellm', 'litellm>=1.100', 'litellm<=1.107',
+                            'unknown-litellm', 'LITELLM', '# LiteLLM', 'litellm_proxy',
+                            'unknown-litellm==1.104.0', 'xlitellm:v1.104.0',
+                            'other_litellm-1.104.0.tar.gz', 'langchain-litellm-unknown',
+                            'langchain-litellm.git', 'xlangchain-litellm',
+                            'litellm = {version = "==1.106.2", git = "repo"}',
+                            'litellm-1.104.0.tar.gz"suffix',
+                            'litellm = {version = "==1.106.2"}"suffix'):
+                with self.subTest(name=name, unknown=unknown):
+                    self.refused(name, prefix + unknown + '\n', 'occurrence')
+
+    def test_each_occurrence_is_checked_and_reports_its_line_and_case(self):
+        code, output = self.run_check(self.write('requirements.txt',
+            'langchain-litellm litellm==1.106.2\n# LiteLLM\nlitellm.git LITELLM_PROXY\n'))
+        self.assertEqual(code, 1, output)
+        self.assertIn("requirements.txt:2:", output)
+        self.assertIn("occurrence 'LiteLLM'", output)
+        self.assertIn("requirements.txt:3:", output)
+        self.assertIn("occurrence 'LITELLM'", output)
+        self.assertIn('3 finding(s)', output)
 
     def test_locks_read_only_own_resolved_versions(self):
         for name in ('uv.lock', 'poetry.lock', 'pdm.lock'):
@@ -472,8 +515,9 @@ class Manifests(unittest.TestCase):
                                 self.allowed(name, text)
                             else:
                                 self.refused(name, text, f'{name}:1:')
-        for other in ('litellm-proxy', 'langchain-litellm', 'other_litellm-1.107.0.tar.gz'):
-            self.allowed('requirements.txt', other + '\n')
+        self.allowed('requirements.txt', 'langchain-litellm\n')
+        for other in ('litellm-proxy', 'other_litellm-1.107.0.tar.gz'):
+            self.refused('requirements.txt', other + '\n')
         self.refused('requirements.txt', './litellm-1.107.0-unknown.whl\n',
                      'distribution filename cannot be evaluated safely')
 
@@ -522,7 +566,7 @@ class Manifests(unittest.TestCase):
     def test_compose_files(self):
         for name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml", "compose.override.yaml", "docker-compose.prod.yml"):
             self.allowed(name, f'services:\n  db:\n    image: postgres:16\n  proxy:\n    image: "{IMAGE}:v1.106.2-stable"\n')
-            self.allowed(name, "services:\n  proxy:\n    image: ${LITELLM_IMAGE}\n")
+            self.refused(name, "services:\n  proxy:\n    image: ${LITELLM_IMAGE}\n")
             self.refused(name, f"services:\n  proxy:\n    image: {IMAGE}:latest\n", "is refused")
             self.refused(name, f"services:\n  proxy:\n    image: {IMAGE}:main-stable\n", "is refused")
             self.refused(name, f"services:\n  proxy:\n    image: berriai/litellm:v1.107.0\n", "above the cap")
@@ -569,9 +613,10 @@ class Manifests(unittest.TestCase):
         # Include paths have no special meaning. Named files are scanned on their own.
         for include in ('-r requirements-extra.in', '-c constraints-extra.txt',
                         '--requirement=requirements-extra.in', '--constraint constraints-extra.txt',
-                        '-r requirements.txt', '-r https://example.invalid/deps.txt', '-r missing.txt',
-                        '-r missing-litellm.txt', '-r https://example.invalid/litellm.txt'):
+                        '-r requirements.txt', '-r https://example.invalid/deps.txt', '-r missing.txt'):
             self.allowed('requirements.txt', include + '\n')
+        for include in ('-r missing-litellm.txt', '-r https://example.invalid/litellm.txt'):
+            self.refused('requirements.txt', include + '\n')
         self.write('requirements-extra.in', '-r requirements.txt\nlitellm==1.107.0\n')
         self.write('constraints-extra.txt', 'litellm==1.104.0\n')
         subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
@@ -643,18 +688,20 @@ class Manifests(unittest.TestCase):
         self.assertIn('above the cap', output)
         self.assertNotIn('compose.yaml:', output)
 
-    def test_container_whole_token_boundaries(self):
+    def test_container_substrings_fail_closed(self):
         for name in ('Dockerfile', 'compose.yaml'):
-            for text in ('langchain-litellm', 'litellm-extra', 'other_litellm',
+            self.allowed(name, 'langchain-litellm\n')
+            for text in ('litellm-extra', 'other_litellm',
                          'litellm.py', 'xlitellm', 'litellmx', 'LITELLM_IMAGE'):
                 with self.subTest(name=name, text=text):
-                    self.allowed(name, text + '\n')
+                    self.refused(name, text + '\n')
             for text in ('litellm', '(litellm)', '/litellm',
-                         'litellm ==1.106.2', 'litellm===1.106.2', 'litellm==1.106.2junk',
+                         'litellm===1.106.2', 'litellm==1.106.2junk',
                          'litellm==1.106.2+custom', 'litellm==1.106.2.post1'):
                 with self.subTest(name=name, text=text):
                     self.refused(name, text + '\n')
             self.allowed(name, 'LiteLLM==1.106.2 litellm:v1.104.0 litellm[proxy]==1.106.2\n')
+            self.allowed(name, 'litellm ==1.106.2\n')
             self.refused(name, 'litellm==1.106.2 litellm==1.107.0\n', 'above the cap')
             self.refused(name, 'other/litellm:latest\n', 'is refused')
 
@@ -723,7 +770,11 @@ class Manifests(unittest.TestCase):
     def test_policy_schema_and_production_override_removal(self):
         original = tomllib.loads(POLICY.read_text())['packages']['litellm']
         for key, value in (('images', 'berriai/litellm'), ('max_version', 'latest'),
-                           ('reason', ''), ('source', 123), ('approved_digests', ['sha256:bad'])):
+                           ('reason', ''), ('source', 123), ('approved_digests', ['sha256:bad']),
+                           ('allowed_names', ['langchain-litellm']),
+                           ('allowed_names', {'langchain-litellm': ''}),
+                           ('allowed_names', {'litellm': 'cannot exempt the capped name'}),
+                           ('allowed_names', {'numpy': 'does not contain capped name'})):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 check.Cap('litellm', original | {key: value})
         with patch.dict(os.environ, {'PACKAGE_CAPS_FILE': '/tmp/relaxed-policy.toml'}), \

@@ -98,15 +98,19 @@ printf 'services:\n  proxy:\n    image: ghcr.io/berriai/litellm:main-latest\n' >
 git -C "$repo" add compose.yaml
 blocked "compose file with a refused litellm image tag"
 grep -q "package-cap-check" "$tmp/out"
-grep -q "compose.yaml:3: image tag main-latest is refused" "$tmp/out"
+grep -qF "compose.yaml:3: image tag main-latest is refused; cap v1.106.2; occurrence 'litellm'" "$tmp/out"
 printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm\n' > "$repo/Dockerfile"
 git -C "$repo" add Dockerfile
 blocked "Dockerfile installing litellm without a pin"
-grep -qF "Dockerfile:2: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2" "$tmp/out"
+grep -qF "Dockerfile:2: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2; occurrence 'litellm'" "$tmp/out"
 printf '[project]\nname = "demo"\ndependencies = ["litellm>=1.100"]\n' > "$repo/pyproject.toml"
 git -C "$repo" add pyproject.toml
 blocked "pyproject range without a lock file"
-grep -qF "pyproject.toml:3: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2" "$tmp/out"
+grep -qF "pyproject.toml:3: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2; occurrence 'litellm'" "$tmp/out"
+printf 'FROM python:3.12\nRUN pip install git+https://github.com/BerriAI/litellm.git\n' > "$repo/Dockerfile"
+git -C "$repo" add Dockerfile
+blocked "unknown litellm VCS form"
+grep -qF "Dockerfile:2: litellm needs an exact pin (==) or upper bound (<=) at or below 1.106.2; occurrence 'litellm'" "$tmp/out"
 printf '[project]\nname = "demo"\ndependencies = ["litellm==1.106.2"]\n' > "$repo/pyproject.toml"
 printf 'services:\n  proxy:\n    image: ghcr.io/berriai/litellm:v1.106.2-stable\n' > "$repo/compose.yaml"
 printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm==1.106.2\n' > "$repo/Dockerfile"
@@ -119,7 +123,7 @@ git -C "$repo" commit -q -m "Above the cap" --no-verify >/dev/null 2>&1
 printf '# Unrelated\n' > "$repo/docs/unrelated.md"
 git -C "$repo" add docs/unrelated.md
 blocked "unrelated change while a tracked manifest is above the cap"
-grep -qF "pyproject.toml:3: litellm 1.107.0 is above the cap 1.106.2" "$tmp/out"
+grep -qF "pyproject.toml:3: litellm 1.107.0 is above the cap 1.106.2; occurrence 'litellm'" "$tmp/out"
 git -C "$repo" reset -q --hard HEAD~1
 
 # pre-commit-enable never overwrites a different existing config.

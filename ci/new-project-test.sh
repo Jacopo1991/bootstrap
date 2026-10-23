@@ -34,7 +34,10 @@ grep -qx ".work/" "$HOME/dev_workspace/demo-site/.gitignore"
 # Every code repository has the standard verification command (`just check`, used by `task check`).
 grep -qx "check:" "$HOME/dev_workspace/demo-site/justfile"
 git -C "$HOME/dev_workspace/demo-site" ls-files --error-unmatch justfile >/dev/null
-grep -q 'constraint-dependencies = \["litellm<=1.106.2"\]' "$HOME/dev_workspace/demo-site/pyproject.toml"
+# Both generated resolver settings use the allowlisted upper-bound form.
+grep -qxF 'constraint-dependencies = ["litellm<=1.106.2"]' "$HOME/dev_workspace/demo-site/pyproject.toml"
+grep -qxF 'build-constraint-dependencies = ["litellm<=1.106.2"]' "$HOME/dev_workspace/demo-site/pyproject.toml"
+package-cap-check "$HOME/dev_workspace/demo-site/pyproject.toml"
 git -C "$HOME/dev_workspace/demo-site" ls-files --error-unmatch pyproject.toml >/dev/null
 kb="$HOME/cortex/cortex-kb-demo-site"
 for f in INTENT.md STATUS.md AGENTS.md README.md backlog/config.yml; do

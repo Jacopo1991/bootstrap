@@ -1211,7 +1211,7 @@ PyPI and about six for npm (its database is about 200 MB).
 `system/agent-policy/package-caps.toml` caps `litellm` at `1.106.2`, with exact
 pins or upper bounds for PyPI and pinned tags for images naming `litellm`,
 including `ghcr.io/berriai/litellm` / `berriai/litellm`. The text rule applies
-to any image repository with that package token, regardless of registry.
+to any image repository with that package name, regardless of registry.
 Version `1.107.0` and the affected floating image tags were compromised on
 2026-10-21 ([incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
 The rule rests on resolver constraints plus the offline repository gate:
@@ -1232,35 +1232,45 @@ The rule rests on resolver constraints plus the offline repository gate:
   `python3 ci/package-cap-check.py` with its checkout's policy before installation.
   Lock files are always parsed, even without capped names; a malformed lock fails
   closed. Capped entries must resolve at or below the cap and use registry sources;
-  git, path and URL sources fail. Every scanned non-lock file uses the same text rule: each whole-token
-  capped name needs an allowed exact pin (`litellm==1.106.2`,
-  `litellm[proxy]==1.104.0`, `litellm = "==1.106.2"`), an upper bound at or below
-  the cap (`litellm<=1.106.2`, `litellm[proxy]<=1.104.0`, including quoted forms),
-  or image tag (`litellm:v1.106.2`). Bare names and ranges without an upper bound
-  at or below the cap fail even with an allowed lock pin.
+  git, path and URL sources fail. Every scanned non-lock file uses one allowlist:
+  every case-insensitive **substring** occurrence of a capped name must belong to
+  an allowed form. These are exact pins or upper bounds at or below the cap
+  (`litellm==1.106.2`, `litellm[proxy] <= 1.104.0`, quoted or unquoted), Poetry
+  assignments (`litellm = "==1.106.2"`, `litellm = {version = "<=1.104.0"}`,
+  optionally with extras), image tags (`litellm:v1.106.2`, optionally `-stable`
+  and an approved digest), wheel/sdist filenames whose complete version is at
+  or below the cap, and explicitly allowed other package names.
+  Unknown forms fail closed: bare names, `litellm.git`, `litellm_proxy`, unknown
+  joined names, and ranges without an allowed upper bound fail even with an
+  allowed lock pin. Rewrite refused declarations as plain pins.
   Container discovery uses `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
   `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository.
   A version must end the word; quote or escape concatenation after a safe version
   prefix is refused.
-  Letters, digits, `_`, `.` and `-` join tokens, so `langchain-litellm` and
-  `litellm-proxy` are ignored. The exception is `litellm-` followed by a digit:
-  wheel and sdist filenames in URLs, paths and install lines count, and their
-  complete filename version must be at or below the cap.
+  The policy's `allowed_names` currently exempts only `langchain-litellm`, a
+  separate distribution. An exemption matches that complete name; extending
+  it into an unknown name such as `langchain-litellm-unknown` still fails.
   Comments and heredocs count; manifest/shell/YAML syntax, variables, requirement
   includes and `dockerfile:` references are not interpreted. Non-lock files without a
-  whole-token capped name are never parsed further. Violations report the file
-  and line; unapproved image digests and local versions still fail. Resolver
+  capped-name substring are never parsed further. Violations report the file,
+  line and occurrence; unapproved image digests and local versions still fail. Resolver
   constraints still cap transitive installs. The installed command requires the
   root-owned policy at `/usr/local/lib/agent-policy/package-caps.toml`.
 
-`pipx`, Poetry, conda/mamba, images and existing uv projects without workspace
-constraints have only the gate guard. It checks tracked declarations/locks at
-commit time; it does not block ad hoc installs. The agent hook keeps its ordinary
+`pipx`, Poetry, images and existing uv projects without workspace constraints
+have only the gate guard for the scanned file formats listed above. Files such
+as conda's `environment.yml`, `Pipfile` and `Containerfile` are outside discovery.
+The gate checks tracked declarations/locks at commit time; it does not block ad hoc installs. The agent hook keeps its ordinary
 command rules, including allowing `uv sync`.
 
 To add a package, add `[packages.<pypi-name>]` with required keys `max_version`,
 `reason` and `source` (HTTPS). Optional keys are `images`, `added` and
-`approved_digests`. Reinstall bootstrap to regenerate constraints; the PM handles
+`approved_digests` and `allowed_names`. To allow another package name containing
+the capped name, add it to that package's `allowed_names` map with a nonempty
+reason, for example `allowed_names = { langchain-litellm = "Separate LangChain integration distribution" }`.
+Keep this list small; unknown names remain refused. `images` records known vendor
+repositories; the text rule also checks other registries.
+Reinstall bootstrap to regenerate constraints; the PM handles
 existing-project rollout. Gate and resolver tests are `ci/package-caps-test.py`
 and `ci/package-cap-resolver-test.py`.
 
