@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Starts the pinned Backlog.md MCP server over stdio as the agent user for one knowledge
+# repository: one Claude app entry per repository
+# (wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-backlog-mcp <repo>), because
+# the Claude app reports no MCP roots. Never for Claude Code or Codex sessions. It opens no
+# network port; stdout belongs to MCP, so this script writes only to stderr before the exec.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin"
+# The only repositories it serves. Never cortex-kb-typo3-dkm, cortex-kb-customer-harness or
+# cortex-kb-photo-organizer (standing privacy rule). The README and
+# ~/.local/share/bootstrap/claude-app-mcp.json carry one entry per name (ci/backlog-mcp-test.py).
+repos=(cortex-kb-company cortex-kb-product-harness cortex-kb-household-signal-harness
+  cortex-kb-madplanner-v2 cortex-kb-consultancy-website cortex-kb-home-energy-lab
+  cortex-kb-hermes cortex-kb-historical-ingestion cortex-kb-linkedin-ops cortex-kb-orw)
+refuse() { printf 'agentdev-backlog-mcp: %s\n' "$*" >&2; exit 2; }
+[[ $# -eq 1 ]] || refuse 'usage: agentdev-backlog-mcp <repo-name>'
+allowed=
+for name in "${repos[@]}"; do [[ $1 == "$name" ]] && allowed=1; done
+[[ -n $allowed ]] || refuse "not an allowed knowledge repository: $(printf '%q' "$1")"
+
+# The pinned 1.53.0 resolves its project by walking up from --cwd to the first directory with a
+# Backlog config (then the git top level), and backlog.config.yml can move the backlog folder.
+# So the repository must be a real directory, no symlink on the way from $HOME, with its own
+# backlog/config.yml and no root config.
+home=$(realpath -e -- "$HOME")
+repo=$home/cortex/$1
+[[ -d $repo && $(realpath -e -- "$repo") == "$repo" ]] || refuse "$repo is missing or not a real directory"
+[[ -d $repo/backlog && ! -L $repo/backlog && -f $repo/backlog/config.yml && ! -L $repo/backlog/config.yml ]] \
+  || refuse "$repo has no backlog/config.yml of its own"
+[[ ! -e $repo/backlog.config.yml && ! -L $repo/backlog.config.yml ]] || refuse "$repo has a backlog.config.yml"
+
+# The platform binary itself: the npm wrapper (cli.js) does not pass SIGTERM on to it.
+binary=$HOME/.local/share/bootstrap/npm/node_modules/backlog.md-linux-x64/backlog
+[[ -x $binary ]] || { echo "Missing $binary; run chezmoi apply." >&2; exit 1; }
+# Backlog.md 1.53.0 has no telemetry or update check. A clean environment keeps DEBUG (which
+# prints to stdout) and BACKLOG_CWD from reaching it.
+cd "$repo"
+exec env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 "$binary" mcp start --cwd "$repo"

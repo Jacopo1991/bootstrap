@@ -856,6 +856,104 @@ behind when a call hung. Long-lived processes go through `start_process` and
   speaks MCP to the real `~/.local/bin/agentdev-shell-mcp`, lists its tools and runs `echo ok` as
   `agent`; the fresh-distro CI run (`ci/distro.sh`) does the same.
 
+### Backlog.md MCP for the Claude app
+
+The Company Control Room page calls [Backlog.md](https://github.com/MrLesk/Backlog.md)'s own MCP
+server through the Claude app on Windows (as `host:<server>`). The Claude app reports no MCP
+roots, so there is one server entry per knowledge repository, each pinned to its repository
+with `backlog mcp start --cwd`. Started through
+`wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-backlog-mcp <repo>`, it runs
+inside AgentDev as `agent` over stdio, like qmd and the shell connector.
+
+- **Pin:** `backlog.md` 1.53.0 and `backlog.md-linux-x64` 1.53.0 in the npm lock, installed by
+  `chezmoi apply` like the other npm tools. The launcher execs the platform binary directly (the
+  npm `cli.js` wrapper does not pass SIGTERM on). 1.53.0 has no telemetry and no update check.
+- **Never in agent sessions.** Agents use the `backlog` CLI. `ci/backlog-mcp-test.py` fails if a
+  tracked agent-session config references the launcher, and `checks/agent-drift.py` reports
+  `backlog-mcp-in-agent-session` for a live registration of the launcher or of `backlog mcp` in
+  `~/.claude.json`, `~/.claude/settings.json` or `~/.codex/config.toml`.
+- **Launcher allowlist:** `~/.local/bin/agentdev-backlog-mcp` serves only the repositories named
+  in it: `cortex-kb-company`, `cortex-kb-product-harness`, `cortex-kb-household-signal-harness`,
+  `cortex-kb-madplanner-v2`, `cortex-kb-consultancy-website`, `cortex-kb-home-energy-lab`, and the
+  dormant `cortex-kb-hermes`, `cortex-kb-historical-ingestion`, `cortex-kb-linkedin-ops` and
+  `cortex-kb-orw`. Never `cortex-kb-typo3-dkm`, `cortex-kb-customer-harness` or
+  `cortex-kb-photo-organizer` (standing privacy rule). Any other name, a path or `..` exits 2
+  before the server starts. Backlog.md resolves its project by walking up from `--cwd` to the
+  first directory with a Backlog config, and a root `backlog.config.yml` can move the backlog
+  folder, so the launcher also refuses a repository that is a symlink (or sits behind one under
+  `$HOME`), whose `backlog/` or `backlog/config.yml` is a symlink or missing, or that has a
+  `backlog.config.yml`. It starts the server in the repository with a clean environment
+  (`HOME`, `PATH`, `LANG` only: `DEBUG` would print to stdout and break MCP), opens no network
+  port and writes nothing to stdout before the exec.
+- **What the page may call:** the page's capability manifest names the only tools it may call:
+  `task_view`, `task_list`, `task_search`, `task_create`, `task_edit`, `document_view` and
+  `document_update`. Backlog.md 1.53.0 has no tool filter, so that manifest, enforced by the
+  Claude app, is the allowlist for the page. It covers the page only: any other Claude app chat
+  with these servers connected sees every Backlog.md tool, including `task_archive`,
+  `milestone_archive` and `milestone_remove` (archive and delete), `document_create`, and the
+  Definition of Done config upsert. Recovery is the git history in each knowledge repository;
+  Backlog.md writes files without committing (`autoCommit` off), so an edit is recoverable only
+  once the PM has committed the state before it.
+- **Claude app entries** (Windows-side config, pasted by Jacopo after the install; nothing in
+  this repository touches Windows files). `chezmoi apply` writes the same block to
+  `~/.local/share/bootstrap/claude-app-mcp.json`; merge its entries into `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "backlog-company": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-company"]
+    },
+    "backlog-product-harness": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-product-harness"]
+    },
+    "backlog-household-signal-harness": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-household-signal-harness"]
+    },
+    "backlog-madplanner-v2": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-madplanner-v2"]
+    },
+    "backlog-consultancy-website": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-consultancy-website"]
+    },
+    "backlog-home-energy-lab": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-home-energy-lab"]
+    },
+    "backlog-hermes": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-hermes"]
+    },
+    "backlog-historical-ingestion": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-historical-ingestion"]
+    },
+    "backlog-linkedin-ops": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-linkedin-ops"]
+    },
+    "backlog-orw": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-orw"]
+    }
+  }
+}
+```
+
+- **Tests and probe:** `python3 ci/backlog-mcp-test.py` (run by `ci/lint.sh`) starts a stub
+  server through the launcher for each allowed name and checks the refusals (private and
+  unknown names, paths, `..`, symlinks, a missing or parent Backlog config), runs the pinned
+  server over stdio through the launcher against a temporary Backlog project (tools listed,
+  `task_list` leaves the project unchanged), checks that this block and `claude-app-mcp.json`
+  match the launcher's allowlist, and checks the agent-session configs. After an install,
+  `python3 ci/backlog-mcp-probe.py` speaks MCP to the real `~/.local/bin/agentdev-backlog-mcp`
+  for `cortex-kb-company`, lists its tools and runs `task_list` read-only.
+
 ### Browser tests in a project gate
 
 `gate-browser` runs browser and persona specs in the trusted host gate using the

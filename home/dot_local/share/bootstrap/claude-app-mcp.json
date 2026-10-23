@@ -1,0 +1,44 @@
+{
+  "mcpServers": {
+    "backlog-company": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-company"]
+    },
+    "backlog-product-harness": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-product-harness"]
+    },
+    "backlog-household-signal-harness": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-household-signal-harness"]
+    },
+    "backlog-madplanner-v2": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-madplanner-v2"]
+    },
+    "backlog-consultancy-website": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-consultancy-website"]
+    },
+    "backlog-home-energy-lab": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-home-energy-lab"]
+    },
+    "backlog-hermes": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-hermes"]
+    },
+    "backlog-historical-ingestion": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-historical-ingestion"]
+    },
+    "backlog-linkedin-ops": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-linkedin-ops"]
+    },
+    "backlog-orw": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-orw"]
+    }
+  }
+}
