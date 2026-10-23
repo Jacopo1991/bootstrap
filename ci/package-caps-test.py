@@ -5,8 +5,11 @@ package-cap-check to every manifest, lock, Dockerfile and compose format, offlin
 Fixtures are temporary repositories; no real venv, repository or Docker is touched."""
 import importlib.machinery
 import importlib.util
+import contextlib
+import io
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -16,7 +19,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "system/agent-policy/package-caps.toml"
-COMMAND = ROOT / "home/dot_local/bin/executable_package-cap-check"
+COMMAND = ROOT / "system/agent-policy/package_caps.py"
 GATE_CONFIG = ROOT / "home/dot_local/share/bootstrap/pre-commit/pre-commit-config.yaml"
 IMAGE = "ghcr.io/berriai/litellm"
 
@@ -61,6 +64,24 @@ class PolicyFile(unittest.TestCase):
         for script in ("executable_new-project", "executable_pre-commit-enable"):
             self.assertIn("package-cap-check", (ROOT / "home/dot_local/bin" / script).read_text(), script)
 
+    def test_bootstrap_gate_runs_from_checkout_before_install(self):
+        config = (ROOT / '.pre-commit-config.yaml').read_text()
+        hook = config.split('- id: package-caps\n', 1)[1]
+        entry = next(line.strip().removeprefix('entry: ') for line in hook.splitlines()
+                     if line.strip().startswith('entry: '))
+        self.assertEqual(entry, 'python3 ci/package-cap-fixture.py')
+        self.assertIn('pass_filenames: false\n', hook)
+        self.assertIn('always_run: true\n', hook)
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = Path(temp) / 'requirements.txt'
+            for requirement, expected in (('litellm==1.106.2', 0), ('litellm==1.107.0', 1)):
+                manifest.write_text(requirement + '\n')
+                result = subprocess.run([*shlex.split(entry), str(manifest)], cwd=ROOT,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                if expected:
+                    self.assertIn('above the cap 1.106.2', result.stdout)
+
 
 class Versions(unittest.TestCase):
     def test_pep440_ordering_against_the_cap(self):
@@ -69,7 +90,7 @@ class Versions(unittest.TestCase):
             self.assertLessEqual(check.version_key(lower), cap, lower)
         for higher in ("1.106.3", "1.107.0", "1.107.0rc1", "1.106.2.post1", "1.106.10", "2.0", "1.107.0.dev1"):
             self.assertGreater(check.version_key(higher), cap, higher)
-        for junk in ("latest", "1.106.*", "", "main-v1.106.2", ">=1.106.2"):
+        for junk in ("latest", "1.106.*", "", "main-v1.106.2", ">=1.106.2", "1.106.2+custom"):
             self.assertIsNone(check.version_key(junk), junk)
 
     def test_requirement_parsing(self):
@@ -107,12 +128,11 @@ class Manifests(unittest.TestCase):
         self.temp.cleanup()
 
     def run_check(self, *paths: str, env_policy: str | None = str(POLICY), args=()) -> tuple[int, str]:
-        env = {"PATH": os.environ["PATH"], "HOME": self.temp.name, "PYTHONDONTWRITEBYTECODE": "1"}
-        if env_policy is not None:
-            env["PACKAGE_CAPS_FILE"] = env_policy
-        result = subprocess.run([sys.executable, "-I", str(COMMAND), *args, *paths], cwd=self.repo, env=env,
-                                capture_output=True, text=True, timeout=60)
-        return result.returncode, result.stdout + result.stderr
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            code = check.main(["--root", str(self.repo), *args, *(str(self.repo / p) for p in paths)],
+                              policy_path=Path(env_policy) if env_policy else POLICY)
+        return code, output.getvalue()
 
     def write(self, name: str, text: str) -> str:
         path = self.repo / name
@@ -133,6 +153,8 @@ class Manifests(unittest.TestCase):
             self.assertIn(fragment, output, (name, text, output))
 
     def test_requirements_and_constraints(self):
+        self.write("other.txt", "requests==2.32.0\n")
+        self.write("api/other.txt", "requests==2.32.0\n")
         for name in ("requirements.txt", "requirements-dev.txt", "constraints.txt", "constraints-prod.txt", "api/requirements.txt"):
             self.allowed(name, "requests==2.32.0\nlitellm==1.106.2  # pinned\n")
             self.allowed(name, "litellm[proxy]==1.104.2 \\\n    --hash=sha256:0123\n")
@@ -157,7 +179,8 @@ class Manifests(unittest.TestCase):
         self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = "^1.100"\n', "no uv.lock or poetry.lock")
         self.refused("pyproject.toml", '[tool.poetry.group.dev.dependencies]\nlitellm = "*"\n', "no uv.lock or poetry.lock")
         self.refused("pyproject.toml", '[build-system]\nrequires = ["litellm>1"]\n', "no uv.lock or poetry.lock")
-        self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<1.108"]\n', "no uv.lock or poetry.lock")
+        self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<1.108"]\n', "unverified uv")
+        self.allowed("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<=1.106.2"]\n')
 
     def test_pyproject_range_needs_a_lock_pinning_an_allowed_version(self):
         project = '[project]\nname = "x"\ndependencies = ["litellm>=1.100"]\n'
@@ -184,6 +207,8 @@ class Manifests(unittest.TestCase):
         self.refused("Pipfile.lock", '{"default": {"litellm": {"git": "https://example.invalid", "ref": "main"}}}', "pinned exactly")
 
     def test_dockerfiles(self):
+        self.write("requirements.txt", "requests==2.32.0\n")
+        self.write("deploy/requirements.txt", "requests==2.32.0\n")
         for name in ("Dockerfile", "Dockerfile.api", "api.Dockerfile", "Containerfile", "deploy/Dockerfile"):
             self.allowed(name, f"FROM {IMAGE}:v1.106.2-stable\nRUN pip install \"litellm==1.106.2\" && pip install requests\n")
             self.allowed(name, f"FROM --platform=linux/amd64 docker.io/berriai/litellm:v1.104.0 AS base\nFROM python:3.12\n")
@@ -202,7 +227,7 @@ class Manifests(unittest.TestCase):
     def test_compose_files(self):
         for name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml", "compose.override.yaml", "docker-compose.prod.yml"):
             self.allowed(name, f'services:\n  db:\n    image: postgres:16\n  proxy:\n    image: "{IMAGE}:v1.106.2-stable"\n')
-            self.allowed(name, "services:\n  proxy:\n    image: ${LITELLM_IMAGE}\n")
+            self.refused(name, "services:\n  proxy:\n    image: ${LITELLM_IMAGE}\n", "unresolved image")
             self.refused(name, f"services:\n  proxy:\n    image: {IMAGE}:latest\n", "is refused")
             self.refused(name, f"services:\n  proxy:\n    image: {IMAGE}:main-stable\n", "is refused")
             self.refused(name, f"services:\n  proxy:\n    image: berriai/litellm:v1.107.0\n", "above the cap")
@@ -226,10 +251,11 @@ class Manifests(unittest.TestCase):
         (plain / ".venv").mkdir(parents=True)
         (plain / ".venv/requirements.txt").write_text("litellm\n")
         (plain / "requirements.txt").write_text("litellm==1.106.2\n")
-        result = subprocess.run([sys.executable, "-I", str(COMMAND), "--policy", str(POLICY)], cwd=plain,
-                                capture_output=True, text=True, env={"PATH": os.environ["PATH"]})
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("OK (1 manifest(s), 1 capped package(s))", result.stdout)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = check.main(["--root", str(plain)], policy_path=POLICY)
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertIn("OK (1 manifest(s), 1 capped package(s))", output.getvalue())
 
     def test_policy_file_is_required(self):
         self.write("requirements.txt", "litellm==1.106.2\n")
@@ -238,11 +264,92 @@ class Manifests(unittest.TestCase):
         self.assertEqual(code, 2, output)
         self.assertIn("cannot read the policy file", output)
         self.assertIn("install.sh", output)
-        code, output = self.run_check("requirements.txt", env_policy=None, args=("--policy", str(POLICY)))
+        code, output = self.run_check("requirements.txt", env_policy=None)
         self.assertEqual(code, 0, output)
         broken = self.write("broken.toml", "[packages]\n")
         code, output = self.run_check("requirements.txt", env_policy=str(self.repo / broken))
         self.assertEqual(code, 2, output)
+
+    def test_includes_artifacts_and_expansions(self):
+        for include in ('-r deps.txt', '-c deps.txt', '--requirement=deps.txt', '--constraint deps.txt'):
+            self.write('deps.txt', 'litellm==1.107.0\n')
+            code, output = self.run_check(self.write('requirements.in', include + '\n'))
+            self.assertEqual(code, 1, output)
+            self.assertIn('deps.txt:1:', output)
+            self.assertIn('above the cap 1.106.2', output)
+        for body in ('-r requirements.txt\n', '-r https://example.invalid/deps.txt\n', 'litellm==$VERSION\n'):
+            self.refused('requirements.txt', body)
+        code, output = self.run_check(self.write('requirements.txt', '-r missing.txt\n'))
+        self.assertEqual(code, 1, output)
+        self.assertIn('missing.txt:1: requirements include is unavailable', output)
+        self.assertIn('1.106.2', output)
+        self.assertIn('security-incident-oct-21-2026', output)
+        self.write('nested.txt', 'litellm==1.104.0\n')
+        self.write('deps.txt', '-c nested.txt\n')
+        self.allowed('requirements.in', '-r deps.txt\n')
+        for operand in ('./litellm-1.107.0-py3-none-any.whl',
+                        'https://example.invalid/litellm-1.107.0-py3-none-any.whl',
+                        'git+https://example.invalid/litellm',
+                        'https://example.invalid/innocent.whl',
+                        'litellm==1.106.2+custom', 'litellm==1.106.2.post1', 'litellm===1.106.2'):
+            self.refused('requirements.txt', operand + '\n')
+        self.allowed('requirements.txt', './litellm-1.106.2-py3-none-any.whl\n')
+
+    def test_yaml_args_defaults_digests_and_discovery(self):
+        self.refused('anything.yaml', 'services: {proxy: {"image": "berriai/litellm:latest"}}\n')
+        self.refused('weird-compose.yaml', 'x: &proxy {image: berriai/litellm:latest}\nservices: {proxy: *proxy}\n')
+        self.allowed('compose.yaml', 'services: {proxy: {image: "berriai/litellm:${TAG:-v1.106.2}"}}\n')
+        self.refused('compose.yaml', 'services: {proxy: {image: "berriai/litellm:${TAG:-v1.107.0}"}}\n')
+        self.refused('compose.yaml', 'services: {proxy: {image: "${IMAGE}"}}\n')
+        for name in ('custom.Dockerfile.build', 'dockerfile-custom', 'odd-containerfile'):
+            self.allowed(name, 'ARG TAG=v1.106.2\nFROM berriai/litellm:$TAG\n')
+            self.refused(name, 'ARG TAG=v1.107.0\nFROM berriai/litellm:${TAG}\n')
+            self.refused(name, 'ARG TAG\nFROM berriai/litellm:$TAG\n')
+            for suffix in ('post1', '+custom'):
+                tag = 'v1.106.2.' + suffix if suffix == 'post1' else 'v1.106.2' + suffix
+                self.refused(name, 'FROM berriai/litellm:' + tag + '\n')
+            self.refused(name, 'FROM berriai/litellm:v1.106.2@sha256:' + 'a' * 64 + '\n')
+        cap = check.load_policy(POLICY)['litellm']
+        cap.approved_digests.add('sha256:' + 'a' * 64)
+        self.assertIsNone(cap.image_reason('berriai/litellm:v1.106.2@sha256:' + 'a' * 64))
+        self.assertIsNotNone(cap.image_reason('berriai/litellm:v1.107.0@sha256:' + 'a' * 64))
+
+    def test_lock_consistency_and_sources(self):
+        self.write('uv.lock', '[[package]]\nname="litellm"\nversion="1.106.2"\n')
+        for req in ('litellm>=1.107.0', 'litellm==1.104.0', 'litellm @ git+https://example.invalid/repo'):
+            self.refused('pyproject.toml', '[project]\ndependencies = ["' + req + '"]\n')
+        self.refused('pyproject.toml', '[tool.poetry.dependencies]\nlitellm={git="https://example.invalid", version="1.106.2"}\n')
+        self.refused('pyproject.toml', '[tool.uv.sources]\nlitellm={path="./litellm"}\n')
+        for name in ('uv.lock', 'poetry.lock'):
+            for source in ('git="https://example.invalid/repo"', 'path="./litellm"', 'url="https://example.invalid/repo.whl"'):
+                self.refused(name, '[[package]]\nname="litellm"\nversion="1.106.2"\nsource={' + source + '}\n')
+            self.refused(name, '[[package]]\nname="litellm"\nversion="1.106.2"\n[[package]]\nname="litellm"\nversion="1.107.0"\n')
+        self.refused('Pipfile.lock', '{"default":{"litellm":{"version":"==1.106.2","path":"./litellm"}}}')
+
+    def test_setup_and_script_metadata(self):
+        self.allowed('setup.cfg', '[options]\ninstall_requires =\n    litellm==1.106.2\n')
+        self.refused('setup.cfg', '[options.extras_require]\nproxy =\n    litellm==1.107.0\n')
+        self.refused('setup.py', 'setup(install_requires=["litellm==1.106.2"])\n')
+        self.allowed('script.py', '# /// script\n# dependencies = ["litellm==1.106.2"]\n# ///\nprint("hello")\n')
+        self.refused('script.py', '# /// script\n# dependencies = ["litellm"]\n# ///\n')
+
+    def test_policy_schema_and_production_override_removal(self):
+        original = tomllib.loads(POLICY.read_text())['packages']['litellm']
+        for key, value in (('images', 'berriai/litellm'), ('max_version', 'latest'),
+                           ('reason', ''), ('source', 123), ('approved_digests', ['sha256:bad'])):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                check.Cap('litellm', original | {key: value})
+        with patch.dict(os.environ, {'PACKAGE_CAPS_FILE': '/tmp/relaxed-policy.toml'}), \
+                patch.object(check, 'load_policy', return_value=check.load_policy(POLICY)) as load:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(check.main(['--root', str(self.repo)]), 0)
+            load.assert_called_once_with(check.DEFAULT_POLICY)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            check.main(['--policy', str(POLICY)])
+        self.assertEqual(error.exception.code, 2)
+        wrapper = (ROOT / 'home/dot_local/bin/executable_package-cap-check').read_text()
+        self.assertIn("runpy.run_path('/usr/local/lib/agent-policy/package_caps.py'", wrapper)
+        self.assertNotIn('PACKAGE_CAPS_FILE', wrapper)
 
 
 if __name__ == "__main__":

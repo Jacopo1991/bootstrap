@@ -10,9 +10,9 @@ trap 'rm -rf "$tmp"' EXIT
 # The package cap gate command and its policy file come from this checkout, as chezmoi (which sets
 # the executable bit on apply) and install.sh place them.
 mkdir -p "$tmp/bin"
-printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/home/dot_local/bin/executable_package-cap-check" > "$tmp/bin/package-cap-check"
+printf '#!/usr/bin/env bash\nexec /usr/bin/python3 %q "$@"\n' "$ROOT/ci/package-cap-fixture.py" > "$tmp/bin/package-cap-check"
 chmod 0755 "$tmp/bin/package-cap-check"
-export PATH="$tmp/bin:$PATH" PACKAGE_CAPS_FILE="$ROOT/system/agent-policy/package-caps.toml"
+export PATH="$tmp/bin:$PATH"
 # backlog is a node script behind a mise shim; keep mise pointed at the real home.
 export MISE_DATA_DIR="${MISE_DATA_DIR:-$HOME/.local/share/mise}" MISE_CONFIG_DIR="${MISE_CONFIG_DIR:-$HOME/.config/mise}" MISE_CACHE_DIR="${MISE_CACHE_DIR:-$HOME/.cache/mise}"
 export HOME="$tmp" GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
@@ -34,6 +34,8 @@ grep -qx ".work/" "$HOME/dev_workspace/demo-site/.gitignore"
 # Every code repository has the standard verification command (`just check`, used by `task check`).
 grep -qx "check:" "$HOME/dev_workspace/demo-site/justfile"
 git -C "$HOME/dev_workspace/demo-site" ls-files --error-unmatch justfile >/dev/null
+grep -q 'constraint-dependencies = \["litellm<=1.106.2"\]' "$HOME/dev_workspace/demo-site/pyproject.toml"
+git -C "$HOME/dev_workspace/demo-site" ls-files --error-unmatch pyproject.toml >/dev/null
 kb="$HOME/cortex/cortex-kb-demo-site"
 for f in INTENT.md STATUS.md AGENTS.md README.md backlog/config.yml; do
   [ -f "$kb/$f" ]

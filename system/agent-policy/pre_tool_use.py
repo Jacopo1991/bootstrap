@@ -1250,159 +1250,68 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
     return expressions
 
 
-# Package caps (package-caps.toml next to this script, root-owned when installed): a capped
-# package installs only with an exact pin at or below its cap, and its images only with a
-# version tag at or below the cap. The gate command package-cap-check applies the same file
-# to manifests; this rule covers the install commands an agent types.
+# Installer operands use the same version, schema and file checks as the gate.
+# The shell has already been parsed by evaluate_command; no second shell parser.
 PACKAGE_CAPS_FILE = Path(__file__).resolve().parent / "package-caps.toml"
-PACKAGE_INSTALL_FORMS = (("pip", "install"), ("pip3", "install"), ("uv", "pip", "install"),
-                         ("uv", "add"), ("uv", "tool", "install"), ("pipx", "install"), ("poetry", "add"))
-IMAGE_COMMANDS = {"pull", "run", "create"}
-PACKAGE_VERSION = re.compile(
-    r"^v?(?P<release>\d+(?:\.\d+)*)"
-    r"(?:[-._]?(?P<pre_l>alpha|beta|preview|pre|rc|a|b|c)[-._]?(?P<pre_n>\d*))?"
-    r"(?:-(?P<post_i>\d+)|[-._]?(?:post|rev|r)[-._]?(?P<post_n>\d*))?"
-    r"(?:[-._]?dev[-._]?(?P<dev_n>\d*))?"
-    r"(?:\+[A-Za-z0-9]+(?:[-._][A-Za-z0-9]+)*)?$", re.IGNORECASE)
-PACKAGE_PRE_RANK = {"a": 0, "alpha": 0, "b": 1, "beta": 1, "c": 2, "rc": 2, "pre": 2, "preview": 2}
-PACKAGE_REQUIREMENT = re.compile(r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
-                                 r"(?P<extras>\[[^\]]*\])?\s*(?P<spec>.*)$")
-_package_caps: list[dict] | str | None = None  # parsed once per hook process
+_package_caps = None
+_caps_module = None
 
 
-def package_version_key(text: str) -> tuple | None:
-    """PEP 440 ordering key (release, pre, post, dev); None when the text is not a version."""
-    match = PACKAGE_VERSION.match(text.strip())
-    if not match:
-        return None
-    release = [int(part) for part in match["release"].split(".")]
-    while len(release) > 1 and release[-1] == 0:
-        release.pop()
-    post = match["post_i"] or match["post_n"]
-    has_post, has_dev = post is not None, match["dev_n"] is not None
-    if match["pre_l"]:
-        pre = (PACKAGE_PRE_RANK[match["pre_l"].lower()], int(match["pre_n"] or 0))
-    else:
-        pre = (-1, 0) if has_dev and not has_post else (9, 0)
-    return (tuple(release), pre, int(post or 0) if has_post else -1,
-            int(match["dev_n"] or 0) if has_dev else float("inf"))
+def cap_module():
+    global _caps_module
+    if _caps_module is None:
+        import importlib.util
+        path = Path(__file__).resolve().with_name("package_caps.py")
+        spec = importlib.util.spec_from_file_location("agent_package_caps", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _caps_module = module
+    return _caps_module
 
 
-def package_name(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
-def image_reference(reference: str) -> tuple[str, str | None]:
-    """image[:tag][@digest] -> (normalized repository name, tag)."""
-    reference = reference.strip().strip("\"'").split("@", 1)[0]
-    name, tag = reference, None
-    colon = reference.rfind(":")
-    if colon > reference.rfind("/"):
-        name, tag = reference[:colon], reference[colon + 1:]
-    name = name.lower()
-    for prefix in ("docker.io/", "index.docker.io/", "registry-1.docker.io/"):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-    return name.removeprefix("library/"), tag
-
-
-def package_requirement(operand: str, poetry: bool = False) -> tuple[str, str | None] | None:
-    """(normalized name, exact version or None) for one install operand."""
-    text = operand.split(";", 1)[0].strip().strip("\"'")
-    if poetry and "@" in text and not text.startswith("@"):
-        name, constraint = text.split("@", 1)
-        if not PACKAGE_REQUIREMENT.match(name) or PACKAGE_REQUIREMENT.match(name)["spec"]:
-            return None
-        constraint = constraint.strip().removeprefix("==")
-        return package_name(name), constraint if package_version_key(constraint) else None
-    match = PACKAGE_REQUIREMENT.match(text)
-    if not match:
-        return None
-    spec = match["spec"].strip().strip("()").replace(" ", "")
-    exact = re.fullmatch(r"===?([^,*]+)", spec)
-    if exact and package_version_key(exact[1]) is not None:
-        return package_name(match["name"]), exact[1]
-    return package_name(match["name"]), None
-
-
-def package_caps() -> list[dict] | str:
-    """Read package-caps.toml once; an unreadable or malformed file fails closed."""
+def package_caps():
+    """Parse the root-owned policy once per hook process, including failures."""
     global _package_caps
     if _package_caps is None:
         try:
-            data = tomllib.loads(PACKAGE_CAPS_FILE.read_text(encoding="utf-8"))
-            caps = []
-            for name, table in data["packages"].items():
-                key = package_version_key(str(table["max_version"]))
-                if key is None:
-                    raise ValueError(f"{name}: max_version is not a version")
-                caps.append({"name": package_name(name), "max": str(table["max_version"]), "key": key,
-                             "images": {image_reference(str(image))[0] for image in table.get("images", [])},
-                             "reason": str(table.get("reason", ""))})
-            if not caps:
-                raise ValueError("no [packages.<name>] tables")
-            _package_caps = caps
-        except (OSError, ValueError, KeyError, TypeError, AttributeError, UnicodeError):
+            _package_caps = cap_module().load_policy(PACKAGE_CAPS_FILE)
+        except (OSError, ValueError, TypeError, ImportError):
             _package_caps = (f"The package cap policy file {PACKAGE_CAPS_FILE} is missing or unreadable "
                              "(bootstrap system/agent-policy/package-caps.toml, installed by install.sh); "
                              "package installs and image pulls stay blocked until it is installed.")
     return _package_caps
 
 
-def package_cap_reason(tokens: list[str], executable: str) -> str | None:
-    """Deny installs of a capped package without an exact allowed pin, and pulls or runs of
-    its images without an allowed version tag. Redirect tokens were removed already."""
+def package_cap_reason(tokens: list[str], executable: str, cwd: str) -> str | None:
     words = [executable, *tokens[1:]]
-    if re.fullmatch(r"python[0-9.]*", executable) and words[1:3] == ["-m", "pip"]:
-        words = words[2:]
-    operands: list[str] = []
-    images: list[str] = []
-    for form in PACKAGE_INSTALL_FORMS:
-        if tuple(words[:len(form)]) == form:
-            operands = [word for word in words[len(form):] if not word.startswith("-")]
-            break
-    if executable in CONTAINER_CLIS and not executable.endswith("-compose"):
-        rest = words[1:]
-        if rest[:1] and rest[0] in {"image", "container"}:
-            rest = rest[1:]
-        if rest[:1] and rest[0] in IMAGE_COMMANDS:
-            images = [word for word in rest[1:] if not word.startswith("-")]
-    if not operands and not images:
+    installers = {"pip", "pip3", "uv", "uvx", "pipx", "poetry", "conda", "mamba", "micromamba"}
+    python_pip = re.fullmatch(r"python[0-9.]*", executable) and "-m" in words and "pip" in words
+    images = executable in CONTAINER_CLIS and any(w in {"pull", "run", "create"} for w in words[1:])
+    if executable not in installers and not python_pip and not images:
+        return None
+    # Read-only inspection does not require a package policy.
+    if len(words) > 1 and words[1] in {"list", "show", "freeze", "check", "ps", "--version", "--help", "-h"}:
         return None
     caps = package_caps()
     if isinstance(caps, str):
         return caps
-    for operand in operands:
-        parsed = package_requirement(operand, poetry=words[:1] == ["poetry"])
-        if parsed is None:
-            continue
-        name, version = parsed
-        for cap in caps:
-            if cap["name"] != name:
-                continue
-            if version is None:
-                detail = f"{name} must be installed with an exact pin at or below {cap['max']} ({name}=={cap['max']})"
-            elif package_version_key(version) > cap["key"]:
-                detail = f"{name} {version} is above the cap {cap['max']}"
-            else:
-                continue
-            return package_cap_denial(cap, detail)
-    for image in images:
-        name, tag = image_reference(image)
-        for cap in caps:
-            if name not in cap["images"]:
-                continue
-            found = re.search(r"(?<![0-9A-Za-z])v?(\d+(?:\.\d+)+)", tag or "")
-            if (tag is None or tag.lower() in {"latest", "main"} or tag.lower().startswith("main-")
-                    or not found or package_version_key(found[1]) > cap["key"]):
-                return package_cap_denial(cap, f"image {image} needs a version tag at or below v{cap['max']}; "
-                                               "latest, main-* and untagged images are refused")
+    reason = cap_module().install_reason(words, Path(cwd), caps)
+    if not reason and images:
+        for word in words[1:]:
+            if "$" in word:
+                reason = "unresolved image reference refused"
+                break
+            for cap in caps.values():
+                reason = cap.image_reason(word)
+                if reason:
+                    break
+            if reason:
+                break
+    if reason:
+        names = ", ".join(f"{c.name}<={c.max_version}" for c in caps.values())
+        return (f"Package cap rule for {names} (policy file {PACKAGE_CAPS_FILE}, "
+                f"bootstrap system/agent-policy/package-caps.toml): {reason}")
     return None
-
-
-def package_cap_denial(cap: dict, detail: str) -> str:
-    return (f"Package cap rule for {cap['name']} (policy file {PACKAGE_CAPS_FILE}, source "
-            f"bootstrap system/agent-policy/package-caps.toml): {detail}. {cap['reason']}.")
 
 
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
@@ -2502,7 +2411,7 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     reason = recipe_reason(tokens, cwd, root, approved_roots, depth)
     if reason:
         return Denial("command.recipe", reason)
-    reason = package_cap_reason(tokens, executable)
+    reason = package_cap_reason(tokens, executable, cwd)
     if reason:
         return Denial("package.cap", reason)
     args = [t for t in tokens[1:] if not t.startswith("-")]

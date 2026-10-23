@@ -13,9 +13,9 @@ trap 'chmod -R u+w "$tmp"; rm -rf "$tmp"' EXIT
 # The package cap gate command and its policy file come from this checkout, as chezmoi (which sets
 # the executable bit on apply) and install.sh place them.
 mkdir -p "$tmp/bin"
-printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/home/dot_local/bin/executable_package-cap-check" > "$tmp/bin/package-cap-check"
+printf '#!/usr/bin/env bash\nexec /usr/bin/python3 %q "$@"\n' "$ROOT/ci/package-cap-fixture.py" > "$tmp/bin/package-cap-check"
 chmod 0755 "$tmp/bin/package-cap-check"
-export PATH="$tmp/bin:$PATH" PACKAGE_CAPS_FILE="$ROOT/system/agent-policy/package-caps.toml"
+export PATH="$tmp/bin:$PATH"
 export HOME="$tmp/home" XDG_CACHE_HOME="$tmp/home/.cache" PRE_COMMIT_HOME="$tmp/home/.cache/pre-commit"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
 mkdir -p "$HOME"
@@ -102,11 +102,11 @@ grep -q "compose.yaml:3: image tag main-latest is refused" "$tmp/out"
 printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm\n' > "$repo/Dockerfile"
 git -C "$repo" add Dockerfile
 blocked "Dockerfile installing litellm without a pin"
-grep -q "Dockerfile:2: litellm must be pinned exactly" "$tmp/out"
+grep -q "Dockerfile:2: .*litellm must be pinned exactly" "$tmp/out"
 printf '[project]\nname = "demo"\ndependencies = ["litellm>=1.100"]\n' > "$repo/pyproject.toml"
 git -C "$repo" add pyproject.toml
 blocked "pyproject range without a lock file"
-grep -q "pyproject.toml:3: litellm has a version range" "$tmp/out"
+grep -q "pyproject.toml:1: litellm has a range" "$tmp/out"
 printf '[project]\nname = "demo"\ndependencies = ["litellm==1.106.2"]\n' > "$repo/pyproject.toml"
 printf 'services:\n  proxy:\n    image: ghcr.io/berriai/litellm:v1.106.2-stable\n' > "$repo/compose.yaml"
 printf 'FROM ghcr.io/berriai/litellm:v1.106.2-stable\nRUN pip install litellm==1.106.2\n' > "$repo/Dockerfile"

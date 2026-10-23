@@ -28,6 +28,9 @@ create)
     command -v "$tool" >/dev/null || { echo "$tool is not on PATH; run the bootstrap install first. Nothing changed." >&2; exit 1; }
   done
   mkdir -p "$code" "$kb"
+  # Project resolution ignores user uv.toml constraints. Generate workspace
+  # metadata from the same installed policy before the repository's first gate.
+  package-cap-check --uv-project > "$code/pyproject.toml"
   git -C "$code" init -q -b main
   git -C "$kb" init -q -b main
 

@@ -22,3 +22,10 @@ repos:
         entry: osv-scanner scan source --offline
         language: system
         files: (^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|uv\.lock|poetry\.lock|pdm\.lock|Pipfile\.lock|requirements[^/]*\.txt|Cargo\.lock|go\.mod|composer\.lock|Gemfile\.lock)$
+      - id: package-caps
+        name: package-cap-check (capped packages pinned at or below their cap)
+        # Bootstrap must check its own policy before this checkout is installed.
+        entry: python3 ci/package-cap-fixture.py
+        language: system
+        pass_filenames: false
+        always_run: true

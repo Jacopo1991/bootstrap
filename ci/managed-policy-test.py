@@ -236,7 +236,7 @@ assert 'sudo mktemp "$policy_dir/.agent-policy.XXXXXX"' in install
 assert 'sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"' in install
 assert install.index('sudo mv -f -- "$policy_temp" "$policy_dir/$script"') < published
 # The package cap policy file is installed root-owned next to the hook that reads it.
-assert "for script in pre_tool_use.py context_reminder.py package-caps.toml; do" in install
+assert "for script in pre_tool_use.py context_reminder.py package_caps.py package-caps.toml; do" in install
 
 # Git environment overrides cannot redirect policy subprocesses; other environment stays.
 spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/agent-policy/pre_tool_use.py")
@@ -466,8 +466,8 @@ with tempfile.TemporaryDirectory() as temp:
     def outside_temp():
         stack = [patch.object(policy, "LANE_TEMP_ROOTS", ()),
                  patch.object(policy, "scratch_root", return_value=None),
-                 patch.dict(os.environ)]
-        os.environ.pop("TMPDIR", None)
+                 patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TMPDIR"},
+                            clear=True)]
         return stack
 
     outside = make_venv(base / "outside-venv")
@@ -545,9 +545,13 @@ with tempfile.TemporaryDirectory() as temp:
         assert venv_judge(f"{base}/plain/python3.12 --version")
         (base / "dir-elf").mkdir()
         assert venv_judge(f"{base}/dir-elf --version")
-    # Under the real temp roots the outside venv is lane-writable, so it is denied again.
-    assert venv_judge(".venv/bin/python --version")
-    assert venv_judge(f"{root}/.venv/bin/python -m x")
+    # Model the temp boundary explicitly: TMPDIR may be inside the worktree, and
+    # an enclosing fixture may clear it. Neither may weaken this negative control.
+    with patch.object(policy, "LANE_TEMP_ROOTS", (base,)):
+        for command in (".venv/bin/python --version", f"{root}/.venv/bin/python -m x"):
+            reason = venv_judge(command)
+            assert getattr(reason, "rule_id", "") == "command.script", (command, reason)
+            assert str(reason) == "Script cannot be read or judged safely.", (command, reason)
     print("PASS: venv interpreters follow the bare python3 verdict; lane-writable binaries and scripts stay denied")
 
 # Local-only bases, trusted recipes and transitive gate inputs.
@@ -1091,6 +1095,7 @@ with tempfile.TemporaryDirectory() as audit_temp:
 with tempfile.TemporaryDirectory() as temp:
     cap_root = Path(temp)
     subprocess.run(["git", "init", "-q", "-b", "main", temp], check=True)
+    (cap_root / 'requirements.txt').write_text('litellm==1.106.2\n')
 
     def cap_judge(command):
         with patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "TASK_WORKTREE"}, clear=True):
@@ -1118,7 +1123,7 @@ with tempfile.TemporaryDirectory() as temp:
         "podman run ghcr.io/berriai/litellm:v1.106.2", "docker run --rm alpine:latest true")
     for command in allowed_installs:
         reason = cap_judge(command)
-        assert getattr(reason, "rule_id", "") != "package.cap", (command, reason)
+        assert reason is None, (command, reason)
     denied_installs = (
         "pip install litellm", "pip install litellm==1.107.0", "pip install 'litellm>=1.100'", "pip install litellm~=1.106.0",
         "pip install 'litellm[proxy]'", "pip3 install -U litellm", "pip install requests litellm", "pip install litellm==1.106.*",
@@ -1139,6 +1144,37 @@ with tempfile.TemporaryDirectory() as temp:
         assert getattr(reason, "rule_id", "") == "package.cap", (command, reason)
         assert "Package cap rule for litellm" in reason and "package-caps.toml" in reason, reason
         assert "1.106.2" in reason, reason
+    for command in (
+        'pip -q install litellm==1.107.0', 'python -I -m pip install litellm',
+        'uv -q pip install litellm', 'pip install "$DEP"',
+        'pip install ./litellm-1.107.0-py3-none-any.whl',
+        'pip install https://example.invalid/litellm-1.107.0-py3-none-any.whl',
+        'pip install git+https://example.invalid/litellm',
+        'pip install "litellm @ git+https://example.invalid/repo"',
+        'uv sync', 'uv lock', 'uv run --with litellm app.py', 'uvx litellm',
+        'pipx run litellm', 'poetry install', 'conda install litellm==1.106.2',
+        'mamba install litellm', 'micromamba install litellm',
+        'pip install litellm==1.106.2+custom', 'pip install litellm==1.106.2.post1',
+        'docker pull berriai/litellm:v1.106.2.post1',
+        'docker pull berriai/litellm:v1.106.2+custom',
+        'docker pull berriai/litellm:v1.106.2@sha256:' + 'a' * 64,
+        'pip install -r https://example.invalid/requirements.txt',
+        'pip install -c missing.txt litellm==1.106.2',
+    ):
+        reason = cap_judge(command)
+        assert getattr(reason, 'rule_id', '') == 'package.cap', (command, reason)
+    for command in ('pip -q install litellm==1.106.2', 'python -I -m pip install litellm==1.106.2',
+                    'uv -q pip install litellm==1.104.0',
+                    'pip install ./litellm-1.106.2-py3-none-any.whl',
+                    'pip install https://example.invalid/litellm-1.106.2-py3-none-any.whl'):
+        assert cap_judge(command) is None, (command, cap_judge(command))
+    (cap_root / 'requirements.txt').write_text('-r nested.txt\n')
+    for body in ('litellm==1.107.0\n', '-c requirements.txt\n', '-r missing.txt\n'):
+        (cap_root / 'nested.txt').write_text(body)
+        reason = cap_judge('uv pip install -r requirements.txt')
+        assert getattr(reason, 'rule_id', '') == 'package.cap', (body, reason)
+    (cap_root / 'nested.txt').write_text('litellm==1.104.0\n')
+    assert cap_judge('pip install -rrequirements.txt') is None
     # In a lane session the container boundary still comes first; the package rule stays behind it.
     with patch.dict(os.environ, {"TASK_WORKTREE": temp}):
         lane = policy.evaluate({"tool_name": "Bash", "cwd": temp,
