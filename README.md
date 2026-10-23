@@ -715,6 +715,33 @@ Merge and published-merge repair preserve the trusted `check.log` in state
 and archive the lane log separately as `advisory-check.log`. Batch fix rounds
 read the log recorded by the latest check, including trusted PM checks.
 
+### Hold switch
+
+`task hold` shows the two holds. Jacopo uses `sudo agent-hold pull "reason"` and
+`sudo agent-hold release`; `agent-hold` shows his marker at `/etc/agent-hold`.
+Everyone else uses `task hold pull "reason"` with `TASK_HOLDER` set or `--holder <name>`.
+`task hold release` also requires `TASK_HOLDER` or `--holder <name>` and removes only
+`~/.local/state/task/hold`, never Jacopo's marker. Names provide attribution, not authentication;
+the filesystem and sandbox provide the write boundary.
+Existence holds work; the text is for people. Unreadable or nonregular markers also hold work.
+
+The only mode is drain: a step already launched finishes; nothing new launches, including
+retries and fallbacks. New work-changing `task` commands refuse, with fresh checks after
+gate-slot waits, before reviewer launches and between drill phases.
+Runner units and workspace-tidy use `ExecCondition=` with the installed `task hold --check`:
+it needs no holder and succeeds only when both markers are absent and inspectable.
+Direct task-batch, gate-browser launches and workspace-tidy --apply check it at entry too;
+workspace-tidy pauses because it deletes worktrees and branches.
+Checks (attached or detached) run gates, and repair changes work state, so both refuse.
+Status, usage, boost, lock display and hold inspection remain available.
+Running `just check` by hand and the printed manual reviewer command are operator paths
+outside the switch; the operator must respect the hold before launching them.
+For a stop beyond drain, pull a hold first, then use the existing
+`systemctl --user stop task-runner-<repo>-<batch>.service` for runner units and
+`task cancel <repo> <id>` for recorded lanes. Reconcile interrupted work through the
+existing cancel path; interrupted work is never auto-merged. Inspect and reconcile
+before the appropriate owner releases the hold. There is no automatic stop or release.
+
 Always launch build lanes through `task lane`, including from a batch runner:
 
 ```sh

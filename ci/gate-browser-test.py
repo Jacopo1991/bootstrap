@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "home/dot_local/bin/executable_gate-browser"
@@ -19,8 +20,12 @@ if not os.environ.get("TASK_GATE_RUN_ID"):
     sys.exit(77)
 
 base = int(os.environ["TASK_GATE_PORT_BASE"])
+admission = tempfile.TemporaryDirectory(prefix='browser-admission-')
+task = Path(admission.name) / 'task'
+task.write_text('#!/bin/sh\n[ "$*" = "hold --check" ]\n')
+task.chmod(0o755)
 for offset, fail in [(10, False), (11, True)]:
-    env = dict(os.environ)
+    env = dict(os.environ, PATH=f"{admission.name}:{os.environ['PATH']}")
     if fail:
         env["GATE_BROWSER_FIXTURE_FAIL"] = "1"
     result = subprocess.run([

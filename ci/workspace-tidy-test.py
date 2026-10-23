@@ -43,6 +43,18 @@ def age(path: Path):
         os.utime(gitdir / "logs/HEAD", (OLD, OLD))
 
 
+def tidy_environment(home):
+    bin_dir = home / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    task = bin_dir / 'task'
+    task.write_text('#!/bin/sh\n[ "$*" = "hold --check" ]\n')
+    task.chmod(0o755)
+    env = dict(os.environ, HOME=str(home), PATH=f"{bin_dir}:{os.environ['PATH']}",
+               GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    env.pop('CODEX_HOME', None)
+    return env
+
+
 class Tidy(unittest.TestCase):
     def setUp(self):
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -112,8 +124,7 @@ class Tidy(unittest.TestCase):
 
 
     def tidy(self, *args):
-        env = dict(os.environ, HOME=str(self.home), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
-        env.pop("CODEX_HOME", None)
+        env = tidy_environment(self.home)
         result = subprocess.run(["python3", str(TOOL), *args], env=env, capture_output=True, text=True,
                                 timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -306,8 +317,7 @@ class Safety(unittest.TestCase):
         return path
 
     def tidy(self, apply=True):
-        env = dict(os.environ, HOME=str(self.home), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
-        env.pop("CODEX_HOME", None)
+        env = tidy_environment(self.home)
         result = subprocess.run(["python3", str(TOOL), *(["--apply"] if apply else [])], env=env, capture_output=True,
                                 text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
