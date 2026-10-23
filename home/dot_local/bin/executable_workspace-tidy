@@ -61,6 +61,10 @@ IN_PROGRESS = ("MERGE_HEAD", "rebase-merge", "rebase-apply", "CHERRY_PICK_HEAD",
 
 
 def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    query = args[:1] in [('show-ref',), ('rev-list',), ('log',), ('ls-files',), ('rev-parse',), ('for-each-ref',)]
+    query |= args[:2] in [('reflog', 'show'), ('worktree', 'list'), ('remote', 'get-url')]
+    query |= args == ('config', '--bool', 'core.sparseCheckout') or args[:4] == ('--no-optional-locks', '-c', 'status.showUntrackedFiles=all', 'status')
+    if not query: admit()
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
                           timeout=120, stdin=subprocess.DEVNULL)
 

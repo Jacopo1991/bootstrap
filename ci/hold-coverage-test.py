@@ -3,6 +3,10 @@
 import ast
 from collections import Counter
 from pathlib import Path
+import re
+import shlex
+import subprocess
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,22 +16,24 @@ STARTS = {'Popen', 'run', 'call', 'check_call', 'check_output'}
 PUBLICATIONS = {'push', 'commit-tree', 'merge', 'update-ref'}
 
 # One occurrence per entry; duplicates cannot borrow the same exception.
-# The Git/GitHub transports are covered again at every publication caller below.
+# Runtime-classified transports are tested under a hold as well as at their callers.
 ALLOWLIST = {
-    ('executable_task', 'run_git', 'subprocess.run'): 'Git transport; publication callers audited separately; other calls query or maintain local checkouts.',
-    ('executable_task', 'advisory_pre_commit_environment', 'subprocess.run'): 'Read-tree populates a private disposable index for the current gate step.',
+    ('executable_task', 'run_git', 'subprocess.run'): 'Runtime queries and cancellation (merge --abort, named disposable gates); every other Git command admits at transport.',
+    ('executable_task', 'git', 'run_git:<dynamic>'): ('Forwards unchanged to runtime-classified Git transport.', 'run_git(cwd, *args)'),
+    ('executable_task', 'ok', 'run_git:<dynamic>'): ('Forwards unchanged to runtime-classified Git transport.', 'run_git(cwd, *args)'),
     ('executable_task', 'runner_service', 'subprocess.run'): 'Read-only systemctl show query.',
     ('executable_task', 'start_locked', 'subprocess.run'): 'Read-only command availability query.',
     ('executable_task', 'sync_dependencies_after_merge', 'subprocess.run'): 'Read-only just --show sync query.',
-    ('executable_task', 'gh', 'subprocess.run'): 'GitHub transport; every caller is audited below.',
-    ('executable_task', 'open_pr', 'subprocess.run'): 'Read-only gh pr list query.',
+    ('executable_task', 'gh', 'subprocess.run'): 'Runtime PR list/view allowlist; all other GitHub commands admit at transport.',
+    ('executable_task', 'open_pr', 'gh:pr list <dynamic>'): ('Read-only PR list with a timeout, via runtime-classified transport.', "gh(repo, 'pr', 'list', '--head', branch, '--state', 'open', '--json', 'number', '--jq', '.[0].number', timeout=60)"),
     ('executable_task', 'cancel', 'subprocess.run'): 'Operator cancellation must remain available during hold.',
     ('executable_task:RUNNER_WRAPPER', 'admit', 'subprocess.run'): 'Absolute installed hold checker itself.',
-    ('executable_task-batch', 'git', 'subprocess.run'): 'Read-only Git queries; batch publication delegates to guarded task commands.',
-    ('executable_task-batch', 'run_git', 'subprocess.run'): 'Read-only Git history and merge-tree queries.',
+    ('executable_task-batch', 'git', 'run_git:<dynamic>'): ('Forwards unchanged to runtime-classified Git transport.', 'run_git(repo, *args)'),
+    ('executable_task-batch', 'run', 'run_git:<dynamic>'): ('Merge-history closure forwards unchanged to runtime-classified Git transport.', 'run_git(path, *args)'),
+    ('executable_task-batch', 'run_git', 'subprocess.run'): 'Runtime query allowlist; all other commands admit at transport.',
     ('executable_task-batch', 'admit', 'subprocess.run'): 'Absolute installed hold checker itself.',
     ('executable_gate-browser', 'admit', 'subprocess.run'): 'Absolute installed hold checker itself.',
-    ('executable_workspace-tidy', 'git', 'subprocess.run'): 'Git transport; deletion callers audited separately, other calls are queries.',
+    ('executable_workspace-tidy', 'git', 'subprocess.run'): 'Runtime query allowlist; all other commands, including deletions, admit at transport.',
     ('executable_workspace-tidy', 'admit', 'subprocess.run'): 'Absolute installed hold checker itself.',
     ('executable_task', 'merge', 'gh:pr view'): 'Read-only publication read-back.',
     ('executable_task', 'close_pr', 'gh:pr list'): 'Read-only PR query.',
@@ -43,6 +49,11 @@ ALLOWLIST = {
         'Literal status query with fixed global options; no dynamic subcommand.',
         "git(path, '--no-optional-locks', '-c', 'status.showUntrackedFiles=all', 'status', '--porcelain', '-z', '--untracked-files=all', '--ignore-submodules=none', '--ignored=matching')"),
 }
+
+# Only these functions may execute Git/GitHub. Even an admitted raw call elsewhere fails.
+TRANSPORTS = {('executable_task', 'run_git'): 'git', ('executable_task', 'gh'): 'gh',
+              ('executable_task-batch', 'run_git'): 'git',
+              ('executable_workspace-tidy', 'git'): 'git'}
 
 
 def name(node):
@@ -80,9 +91,13 @@ def action(node):
 
 def inventory(source, filename):
     sites = []
-    def visit(node, scope='<module>', previous=None):
+    def visit(node, scope='<module>', previous=None, assignments=None):
+        assignments = {} if assignments is None else assignments
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = node.name
+            assignments = {target.id: child.value for child in ast.walk(node)
+                           if isinstance(child, ast.Assign) for target in child.targets
+                           if isinstance(target, ast.Name)}
         if isinstance(node, ast.Call) and (filename == 'executable_workspace-tidy'
                                            or scope == 'prune_evidence_archive'):
             callee = name(node.func)
@@ -97,15 +112,23 @@ def inventory(source, filename):
                        and name(previous.value.func) == 'admit' and not previous.value.args
                        and not previous.value.keywords)
             sites.append(((filename, scope, kind), node.lineno, guarded, name(node)))
+            if kind.startswith(('subprocess.', 'os.exec', 'os.spawn')) and node.args:
+                argv = node.args[0]
+                if isinstance(argv, ast.Name): argv = assignments.get(argv.id, argv)
+                executable = argv.elts[0] if isinstance(argv, (ast.List, ast.Tuple)) and argv.elts else argv
+                if isinstance(executable, ast.Constant) and isinstance(executable.value, str):
+                    binary = executable.value.split()[0].rsplit('/', 1)[-1]
+                    if binary in {'git', 'gh'} and TRANSPORTS.get((filename, scope)) != binary:
+                        sites.append(((filename, scope, 'raw:' + binary), node.lineno, False, name(node)))
         for _, field in ast.iter_fields(node):
             if isinstance(field, list):
                 prior = None
                 for child in field:
                     if isinstance(child, ast.AST):
-                        visit(child, scope, prior if isinstance(child, ast.stmt) else previous)
+                        visit(child, scope, prior if isinstance(child, ast.stmt) else previous, assignments)
                         if isinstance(child, ast.stmt): prior = child
             elif isinstance(field, ast.AST):
-                visit(field, scope, previous)
+                visit(field, scope, previous, assignments)
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'RUNNER_WRAPPER'
                                                for t in node.targets):
             sites.extend(inventory(ast.literal_eval(node.value), filename + ':RUNNER_WRAPPER'))
@@ -154,6 +177,19 @@ class Coverage(unittest.TestCase):
                 sources['executable_task'] = original + added + 'admit()\n    ' + call + '\n'
                 self.assert_coverage(sources)
 
+    def test_raw_git_and_gh_must_use_runtime_helpers_even_with_admission(self):
+        self.assert_coverage(self.sources())
+        for filename in FILES:
+            for call in ("subprocess.run(['git', command, 'origin'])",
+                         "subprocess.Popen(['/usr/bin/gh', 'pr', command, pr])",
+                         "argv = ['git', *args]\n    subprocess.check_call(argv)"):
+                for admission in ('', 'admit()\n    '):
+                    with self.subTest(filename=filename, call=call, admission=admission):
+                        sources = self.sources()
+                        sources[filename] += '\ndef synthetic_raw(command, pr, args):\n    ' + admission + call + '\n'
+                        with self.assertRaisesRegex(AssertionError, 'raw:'):
+                            self.assert_coverage(sources)
+
     def test_new_launches_and_publications_fail_closed(self):
         calls = ('subprocess.Popen(cmd)', 'subprocess.run(cmd)', 'subprocess.call(cmd)',
                  'subprocess.check_call(cmd)', 'subprocess.check_output(cmd)',
@@ -173,6 +209,79 @@ class Coverage(unittest.TestCase):
                                      ('admit()\nsubprocess.run(other)\n', False)):
                 with self.subTest(call=call, prefix=prefix):
                     self.assertEqual(inventory(prefix + call, 'new')[-1][2], expected)
+
+    def test_runtime_helpers_classify_forwarded_commands_at_transport(self):
+        # Execute the actual wrapper ASTs, with inert transports: no real Git, HOME or /etc.
+        for filename, helpers, queries in (
+                ('executable_task', ('run_git', 'git', 'ok'),
+                 [('status', '--porcelain'), ('remote', 'get-url', 'origin'),
+                  ('worktree', 'list'), ('branch', '--show-current'),
+                  ('merge', '--abort'),
+                  ('worktree', 'remove', '--force', '/inert/.worktrees/.drill-aabbcc-0-group'),
+                  ('worktree', 'remove', '--force', '/inert/.worktrees/.task-gate-t5-123'),
+                  ('symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD')]),
+                ('executable_task-batch', ('run_git', 'git'),
+                 [('status', '--porcelain'), ('rev-parse', 'HEAD'),
+                  ('merge-tree', '--write-tree', 'a', 'b')]),
+                ('executable_workspace-tidy', ('git',),
+                 [('reflog', 'show', 'main'), ('worktree', 'list'),
+                  ('config', '--bool', 'core.sparseCheckout'),
+                  ('--no-optional-locks', '-c', 'status.showUntrackedFiles=all', 'status', '--porcelain')])):
+            selected = set(helpers) | ({'gh'} if filename == 'executable_task' else set())
+            tree = ast.parse(self.sources()[filename])
+            wrappers = ast.Module(body=[node for node in tree.body
+                                       if isinstance(node, ast.FunctionDef) and node.name in selected],
+                                  type_ignores=[])
+            events = []
+            held = True
+            def admit():
+                events.append('admit')
+                if held: raise RuntimeError('refused: hold')
+            def transport(*args, **kwargs):
+                events.append('launch')
+                return subprocess.CompletedProcess(args, 0, stdout='query\n', stderr='')
+            namespace = dict(subprocess=SimpleNamespace(run=transport, CompletedProcess=subprocess.CompletedProcess,
+                                                        TimeoutExpired=subprocess.TimeoutExpired), Path=Path,
+                             Stop=RuntimeError, admit=admit, shlex=shlex, re=re)
+            exec(compile(wrappers, filename, 'exec'), namespace)
+            for helper in helpers:
+                for args in queries:
+                    with self.subTest(filename=filename, helper=helper, query=args):
+                        events.clear()
+                        namespace[helper](Path('/inert'), *args)
+                        self.assertEqual(events, ['launch'])
+                for args in [(), ('push', 'origin'), ('merge', '--ff-only', 'topic'),
+                             ('commit-tree', 'tree'), ('update-ref', 'refs/heads/main', 'sha'),
+                             ('unknown-alias',), ('--no-optional-locks', 'push', 'origin'),
+                             ('remote', 'set-url', 'origin', 'elsewhere'),
+                             ('symbolic-ref', 'HEAD', 'refs/heads/main'),
+                             ('branch', '-D', 'topic'), ('worktree', 'remove', 'path'),
+                             ('worktree', 'remove', '--force', '/other/.worktrees/.drill-aabbcc-0-group'),
+                             ('worktree', 'remove', '--force', '/inert/.worktrees/topic')]:
+                    with self.subTest(filename=filename, helper=helper, publication=args):
+                        held = True
+                        events.clear()
+                        with self.assertRaisesRegex(RuntimeError, 'refused: hold'):
+                            namespace[helper](Path('/inert'), *args)
+                        self.assertEqual(events, ['admit'])
+                        held = False
+                        events.clear()
+                        namespace[helper](Path('/inert'), *args)
+                        self.assertEqual(events, ['admit', 'launch'])
+                held = True
+            if 'gh' in selected:
+                for args in [('pr', 'list'), ('pr', 'view', '1'), ('pr', 'create'),
+                             ('pr', 'merge', '1'), ('api', 'endpoint'), ('unknown',)]:
+                    query = args[:2] in [('pr', 'list'), ('pr', 'view')]
+                    for held in (True, False):
+                        events.clear()
+                        if held and not query:
+                            with self.assertRaisesRegex(RuntimeError, 'refused: hold'):
+                                namespace['gh'](Path('/inert'), *args)
+                        else:
+                            namespace['gh'](Path('/inert'), *args)
+                        self.assertEqual(events, ['launch'] if query else
+                                         ['admit'] if held else ['admit', 'launch'])
 
 
 if __name__ == '__main__':

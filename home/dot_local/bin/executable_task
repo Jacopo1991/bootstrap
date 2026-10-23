@@ -326,9 +326,15 @@ def frontmatter_title(text):
     return ""
 
 
-def run_git(cwd, *args):
+def run_git(cwd, *args, **kwargs):
+    # Only queries and cancellation of disposable gates may run during a hold.
+    query = args[:1] in [('rev-parse',), ('merge-base',), ('rev-list',), ('log',), ('show',), ('diff',), ('status',), ('ls-files',), ('for-each-ref',), ('show-ref',), ('ls-remote',)]
+    query |= args[:2] in [('remote', 'get-url'), ('worktree', 'list'), ('branch', '--show-current'), ('merge', '--abort')]
+    query |= args[:1] == ('symbolic-ref',) and len([a for a in args[1:] if not a.startswith('-')]) == 1 and all(a in {'--quiet', '--short'} for a in args[1:] if a.startswith('-'))
+    query |= len(args) == 4 and args[:3] == ('worktree', 'remove', '--force') and Path(args[3]).parent == Path(cwd) / '.worktrees' and bool(re.fullmatch(r'\.(?:drill-[0-9a-f]{6}-\d+-(?:group|solo)|task-gate-[\w-]+-\d+)', Path(args[3]).name))
+    if not query: admit()
     return subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(cwd), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, **kwargs)
 
 
 def git(cwd, *args):
@@ -2159,8 +2165,8 @@ def advisory_pre_commit_environment(path: Path, child_env):
             shutil.copyfile(real_index, private_index)
         else:
             private_env = dict(child_env, GIT_INDEX_FILE=str(private_index))
-            result = subprocess.run(["git", "-C", str(path), "read-tree", "HEAD"],
-                                    env=private_env, capture_output=True, text=True)
+            admit()
+            result = run_git(path, "read-tree", "HEAD", env=private_env)
             if result.returncode:
                 raise Stop(f"Could not seed advisory pre-commit index: {(result.stderr or result.stdout).strip()}")
     except BaseException:
@@ -3060,9 +3066,10 @@ def on_github(repo):
     return has_origin(repo) and "github" in git(repo, "remote", "get-url", "origin")
 
 
-def gh(repo, *args):
+def gh(repo, *args, timeout=120):
     try:
-        result = subprocess.run(["gh", *args], cwd=repo, capture_output=True, text=True, timeout=120)
+        if args[:2] not in [('pr', 'list'), ('pr', 'view')]: admit()
+        result = subprocess.run(["gh", *args], cwd=repo, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
         raise Stop("gh is not installed.")
     except subprocess.TimeoutExpired:
@@ -3074,17 +3081,8 @@ def gh(repo, *args):
 
 def open_pr(repo, branch):
     """The open PR number for branch, "" when none; Stop when GitHub cannot be asked."""
-    try:
-        result = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open",
-                                 "--json", "number", "--jq", ".[0].number"],
-                                cwd=repo, capture_output=True, text=True, timeout=60)
-    except FileNotFoundError:
-        raise Stop("gh is not installed; cannot tell whether the branch has an open PR.")
-    except subprocess.TimeoutExpired:
-        raise Stop("gh did not answer; run `task merge` again.")
-    if result.returncode:
-        raise Stop(f"gh could not list PRs: {(result.stderr or result.stdout).strip()}")
-    return result.stdout.strip()
+    return gh(repo, "pr", "list", "--head", branch, "--state", "open",
+              "--json", "number", "--jq", ".[0].number", timeout=60)
 
 
 class ReviewParseError(ValueError):
