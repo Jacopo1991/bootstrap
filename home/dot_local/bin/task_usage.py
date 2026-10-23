@@ -28,7 +28,33 @@ _ASSESSMENTS = ContextVar("usage_assessments", default=None)
 DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0, "codex": 1},
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
             "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
-            "boost_five_hour_max": 50}
+            "boost_five_hour_max": 50,
+            "review": {"high_paths": {"*": ["policy/**"], "bootstrap": [
+                "system/agent-policy/**", "system/*managed*", "system/codex-requirements.toml",
+                "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml",
+                "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*",
+                "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"]},
+                "low": {"max_rounds": 2, "extra_rounds": 1},
+                "normal": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1},
+                "high": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1,
+                         "red_team_model": "gpt-6.1-sol"}}}
+
+
+def review_policy(value, result):
+    if not isinstance(value, dict) or value.keys() - result.keys():
+        raise ValueError("invalid review keys")
+    for tier, fields in value.items():
+        if not isinstance(fields, dict) or tier != "high_paths" and fields.keys() - result[tier].keys():
+            raise ValueError(f"invalid review.{tier}")
+        for key, item in fields.items():
+            valid = (isinstance(item, list) and all(isinstance(p, str) and p.strip() for p in item)
+                     if tier == "high_paths" else
+                     type(item) is int and item >= (1 if key == "max_rounds" else 0)
+                     if key in {"max_rounds", "extra_rounds"} else
+                     isinstance(item, str) and item.replace("-", "").replace(".", "").replace("_", "").isalnum())
+            if not valid:
+                raise ValueError(f"invalid review.{tier}.{key}")
+        result[tier].update(fields)
 
 
 def _json(path):
@@ -75,7 +101,13 @@ def policy(home):
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"{path}: {error}")
     for key, value in raw.items():
-        if key in ("reserve", "spare_resets"):
+        if key == "review":
+            try:
+                review_policy(value, result[key])
+            except ValueError as error:
+                raise ValueError(f"{path}: {error}") from error
+            valid = True
+        elif key in ("reserve", "spare_resets"):
             valid = isinstance(value, dict) and all(
                 name in VENDORS and _number(item, 100 if key == "reserve" else None) for name, item in value.items())
             result[key].update(value if valid else {})
@@ -362,7 +394,7 @@ def log(home, text, now=None):
 
 
 def record_override(home, repo, task, model, tier, text, now=None):
-    """Append one model-rule override (a top model outside its tier) to the overrides ledger."""
+    """Append a policy exception or risk change to the shared overrides ledger."""
     entry = dict(time=(now or datetime.now(timezone.utc)).isoformat(timespec="seconds"),
                  repo=repo, task=task, model=model, tier=tier, override=text)
     directory = _dir(home)
@@ -546,7 +578,7 @@ def _applied(vendor, item, pol, top):
                  f"new lanes only for {top or 'the top-priority repo with work'}",
         "under-used-near-reset": f"{reserve}; spend before the reset: "
                                  f"{item['boost_pause'] or 'boost on until it ends (stronger models on queued work)'}; "
-                                 f"deeper reviews ({DEEPER[vendor]}) only in boost for hard tasks or --final rounds; research backlog: "
+                                 f"deeper reviews ({DEEPER[vendor]}) only for high risk in boost for hard tasks or --final rounds; research backlog: "
                                  f"{', '.join(pol['research_backlog']) or 'none named'}",
     }.get(item["verdict"], f"{reserve}; normal")
 

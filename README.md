@@ -524,7 +524,7 @@ text is refused. Each use is appended to
 these models, override or not.
 `--no-boost` disables boosted tier
 routing, while Codex hard remains gpt-6.1-sol.
-The launch notice explains the decision. In boost, hard-tier reviews and rounds explicitly
+The launch notice explains the decision. For high-risk tasks in boost, hard-tier reviews and rounds explicitly
 marked with `task review <repo> <id> --run --final` use Claude opus or Codex gpt-6.1-sol.
 Other reviews keep their usual cheap models; no round is inferred to be final.
 Usage limits retry once on the other reviewer vendor and record its actual
@@ -542,6 +542,55 @@ limit and the slots in `~/.config/task/gate.toml` (default 3).
 Dependencies wait for their predecessor to merge; parked predecessors skip
 their dependants. Expiry reduces new dispatches without interrupting live work.
 `task status` shows the effective vendor limits and gate slots.
+
+#### Risk and checks
+
+Risk (`low`, `normal`, `high`) is separate from the builder-routing `tier` above.
+`task start <repo> <id> --builder codex --risk high --risk-reason "rails change"`
+sets it; omitted risk defaults to normal, including older records. High needs a
+one-line reason. Change it later with `task risk <repo> <id> low` or
+`task risk <repo> <id> high --reason "safety boundary"`; changes enter the override ledger.
+Refresh preserves risk. `task status` shows both risk and builder tier.
+
+| Risk | Required checks | Default build/fix rounds | Extra rounds per exception |
+| --- | --- | --- | --- |
+| low | Trusted check; review commands refused; merge needs no review or report | 2 | 1 |
+| normal | Trusted check and one cheap other-vendor review | 3 | 1 |
+| high | Trusted check, other-vendor review and red-team at the reviewed commit | 3 | 1 |
+
+Normal reviews stay cheap even in boost or with `review --run --final`. Manual
+Opus, Fable and other deeper reviews are refused outside high risk. High keeps the
+existing boost routing: hard builder tier or explicit `--final` selects the deeper
+reviewer while that vendor is boosted. Default cheap reviewers are Haiku for
+Codex-built work and gpt-6-luna for Claude-built work.
+
+At check, review and merge, changed paths in `main...HEAD` matching `review.high_paths`
+force high risk; attempting to lower it names the matching path and refuses.
+Patterns apply to the whole repository-relative path, with `*` matching any part;
+the `"*"` repository entry applies everywhere. Defaults cover every repo's `policy/**`,
+and bootstrap's agent-policy hook/rule tables, managed settings, Codex sandbox/rules,
+hold script/markers, boundary checks, Git credential settings and gitleaks config.
+The task executable itself is excluded. The complete paths are in the example policy.
+
+`task redteam <repo> <id> --brief FILE` runs read-only Codex at high effort,
+records output in private task state for that commit, and appears in status.
+It refuses low and normal risk. High-risk merge requires that output at the reviewed
+head, or `task merge ... --no-redteam "reason"` (ledgered); ordinary `--override`
+does not waive this rule.
+
+`task lane ... --extra-round "small contained fix"` grants the policy's extra rounds
+when the limit is reached; the grant is ledgered and survives refresh.
+`task lane ... --effort low|medium|high` forwards effort to either vendor and records
+it; default is high.
+
+The company usage-pacing TOML also accepts `[review]`: `high_paths` maps repository
+names (or `"*"`) to pattern lists. `[review.low]` accepts positive-integer `max_rounds`
+and nonnegative-integer `extra_rounds`; `[review.normal]` and `[review.high]` also
+accept `codex` and `claude` reviewer model names, keyed by builder vendor.
+`[review.high]` additionally accepts `red_team_model` (default `gpt-6.1-sol`).
+Missing keys use built-in defaults; per-repository high-path lists replace their
+defaults. Unknown keys and malformed values are refused. Risk enforcement fails
+closed on invalid policy, while usage pacing reports its existing defaults fallback.
 
 #### Usage pacing
 
@@ -569,7 +618,7 @@ so `task runner-start` too) apply the verdict:
 | `on`, `under`, unknown | unchanged (unknown prints a warning) |
 | `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna) even when `--model` names another one (only `--no-pace`, logged, keeps it); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
 | `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
-| `under-used-near-reset` | spend before the reset: when the 5-hour reading permits boost, `task boost` for that vendor is switched on until its weekly reset (stronger models by tier and extra capacity for already queued work, logged). Hard-tier reviews and explicit `--final` rounds use the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+| `under-used-near-reset` | spend before the reset: when the 5-hour reading permits boost, `task boost` for that vendor is switched on until its weekly reset (stronger models by tier and extra capacity for already queued work, logged). High-risk hard-tier reviews and explicit `--final` rounds use the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
 
 Manual and automatic boosts pause per vendor at or above `boost_five_hour_max` (default 50 %).
 A missing 5-hour reading, or one older than 45 minutes while the vendor's lanes ran since it,
@@ -619,7 +668,7 @@ a review without that prompt leaves its start and before reading null.
 A PM logs its run with `task note <repo> - pm-run start`, followed by
 `task note <repo> - pm-run end [finished|failed|interrupted] [reason]`. Set `TASK_VENDOR`, `TASK_MODEL`,
 `TASK_EFFORT`, `TASK_TIER` and `TASK_PLAN` at start to record its identity. Repeating start while pending
-or repeating end is safe. Lane and review commands explicitly use high effort.
+or repeating end is safe. Lanes default to high effort, configurable with `--effort`; reviews use high.
 
 The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
 `~/cortex/cortex-kb-company/policy/usage-pacing.toml`; `task` only reads it and the company PM writes it.

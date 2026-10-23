@@ -216,6 +216,7 @@ class TaskTool(unittest.TestCase):
             ('start', 'proj', 'new-task', '--builder', 'codex'),
             ('lane', 'proj', '5'), ('runner-start', 'proj', 'runner-demo.md'),
             ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
+            ('risk', 'proj', '5', 'low'), ('redteam', 'proj', '5', '--brief', 'brief.md'),
             ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
             ('check', 'proj', '5'), ('gate-drill', 'proj'), ('realign', 'proj'),
         ]
@@ -1494,6 +1495,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_boost_builder_models_opt_out_and_astra(self):
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 20\n')
         self.readings(claude=(40, 84), codex=(40, 84), five=10)
         self.stub_models()
         wt, _ = self.started()
@@ -1564,6 +1566,7 @@ class TaskTool(unittest.TestCase):
     def test_deeper_review_requires_boost_and_hard_tier_or_explicit_final(self):
         self.stub_reviewers()
         wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise high review routing')
         self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00',
                   '--codex-until', '2099-01-01T00:00:00+00:00')
         self.assertIn('--final requires --run', self.task('review', 'proj', '5', '--final', code=1))
@@ -2702,7 +2705,7 @@ sys.exit(7)
         out = self.raw_task('merge', 'proj', '5', '--override', 'approved emergency')
         waived = json.loads((self.state() / 'exception.json').read_text())['waived']
         self.assertEqual({item['step'] for item in waived}, {
-            'recorded PASS review for lane head with every criterion pass by the other vendor',
+            'risk normal: recorded PASS review for lane head with every criterion pass by the other vendor',
             'filled .work/report.md'})
         for item in waived:
             self.assertIn(item['step'] + ' waived: approved emergency', out)
@@ -3867,6 +3870,196 @@ store.write_text(json.dumps(prs))
         wt = self.repo / ".worktrees/t5"
         self.assertTrue(wt.is_dir(), out)
         return wt, out
+
+    def risk_policy_fixture(self, text):
+        path = self.home / 'cortex/cortex-kb-company/policy/usage-pacing.toml'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_risk_defaults_legacy_records_changes_and_high_reason(self):
+        self.assertIn('--risk-reason', self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'high', code=1))
+        wt, _ = self.started()
+        record_path = self.state() / 'task.json'
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record['risk'], 'normal')
+        record.pop('risk'); record.pop('risk_reason')
+        record['revision'] = TASK_MODULE.record_revision(record)
+        record_path.write_text(json.dumps(record))
+        self.assertIn('tier=routine risk=normal', self.raw_task('status', 'proj'))
+        self.assertIn('one-line reason', self.raw_task('risk', 'proj', '5', 'high', code=1))
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'rails change')
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record['risk'], record['risk_reason']), ('high', 'rails change'))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'low')
+        self.assertIn('risk=low', self.raw_task('status', 'proj'))
+        ledger = [json.loads(line) for line in (self.home / '.local/state/task/usage/overrides.jsonl').read_text().splitlines()]
+        self.assertEqual([(r['model'], r['tier']) for r in ledger], [('risk change', 'normal to high'), ('risk change', 'high to low')])
+        self.assertIn('nonempty line', self.raw_task('risk', 'proj', '5', 'high', '--reason', 'two\nlines', code=1))
+
+    def test_risk_low_runs_trusted_check_and_merges_without_review_or_report(self):
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'low')
+        wt = self.repo / '.worktrees/t5'
+        self.commit_in(wt, 'b.txt')
+        for flags in (('--run',), (), ('--record', 'missing.md')):
+            out = self.raw_task('review', 'proj', '5', *flags, code=1)
+            self.assertIn('risk low: trusted check only', out)
+        self.assertIn('risk low', self.raw_task('redteam', 'proj', '5', '--brief', 'missing.md', code=1))
+        (wt / '.work/report.md').unlink()
+        self.assertIn('Risk: low', self.raw_task('check', 'proj', '5'))
+        self.assertFalse((self.state() / 'review.json').exists())
+        self.raw_task('merge', 'proj', '5', '--keep')
+        self.assertEqual(self.git(self.repo, 'show', 'origin/main:b.txt'), 'x')
+
+    def test_risk_normal_keeps_cheap_review_in_boost_and_final_for_both_builders(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00', '--codex-until', '2099-01-01T00:00:00+00:00')
+        for builder, vendor, model in (('codex', 'claude', 'haiku'), ('claude', 'codex', 'gpt-6-luna')):
+            self.raw_task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', 'hard', '--override', 'Jacopo 2026-10-23: routing fixture')
+            self.raw_task('check', 'proj', '5')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+            self.raw_task('review', 'proj', '5', '--run', '--final', '--no-pace', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+            review = json.loads((self.state() / 'review.json').read_text())
+            self.assertEqual((review['reviewer'], review['model']), (vendor, model))
+        self.assertIn('risk normal', self.raw_task('redteam', 'proj', '5', '--brief', 'missing', code=1))
+
+    def test_risk_normal_manual_deeper_review_refused_even_with_stored_route(self):
+        wt, _ = self.started()
+        self.raw_task('review', 'proj', '5')
+        for model in ('opus', 'claude-opus-5-5', 'fable', 'claude-fable-5-1', 'gpt-6.1-sol'):
+            self.assertIn('risk normal', self.raw_task('review', 'proj', '5', '--record', 'missing', '--reviewer', 'claude', model, code=1))
+
+    def test_risk_policy_selects_reviewers_and_invalid_policy_fails_closed(self):
+        self.started()
+        self.risk_policy_fixture('[review.normal]\ncodex = "sonnet"\n')
+        self.assertIn('--model sonnet', self.raw_task('review', 'proj', '5'))
+        self.risk_policy_fixture('[review.normal]\ncodex = "opus"\n')
+        self.assertIn('risk normal', self.raw_task('review', 'proj', '5', code=1))
+        self.risk_policy_fixture('[review.normal]\nunknown = 1\n')
+        self.assertIn('invalid review.normal', self.raw_task('check', 'proj', '5', code=1))
+
+    def test_risk_forced_high_global_and_company_repo_paths_refuse_lowering(self):
+        wt, _ = self.started()
+        target = wt / 'rails/guard.py'
+        target.parent.mkdir()
+        self.commit_in(wt, 'rails/guard.py')
+        self.risk_policy_fixture('[review]\nhigh_paths = { proj = ["rails/**"] }\n')
+        self.assertIn('risk=high', self.raw_task('status', 'proj'))
+        self.assertIn('Risk: high (forced by rails/guard.py)', self.raw_task('check', 'proj', '5'))
+        for value in ('low', 'normal'):
+            self.assertIn('rails/guard.py', self.raw_task('risk', 'proj', '5', value, code=1))
+            self.assertIn('rails/guard.py', self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', value, code=1))
+        self.assertIn('risk high: merge requires red-team', self.raw_task('merge', 'proj', '5', '--override', 'cannot skip red-team', code=1))
+        self.risk_policy_fixture('')
+        (wt / 'policy').mkdir()
+        self.commit_in(wt, 'policy/access.toml')
+        self.assertIn('forced by policy/access.toml', self.raw_task('check', 'proj', '5'))
+
+    def test_risk_bootstrap_defaults_cover_rails_but_not_task_itself(self):
+        wt, _ = self.started()
+        fake_task = SimpleNamespace(repo=Path('bootstrap'))
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), mock.patch.object(TASK_MODULE, 'default_branch', return_value='main'), \
+                mock.patch.object(TASK_MODULE, 'has_origin', return_value=False):
+            for path in ('home/dot_local/bin/executable_task', 'system/agent-policy/pre_tool_use.py',
+                         'system/claude-managed-guardrails.json', 'home/dot_codex/rules/default.rules',
+                         'system/codex-requirements.toml', 'home/dot_claude/settings.json',
+                         'home/dot_local/bin/executable_task-hold', 'HOLD.founder', 'profiles/sandbox.json',
+                         'home/dot_gitconfig.tmpl', '.gitleaks.toml'):
+                target = wt / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                self.commit_in(wt, path)
+                risk, _, forced = TASK_MODULE.risk_context(fake_task, wt, {})
+                self.assertEqual(risk, 'normal' if path.endswith('executable_task') else 'high')
+                if risk == 'high': self.assertTrue(forced)
+                self.git(self.repo, 'update-ref', 'refs/heads/main', self.git(wt, 'rev-parse', 'HEAD'))
+
+    def test_risk_high_redteam_command_head_staleness_and_waiver(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
+        self.prepare_merge_evidence('5')
+        brief = self.home / 'redteam-brief.md'
+        brief.write_text('Attack the safety assumptions.\n')
+        binary = self.home / 'bin/codex'
+        binary.write_text('#!/usr/bin/env python3\nimport json, os, pathlib, sys\n'
+                          'pathlib.Path(".work/redteam-call.json").write_text(json.dumps(dict(args=sys.argv[1:], '
+                          'brief=sys.stdin.read(), locks=os.environ.get("GIT_OPTIONAL_LOCKS"))))\n'
+                          'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text("Risks reviewed.\\n")\n')
+        binary.chmod(0o755)
+        self.risk_policy_fixture('[review.high]\nred_team_model = "gpt-6-luna"\n')
+        self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        meta = json.loads((self.state() / 'redteam.json').read_text())
+        call = json.loads((wt / '.work/redteam-call.json').read_text())
+        self.assertEqual(call, dict(args=['exec', '--sandbox', 'read-only', '-m', 'gpt-6-luna', '-c',
+                         'model_reasoning_effort=high', '--skip-git-repo-check', '-C', str(wt), '-o', meta['output'], '-'],
+                         brief=brief.read_text(), locks='0'))
+        self.assertEqual(meta['commit'], head)
+        self.assertIn(f"redteam={meta['output']} matches", self.raw_task('status', 'proj'))
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        self.assertIn('stale', self.raw_task('status', 'proj'))
+        self.assertIn('risk high: merge requires red-team', self.raw_task('merge', 'proj', '5', code=1))
+        self.raw_task('merge', 'proj', '5', '--keep', '--no-redteam', 'PM accepts bounded change')
+        ledger = (self.home / '.local/state/task/usage/overrides.jsonl').read_text()
+        self.assertIn('PM accepts bounded change', ledger)
+
+    def test_risk_high_redteam_current_output_allows_merge_and_failed_run_is_not_recorded(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'guard')
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        output = self.state() / 'redteam.md'
+        output.write_text('Reviewed risks\n')
+        (self.state() / 'redteam.json').write_text(json.dumps(dict(commit=self.git(wt, 'rev-parse', 'HEAD'), output=str(output))))
+        brief = self.home / 'brief.md'
+        brief.write_text('Check the guard.\n')
+        binary = self.home / 'bin/codex'
+        binary.write_text('#!/bin/sh\nexit 1\n')
+        binary.chmod(0o755)
+        self.assertIn('red-team failed', self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1))
+        self.assertFalse((self.state() / 'redteam.json').exists())
+        binary.write_text('#!/usr/bin/env python3\nimport pathlib, sys\n'
+                          'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text("Reviewed risks\\n")\n')
+        self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+        self.raw_task('merge', 'proj', '5', '--keep')
+
+    def test_risk_round_limits_per_tier_and_extra_allowance_persists_across_refresh(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('build fixture\n')
+        for risk, maximum in (('low', 2), ('normal', 3), ('high', 3)):
+            with self.subTest(risk=risk):
+                self.raw_task('risk', 'proj', '5', risk, '--reason', 'round fixture')
+                (self.state() / 'rounds.json').unlink(missing_ok=True)
+                (wt / '.work/lane.json').unlink(missing_ok=True)
+                for _ in range(maximum):
+                    self.raw_task('lane', 'proj', '5', '--no-pace')
+                    self.wait_for_lane(wt)
+                refused = self.raw_task('lane', 'proj', '5', '--no-pace', code=1)
+                self.assertIn(f'risk {risk}: maximum {maximum}', refused)
+                self.assertIn('nonempty reason', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', ' ', code=1))
+                self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'small contained fix')
+                self.wait_for_lane(wt)
+                self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+                self.assertIn(f'maximum {maximum + 1}', self.raw_task('lane', 'proj', '5', '--no-pace', code=1))
+        self.assertEqual((self.home / '.local/state/task/usage/overrides.jsonl').read_text().count('small contained fix'), 3)
+
+    def test_risk_policy_round_limits_and_lane_effort_are_forwarded_and_logged(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 6\nextra_rounds = 0\n')
+        (wt / '.work/prompt.md').write_text('effort fixture\n')
+        for builder in ('codex', 'claude'):
+            for effort in ('low', 'medium', 'high'):
+                self.raw_task('lane', 'proj', '5', '--builder', builder, '--effort', effort, '--no-pace')
+                run = self.wait_for_lane(wt)
+                call = json.loads((wt / '.work/model-call.json').read_text())['args']
+                self.assertIn(f'model_reasoning_effort={effort}' if builder == 'codex' else effort, call)
+                self.assertEqual(run['usage_run']['effort'], effort)
+        self.assertIn('risk normal: maximum 6', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'no allowance', code=1))
 
     def state(self, name="t5"):
         return self.home / ".local/state/task/proj" / name
@@ -5405,6 +5598,7 @@ store.write_text(json.dumps(prs))
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob("*") if path.is_file()}
         commands = (("start", "proj", "5", "--builder", "codex", "--refresh"),
+                    ("risk", "proj", "5", "low"), ("redteam", "proj", "5", "--brief", "missing.md"),
                     ("review", "proj", "5"),
                     ("review", "proj", "5", "--run"),
                     ("review", "proj", "5", "--record", "missing-review.md"),
@@ -5868,6 +6062,7 @@ store.write_text(json.dumps(prs))
     def test_pace_review_holds_exhausted_reviewer_and_final_goes_deeper_when_under_used(self):
         self.stub_reviewers()
         wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise high review pacing')
         head = self.git(wt, "rev-parse", "HEAD")
         self.raw_task("check", "proj", "5")
         self.readings(claude=(80, 84))
@@ -5918,7 +6113,7 @@ store.write_text(json.dumps(prs))
             publish(path, run)
 
         args = SimpleNamespace(repo=str(self.repo), id="5", builder="claude", tier=None,
-                               model="opus", no_boost=True, _worker=True, timeout=None, override="")
+                               model="opus", no_boost=True, _worker=True, timeout=None, override="", effort="high")
         with mock.patch.dict(os.environ, self.env), \
                 mock.patch.object(TASK_MODULE, "HOME", self.home), \
                 mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
@@ -6058,6 +6253,7 @@ store.write_text(json.dumps(prs))
         self.assertFalse((wt / ".work/model-call.json").exists())
 
     def test_lane_full_model_ids_and_builder_override_review_route(self):
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 10\n')
         import json
         self.stub_models()
         wt, _ = self.started()
