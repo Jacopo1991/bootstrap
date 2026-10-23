@@ -283,6 +283,8 @@ GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FIL
 class Stop(Exception):
     """A clear, expected reason to stop; printed without a traceback."""
 
+class HoldRefused(Stop): """Admission refused by a hold."""
+
 
 class UsageLimit(Stop):
     """A reviewer CLI ended with a terminal usage-limit diagnostic."""
@@ -328,7 +330,7 @@ def frontmatter_title(text):
 
 def run_git(cwd, *args, **kwargs):
     # Only queries and cancellation of disposable gates may run during a hold.
-    query = args[:1] in [('rev-parse',), ('merge-base',), ('rev-list',), ('log',), ('show',), ('diff',), ('status',), ('ls-files',), ('for-each-ref',), ('show-ref',), ('ls-remote',)]
+    query = args == ('worktree', 'prune') or args[:1] in [('rev-parse',), ('merge-base',), ('rev-list',), ('log',), ('show',), ('diff',), ('status',), ('ls-files',), ('for-each-ref',), ('show-ref',), ('ls-remote',)]
     query |= args[:2] in [('remote', 'get-url'), ('worktree', 'list'), ('branch', '--show-current'), ('merge', '--abort')]
     query |= args[:1] == ('symbolic-ref',) and len([a for a in args[1:] if not a.startswith('-')]) == 1 and all(a in {'--quiet', '--short'} for a in args[1:] if a.startswith('-'))
     query |= len(args) == 4 and args[:3] == ('worktree', 'remove', '--force') and Path(args[3]).parent == Path(cwd) / '.worktrees' and bool(re.fullmatch(r'\.(?:drill-[0-9a-f]{6}-\d+-(?:group|solo)|task-gate-[\w-]+-\d+)', Path(args[3]).name))
@@ -1538,7 +1540,7 @@ def detached(args, task, path):
         child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
                              stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
                              close_fds=True)
-    except Stop:
+    except HoldRefused:
         lock.unlink(missing_ok=True)
         atomic_json(run_path, dict(command=args.command, state='refused: hold', ended_at=utc_now())); raise
     atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
@@ -1879,13 +1881,17 @@ def lane(args):
                 worker.extend(["--override", args.override])
             if args.timeout is not None:
                 worker.extend(["--timeout", str(args.timeout)])
-            with (work / "lane.log").open("wb") as log:
-                admit()
-                child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
-                                         pass_fds=task_lock.descriptors(),
-                                         stdin=subprocess.DEVNULL, stdout=log,
-                                         stderr=subprocess.STDOUT, start_new_session=True,
-                                         close_fds=True)
+            try:
+                with (work / "lane.log").open("wb") as log:
+                    admit()
+                    child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
+                                             pass_fds=task_lock.descriptors(),
+                                             stdin=subprocess.DEVNULL, stdout=log,
+                                             stderr=subprocess.STDOUT, start_new_session=True,
+                                             close_fds=True)
+            except HoldRefused:
+                atomic_json(lane_record, dict(state='refused: hold', ended_at=utc_now()))
+                raise
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
                                       "usage_run": task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier),
@@ -1961,7 +1967,7 @@ def lane(args):
                     timed_out = True
                     finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
-    except Stop:
+    except HoldRefused:
         result = "refused: hold"; raise
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
@@ -3235,7 +3241,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
         argv.pop(0)
     run_file = reply_file.with_name("review-run.json")
     stderr_file = reply_file.with_name("review-stderr.log")
-    run = {"builder": argv[0], "state": "refused: hold", "exit_code": None}
+    run = {"builder": argv[0], "state": "running", "exit_code": None}
     usage_run = None
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
@@ -3260,6 +3266,8 @@ def run_reviewer(command, path, prompt_file, reply_file):
                 process.wait()
                 run.update(state="timed_out")
                 raise Stop(f"Reviewer timed out after {timeout}s; no review recorded. Reply: {reply_file}")
+    except HoldRefused:
+        run.update(state='refused: hold'); raise
     except OSError as error:
         run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
@@ -5095,7 +5103,7 @@ def admit():
         if ACTIVE_FOREGROUND_TASK:
             path = run_record_path(ACTIVE_FOREGROUND_TASK)
             atomic_json(path, read_json_object(path) | dict(state='refused: hold', ended_at=utc_now()))
-        raise Stop('refused: hold\n' + held)
+        raise HoldRefused('refused: hold\n' + held)
 
 
 def hold(args):

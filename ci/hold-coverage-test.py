@@ -18,7 +18,7 @@ PUBLICATIONS = {'push', 'commit-tree', 'merge', 'update-ref'}
 # One occurrence per entry; duplicates cannot borrow the same exception.
 # Runtime-classified transports are tested under a hold as well as at their callers.
 ALLOWLIST = {
-    ('executable_task', 'run_git', 'subprocess.run'): 'Runtime queries and cancellation (merge --abort, named disposable gates); every other Git command admits at transport.',
+    ('executable_task', 'run_git', 'subprocess.run'): 'Runtime queries and cancellation (merge --abort, worktree prune, named disposable gates); every other Git command admits at transport.',
     ('executable_task', 'git', 'run_git:<dynamic>'): ('Forwards unchanged to runtime-classified Git transport.', 'run_git(cwd, *args)'),
     ('executable_task', 'ok', 'run_git:<dynamic>'): ('Forwards unchanged to runtime-classified Git transport.', 'run_git(cwd, *args)'),
     ('executable_task', 'runner_service', 'subprocess.run'): 'Read-only systemctl show query.',
@@ -39,6 +39,9 @@ ALLOWLIST = {
     ('executable_task', 'close_pr', 'gh:pr list'): 'Read-only PR query.',
     ('executable_task', 'close_with_pr', 'gh:pr view'): 'Read-only publication read-back.',
     ('executable_task', 'gate_merge_result', 'run_git:merge --abort'): 'Cancel a conflicted disposable gate merge.',
+    ('executable_task', 'remove_gate_worktree', 'run_git:worktree prune'): (
+        'Cancellation maintenance: prune stale worktree metadata after failed gate removal; moves no branch.',
+        "run_git(task.repo, 'worktree', 'prune')"),
     ('executable_task', 'apply_close_update', 'ok:diff <dynamic>'): (
         'Read-only cached diff; expanded paths follow -- and cannot select another command.',
         "ok(kb, 'diff', '--cached', '--quiet', '--', *paths)"),
@@ -82,6 +85,8 @@ def action(node):
             return callee + ':' + (command + ' ' if command else '') + '<dynamic>'
         if callee == 'gh':
             return 'gh:' + command
+        if command == 'worktree' and len(args) > 1 and isinstance(args[1], ast.Constant) and args[1].value == 'prune':
+            return callee + ':worktree prune'
         if command in PUBLICATIONS:
             if len(args) > 1 and isinstance(args[1], ast.Constant) and args[1].value == '--abort':
                 return callee + ':merge --abort'
@@ -215,7 +220,7 @@ class Coverage(unittest.TestCase):
         for filename, helpers, queries in (
                 ('executable_task', ('run_git', 'git', 'ok'),
                  [('status', '--porcelain'), ('remote', 'get-url', 'origin'),
-                  ('worktree', 'list'), ('branch', '--show-current'),
+                  ('worktree', 'list'), ('worktree', 'prune'), ('branch', '--show-current'),
                   ('merge', '--abort'),
                   ('worktree', 'remove', '--force', '/inert/.worktrees/.drill-aabbcc-0-group'),
                   ('worktree', 'remove', '--force', '/inert/.worktrees/.task-gate-t5-123'),

@@ -522,6 +522,151 @@ class TaskTool(unittest.TestCase):
         self.assertFalse((work / 'model-call.json').exists())
         self.assertEqual(json.loads((work / 'lane.json').read_text())['state'], 'refused: hold')
 
+    def test_hold_round5_worker_stop_records_distinguish_hold(self):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('Do the task.\n')
+        record = work / 'lane.json'
+        config = wt / '.task.toml'
+        args = SimpleNamespace(repo=str(self.repo), id='5', builder='codex', tier=None,
+                               model='gpt-6.1-sol', no_boost=True, _worker=True,
+                               timeout=None, override='')
+        claude_root = self.home / 'claude-root'
+        claude_root.mkdir(mode=0o700)
+        bad_tmp = self.home / 'bad-tmp'
+        bad_tmp.mkdir()
+        # Run the real root validators against an isolated /tmp stand-in.
+        for prefix in ('claude', 'task-gate'):
+            (bad_tmp / f'{prefix}-{os.getuid()}').mkdir(mode=0o777)
+            (bad_tmp / f'{prefix}-{os.getuid()}').chmod(0o777)
+        advisory_root = bad_tmp / 'advisory'
+        advisory_root.mkdir(mode=0o777)
+        advisory_root.chmod(0o777)
+        popen = subprocess.Popen
+        def invalid_root(function):
+            def validate():
+                with mock.patch.object(TASK_MODULE, 'Path',
+                        side_effect=lambda value: bad_tmp if value == '/tmp' else Path(value)):
+                    return function()
+            return validate
+        cases = [
+            ('env table', 'env = 1\n', 'codex', None, None),
+            ('reserved env', '[env]\nTMPDIR = "bad"\n', 'codex', None, None),
+            ('credential env', '[env]\nAPI_TOKEN = "fixture"\n', 'codex', None, None),
+            ('invalid env name', '[env]\n"bad-name" = "x"\n', 'codex', None, None),
+            ('invalid env value', '[env]\nNORMAL = 1\n', 'codex', None, None),
+            ('NUL env value', '[env]\nNORMAL = "\\u0000"\n', 'codex', None, None),
+            ('unreadable config', '[env\n', 'codex', None, None),
+            ('escaped lane tmp', '', 'codex', None, None),
+            ('advisory root', '', 'codex', 'lane_temporary_root', lambda: advisory_root),
+            ('claude root', '', 'claude', 'claude_temporary_root',
+             invalid_root(TASK_MODULE.claude_temporary_root)),
+            ('gate root', '', 'claude', 'gate_temporary_root',
+             invalid_root(TASK_MODULE.gate_temporary_root)),
+            ('generic Stop', '', 'codex', 'admit',
+             TASK_MODULE.Stop('refused: hold is only text, not a HoldRefused')),
+            ('hold', '', 'codex', None, None),
+        ]
+        for label, contents, builder, target, failure in cases:
+            with self.subTest(reason=label), contextlib.ExitStack() as stack:
+                config.write_text(contents)
+                record.write_text(json.dumps(dict(pid=os.getpid(), state='running')))
+                args.builder = builder
+                args.model = 'opus' if builder == 'claude' else 'gpt-6.1-sol'
+                stack.enter_context(mock.patch.dict(os.environ, self.env, clear=True))
+                stack.enter_context(mock.patch.object(TASK_MODULE, 'claude_temporary_root', return_value=claude_root))
+                launch = mock.Mock(side_effect=AssertionError('builder launched'))
+                def start(command, *positional, **keywords):
+                    if command[0] in {'codex', 'claude'}:
+                        return launch(command, *positional, **keywords)
+                    return popen(command, *positional, **keywords)
+                stack.enter_context(mock.patch.object(TASK_MODULE.subprocess, 'Popen', side_effect=start))
+                if target:
+                    stack.enter_context(mock.patch.object(TASK_MODULE, target, side_effect=failure))
+                if label == 'escaped lane tmp':
+                    temporary = work / 'tmp'
+                    if temporary.exists(): shutil.rmtree(temporary)
+                    temporary.symlink_to(self.home)
+                    stack.callback(temporary.unlink)
+                if label == 'hold':
+                    marker = self.home / '.local/state/task/hold'
+                    marker.write_text('worker admission')
+                    stack.callback(marker.unlink)
+                with self.assertRaises(TASK_MODULE.Stop):
+                    TASK_MODULE.lane(args)
+                launch.assert_not_called()
+                run = json.loads(record.read_text())
+                self.assertEqual(run['state'], 'refused: hold' if label == 'hold' else 'finished')
+                self.assertEqual(run['exit_code'], 1)
+
+    def test_hold_round5_cancel_prunes_after_failed_worktree_removal(self):
+        self.started()
+        run_path = self.state() / 'run.json'
+        run_path.write_text(json.dumps(dict(state='running', pgid=99999999)))
+        gate = self.repo / '.worktrees/.task-gate-t5-99999999'
+        gate.mkdir()
+        self.raw_task('hold', 'pull', 'cancel must remain available')
+        transport = TASK_MODULE.subprocess.run
+        pruned = []
+        def fail_removal(command, **kwargs):
+            if command[-4:-1] == ['worktree', 'remove', '--force']:
+                return subprocess.CompletedProcess(command, 1, '', 'fixture removal failure')
+            if command[-2:] == ['worktree', 'prune']:
+                pruned.append(command)
+            return transport(command, **kwargs)
+        # The first sweep sees a live gate; the post-cancel sweep cleans it up.
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(TASK_MODULE, 'pid_alive', side_effect=[True, False]), \
+                mock.patch.object(TASK_MODULE, 'task_lock_status', return_value='running'), \
+                mock.patch.object(TASK_MODULE, 'signal_task_run'), \
+                mock.patch.object(TASK_MODULE, 'task_run_pids', return_value=[]), \
+                mock.patch.object(TASK_MODULE.os, 'killpg', side_effect=ProcessLookupError), \
+                mock.patch.object(TASK_MODULE.subprocess, 'run', side_effect=fail_removal):
+            self.assertEqual(TASK_MODULE.main(['cancel', str(self.repo), '5']), 0)
+        self.assertEqual(json.loads(run_path.read_text())['state'], 'cancelled')
+        self.assertFalse(gate.exists())
+        self.assertEqual(len(pruned), 1)
+
+    def test_hold_round5_launcher_records_refusal_after_lane_lock_wait(self):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('Do the task.\n')
+        (work / 'lane.json').write_text(json.dumps(dict(state='finished')))
+        ready = self.home / 'waiting-launcher-lock'
+        script = self.home / 'lane-launcher.py'
+        script.write_text(textwrap.dedent(f'''\
+            import fcntl, pathlib, runpy
+            module = runpy.run_path({str(TOOL)!r})
+            original = fcntl.flock
+            def flock(stream, flags):
+                if getattr(stream, 'name', '') == {str(work / 'lane.lock')!r}:
+                    pathlib.Path({str(ready)!r}).touch()
+                return original(stream, flags)
+            fcntl.flock = flock
+            raise SystemExit(module['main'](['lane', 'proj', '5', '--no-boost']))
+            '''))
+        transcript = self.home / 'waiting-launcher.log'
+        with (work / 'lane.lock').open('a') as lock, transcript.open('w') as output:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = subprocess.Popen([sys.executable, str(script)], cwd=wt, env=self.env,
+                                       stdout=output, stderr=subprocess.STDOUT)
+            try:
+                self.wait_runner_file(ready)
+                self.assertIsNone(process.poll())
+                self.raw_task('hold', 'pull', 'hold during launcher lock wait')
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(process.wait(timeout=10), 1, transcript.read_text())
+            finally:
+                if process.poll() is None: process.kill(); process.wait()
+        self.assertIn('refused: hold', transcript.read_text())
+        self.assertFalse((work / 'model-call.json').exists())
+        run = json.loads((work / 'lane.json').read_text())
+        self.assertEqual(run['state'], 'refused: hold')
+        self.assertTrue(run['ended_at'])
+        self.assertNotIn('pid', run)
+
     def test_hold_during_last_merge_gate_step_prevents_all_publication(self):
         last = self.home / 'last-gate-step.sh'
         last.write_text(f'#!/bin/sh\n"{self.home}/.local/bin/task" hold pull "last merge gate step" --holder gate\n')
