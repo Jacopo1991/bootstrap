@@ -149,6 +149,7 @@ class Usage(unittest.TestCase):
         self.assertEqual(defaults["normal"], dict(codex="haiku", claude="gpt-6-luna", max_rounds=3, extra_rounds=1))
         self.assertEqual(defaults["high"]["red_team_model"], "gpt-6.1-sol")
         self.assertIn("system/agent-policy/**", defaults["high_paths"]["bootstrap"])
+        self.assertIn("home/dot_local/share/bootstrap/agent-policy/**", defaults["high_paths"]["bootstrap"])
         self.assertNotIn("home/dot_local/bin/executable_task", defaults["high_paths"]["bootstrap"])
         path = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
         path.parent.mkdir(parents=True)
@@ -176,6 +177,9 @@ class Usage(unittest.TestCase):
                 path.write_text(text + '\n')
                 with self.assertRaisesRegex(ValueError, "review"):
                     usage.policy(self.home)
+                pol, _, notes = usage.assessments(self.home, NOW)
+                self.assertEqual(pol, usage.DEFAULTS)
+                self.assertTrue(any('invalid review' in note and 'built-in defaults used' in note for note in notes))
 
     def test_gate_unknown_reading_warns_and_changes_nothing(self):
         decision = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)

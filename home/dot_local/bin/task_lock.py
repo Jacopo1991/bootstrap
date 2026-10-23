@@ -98,11 +98,10 @@ def configure(commands):
     sub.add_argument('--release', action='store_true'); sub.add_argument('--force', action='store_true')
 def requires_pm(args): return args.command == 'lock' and (args.release or args.holder is not None or args.ttl is not None)
 def before_work(args, home, resolve_repo):
-    if args.command in {'start', 'lane', 'merge', 'close', 'risk', 'redteam', 'runner-start', 'realign', 'gate-drill'} or args.command == 'review' and args.run:
-        for name in args.repos if args.command == 'gate-drill' else [args.repo]:
-            repo = resolve_repo(name)
-            if not os.environ.get('TASK_HOLDER', '').strip(): raise refusal(repo, 'Set TASK_HOLDER or pass --holder <name>')
-            with guarded(home, repo): inspect(home, repo, os.environ['TASK_HOLDER'])
+    if args.command in {'start', 'lane', 'merge', 'close', 'risk', 'redteam', 'runner-start', 'realign'} or args.command == 'review' and args.run:
+        repo = resolve_repo(args.repo)
+        if not os.environ.get('TASK_HOLDER', '').strip(): raise refusal(repo, 'Set TASK_HOLDER or pass --holder <name>')
+        with guarded(home, repo): inspect(home, repo, os.environ['TASK_HOLDER'])
 def command(args, home, resolve_repo):
     repo = resolve_repo(args.repo)
     if args.release: release(home, repo, args.force, args.holder)

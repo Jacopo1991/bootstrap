@@ -16,9 +16,9 @@ def findings(home, now):
     found = {}
     def add(kind, source, key):
         found[kind + ':' + key] = dict(class_=kind, source=str(source), key=key)
-    pol = usage.policy(home)
-    for vendor, reading in usage.readings(home, now).items():
-        item = usage.assess(reading, pol, now)
+    _, seen, notes = usage.assessments(home, now)
+    for warning in notes: print(warning, file=sys.stderr)
+    for vendor, item in seen.items():
         if item['verdict'] == usage.EXHAUSTED or item['five'] == usage.FIVE_OUT:
             add('P2', 'task usage', vendor)
     units = home / '.config/task/live-units'
