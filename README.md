@@ -1202,7 +1202,8 @@ PyPI and about six for npm (its database is about 200 MB).
 ### Package caps (the litellm lock rule)
 
 `system/agent-policy/package-caps.toml` caps `litellm` at `1.106.2`, with exact
-pins for PyPI and the `ghcr.io/berriai/litellm` / `berriai/litellm` images.
+pins or upper bounds for PyPI and pinned tags for the
+`ghcr.io/berriai/litellm` / `berriai/litellm` images.
 Version `1.107.0` and the affected floating image tags were compromised on
 2026-10-21 ([incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
 The rule rests on resolver constraints plus the offline repository gate:
@@ -1223,8 +1224,10 @@ The rule rests on resolver constraints plus the offline repository gate:
   Lock files read only the capped package's own resolved version and fail above
   the cap. Every scanned non-lock file uses the same text rule: each whole-token
   capped name needs an allowed exact pin (`litellm==1.106.2`,
-  `litellm[proxy]==1.104.0`, `litellm = "==1.106.2"`) or image tag
-  (`litellm:v1.106.2`). Pyproject ranges fail even with an allowed lock pin.
+  `litellm[proxy]==1.104.0`, `litellm = "==1.106.2"`), an upper bound at or below
+  the cap (`litellm<=1.106.2`, `litellm[proxy]<=1.104.0`, including quoted forms),
+  or image tag (`litellm:v1.106.2`). Bare names and ranges without an upper bound
+  at or below the cap fail even with an allowed lock pin.
   Container discovery uses `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
   `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository.
   A version must end the word; quote or escape concatenation after a safe version

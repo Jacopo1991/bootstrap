@@ -211,7 +211,33 @@ class Manifests(unittest.TestCase):
         self.refused("pyproject.toml", '[tool.poetry.group.dev.dependencies]\nlitellm = "*"\n', "pinned exactly")
         self.refused("pyproject.toml", '[build-system]\nrequires = ["litellm>1"]\n', "pinned exactly")
         self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<1.108"]\n', "pinned exactly")
-        self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<=1.106.2"]\n')
+        self.allowed("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<=1.106.2"]\n')
+
+    def test_generated_new_project_pyproject_passes(self):
+        generated = io.StringIO()
+        with contextlib.redirect_stdout(generated):
+            code = check.main(['--uv-project', 'cap-fixture'], policy_path=POLICY)
+        self.assertEqual(code, 0)
+        text = generated.getvalue()
+        uv = tomllib.loads(text)['tool']['uv']
+        for key in ('constraint-dependencies', 'build-constraint-dependencies'):
+            self.assertEqual(uv[key], ['litellm<=1.106.2'])
+        self.allowed('pyproject.toml', text)
+        for requirement in ('litellm<=1.106.2', 'litellm[proxy]<=1.104.0',
+                            '"litellm<=1.106.2"', "'litellm[proxy]<=1.104.0'",
+                            'litellm = "<=1.106.2"', "litellm = '<=1.104.0'"):
+            with self.subTest(requirement=requirement):
+                self.allowed('requirements.txt', requirement + '\n')
+
+    def test_lower_bound_without_safe_upper_bound_fails(self):
+        self.refused('pyproject.toml', '[project]\ndependencies=["litellm>=1.100"]\n',
+                     'pyproject.toml:2:', 'pinned exactly')
+
+    def test_upper_bound_above_cap_fails(self):
+        for requirement in ('litellm<=1.107', 'litellm[proxy]<=1.107',
+                            '"litellm<=1.107"', 'litellm = "<=1.107"'):
+            with self.subTest(requirement=requirement):
+                self.refused('requirements.txt', requirement + '\n', 'above the cap')
 
     def test_pyproject_ranges_fail_even_with_allowed_locks(self):
         project = '[project]\nname="x"\ndependencies=["litellm>=1.100"]\n'
@@ -226,7 +252,7 @@ class Manifests(unittest.TestCase):
             for requirement in ('setuptools==80.9.0', 'setuptools @ https://example.invalid/setuptools.whl'):
                 self.allowed('pyproject.toml', '[tool.uv]\n' + key +
                              ' = [{requirement = "' + requirement + '", hashes = ["sha256:abc"]}]\n')
-            for requirement, allowed in (('litellm<=1.106.2', False),
+            for requirement, allowed in (('litellm<=1.106.2', True),
                                          ('litellm==1.106.2', True),
                                          ('litellm==1.107.0', False), ('litellm', False)):
                 text = '[tool.uv]\n' + key + ' = [{requirement = "' + requirement + '", hashes = []}]\n'

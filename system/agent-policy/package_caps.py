@@ -156,7 +156,7 @@ class Checker:
                 self.error(path, self.line_of(text, name), reason)
 
     def pinned_text(self, path: Path, text: str) -> None:
-        """Require an immediate allowed pin/tag for every whole-token policy name.
+        """Require an allowed pin, upper bound or tag for every whole-token name.
 
         All non-lock formats, including comments, use the same literal rule.
         No manifest/shell/YAML parsing, expansion or referenced-file resolution.
@@ -167,9 +167,9 @@ class Checker:
                 line = text.count('\n', 0, match.start()) + 1
                 # Read the entire adjacent value, never an allowed prefix of it.
                 pin = re.match(
-                    r'''(?:\[[A-Za-z0-9_,. -]+\])?==(?P<version>[^\s"'`,;\[\]{}()<>|&\\]+)'''
+                    r'''(?:\[[A-Za-z0-9_,. -]+\])?(?:==|<=)(?P<version>[^\s"'`,;\[\]{}()<>|&\\]+)'''
                     r'''|:(?P<tag>[^\s"'`,;\[\]{}()<>|&\\]+)'''
-                    r'''|[ \t]*=[ \t]*["']==(?P<assigned>[^\s"'`,;\[\]{}()<>|&\\]+)''',
+                    r'''|[ \t]*=[ \t]*["'](?:==|<=)(?P<assigned>[^\s"'`,;\[\]{}()<>|&\\]+)''',
                     text[match.end():])
                 if pin is None:
                     reason = cap.version_reason(None)
