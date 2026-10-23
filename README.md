@@ -1217,26 +1217,25 @@ The rule rests on resolver constraints plus the offline repository gate:
   build dependency resolution is not probed.
 
 - **Gate:** every standard pre-commit config runs `package-cap-check` over tracked
-  requirements/constraints (`.txt`/`.in`), pyproject, uv/Poetry/Pipenv locks,
+  requirements/constraints (`.txt`/`.in`), all `*.in` files, pyproject, uv/Poetry/Pipenv/PDM locks,
   Dockerfiles, compose YAML, setup metadata and PEP 723 scripts. Bootstrap uses
   `python3 ci/package-cap-check.py` with its checkout's policy before installation.
-  It checks only capped names, follows readable local includes, and checks pins,
-  sources and manifest/lock consistency, including PEP 723 uv sources and uv's
-  hash-bearing dependency tables. Pyproject ranges need an allowed lock pin in the
-  same project (the workspace-root `uv.lock` for uv members).
-  Files named `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
-  `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository, use a
-  text rule: every whole-token capped name must be immediately followed by an
-  allowed exact pin (`litellm==1.106.2`) or image tag (`litellm:v1.106.2`).
+  Lock files read only the capped package's own resolved version and fail above
+  the cap. Every scanned non-lock file uses the same text rule: each whole-token
+  capped name needs an allowed exact pin (`litellm==1.106.2`,
+  `litellm[proxy]==1.104.0`, `litellm = "==1.106.2"`) or image tag
+  (`litellm:v1.106.2`). Pyproject ranges fail even with an allowed lock pin.
+  Container discovery uses `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
+  `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository.
   A version must end the word; quote or escape concatenation after a safe version
   prefix is refused.
   Letters, digits, `_`, `.` and `-` join tokens, so `langchain-litellm` is ignored.
-  Comments and heredocs count; shell/YAML syntax, variables and `dockerfile:`
-  references are not interpreted. Violations report the file and line;
-  unapproved image digests and local versions still fail. Remote or missing
-  requirements includes naming no capped package are ignored; resolver constraints
-  still cap the actual install. The installed command requires the root-owned
-  policy at `/usr/local/lib/agent-policy/package-caps.toml`.
+  Comments and heredocs count; manifest/shell/YAML syntax, variables, requirement
+  includes and `dockerfile:` references are not interpreted. Files without a
+  whole-token capped name are never parsed further. Violations report the file
+  and line; unapproved image digests and local versions still fail. Resolver
+  constraints still cap transitive installs. The installed command requires the
+  root-owned policy at `/usr/local/lib/agent-policy/package-caps.toml`.
 
 `pipx`, Poetry, conda/mamba, images and existing uv projects without workspace
 constraints have only the gate guard. It checks tracked declarations/locks at

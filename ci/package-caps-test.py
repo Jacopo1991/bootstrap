@@ -93,16 +93,10 @@ class Versions(unittest.TestCase):
         for junk in ("latest", "1.106.*", "", "main-v1.106.2", ">=1.106.2", "1.106.2+custom"):
             self.assertIsNone(check.version_key(junk), junk)
 
-    def test_requirement_parsing(self):
-        self.assertEqual(check.parse_requirement("litellm==1.106.2"), ("litellm", "1.106.2", True))
-        self.assertEqual(check.parse_requirement("LiteLLM[proxy] == 1.104.2 ; python_version > '3.8'"),
-                         ("litellm", "1.104.2", True))
-        self.assertEqual(check.parse_requirement("litellm")[1:], (None, False))
-        self.assertEqual(check.parse_requirement("litellm>=1.100,<1.107")[1:], (None, False))
-        self.assertEqual(check.parse_requirement("litellm==1.106.*")[1:], (None, False))
-        self.assertEqual(check.parse_requirement("litellm @ https://example.invalid/litellm.whl")[1:], (None, False))
-        self.assertEqual(check.poetry_requirement("litellm", "1.106.2"), ("litellm", "1.106.2", True))
-        self.assertEqual(check.poetry_requirement("litellm", {"version": "^1.100", "extras": ["proxy"]})[1:], (None, False))
+    def test_exact_versions_refuse_ranges_and_wildcards(self):
+        cap = check.load_policy(POLICY)['litellm']
+        for value in (None, '>=1.100,<1.107', '1.106.*', '==1.106.2'):
+            self.assertIsNotNone(cap.version_reason(value))
 
     def test_image_tags(self):
         cap = check.load_policy(POLICY)["litellm"]
@@ -158,12 +152,12 @@ class Manifests(unittest.TestCase):
         for name in ("requirements.txt", "requirements-dev.txt", "constraints.txt", "constraints-prod.txt", "api/requirements.txt"):
             self.allowed(name, "requests==2.32.0\nlitellm==1.106.2  # pinned\n")
             self.allowed(name, "litellm[proxy]==1.104.2 \\\n    --hash=sha256:0123\n")
-            self.allowed(name, 'litellm==1.106.2; python_version >= "3.9"\n# litellm\n-r other.txt\n')
+            self.allowed(name, 'litellm==1.106.2; python_version >= "3.9"\n# litellm==1.106.2\n-r other.txt\n')
             self.refused(name, "litellm==1.107.0\n", "above the cap")
             self.refused(name, "litellm\n", "pinned exactly")
             self.refused(name, "litellm>=1.100\n", "pinned exactly")
             self.refused(name, "litellm~=1.106.0\n", "pinned exactly")
-            self.refused(name, "litellm==1.106.*\n", "pinned exactly")
+            self.refused(name, "litellm==1.106.*\n", "not an allowed exact version")
             self.refused(name, "-e git+https://github.com/BerriAI/litellm@main#egg=litellm\n", "pinned exactly")
             self.refused(name, "litellm @ https://example.invalid/litellm-1.107.0.tar.gz\n", "pinned exactly")
 
@@ -181,7 +175,7 @@ class Manifests(unittest.TestCase):
                     # An unrelated line remains ignored beside an allowed pin.
                     self.allowed(name, example + '\nlitellm==1.106.2\n')
         self.refused('requirements.txt', '--editable git+https://example.invalid/repo#egg=litellm\n',
-                     'unverifiable editable source')
+                     'pinned exactly')
 
     def test_uncapped_installer_arguments_are_ignored(self):
         for args in ('--timeout 100 numpy', '--no-compile numpy', '--unknown-flag numpy',
@@ -208,45 +202,39 @@ class Manifests(unittest.TestCase):
         self.allowed("pyproject.toml", '[project]\nname = "x"\ndependencies = ["requests", "litellm==1.106.2"]\n')
         self.allowed("pyproject.toml", '[project]\nname = "x"\n[project.optional-dependencies]\nproxy = ["litellm[proxy]==1.104.2"]\n')
         self.allowed("pyproject.toml", '[dependency-groups]\ndev = ["litellm==1.106.2", {include-group = "test"}]\ntest = ["pytest"]\n')
-        self.allowed("pyproject.toml", '[tool.poetry.dependencies]\npython = "^3.12"\nlitellm = "1.106.2"\n')
-        self.allowed("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = {version = "==1.104.0", extras = ["proxy"]}\n')
+        self.allowed("pyproject.toml", '[tool.poetry.dependencies]\npython = "^3.12"\nlitellm = "==1.106.2"\n')
+        self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = {version = "==1.104.0", extras = ["proxy"]}\n')
         self.refused("pyproject.toml", '[project]\nname = "x"\ndependencies = ["litellm==1.107.0"]\n', "above the cap")
-        self.refused("pyproject.toml", '[project]\ndependencies = ["litellm>=1.100"]\n', "no uv.lock or poetry.lock")
-        self.refused("pyproject.toml", '[project]\ndependencies = ["litellm"]\n', "no uv.lock or poetry.lock")
-        self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = "^1.100"\n', "no uv.lock or poetry.lock")
-        self.refused("pyproject.toml", '[tool.poetry.group.dev.dependencies]\nlitellm = "*"\n', "no uv.lock or poetry.lock")
-        self.refused("pyproject.toml", '[build-system]\nrequires = ["litellm>1"]\n', "no uv.lock or poetry.lock")
-        self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<1.108"]\n', "unverified uv")
-        self.allowed("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<=1.106.2"]\n')
+        self.refused("pyproject.toml", '[project]\ndependencies = ["litellm>=1.100"]\n', "pinned exactly")
+        self.refused("pyproject.toml", '[project]\ndependencies = ["litellm"]\n', "pinned exactly")
+        self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = "^1.100"\n', "pinned exactly")
+        self.refused("pyproject.toml", '[tool.poetry.group.dev.dependencies]\nlitellm = "*"\n', "pinned exactly")
+        self.refused("pyproject.toml", '[build-system]\nrequires = ["litellm>1"]\n', "pinned exactly")
+        self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<1.108"]\n', "pinned exactly")
+        self.refused("pyproject.toml", '[tool.uv]\nconstraint-dependencies = ["litellm<=1.106.2"]\n')
 
-    def test_pyproject_range_needs_a_lock_pinning_an_allowed_version(self):
-        project = '[project]\nname = "x"\ndependencies = ["litellm>=1.100"]\n'
-        lock = '[[package]]\nname = "litellm"\nversion = "{}"\n'
-        self.write("uv.lock", lock.format("1.104.0"))
-        self.allowed("pyproject.toml", project)
-        self.write("uv.lock", lock.format("1.107.0"))
-        self.refused("pyproject.toml", project, "uv.lock pins 1.107.0")
-        self.write("uv.lock", '[[package]]\nname = "requests"\nversion = "2.32.0"\n')
-        self.refused("pyproject.toml", project, "lock file does not pin it")
-        (self.repo / "uv.lock").unlink()
-        self.write("poetry.lock", lock.format("1.106.2"))
-        self.allowed("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = "^1.100"\n')
-        self.write("poetry.lock", lock.format("1.106.3"))
-        self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = "^1.100"\n', "poetry.lock pins 1.106.3")
+    def test_pyproject_ranges_fail_even_with_allowed_locks(self):
+        project = '[project]\nname="x"\ndependencies=["litellm>=1.100"]\n'
+        for lock_name in ('uv.lock', 'poetry.lock'):
+            for version in ('1.104.0', '1.107.0'):
+                self.write(lock_name, '[[package]]\nname="litellm"\nversion="' + version + '"\n')
+                self.refused('pyproject.toml', project, 'pinned exactly')
+                self.refused('pyproject.toml', '[tool.poetry.dependencies]\nlitellm="^1.100"\n', 'pinned exactly')
 
     def test_uv_dependency_tables_and_uncapped_requirements(self):
         for key in ('constraint-dependencies', 'build-constraint-dependencies', 'override-dependencies'):
             for requirement in ('setuptools==80.9.0', 'setuptools @ https://example.invalid/setuptools.whl'):
                 self.allowed('pyproject.toml', '[tool.uv]\n' + key +
                              ' = [{requirement = "' + requirement + '", hashes = ["sha256:abc"]}]\n')
-            for requirement, allowed in (('litellm<=1.106.2', True),
+            for requirement, allowed in (('litellm<=1.106.2', False),
                                          ('litellm==1.106.2', True),
                                          ('litellm==1.107.0', False), ('litellm', False)):
                 text = '[tool.uv]\n' + key + ' = [{requirement = "' + requirement + '", hashes = []}]\n'
                 if allowed:
                     self.allowed('pyproject.toml', text)
                 else:
-                    self.refused('pyproject.toml', text, 'unverified uv')
+                    self.refused('pyproject.toml', text,
+                                 'above the cap' if '1.107.0' in requirement else 'pinned exactly')
         for table, key in (('project', 'dependencies'), ('build-system', 'requires'),
                            ('project.optional-dependencies', 'test'), ('dependency-groups', 'test'),
                            ('tool.uv', 'dev-dependencies')):
@@ -258,32 +246,78 @@ class Manifests(unittest.TestCase):
                 else:
                     self.refused('pyproject.toml', text)
 
-    def test_uv_workspace_member_uses_owning_root_lock(self):
+    def test_workspace_locks_are_scanned_independently_of_members(self):
         self.write('pyproject.toml', '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["packages/excluded"]\n')
         member = 'packages/member/pyproject.toml'
-        project = '[project]\nname="member"\ndependencies=["litellm>=1.100"]\n'
-        lock = '[[package]]\nname="litellm"\nversion="{}"\n'
-        self.write('uv.lock', lock.format('1.106.2'))
-        self.allowed(member, project)
-        self.refused('unrelated/pyproject.toml', project, 'no uv.lock or poetry.lock')
-        self.refused('packages/excluded/pyproject.toml', project, 'no uv.lock or poetry.lock')
-        self.write('uv.lock', lock.format('1.107.0'))
-        self.refused(member, project, 'uv.lock pins 1.107.0')
-        # A stale member lock must not hide the owning workspace's resolution.
-        self.write('packages/member/uv.lock', lock.format('1.106.2'))
-        self.refused(member, project, 'uv.lock pins 1.107.0')
-        self.write('uv.lock', lock.format('1.104.0'))
-        self.refused(member, project.replace('>=1.100', '>=1.106'), 'manifest/lock mismatch')
+        for name in (member, 'unrelated/pyproject.toml', 'packages/excluded/pyproject.toml'):
+            self.refused(name, '[project]\ndependencies=["litellm>=1.100"]\n', 'pinned exactly')
+            self.allowed(name, '[project]\ndependencies=["litellm==1.104.0"]\n')
+        self.write('uv.lock', '[[package]]\nname="litellm"\nversion="1.107.0"\n')
+        # A safe member lock cannot hide a capped root resolution.
+        self.write('packages/member/uv.lock', '[[package]]\nname="litellm"\nversion="1.104.0"\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
+        code, output = self.run_check()
+        self.assertEqual(code, 1, output)
+        self.assertIn('uv.lock:2:', output)
+        self.assertIn('above the cap', output)
 
-    def test_pep723_preserves_uv_source_metadata(self):
+    def test_scoped_uv_override_uses_the_text_rule(self):
+        for dependency in ('litellm==1.107.0', 'litellm', 'litellm>=1.100'):
+            self.refused('pyproject.toml', '[tool.uv]\noverride-dependencies=[{package={name="parent"}, '
+                         'dependencies=["' + dependency + '"]}]\n')
+        self.allowed('pyproject.toml', '[tool.uv]\noverride-dependencies=[{package={name="parent"}, '
+                     'dependencies=["litellm==1.106.2"]}]\n')
+
+    def test_absolute_workspace_exclusion_without_capped_names_is_ignored(self):
+        text = '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["' + str(self.repo / 'packages/excluded') + '"]\n'
+        self.write('pyproject.toml', text)
+        self.write('packages/member/pyproject.toml', '[project]\nname="member"\ndependencies=["numpy"]\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
+        with patch.object(tomllib, 'loads', wraps=tomllib.loads) as parse:
+            code, output = self.run_check()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(parse.call_count, 1)  # policy only; no manifest parsing
+
+    def test_every_non_lock_format_uses_the_same_text_rule(self):
+        for name in ('requirements.txt', 'constraints.in', 'dependencies.in', 'pyproject.toml',
+                     'setup.cfg', 'setup.py', 'script.py', 'Dockerfile', 'compose.yaml'):
+            prefix = '# /// script\n' if name == 'script.py' else ''
+            for pin in ('litellm==1.106.2', 'litellm[proxy,extra]==1.104.0',
+                        'litellm = "==1.106.2"', "litellm='==1.104.0'",
+                        'berriai/litellm:v1.106.2'):
+                with self.subTest(name=name, pin=pin):
+                    self.allowed(name, prefix + '# ' + pin + '\n')
+            for mention in ('litellm', 'litellm>=1.100', 'litellm = "1.106.2"',
+                            'litellm = "==1.107.0"', 'litellm[proxy]==1.107.0',
+                            '"litellm==1.10"7.0', 'litellm = "==1.10"7.0',
+                            'litellm[proxy]==1.10\\7.0', 'litellm:v1.107.0'):
+                with self.subTest(name=name, mention=mention):
+                    self.refused(name, prefix + '\n# ' + mention + '\n',
+                                 f'{name}:{3 if prefix else 2}:')
+            # Invalid format syntax and uncapped joined names are never parsed.
+            self.allowed(name, prefix + '[[{ not valid syntax: langchain-litellm\n')
+            self.refused(name, prefix + 'litellm[proxy]:v1.106.2\n', 'pinned exactly')
+
+    def test_locks_read_only_own_resolved_versions(self):
+        for name in ('uv.lock', 'poetry.lock', 'pdm.lock'):
+            self.allowed(name, '[[package]]\nname="parent"\nversion="9"\n'
+                         'dependencies=[{name="litellm", version="1.107.0"}]\n'
+                         '[[package]]\nname="litellm"\nversion="1.106.2"\n'
+                         'source={url="https://example.invalid/litellm"}\n')
+            self.refused(name, '[[package]]\nname="parent"\nversion="1.104.0"\n'
+                         '[[package]]\nname="litellm"\nversion="1.107.0"\n', 'above the cap')
+        self.allowed('Pipfile.lock', '{"_meta":{"litellm":"1.107.0"},'
+                     '"default":{"litellm":{"version":"==1.106.2", "url":"ignored"}}}')
+
+    def test_pep723_source_mentions_use_the_text_rule(self):
         for dependencies in ('[]', '["litellm==1.106.2"]'):
             prefix = '# /// script\n# dependencies = ' + dependencies + '\n'
             self.allowed('script.py', prefix + '# [tool.uv.sources]\n# numpy = {path="./numpy"}\n# ///\n')
             self.refused('script.py', prefix + '# [tool.uv.sources]\n# litellm = {path="./local"}\n# ///\n',
-                         'alternate uv source refused')
+                         'pinned exactly')
 
     def test_lock_files(self):
-        for name in ("uv.lock", "poetry.lock"):
+        for name in ("uv.lock", "poetry.lock", "pdm.lock"):
             self.allowed(name, '[[package]]\nname = "requests"\nversion = "2.32.0"\n\n[[package]]\nname = "litellm"\nversion = "1.104.0"\n')
             self.refused(name, '[[package]]\nname = "litellm"\nversion = "1.107.0"\n', "above the cap", f"{name}:2")
             self.refused(name, '[[package]]\nname = "litellm"\nsource = { git = "https://example.invalid" }\n', "pinned exactly")
@@ -297,6 +331,7 @@ class Manifests(unittest.TestCase):
         self.write('pyproject.toml', '[project]\nname="demo"\ndependencies=["parent-package"]\n')
         for name, template in (
             ('uv.lock', '[[package]]\nname="parent-package"\nversion="1.0"\ndependencies=[{name="litellm"}]\n[[package]]\nname="litellm"\nversion="VERSION"\n'),
+            ('pdm.lock', '[[package]]\nname="litellm"\nversion="VERSION"\n'),
             ('poetry.lock', '[[package]]\nname="parent-package"\nversion="1.0"\n[package.dependencies]\nlitellm="*"\n[[package]]\nname="litellm"\nversion="VERSION"\n'),
             ('Pipfile.lock', '{"default":{"parent-package":{"version":"==1.0"},"litellm":{"version":"==VERSION"}}}'),
         ):
@@ -371,13 +406,13 @@ class Manifests(unittest.TestCase):
         self.refused('compose.yaml', 'services: {app: {entrypoint: [sh, -c, "pip install litellm==1.107.0"]}}\n',
                      'above the cap')
 
-    def test_artifact_identity_stays_structured_only_in_requirements(self):
+    def test_artifact_names_obey_the_same_literal_token_rule(self):
         for artifact in ('./litellm-1.106.2-py3-none-any.whl',
                          'https://example.invalid/litellm-1.106.2-py3-none-any.whl'):
             self.allowed('requirements.txt', artifact + '\n')
             self.allowed('Dockerfile', 'RUN pip install ' + artifact + '\n')
-        for artifact in ('./litellm-1.107.0-py3-none-any.whl',
-                         'litellm@https://example.invalid/innocent-1.0-py3-none-any.whl',
+        self.allowed('requirements.txt', './litellm-1.107.0-py3-none-any.whl\n')
+        for artifact in ('litellm@https://example.invalid/innocent-1.0-py3-none-any.whl',
                          'git+https://example.invalid/repo#egg=litellm'):
             self.refused('requirements.txt', artifact + '\n')
         # A wheel filename is not a whole-token name; @ and = delimit names.
@@ -432,33 +467,26 @@ class Manifests(unittest.TestCase):
         code, output = self.run_check("requirements.txt", env_policy=str(self.repo / broken))
         self.assertEqual(code, 2, output)
 
-    def test_includes_artifacts_and_expansions(self):
-        for include in ('-r deps.txt', '-c deps.txt', '--requirement=deps.txt', '--constraint deps.txt'):
-            self.write('deps.txt', 'litellm==1.107.0\n')
-            code, output = self.run_check(self.write('requirements.in', include + '\n'))
-            self.assertEqual(code, 1, output)
-            self.assertIn('deps.txt:1:', output)
-            self.assertIn('above the cap 1.106.2', output)
-        for body in ('-r https://example.invalid/litellm.txt\n', 'litellm==$VERSION\n'):
-            self.refused('requirements.txt', body)
-        code, output = self.run_check(self.write('requirements.txt', '-r missing-litellm.txt\n'))
-        self.assertEqual(code, 1, output)
-        self.assertIn('missing-litellm.txt:1: requirements include is unavailable', output)
-        self.assertIn('1.106.2', output)
-        self.assertIn('security-incident-oct-21-2026', output)
-        self.write('nested.txt', 'litellm==1.104.0\n')
-        self.write('deps.txt', '-c nested.txt\n')
-        self.allowed('requirements.in', '-r deps.txt\n')
-        for include in ('-r requirements.txt', '-r https://example.invalid/deps.txt', '-r missing.txt'):
+    def test_includes_artifacts_and_expansions_use_literal_tokens(self):
+        # Include paths have no special meaning. Named files are scanned on their own.
+        for include in ('-r requirements-extra.in', '-c constraints-extra.txt',
+                        '--requirement=requirements-extra.in', '--constraint constraints-extra.txt',
+                        '-r requirements.txt', '-r https://example.invalid/deps.txt', '-r missing.txt',
+                        '-r missing-litellm.txt', '-r https://example.invalid/litellm.txt'):
             self.allowed('requirements.txt', include + '\n')
-        self.write('deps.txt', '-r requirements.txt\nlitellm==1.107.0\n')
-        self.refused('requirements.txt', '-r deps.txt\n', 'above the cap', reported_path='deps.txt')
-        for operand in ('./litellm-1.107.0-py3-none-any.whl',
-                        'https://example.invalid/litellm-1.107.0-py3-none-any.whl',
-                        'git+https://example.invalid/litellm',
+        self.write('requirements-extra.in', '-r requirements.txt\nlitellm==1.107.0\n')
+        self.write('constraints-extra.txt', 'litellm==1.104.0\n')
+        subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
+        code, output = self.run_check()
+        self.assertEqual(code, 1, output)
+        self.assertIn('requirements-extra.in:2:', output)
+        for operand in ('litellm==$VERSION', 'git+https://example.invalid/litellm',
                         'litellm==1.106.2+custom', 'litellm==1.106.2.post1', 'litellm===1.106.2'):
             self.refused('requirements.txt', operand + '\n')
-        self.allowed('requirements.txt', './litellm-1.106.2-py3-none-any.whl\n')
+        for operand in ('./litellm-1.107.0-py3-none-any.whl',
+                        'https://example.invalid/litellm-1.107.0-py3-none-any.whl',
+                        './litellm-1.106.2-py3-none-any.whl'):
+            self.allowed('requirements.txt', operand + '\n')
 
     def test_container_variables_are_text_and_digests_still_need_approval(self):
         self.refused('compose.yaml', 'x: &proxy {image: berriai/litellm:latest}\nservices: {proxy: *proxy}\n')
@@ -520,12 +548,12 @@ class Manifests(unittest.TestCase):
                          'litellm.py', 'xlitellm', 'litellmx', 'LITELLM_IMAGE'):
                 with self.subTest(name=name, text=text):
                     self.allowed(name, text + '\n')
-            for text in ('litellm', '(litellm)', '/litellm', 'litellm[proxy]==1.106.2',
+            for text in ('litellm', '(litellm)', '/litellm',
                          'litellm ==1.106.2', 'litellm===1.106.2', 'litellm==1.106.2junk',
                          'litellm==1.106.2+custom', 'litellm==1.106.2.post1'):
                 with self.subTest(name=name, text=text):
                     self.refused(name, text + '\n')
-            self.allowed(name, 'LiteLLM==1.106.2 litellm:v1.104.0\n')
+            self.allowed(name, 'LiteLLM==1.106.2 litellm:v1.104.0 litellm[proxy]==1.106.2\n')
             self.refused(name, 'litellm==1.106.2 litellm==1.107.0\n', 'above the cap')
             self.refused(name, 'other/litellm:latest\n', 'is refused')
 
@@ -561,24 +589,35 @@ class Manifests(unittest.TestCase):
             self.allowed(name, 'litellm==1.106.2\n')
             self.refused(name, 'litellm==1.107.0\n', 'above the cap')
 
-    def test_lock_consistency_and_sources(self):
+    def test_manifest_mentions_and_lock_versions_are_independent(self):
         self.write('uv.lock', '[[package]]\nname="litellm"\nversion="1.106.2"\n')
-        for req in ('litellm>=1.107.0', 'litellm==1.104.0', 'litellm @ git+https://example.invalid/repo'):
+        self.allowed('pyproject.toml', '[project]\ndependencies=["litellm==1.104.0"]\n')
+        for req in ('litellm>=1.107.0', 'litellm @ git+https://example.invalid/repo'):
             self.refused('pyproject.toml', '[project]\ndependencies = ["' + req + '"]\n')
         self.refused('pyproject.toml', '[tool.poetry.dependencies]\nlitellm={git="https://example.invalid", version="1.106.2"}\n')
         self.refused('pyproject.toml', '[tool.uv.sources]\nlitellm={path="./litellm"}\n')
         for name in ('uv.lock', 'poetry.lock'):
             for source in ('git="https://example.invalid/repo"', 'path="./litellm"', 'url="https://example.invalid/repo.whl"'):
-                self.refused(name, '[[package]]\nname="litellm"\nversion="1.106.2"\nsource={' + source + '}\n')
+                self.allowed(name, '[[package]]\nname="litellm"\nversion="1.106.2"\nsource={' + source + '}\n')
             self.refused(name, '[[package]]\nname="litellm"\nversion="1.106.2"\n[[package]]\nname="litellm"\nversion="1.107.0"\n')
-        self.refused('Pipfile.lock', '{"default":{"litellm":{"version":"==1.106.2","path":"./litellm"}}}')
+        self.allowed('Pipfile.lock', '{"default":{"litellm":{"version":"==1.106.2","path":"./litellm"}}}')
 
     def test_setup_and_script_metadata(self):
         self.allowed('setup.cfg', '[options]\ninstall_requires =\n    litellm==1.106.2\n')
         self.refused('setup.cfg', '[options.extras_require]\nproxy =\n    litellm==1.107.0\n')
-        self.refused('setup.py', 'setup(install_requires=["litellm==1.106.2"])\n')
+        self.allowed('setup.py', 'setup(install_requires=["litellm==1.106.2"])\n')
         self.allowed('script.py', '# /// script\n# dependencies = ["litellm==1.106.2"]\n# ///\nprint("hello")\n')
         self.refused('script.py', '# /// script\n# dependencies = ["litellm"]\n# ///\n')
+
+    def test_pep723_marker_must_be_a_comment_line(self):
+        for text in ('marker = "# /// script"\nrequirement = "litellm"\n',
+                     '# /// scripts\n# litellm\n'):
+            code, output = self.run_check(self.write('ordinary.py', text))
+            self.assertEqual(code, 0, output)
+            self.assertIn('0 manifest(s)', output)
+        # Once it is a script, all of its text is subject to the same rule.
+        self.refused('script.py', '# /// script\n# dependencies=[]\n# ///\n# litellm\n',
+                     'script.py:4:')
 
     def test_policy_schema_and_production_override_removal(self):
         original = tomllib.loads(POLICY.read_text())['packages']['litellm']
