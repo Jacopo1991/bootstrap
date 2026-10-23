@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -547,6 +547,60 @@ def plan_time(value):
         return None
 
 
+def plan_budget(ident, fields=None, clear=None, reserve=True):
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", ident): raise ValueError("invalid id")
+        with (CORTEX / "cortex-kb-company/plans" / f"{ident}.toml").open("rb") as source: content = source.read(16385)
+        if len(content) > 16384: raise ValueError("plan exceeds 16 KiB")
+        plan = tomllib.loads(content.decode("utf-8"))
+        expiry = plan_time(str(plan["expires"]))
+        if plan["id"] != ident or not expiry or expiry.utcoffset().total_seconds() != 0: raise ValueError("id or UTC expiry")
+        created = plan_time(str(plan.get("created", utc_now())))
+        if not created or created.utcoffset().total_seconds() != 0 or created > datetime.now(timezone.utc) or expiry - created > timedelta(days=31): raise ValueError("created must not be future; expiry must be within 31 days from created (or now)")
+        if set(plan["points"]) != set(task_usage.VENDORS) or not all(type(n) is int and 0 <= n <= 200 for n in plan["points"].values()): raise ValueError("integer points per vendor must be between 0 and 200")
+        if not isinstance(plan["allowed"], dict) or not all(isinstance(v, list) and all(isinstance(t, str) for t in v) for v in plan["allowed"].values()): raise ValueError("allowed must map repositories to task lists")
+        root = HOME / ".local/state/task"; log = root / "runs.jsonl"
+        if clear: require_pm(argparse.Namespace(command="plan-budget"))
+        if fields or clear: root.mkdir(parents=True, exist_ok=True)
+        with (log.open("a+" if fields or clear else "r") if log.exists() or fields or clear else contextlib.nullcontext(None)) as stream:
+            if stream: fcntl.flock(stream, fcntl.LOCK_EX if fields or clear else fcntl.LOCK_SH); stream.seek(0)
+            rows = [json.loads(line) for line in stream] if stream else []
+            rows += [json.loads(p.read_text()) for p in (root / "pending-runs").glob("*.json") if not any(r.get("run_id", r["id"]) == p.stem for r in rows if r.get("type") == "run")]
+            rows = [r for r in rows if r.get("plan") == ident]
+            # Transfer the primary draw only when its fallback is admitted to spawn.
+            replaced = {ident for r in rows if r.get("invoked") for ident in [r.get("replaces"), *r.get("superseded", [])]}
+            charged = [r for r in rows if r["id"] not in replaced]
+            used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in charged if r.get("vendor") == v and r.get("type") != "outcome"}) for v in task_usage.VENDORS}
+            last, disabled = {}, set()
+            for row in rows:
+                kind, outcome = row.get("kind"), row.get("outcome")
+                if outcome == "cleared": disabled.discard(kind); last.pop(kind, None)
+                elif outcome in {"finished", "failed", "interrupted"}:
+                    if outcome in {"failed", "interrupted"} and last.get(kind) == outcome: disabled.add(kind)
+                    last[kind] = outcome
+            if clear:
+                stream.write(json.dumps(dict(id=secrets.token_hex(12), plan=ident, kind=clear, outcome="cleared", start=utc_now(), type="control")) + "\n"); return
+            if fields:
+                if datetime.now(timezone.utc) >= expiry: raise Stop(f"Plan {ident}: expired")
+                allowed = plan["allowed"].get(fields["repo"], [])
+                if "*" not in allowed and any(t.lower() not in [a.lower() for a in allowed] for t in fields.get("tasks", [fields["task"]])): raise Stop(f"Plan {ident}: outside allowed work")
+                if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
+                prior = next((r for r in reversed(charged) if all(r.get(k) == fields.get(k) for k in ("repo", "task", "kind", "commit", "vendor")) and r.get("type") != "outcome"), None)
+                if (not prior or reserve is False) and used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
+                if isinstance(reserve, dict): reserve["invoked"] = True; atomic_json(root / "pending-runs" / (reserve["id"] + ".json"), reserve); return reserve
+                if prior and reserve and not prior.get("outcome") and not prior.get("invoked"): prior["superseded"] = sorted(set(prior.get("superseded", []) + [prior.get("replaces"), fields.get("replaces")]) - {None}); atomic_json(root / "pending-runs" / (prior["id"] + ".json"), prior); return prior
+                return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
+        return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(disabled)}"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Stop(f"Missing or malformed plan/log {ident}: {error}") from error
+def budget_run(**fields):
+    return plan_budget(os.environ["TASK_PLAN"], fields) if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, **fields)
+def bind_plan(task, args, save=False):
+    record = read_json_object(task_state(task) / "task.json") if getattr(args, "refresh", False) else (load_record(task, required=False) or {})
+    choices = {value for value in (record.get("plan"), os.environ.get("TASK_PLAN"), getattr(args, "plan", None)) if value}
+    if len(choices) > 1: raise Stop(f"Conflicting plan for {task.id}: {sorted(choices)}")
+    if choices: os.environ["TASK_PLAN"] = choices.pop()
+    if save and os.environ.get("TASK_PLAN"): record["plan"] = os.environ["TASK_PLAN"]; record["revision"] = record_revision(record); atomic_json(task_state(task) / "task.json", record)
 def decision_content(text):
     """Ignore only the frontmatter status field."""
     lines = text.splitlines()
@@ -1697,7 +1751,9 @@ def finalize_lane_record(path, run, state, **fields):
         print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
     finally:
         run.update(state=state, ended_at=utc_now(), **fields)
-        if run.get("usage_run"):
+        usage_run = run.get("usage_run")
+        if usage_run and usage_run.get("plan"): usage_run.update(read_json_object(HOME / ".local/state/task/pending-runs" / (usage_run["id"] + ".json")))
+        if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")):
             task_usage.run_log(HOME, run["usage_run"], "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
         atomic_json(path, run)
 
@@ -1844,6 +1900,7 @@ def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
     path = task.worktree()
     record = load_record(task)
+    bind_plan(task, args)
     refresh_context(task)
     builder = args.builder or record["builder"]
     recorded = record.get("tier", "routine")
@@ -1915,6 +1972,7 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            if os.environ.get("TASK_PLAN"): guards(tier, recorded, model, args.override); usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", commit=sha(path, "HEAD"), vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1)
             if tier_changed:
                 task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
                 print(f"override recorded: tier {recorded} to {tier} ({args.override})")
@@ -1939,7 +1997,7 @@ def lane(args):
                 task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                                      "usage_run": task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1),
+                                      "usage_run": usage_run if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1),
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
             if builder != record["builder"] or tier != record.get("tier", "routine"):
@@ -1976,6 +2034,7 @@ def lane(args):
                     (work / "lane.jsonl").open("wb") if builder == "claude" else contextlib.nullcontext() as raw:
                 # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
                 stream = task_usage.ClaudeStream(HOME) if raw else None
+                if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], run["usage_run"], reserve=run["usage_run"])
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          pass_fds=task_lock.descriptors(),
                                          stdout=subprocess.PIPE if output else None)
@@ -2376,6 +2435,7 @@ def runner_check(args):
         print("\n".join(problems))
         return 1
     print(f"runner file OK ({task_lines} tasks)")
+    args.plan_tasks = sorted(seen_tasks)
     return 0
 
 
@@ -2435,6 +2495,7 @@ def runner_start(args):
         raise Stop('Runner file must be named runner-<batch>.md.')
     if runner_check(args):
         return 1
+    for ident in args.plan_tasks: bind_plan(Task(repo, ident), args)
     batch = match[1]
     unit = runner_unit(repo, batch)
     work = repo / '.work'
@@ -2452,6 +2513,7 @@ def runner_start(args):
         raise Stop('task-batch is unavailable.')
     holder = os.environ['TASK_HOLDER']
     task_lock.work(HOME, repo)
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=batch, tasks=args.plan_tasks, kind="runner-start", vendor=os.environ.get("TASK_VENDOR", "codex")), reserve=False)
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
@@ -2466,6 +2528,7 @@ def runner_start(args):
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
               '--setenv=PATH=' + os.environ.get('PATH', ''),
               '--setenv=TASK_HOLDER=' + holder,
+              *(['--setenv=TASK_PLAN=' + os.environ['TASK_PLAN']] if os.environ.get('TASK_PLAN') else []),
               *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
         result = subprocess.run(launch, capture_output=True, text=True)
@@ -2495,13 +2558,16 @@ def start(args):
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     with (common / "task-start.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return start_locked(args, repo)
+        try: return start_locked(args, repo)
+        finally:
+            if getattr(args, "usage_run", None): task_usage.run_log(HOME, args.usage_run, "failed" if sys.exc_info()[0] else "finished")
 
 
 def start_locked(args, repo):
     lane_contract_source()
     ensure_origin_head(repo)
     task = Task(repo, args.id)
+    bind_plan(task, args)
     previous = read_json_object(task_state(task) / "task.json")
     if args.risk == "high" and not (args.risk_reason or "").strip():
         raise Stop("risk high requires --risk-reason with a one-line reason")
@@ -2570,9 +2636,11 @@ def start_locked(args, repo):
             print(f"warning: environment link {candidate} does not resolve.")
     for name in args.seed: seed_source(repo, name)
     task_tier(task_text, args.tier)
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=task.id, kind="start", vendor=args.builder), reserve=None); bind_plan(task, args, save=True)
     if task.path.exists():
         task.worktree()
         task_lock.work(HOME, repo, sha(task.path, "HEAD"))
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
         print(f"{task.path} already exists.")
     else:
         default = default_branch(repo)
@@ -2580,8 +2648,7 @@ def start_locked(args, repo):
         branch, remote_only = task.existing_branch()
         if branch and remote_only:
             task_lock.work(HOME, repo, sha(repo, f"origin/{branch}"))
-            git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
-            print(f"Created {task.path} on {branch}, from origin's existing branch.")
+            create, source = ["--track", "-b", branch, str(task.path), f"origin/{branch}"], f"{branch}, from origin's existing branch"
         elif branch:
             for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
                 lines = block.splitlines()
@@ -2593,14 +2660,15 @@ def start_locked(args, repo):
                     raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
                                f"move or free that worktree before `task start` can adopt it at {task.path}.")
             task_lock.work(HOME, repo, sha(repo, branch))
-            git(repo, "worktree", "add", "-q", str(task.path), branch)
-            print(f"Created {task.path} on the existing branch {branch}.")
+            create, source = [str(task.path), branch], f"the existing branch {branch}"
         else:
             base, label = base_commit(repo, default)
             branch = task.branch_name()
             task_lock.work(HOME, repo, base)
-            git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
-            print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
+            create, source = ["--no-track", "-b", branch, str(task.path), base], f"{branch} from {label} {base[:7]}"
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
+        git(repo, "worktree", "add", "-q", *create)
+        print(f"Created {task.path} on {source}.")
     seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
     exclude(task.path, ".work/")
@@ -2613,7 +2681,7 @@ def start_locked(args, repo):
     record_path = state / "task.json"
     state.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
-    if record_path.exists() and not args.refresh:
+    if record_path.exists() and not args.refresh and (read_json_object(record_path).get("branch") or not read_json_object(record_path).get("plan")):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
@@ -2629,7 +2697,8 @@ def start_locked(args, repo):
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone"),
-                  "seeds": list(dict.fromkeys(previous_seeds + args.seed))}
+                  "seeds": list(dict.fromkeys(previous_seeds + args.seed)),
+                  **({"plan": os.environ["TASK_PLAN"]} if os.environ.get("TASK_PLAN") else {})}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
         if args.refresh:
@@ -3239,7 +3308,7 @@ def parse_review_reply(text, criteria):
     return verdict, commit, reviewer, judgments
 
 
-def run_reviewer(command, path, prompt_file, reply_file):
+def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=None):
     try:
         timeout = int(os.environ.get("TASK_REVIEW_TIMEOUT", "900"))
     except ValueError:
@@ -3254,14 +3323,16 @@ def run_reviewer(command, path, prompt_file, reply_file):
     run_file = reply_file.with_name("review-run.json")
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
-    usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
+    usage_run = budget_run(repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1], **({"commit": sha(path, "HEAD"), "replaces": replaces} if os.environ.get("TASK_PLAN") else {}))
+    if os.environ.get("TASK_PLAN"): run["usage_run"] = usage_run
     atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
+            if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
-                                       pass_fds=task_lock.descriptors(),
+                                       pass_fds=task_lock.descriptors() + ((lock_fd,) if lock_fd is not None else ()),
                                        stderr=errors, start_new_session=True)
             task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
@@ -3283,7 +3354,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
-        task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
+        if not usage_run.get("plan") or usage_run.get("invoked"): task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
@@ -3297,10 +3368,19 @@ def run_reviewer(command, path, prompt_file, reply_file):
 def review(args):
     if args.final and not args.run:
         raise Stop("--final requires --run")
+    task = Task(resolve_repo(args.repo), args.id); load_record(task)
+    with (task_state(task) / "review.lock").open("a") as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise Stop("Review already running; retry after it finishes.")
+        args.review_lock_fd = lock.fileno(); return review_locked(args)
+
+
+def review_locked(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
     path = task.worktree()
     record = load_record(task)
+    bind_plan(task, args)
     risk, review_policy, _ = risk_context(task, path, record)
     if risk == "low":
         raise Stop("risk low: trusted check only; review is not allowed")
@@ -3407,7 +3487,7 @@ def review(args):
             prompt.append(args.append_prompt)
         prompt_text = "\n".join(prompt) + "\n"
         state.mkdir(parents=True, exist_ok=True)
-        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1])})
+        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1], plan=None)})
         prompt_file = state / "review-prompt.md"
         reply_file = state / "review-response.md"
         prompt_file.write_text(prompt_text)
@@ -3431,7 +3511,7 @@ def review(args):
         used_fallback = False
         for attempt in range(2):
             try:
-                run_reviewer(command, path, prompt_file, reply_file)
+                run_reviewer(command, path, prompt_file, reply_file, lock_fd=args.review_lock_fd)
             except UsageLimit:
                 if used_fallback:
                     raise
@@ -3445,7 +3525,7 @@ def review(args):
                     "vendor": reviewer_route[0], "model": reviewer_route[1],
                     "fallback_from": list(previous_route)})
                 command = reviewer_command(*reviewer_route)
-                run_reviewer(command, path, prompt_file, reply_file)
+                run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if os.environ.get("TASK_PLAN") else None, lock_fd=args.review_lock_fd)
             head = sha(path, "HEAD")
             try:
                 verdict, commit, _, _ = parse_review_reply(
@@ -3515,7 +3595,7 @@ def review(args):
     save_review_history(state, meta, text)
     atomic_json(state / "review.json", meta)
     if not args.run:
-        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, plan=os.environ.get("TASK_PLAN"), ccusage_tokens=None)), "finished")
+        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, ccusage_tokens=None)) | dict(plan=None), "finished")
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     if args.run:
@@ -4410,6 +4490,11 @@ def status(args):
     for warning in notes:
         print(warning)
     print("\n".join(task_usage.run_summary(HOME)))
+    for path in sorted((CORTEX / "cortex-kb-company/plans").glob("*.toml")):
+        try:
+            line = plan_budget(path.stem)
+            if datetime.now(timezone.utc) < plan_time(str(tomllib.loads(path.read_text())["expires"])): print(line)
+        except (Stop, OSError, ValueError, KeyError, TypeError): print(f"plan {path.stem}: malformed")
     active = boost_line()
     if active:
         print(active)
@@ -4878,6 +4963,7 @@ def main(argv=None):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
         sub.add_argument("id")
+        if name in {"start", "lane", "review"}: sub.add_argument("--plan")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
         if name in {"start", "lane"}:
@@ -4949,6 +5035,9 @@ def main(argv=None):
     sub.add_argument("repo")
     sub.add_argument("file")
     sub.add_argument("--no-pace", action="store_true", help="run the batch without usage pacing (logged)")
+    sub.add_argument("--plan")
+    sub = commands.add_parser("plan-budget")
+    sub.add_argument("id"); sub.add_argument("--clear")
     task_lock.configure(commands)
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
@@ -5040,6 +5129,7 @@ def main(argv=None):
                           "review": review, "risk": risk, "redteam": redteam, "cancel": cancel, "note": note, "status": status,
                           "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
                           "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
+                          "plan-budget": lambda a: print(plan_budget(a.id, clear=a.clear)) if not a.clear else plan_budget(a.id, clear=a.clear),
                           "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo)}[args.command](args) or 0
         finally:
             if lock:
