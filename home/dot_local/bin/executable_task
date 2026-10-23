@@ -5,7 +5,6 @@ import contextlib
 from contextlib import contextmanager
 from contextvars import ContextVar
 import fcntl
-import fnmatch
 import hashlib
 import json
 import os
@@ -982,13 +981,10 @@ def risk_context(task, path, record, policy=None):
         policy = policy if policy is not None else task_usage.policy(HOME)["review"]
     except ValueError as error:
         raise Stop(str(error)) from error
-    patterns = policy["high_paths"].get("*", []) + policy["high_paths"].get(task.repo.name, [])
     base = default_branch(task.repo)
     base = f"origin/{base}" if has_origin(task.repo) else base
     paths = git(path, "diff", "--name-only", "--no-renames", "-z", f"{base}...HEAD", "--").split("\0")
-    forced = next((p for p in paths if p and any(fnmatch.fnmatchcase(p, pat) for pat in patterns)), "")
-    risk = "high" if forced else (record or {}).get("risk", "normal")
-    return risk, policy[risk], forced
+    return task_usage.risk_paths(task.repo.name, record or {}, paths, policy)
 
 
 def change_risk(task, path, record, risk, reason):
@@ -1031,17 +1027,29 @@ def redteam(args):
         brief = Path(args.brief).read_text(encoding="utf-8")
         if not brief.strip():
             raise Stop("risk high: --brief must contain nonempty UTF-8 text")
-        codex = shutil.which("codex")
-        if not codex:
-            raise Stop("risk high: codex is not available on PATH")
-        result = subprocess.run([codex, "exec", "--sandbox", "read-only", "-m", policy["red_team_model"],
+        wrapper = HOME / "cortex/cortex-core/skills/company/references/red-team-brief.md"
+        wrapped = wrapper.is_file()
+        if wrapped:
+            brief = wrapper.read_text(encoding="utf-8") + "\n\n" + brief
+        vendor = "claude" if record["builder"] == "codex" else "codex"
+        model = policy["red_team_model_claude" if vendor == "claude" else "red_team_model"]
+        binary = shutil.which(vendor)
+        if not binary:
+            raise Stop(f"risk high: {vendor} is not available on PATH")
+        command = ([binary, "exec", "--sandbox", "read-only", "-m", model,
                                  "-c", "model_reasoning_effort=high", "--skip-git-repo-check", "-C", str(path),
-                                 "-o", str(temporary), "-"], cwd=path, input=brief, text=True, encoding="utf-8",
-                                env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
+                                 "-o", str(temporary), "-"] if vendor == "codex" else
+                   [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
+                    "--allowedTools", "Read", "Grep", "Glob", "Bash(git --no-optional-locks:*)"])
+        with temporary.open("w") as output_stream:
+            result = subprocess.run(command, cwd=path, input=brief, text=True, encoding="utf-8",
+                                    stdout=output_stream if vendor == "claude" else None,
+                                    env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
         if result.returncode or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
             raise Stop("risk high: red-team failed or head changed; no output recorded")
         temporary.replace(output)
-        atomic_json(state / "redteam.json", dict(commit=head, output=str(output), time=utc_now()))
+        atomic_json(state / "redteam.json", dict(commit=head, output=str(output), time=utc_now(),
+                                                vendor=vendor, model=model, ambition_wrapper=wrapped))
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
         raise Stop(f"risk high: red-team failed: {error}") from error
     finally:
@@ -1968,7 +1976,9 @@ def lane(args):
             if used >= limits["max_rounds"] + extra:
                 if not args.extra_round or not limits["extra_rounds"]:
                     raise Stop(f"risk {risk}: maximum {limits['max_rounds'] + extra} build/fix rounds; use --extra-round REASON")
-                extra += limits["extra_rounds"]
+                if extra >= limits["extra_rounds"]:
+                    raise Stop(f"risk {risk}: extra rounds exhausted ({extra}/{limits['extra_rounds']} granted)")
+                extra += 1
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
@@ -4266,14 +4276,29 @@ def close(args):
     except (OSError, json.JSONDecodeError):
         raise Stop("Close requires the pinned task record from `task start`.")
     exception_path = archive / "exception.json"
+    merge_evidence = read_json_object(archive / "merge.json")
+    review = read_json_object(archive / "review.json")
+    head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else merge_evidence.get("head") or review.get("commit")
+    paths = git(repo, "diff", "--name-only", "--no-renames", "-z", f"{record['base_sha']}...{head}", "--").split("\0") if head and record.get("base_sha") else []
     try:
-        review = json.loads((archive / "review.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        if exception_path.is_file() or args.no_merge:
-            review = {}
-        else:
-            raise Stop("Close requires a recorded review, or an explicit merge exception.")
+        risk, _, _ = task_usage.risk_paths(repo.name, record, paths, task_usage.policy(HOME)["review"])
+    except ValueError as error:
+        raise Stop(str(error)) from error
+    if not review and risk != "low" and not exception_path.is_file() and not args.no_merge:
+        raise Stop("Close requires a recorded review, or an explicit merge exception.")
     passed = {int(n) for n, verdict in review.get("judgments", {}).items() if verdict == "pass"}
+    if risk == "low":
+        passed = {item["number"] for item in record.get("criteria", [])}
+    if risk == "normal" and deeper_review(review.get("model", "")):
+        raise Stop("risk normal: close requires a cheap review")
+    if risk == "high" and not args.partial:
+        if (review.get("verdict") != "PASS" or review.get("commit") != head
+                or review.get("record_revision") != record.get("revision")
+                or review.get("reviewer") == record.get("builder")):
+            raise Stop("risk high: close requires a current PASS review by the other vendor")
+        redteam = read_json_object(archive / "redteam.json")
+        if not head or redteam.get("commit") != head or not task_usage._text(Path(redteam.get("output", ""))):
+            raise Stop("risk high: close requires red-team output at the task head")
     criteria = [str(item["number"]) for item in record.get("criteria", []) if item["number"] in passed]
     not_passed = [str(item["number"]) for item in record.get("criteria", []) if item["number"] not in passed]
     if not_passed and not args.partial and not exception_path.is_file() and not args.no_merge:
@@ -4294,11 +4319,7 @@ def close(args):
             r"(?i)went well\s*[:/].*went wrong\s*[:/].*change\s*[:/]", args.retro)) == 0:
         raise Stop("This task needs a three-part retro: went well / went wrong / change.")
     status = "In Progress" if args.partial else "Done"
-    try:
-        merge_evidence = json.loads((archive / "merge.json").read_text())
-    except (OSError, ValueError):
-        merge_evidence = {}
-    head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else review.get("commit")
+    head = head or review.get("commit")
     if not args.partial and (not head or merge_evidence.get("head") != head):
         if not args.no_merge:
             print("Notice: merge not recorded for the task head.")

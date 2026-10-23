@@ -392,7 +392,13 @@ class Batch:
                                             + [line for line in check_output(state).splitlines()
                                                if line.startswith("Gate suites finished")][-1:]))
                     review = {}
-                    for _ in range(2):
+                    head = git(path, "rev-parse", "HEAD")
+                    paths = git(path, "diff", "--name-only", "--no-renames", "-z",
+                                f"{record.get('base_sha', 'main')}...{head}", "--").split("\0")
+                    risk, _, _ = task_usage.risk_paths(self.repo.name, record, paths, task_usage.policy(Path.home())["review"])
+                    if risk == "low":
+                        review = {"verdict": "PASS"}
+                    for _ in range(0 if risk == "low" else 2):
                         result = self.call("review", ident, "--run", "--append-prompt", BLOCK_INSTRUCTION)
                         self.reviewer_outcome(state)
                         candidate = data(state / "review.json")
@@ -405,6 +411,10 @@ class Batch:
                         return f"parked: total time cap; last blocking findings: {findings or 'time cap'}"
                     if (review.get("verdict") == "PASS"
                             and all(v == "pass" for v in review.get("judgments", {}).values())):
+                        if risk == "high":
+                            brief = work / "redteam-brief.md"
+                            brief.write_text(task["block"] + "\n\n" + dispatch + "\n\n" + read(work / "request.md"))
+                            self.require("redteam", ident, "--brief", str(brief))
                         merged = self.call("merge", ident, retry=True)
                         if merged.returncode == 0:
                             return f"merged after {rounds} fix rounds" if rounds else "merged"

@@ -4,6 +4,7 @@ Readings are the vendors' own numbers: the newest Codex rollout `rate_limits` an
 Claude `rate_limit_event` that a recorded lane or review left behind. Nothing here calls a model.
 """
 import json
+import fnmatch
 import fcntl
 from collections import Counter
 from contextlib import contextmanager
@@ -29,7 +30,9 @@ DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
             "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
             "boost_five_hour_max": 50,
-            "review": {"high_paths": {"*": ["policy/**"], "bootstrap": [
+            "review": {"high_paths": {"*": ["policy/**", "skills/**/SKILL.md", "skills/**/references/**",
+                "AGENTS.md", "CLAUDE.md", "home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md",
+                "INTENT.md", "decisions/**", "backlog/decisions/**"], "bootstrap": [
                 "system/agent-policy/**", "home/dot_local/share/bootstrap/agent-policy/**", "system/*managed*", "system/codex-requirements.toml",
                 "home/dot_claude/settings.json", "home/dot_codex/**", "home/.chezmoitemplates/codex-config.toml",
                 "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*",
@@ -37,7 +40,14 @@ DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0
                 "low": {"max_rounds": 2, "extra_rounds": 1},
                 "normal": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1},
                 "high": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1,
-                         "red_team_model": "gpt-6.1-sol"}}}
+                         "red_team_model": "gpt-6.1-sol", "red_team_model_claude": "sonnet"}}}
+
+
+def risk_paths(repo, record, paths, policy):
+    patterns = policy["high_paths"].get("*", []) + policy["high_paths"].get(repo, [])
+    forced = next((p for p in paths if p and any(fnmatch.fnmatchcase(p, pat) for pat in patterns)), "")
+    risk = "high" if forced else record.get("risk", "normal")
+    return risk, policy[risk], forced
 
 
 def review_policy(value, result):

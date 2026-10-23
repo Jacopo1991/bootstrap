@@ -4708,30 +4708,115 @@ store.write_text(json.dumps(prs))
                 if risk == 'high': self.assertTrue(forced)
                 self.git(self.repo, 'update-ref', 'refs/heads/main', self.git(wt, 'rev-parse', 'HEAD'))
 
+    def test_risk_rules_paths_are_high_but_skill_support_files_are_normal(self):
+        wt, _ = self.started()
+        fake = SimpleNamespace(repo=Path('proj'))
+        high = ('skills/company/SKILL.md', 'skills/company/references/nested/rules.md',
+                'AGENTS.md', 'CLAUDE.md', 'home/dot_codex/AGENTS.md', 'home/dot_claude/CLAUDE.md',
+                'INTENT.md', 'decisions/d-1.md', 'backlog/decisions/d-1.md', 'policy/usage.toml')
+        normal = ('skills/company/evals/case.json', 'skills/company/scripts/run.py',
+                  'skills/company/assets/logo.svg')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE, 'default_branch', return_value='main'), \
+                mock.patch.object(TASK_MODULE, 'has_origin', return_value=False):
+            for name in (*high, *normal):
+                with self.subTest(path=name):
+                    (wt / name).parent.mkdir(parents=True, exist_ok=True)
+                    self.commit_in(wt, name)
+                    risk, _, forced = TASK_MODULE.risk_context(fake, wt, {})
+                    self.assertEqual((risk, forced), ('high', name) if name in high else ('normal', ''))
+                    self.git(self.repo, 'update-ref', 'refs/heads/main', self.git(wt, 'rev-parse', 'HEAD'))
+
+    def test_risk_redteam_both_vendors_wrapper_and_default_models(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'wrapper fixture')
+        wrapper = self.home / 'cortex/cortex-core/skills/company/references/red-team-brief.md'
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text('# Ambition bar fixture\nJudge against today\'s best practice.\n')
+        brief = self.home / 'brief.md'
+        brief.write_text('Attack the task.\n')
+        for vendor in ('claude', 'codex'):
+            binary = self.home / 'bin' / vendor
+            binary.write_text('#!/usr/bin/env python3\nimport json, os, pathlib, sys\n'
+                              'pathlib.Path(".work/redteam-call.json").write_text(json.dumps(dict(args=sys.argv[1:], brief=sys.stdin.read())))\n'
+                              'if "-o" in sys.argv: pathlib.Path(sys.argv[sys.argv.index("-o")+1]).write_text("Reviewed risks\\n")\n'
+                              'else: print("Reviewed risks")\n')
+            binary.chmod(0o755)
+        for builder, vendor, model in (('codex', 'claude', 'sonnet'), ('claude', 'codex', 'gpt-6.1-sol')):
+            self.raw_task('start', 'proj', '5', '--builder', builder, '--refresh')
+            self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+            meta = json.loads((self.state() / 'redteam.json').read_text())
+            call = json.loads((wt / '.work/redteam-call.json').read_text())
+            self.assertEqual((meta['vendor'], meta['model'], meta['ambition_wrapper']), (vendor, model, True))
+            self.assertEqual(call['brief'], wrapper.read_text() + '\n\n' + brief.read_text())
+            self.assertIn(model, call['args'])
+            if vendor == 'codex':
+                self.assertEqual(call['args'][:3], ['exec', '--sandbox', 'read-only'])
+            else:
+                self.assertIn('dontAsk', call['args'])
+        wrapper.unlink()
+        self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+        self.assertFalse(json.loads((self.state() / 'redteam.json').read_text())['ambition_wrapper'])
+
+    def test_risk_close_low_without_review_after_worktree_removal(self):
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'low')
+        wt = self.repo / '.worktrees/t5'
+        self.commit_in(wt, 'b.txt')
+        self.raw_task('merge', 'proj', '5')
+        self.assertFalse(wt.exists())
+        self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine')
+        text = next((self.kb / 'backlog/tasks').glob('t-5*')).read_text()
+        self.assertIn('status: Done', text)
+        self.assertIn('[x] #1', text)
+        self.assertIn('[x] #2', text)
+        self.assertNotIn('## Review evidence', text)
+
+    def test_risk_close_high_forced_paths_stale_missing_empty_redteam_and_normal_review(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.assertIn('recorded review', self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine', code=1))
+        self.prepare_merge_evidence('5')
+        review_path = self.state() / 'review.json'
+        review = json.loads(review_path.read_text())
+        review['model'] = 'opus'
+        review_path.write_text(json.dumps(review))
+        self.assertIn('cheap review', self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine', code=1))
+        (wt / 'skills/company').mkdir(parents=True)
+        self.commit_in(wt, 'skills/company/SKILL.md')
+        self.prepare_merge_evidence('5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'worktree', 'remove', '--force', str(wt))
+        output = self.state() / 'redteam-output.md'
+        for commit, content in ((None, None), ('old-head', 'Risks'), (head, '')):
+            if commit:
+                output.write_text(content)
+                (self.state() / 'redteam.json').write_text(json.dumps(dict(commit=commit, output=str(output))))
+            self.assertIn('risk high: close requires red-team', self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine', code=1))
+        output.write_text('Risks reviewed')
+        self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine')
+
     def test_risk_high_redteam_command_head_staleness_and_waiver(self):
         wt, _ = self.started()
         self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
         self.prepare_merge_evidence('5')
         brief = self.home / 'redteam-brief.md'
         brief.write_text('Attack the safety assumptions.\n')
-        binary = self.home / 'bin/codex'
+        binary = self.home / 'bin/claude'
         binary.write_text('#!/usr/bin/env python3\nimport json, os, pathlib, sys\n'
                           'pathlib.Path(".work/redteam-call.json").write_text(json.dumps(dict(args=sys.argv[1:], '
                           'brief=sys.stdin.read(), locks=os.environ.get("GIT_OPTIONAL_LOCKS"))))\n'
-                          'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text("Risks reviewed.\\n")\n')
+                          'print("Risks reviewed.")\n')
         binary.chmod(0o755)
-        self.risk_policy_fixture('[review.high]\nred_team_model = "gpt-6-luna"\n')
+        self.risk_policy_fixture('[review.high]\nred_team_model_claude = "haiku"\n')
         self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
         head = self.git(wt, 'rev-parse', 'HEAD')
         meta = json.loads((self.state() / 'redteam.json').read_text())
         call = json.loads((wt / '.work/redteam-call.json').read_text())
-        temporary = call['args'][-2]
-        self.assertEqual(Path(temporary).parent, Path(meta['output']).parent)
-        self.assertFalse(Path(temporary).exists())
-        self.assertEqual(call, dict(args=['exec', '--sandbox', 'read-only', '-m', 'gpt-6-luna', '-c',
-                         'model_reasoning_effort=high', '--skip-git-repo-check', '-C', str(wt), '-o', temporary, '-'],
+        self.assertEqual(call, dict(args=['-p', '--permission-mode', 'dontAsk', '--model', 'haiku', '--effort', 'high',
+                         '--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(git --no-optional-locks:*)'],
                          brief=brief.read_text(), locks='0'))
         self.assertEqual(meta['commit'], head)
+        self.assertEqual((meta['vendor'], meta['model'], meta['ambition_wrapper']), ('claude', 'haiku', False))
         self.assertIn(f"redteam={meta['output']} matches", self.raw_task('status', 'proj'))
         self.commit_in(wt, 'b.txt')
         self.prepare_merge_evidence('5')
@@ -4751,18 +4836,17 @@ store.write_text(json.dumps(prs))
         (self.state() / 'redteam.json').write_text(json.dumps(dict(commit=self.git(wt, 'rev-parse', 'HEAD'), output=str(output))))
         brief = self.home / 'brief.md'
         brief.write_text('Check the guard.\n')
-        binary = self.home / 'bin/codex'
+        binary = self.home / 'bin/claude'
         binary.write_text('#!/bin/sh\nexit 1\n')
         binary.chmod(0o755)
         self.assertIn('red-team failed', self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1))
         self.assertEqual(json.loads((self.state() / 'redteam.json').read_text())['output'], str(output))
         self.assertEqual(output.read_text(), 'Reviewed risks\n')
-        binary.write_text('#!/usr/bin/env python3\nimport pathlib, sys\n'
-                          'pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text("Reviewed risks\\n")\n')
+        binary.write_text('#!/bin/sh\necho "Reviewed risks"\n')
         self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
         self.raw_task('merge', 'proj', '5', '--keep')
 
-    def test_risk_redteam_invalid_brief_and_unavailable_codex_preserve_old_evidence(self):
+    def test_risk_redteam_invalid_brief_and_unavailable_claude_preserve_old_evidence(self):
         wt, _ = self.started()
         self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
         head = self.git(wt, 'rev-parse', 'HEAD')
@@ -4775,7 +4859,7 @@ store.write_text(json.dumps(prs))
         unreadable = self.home / 'unreadable.md'
         unreadable.write_text('valid content')
         make_read_only(self, unreadable, 0)
-        binary = self.home / 'bin/codex'
+        binary = self.home / 'bin/claude'
         binary.write_text('#!/bin/sh\ntouch "$HOME/redteam-launched"\nexit 1\n')
         binary.chmod(0o755)
         for value in (None, self.home, unreadable, b'', b' \n', b'\xff'):
@@ -4789,14 +4873,14 @@ store.write_text(json.dumps(prs))
                 self.assertFalse((self.home / 'redteam-launched').exists())
                 self.assertEqual((meta.read_bytes(), output.read_bytes()), before)
         brief.write_text('Attack this boundary.\n')
-        # An explicit PATH with only Git makes the missing-Codex fixture independent
+        # An explicit PATH with only Git makes the missing-Claude fixture independent
         # of any real vendor CLI installed on the machine.
         git_only = self.home / 'git-only'
         git_only.mkdir()
         (git_only / 'git').symlink_to(shutil.which('git'))
         out = self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1,
                             env=dict(self.env, PATH=str(git_only)))
-        self.assertIn('codex is not available on PATH', out)
+        self.assertIn('claude is not available on PATH', out)
         self.assertNotIn('Traceback', out)
         self.assertEqual((meta.read_bytes(), output.read_bytes()), before)
         binary.write_text('#!/missing-fixture-interpreter\n')
@@ -4863,6 +4947,10 @@ store.write_text(json.dumps(prs))
                 self.wait_for_lane(wt)
                 self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
                 self.assertIn(f'maximum {maximum + 1}', self.raw_task('lane', 'proj', '5', '--no-pace', code=1))
+                before = (self.state() / 'rounds.json').read_bytes()
+                refused = self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'second grant', code=1)
+                self.assertIn('extra rounds exhausted (1/1 granted)', refused)
+                self.assertEqual((self.state() / 'rounds.json').read_bytes(), before)
         self.assertEqual((self.home / '.local/state/task/usage/overrides.jsonl').read_text().count('small contained fix'), 3)
 
     def test_risk_policy_round_limits_and_lane_effort_are_forwarded_and_logged(self):
@@ -4878,6 +4966,23 @@ store.write_text(json.dumps(prs))
                 self.assertIn(f'model_reasoning_effort={effort}' if builder == 'codex' else effort, call)
                 self.assertEqual(run['usage_run']['effort'], effort)
         self.assertIn('risk normal: maximum 6', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'no allowance', code=1))
+
+    def test_risk_extra_round_policy_two_grants_capped_across_tier_changes(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 1\nextra_rounds = 2\n')
+        (wt / '.work/prompt.md').write_text('round fixture\n')
+        self.raw_task('lane', 'proj', '5', '--no-pace')
+        self.wait_for_lane(wt)
+        for count in (1, 2):
+            self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'one more')
+            self.wait_for_lane(wt)
+            self.assertEqual(json.loads((self.state() / 'rounds.json').read_text())['extra'], count)
+        self.assertIn('(2/2 granted)', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'excess', code=1))
+        self.raw_task('risk', 'proj', '5', 'low')
+        self.raw_task('lane', 'proj', '5', '--no-pace')
+        self.wait_for_lane(wt)
+        self.assertIn('(2/1 granted)', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'excess', code=1))
 
     def state(self, name="t5"):
         return self.home / ".local/state/task/proj" / name
