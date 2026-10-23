@@ -18,6 +18,8 @@ PROBE = ROOT / "ci/backlog-mcp-probe.py"
 APP_JSON = ROOT / "home/dot_local/share/bootstrap/claude-app-mcp.json"
 BINARY = "backlog.md-linux-x64/backlog"
 REAL_MODULES = Path.home() / ".local/share/bootstrap/npm/node_modules"
+NODE = subprocess.run(["node", "-p", "process.execPath"], capture_output=True, text=True,
+                      check=True).stdout.strip()
 ALLOWED = ["cortex-kb-company", "cortex-kb-product-harness", "cortex-kb-household-signal-harness",
            "cortex-kb-madplanner-v2", "cortex-kb-consultancy-website", "cortex-kb-home-energy-lab",
            "cortex-kb-hermes", "cortex-kb-historical-ingestion", "cortex-kb-linkedin-ops", "cortex-kb-orw"]
@@ -52,6 +54,11 @@ def app_block(repos):
 
 
 def launcher_env(home, **extra):
+    # The launcher fixes PATH under HOME; give each explicit temporary environment node.
+    shims = home / ".local/share/mise/shims"
+    if not (shims / "node").exists():
+        shims.mkdir(parents=True, exist_ok=True)
+        (shims / "node").symlink_to(NODE)
     return {"HOME": str(home), "PATH": os.environ["PATH"], **extra}
 
 
@@ -63,6 +70,7 @@ class LauncherTests(unittest.TestCase):
         stub.parent.mkdir(parents=True)
         stub.write_text(STUB_SERVER)
         stub.chmod(0o755)
+        (stub.parent.parent / "yaml").symlink_to(REAL_MODULES / "yaml")
         self.started = self.home / "stub-start.txt"
 
     def tearDown(self):
@@ -71,7 +79,7 @@ class LauncherTests(unittest.TestCase):
     def make_repo(self, name, base=None):
         repo = (base or self.home / "cortex") / name
         (repo / "backlog").mkdir(parents=True)
-        (repo / "backlog/config.yml").write_text("project_name: test\n")
+        (repo / "backlog/config.yml").write_text("project_name: test\nremote_operations: false\n")
         return repo
 
     def start(self, *args, **extra):
@@ -89,7 +97,7 @@ class LauncherTests(unittest.TestCase):
     def test_each_allowed_name_starts_the_pinned_server_in_its_repository(self):
         for name in ALLOWED:
             repo = self.make_repo(name)
-            result = self.start(name, DEBUG="1", BACKLOG_CWD="/")
+            result = self.start(name, DEBUG="1", BACKLOG_CWD="/", NODE_OPTIONS="--not-a-real-option")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "")  # stdout belongs to MCP
             self.assertEqual(self.started.read_text().splitlines(),
@@ -132,6 +140,100 @@ class LauncherTests(unittest.TestCase):
         self.make_repo("cortex-kb-company", other)
         (self.home / "cortex").symlink_to(other)
         self.assert_refused("cortex-kb-company")
+
+    def test_symlink_in_home_path_is_refused(self):
+        self.make_repo("cortex-kb-company")
+        alias = Path(self.temp.name) / "home-alias"
+        alias.symlink_to(self.home, target_is_directory=True)
+        self.home = alias
+        self.assertIn("symlink in repository path", self.assert_refused("cortex-kb-company").stderr)
+
+    def test_nested_file_and_directory_symlinks_outside_repository_are_refused(self):
+        repo = self.make_repo("cortex-kb-company")
+        outside = Path(self.temp.name) / "outside"
+        outside.mkdir()
+        secret = outside / "doc-1.md"
+        secret.write_text("outside must stay untouched\n")
+        nested = repo / "backlog/docs/deep"
+        nested.mkdir(parents=True)
+        for target in (secret, outside):
+            with self.subTest(target=target):
+                link = nested / "escape.md"
+                link.symlink_to(target)
+                result = self.assert_refused("cortex-kb-company")
+                self.assertIn("backlog symlink escapes repository", result.stderr)
+                self.assertEqual(secret.read_text(), "outside must stay untouched\n")
+                link.unlink()
+
+    def test_internal_symlinks_and_cycles_stay_inside_repository(self):
+        repo = self.make_repo("cortex-kb-company")
+        docs = repo / "backlog/docs"
+        docs.mkdir()
+        (repo / "local.md").write_text("local document\n")
+        (docs / "doc-1.md").symlink_to(repo / "local.md")
+        (docs / "cycle").symlink_to(repo / "backlog")
+        self.assertEqual(self.start("cortex-kb-company").returncode, 0)
+
+    def test_checks_are_repeated_after_an_initial_safe_launch(self):
+        repo = self.make_repo("cortex-kb-company")
+        self.assertEqual(self.start("cortex-kb-company").returncode, 0)
+        (repo / "backlog/new-link").symlink_to(Path(self.temp.name))
+        self.assertIn("backlog symlink escapes repository", self.assert_refused("cortex-kb-company").stderr)
+        (repo / "backlog/new-link").unlink()
+        self.assertEqual(self.start("cortex-kb-company").returncode, 0)
+        with (repo / "backlog/config.yml").open("a") as config:
+            config.write("onStatusChange: 'touch should-never-exist'\n")
+        self.assertIn("command hook", self.assert_refused("cortex-kb-company").stderr)
+        self.assertFalse((repo / "should-never-exist").exists())
+
+    def test_project_callback_spellings_and_scalar_parser_edge_cases_are_refused(self):
+        repo = self.make_repo("cortex-kb-company")
+        config = repo / "backlog/config.yml"
+        for hook in ("onStatusChange: 'touch should-never-exist'", "on_status_change: echo callback",
+                     "  onStatusChange: echo indented", "onStatusChange: |\n  echo multiline"):
+            with self.subTest(hook=hook):
+                config.write_text("project_name: test\nremote_operations: false\n" + hook + "\n")
+                self.assertIn("command hook", self.assert_refused("cortex-kb-company").stderr)
+        self.assertFalse((repo / "should-never-exist").exists())
+
+    def test_task_frontmatter_callbacks_in_all_stores_are_refused(self):
+        repo = self.make_repo("cortex-kb-company")
+        for store in ("tasks", "drafts", "completed", "archive/tasks"):
+            task = repo / "backlog" / store / "task-1.md"
+            task.parent.mkdir(parents=True)
+            for metadata in ("onStatusChange: echo callback", '"onStatusChange": echo quoted',
+                             '"onStatus\\u0043hange": echo escaped',
+                             "onStatusChange: >-\n  echo multiline",
+                             "defaults: &callback\n  onStatusChange: echo merged\n<<: *callback"):
+                with self.subTest(store=store, metadata=metadata):
+                    task.write_text("---\nid: TASK-1\n" + metadata + "\n---\nBody\n")
+                    self.assertIn("command hook onStatusChange in task metadata",
+                                  self.assert_refused("cortex-kb-company").stderr)
+            task.unlink()
+
+    def test_metadata_is_parsed_without_executing_frontmatter_engines(self):
+        repo = self.make_repo("cortex-kb-company")
+        task = repo / "backlog/task-1.md"
+        for header in ("---js\n({onStatusChange: 'echo unsafe'})\n---\n", "---\nid: [broken\n---\n"):
+            task.write_text(header)
+            self.assert_refused("cortex-kb-company")
+        task.write_text("---\nid: TASK-1\nonStatusChange: ''\n---\nBody mentions onStatusChange: echo text\n")
+        self.assertEqual(self.start("cortex-kb-company").returncode, 0)
+
+    def test_auto_commit_and_remote_operations_including_defaults_are_refused(self):
+        repo = self.make_repo("cortex-kb-company")
+        config = repo / "backlog/config.yml"
+        for setting, reason in (("remote_operations: false\nauto_commit: true", "auto_commit enabled"),
+                                ("remote_operations: false\n  auto_commit: TRUE", "auto_commit enabled"),
+                                ("remote_operations: true", "remote_operations must be explicitly false"),
+                                ("", "remote_operations must be explicitly false"),
+                                ("remote_operations: false\nremote_operations: true",
+                                 "remote_operations must be explicitly false")):
+            with self.subTest(setting=setting):
+                config.write_text("project_name: test\n" + setting + "\n")
+                self.assertIn(reason, self.assert_refused("cortex-kb-company").stderr)
+        config.write_text("project_name: test\nremote_operations: false\nauto_commit: false\non_status_change: ''\n")
+        self.assertEqual(self.start("cortex-kb-company").returncode, 0)
 
     def test_repository_without_its_own_backlog_config_is_refused(self):
         # The server would walk up and serve the parent's project instead.

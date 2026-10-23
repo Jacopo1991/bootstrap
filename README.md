@@ -880,15 +880,34 @@ inside AgentDev as `agent` over stdio, like qmd and the shell connector.
   `cortex-kb-photo-organizer` (standing privacy rule). Any other name, a path or `..` exits 2
   before the server starts. Backlog.md resolves its project by walking up from `--cwd` to the
   first directory with a Backlog config, and a root `backlog.config.yml` can move the backlog
-  folder, so the launcher also refuses a repository that is a symlink (or sits behind one under
+  folder, so the launcher also refuses a repository whose path contains a symlink (including
   `$HOME`), whose `backlog/` or `backlog/config.yml` is a symlink or missing, or that has a
-  `backlog.config.yml`. It starts the server in the repository with a clean environment
+  `backlog.config.yml`. On every launch it walks the entire `backlog/` tree and refuses any
+  file or directory symlink that resolves outside the repository (also broken links and
+  unreadable files). These are startup checks per connection; restart after filesystem or
+  config changes. It starts the server in the repository with a clean environment
   (`HOME`, `PATH`, `LANG` only: `DEBUG` would print to stdout and break MCP), opens no network
   port and writes nothing to stdout before the exec.
+- **Callbacks and git:** before starting, the launcher rejects project `onStatusChange` or
+  `on_status_change` commands and task-frontmatter callbacks throughout `backlog/`, including
+  drafts, completed and archived tasks. It rejects `auto_commit: true` and requires
+  `remote_operations: false` explicitly, because remote operations default to on. It reads
+  `backlog/config.yml` using the scalar rules in the pinned
+  [1.53.0 config parser](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/src/file-system/operations.ts)
+  and decodes task YAML with the already locked `yaml` package; non-YAML frontmatter engines
+  and unreadable metadata fail closed. `onStatusChange` is the only command callback in this
+  version's [configuration reference](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/ADVANCED-CONFIG.md).
+  The [config resolver](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/src/utils/backlog-directory.ts)
+  selects `backlog.config.yml`, or `backlog/config.yml` / `config.yaml`, or `.backlog/config.yml`
+  / `config.yaml`; it has no user-level Backlog config layer. This launcher requires its own
+  `backlog/config.yml` and rejects the root override, so no parent or alternate config is used.
 - **What the page may call:** the page's capability manifest names the only tools it may call:
   `task_view`, `task_list`, `task_search`, `task_create`, `task_edit`, `document_view` and
   `document_update`. Backlog.md 1.53.0 has no tool filter, so that manifest, enforced by the
-  Claude app, is the allowlist for the page. It covers the page only: any other Claude app chat
+  Claude app, is the allowlist for the page. Its enforcement is proven only by the live probe
+  through the page/platform, including refused calls outside the manifest; the stdio probe
+  below checks server availability and cannot prove that platform boundary.
+  It covers the page only: any other Claude app chat
   with these servers connected sees every Backlog.md tool, including `task_archive`,
   `milestone_archive` and `milestone_remove` (archive and delete), `document_create`, and the
   Definition of Done config upsert. Recovery is the git history in each knowledge repository;
@@ -947,7 +966,8 @@ inside AgentDev as `agent` over stdio, like qmd and the shell connector.
 
 - **Tests and probe:** `python3 ci/backlog-mcp-test.py` (run by `ci/lint.sh`) starts a stub
   server through the launcher for each allowed name and checks the refusals (private and
-  unknown names, paths, `..`, symlinks, a missing or parent Backlog config), runs the pinned
+  unknown names, paths, `..`, repository-path and nested escaping symlinks, callbacks in config
+  and task metadata, unsafe git settings, a missing or parent Backlog config), runs the pinned
   server over stdio through the launcher against a temporary Backlog project (tools listed,
   `task_list` leaves the project unchanged), checks that this block and `claude-app-mcp.json`
   match the launcher's allowlist, and checks the agent-session configs. After an install,

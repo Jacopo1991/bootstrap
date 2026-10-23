@@ -22,9 +22,9 @@ for name in "${repos[@]}"; do [[ $1 == "$name" ]] && allowed=1; done
 # Backlog config (then the git top level), and backlog.config.yml can move the backlog folder.
 # So the repository must be a real directory, no symlink on the way from $HOME, with its own
 # backlog/config.yml and no root config.
-home=$(realpath -e -- "$HOME")
-repo=$home/cortex/$1
-[[ -d $repo && $(realpath -e -- "$repo") == "$repo" ]] || refuse "$repo is missing or not a real directory"
+repo=$HOME/cortex/$1
+[[ -d $repo && $(realpath -e -- "$repo") == "$repo" ]] \
+  || refuse "$repo is missing or not a real directory (symlink in repository path)"
 [[ -d $repo/backlog && ! -L $repo/backlog && -f $repo/backlog/config.yml && ! -L $repo/backlog/config.yml ]] \
   || refuse "$repo has no backlog/config.yml of its own"
 [[ ! -e $repo/backlog.config.yml && ! -L $repo/backlog.config.yml ]] || refuse "$repo has a backlog.config.yml"
@@ -32,6 +32,76 @@ repo=$home/cortex/$1
 # The platform binary itself: the npm wrapper (cli.js) does not pass SIGTERM on to it.
 binary=$HOME/.local/share/bootstrap/npm/node_modules/backlog.md-linux-x64/backlog
 [[ -x $binary ]] || { echo "Missing $binary; run chezmoi apply." >&2; exit 1; }
+
+# v1.53.0: utils/backlog-directory.ts selects the project config (no user config layer);
+# file-system/operations.ts parseConfig reads scalar keys line by line, including indented
+# keys and both callback spellings. ADVANCED-CONFIG.md documents remoteOperations defaulting
+# on. markdown/parser.ts reads onStatusChange from YAML task frontmatter. Use the already
+# locked yaml package to decode metadata safely, including quoted keys and YAML merges;
+# never evaluate gray-matter's optional JavaScript frontmatter engine.
+env -i HOME="$HOME" PATH="$PATH" LANG=C.UTF-8 node --input-type=module - \
+  "$repo" "$HOME/.local/share/bootstrap/npm/node_modules/yaml/dist/index.js" <<'JS' >&2
+import { lstatSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repo, yamlPath] = process.argv.slice(2);
+function refuse(reason) {
+  console.error(`agentdev-backlog-mcp: ${reason}`);
+  process.exit(2);
+}
+try {
+  const { parse } = await import(pathToFileURL(yamlPath));
+  const visited = new Set();
+  const files = [];
+  function walk(path) {
+    const resolved = realpathSync(path);
+    if (resolved !== repo && !resolved.startsWith(`${repo}/`)) refuse(`backlog symlink escapes repository: ${path}`);
+    const info = lstatSync(resolved);
+    if (info.isDirectory()) {
+      if (visited.has(resolved)) return;
+      visited.add(resolved);
+      for (const name of readdirSync(resolved)) walk(join(resolved, name));
+    } else if (info.isFile()) {
+      files.push(path);
+    } else refuse(`unsupported file in backlog tree: ${path}`);
+  }
+  // Finish confinement checks before reading any config or metadata. Repeated per connection.
+  walk(join(repo, 'backlog'));
+  const configPath = join(repo, 'backlog/config.yml');
+  const config = readFileSync(configPath, 'utf8');
+  let remoteDisabled = false;
+  for (const line of config.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const colon = trimmed.indexOf(':');
+    if (colon < 0) continue;
+    const key = trimmed.slice(0, colon).trim();
+    const value = trimmed.slice(colon + 1).trim();
+    if (key === 'onStatusChange' || key === 'on_status_change') {
+      if (value.replace(/^['"]|['"]$/g, '').trim()) refuse(`command hook ${key} in ${configPath}`);
+    }
+    if (key === 'auto_commit' && value.toLowerCase() === 'true') refuse(`auto_commit enabled in ${configPath}`);
+    if (key === 'remote_operations') remoteDisabled = /^false(?:\s+#.*)?$/i.test(value);
+  }
+  if (!remoteDisabled) refuse(`remote_operations must be explicitly false in ${configPath}`);
+  for (const path of files.filter(path => path.endsWith('.md'))) {
+    const content = readFileSync(path, 'utf8').replace(/^\uFEFF/, '');
+    if (!content.startsWith('---')) continue;
+    const lines = content.split(/\r?\n/);
+    // Non-YAML engines can execute code in gray-matter; refuse rather than evaluate them.
+    if (!/^---(?:ya?ml)?\s*$/.test(lines[0])) refuse(`unsupported task frontmatter language: ${path}`);
+    const end = lines.findIndex((line, index) => index > 0 && /^(?:---|\.\.\.)\s*$/.test(line));
+    if (end < 0) refuse(`unterminated task frontmatter: ${path}`);
+    const metadata = parse(lines.slice(1, end).join('\n'), { merge: true, logLevel: 'error' });
+    for (const key of ['onStatusChange', 'on_status_change']) {
+      if (metadata?.[key]) refuse(`command hook ${key} in task metadata: ${path}`);
+    }
+  }
+} catch {
+  // Do not echo parser errors: they can contain private task/config contents.
+  refuse('cannot inspect backlog tree, config or task metadata; check files and installed yaml package');
+}
+JS
 # Backlog.md 1.53.0 has no telemetry or update check. A clean environment keeps DEBUG (which
 # prints to stdout) and BACKLOG_CWD from reaching it.
 cd "$repo"
