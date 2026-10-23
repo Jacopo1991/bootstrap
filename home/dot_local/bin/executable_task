@@ -587,7 +587,7 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
             if stream: fcntl.flock(stream, fcntl.LOCK_EX if fields or clear else fcntl.LOCK_SH); stream.seek(0)
             rows = [json.loads(line) for line in stream] if stream else []
             rows += [json.loads(p.read_text()) for p in (root / "pending-runs").glob("*.json") if not any(r.get("run_id", r["id"]) == p.stem for r in rows if r.get("type") == "run")]
-            rows = [r for r in rows if r.get("plan") == ident]; used = {v: len({(r.get("repo"), r.get("task"), r.get("round"), r.get("kind")) for r in rows if r.get("vendor") == v}) for v in task_usage.VENDORS}
+            rows = [r for r in rows if r.get("plan") == ident]; used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in rows if r.get("vendor") == v}) for v in task_usage.VENDORS}
             last, disabled = {}, set()
             for row in rows:
                 kind, outcome = row.get("kind"), row.get("outcome")
@@ -602,9 +602,7 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
                 allowed = plan["allowed"].get(fields["repo"], [])
                 if "*" not in allowed and any(t.lower() not in [a.lower() for a in allowed] for t in fields.get("tasks", [fields["task"]])): raise Stop(f"Plan {ident}: outside allowed work")
                 if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
-                matching = [r for r in rows if all(r.get(k) == fields[k] for k in ("repo", "task", "kind")) and r.get("type") != "outcome"]
-                fields.setdefault("round", 1 + sum(r.get("outcome") in {"finished", "failed", "interrupted"} for r in matching))
-                prior = next((r for r in matching if r.get("round") == fields["round"]), None)
+                prior = next((r for r in rows if all(r.get(k) == fields.get(k) for k in ("repo", "task", "kind", "commit")) and r.get("type") != "outcome"), None)
                 if prior and reserve: return prior
                 if used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
                 return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
@@ -1889,12 +1887,11 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
-            model_override = guards(tier, recorded, model, args.override)
-            usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier)
+            if os.environ.get("TASK_PLAN"): guards(tier, recorded, model, args.override); usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", commit=sha(path, "HEAD"), vendor=builder, model=model, tier=tier)
             if tier_changed:
                 task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
                 print(f"override recorded: tier {recorded} to {tier} ({args.override})")
-            if model_override:
+            if guards(tier, recorded, model, args.override):
                 task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
@@ -1912,7 +1909,7 @@ def lane(args):
                                          close_fds=True)
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                                      "usage_run": usage_run,
+                                      "usage_run": usage_run if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier),
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
             if builder != record["builder"] or tier != record.get("tier", "routine"):
@@ -3254,7 +3251,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
     run_file = reply_file.with_name("review-run.json")
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
-    usage_run = budget_run(repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
+    usage_run = budget_run(repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1], **({"commit": sha(path, "HEAD")} if os.environ.get("TASK_PLAN") else {}))
     atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
@@ -3406,7 +3403,7 @@ def review(args):
         prompt_text = "\n".join(prompt) + "\n"
         state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)
-        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1])})
+        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1], plan=None)})
         prompt_file = state / "review-prompt.md"
         reply_file = state / "review-response.md"
         prompt_file.write_text(prompt_text)
@@ -3514,7 +3511,7 @@ def review(args):
     save_review_history(state, meta, text)
     atomic_json(state / "review.json", meta)
     if not args.run:
-        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, plan=os.environ.get("TASK_PLAN"), ccusage_tokens=None)), "finished")
+        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, ccusage_tokens=None)) | dict(plan=None), "finished")
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     if args.run:

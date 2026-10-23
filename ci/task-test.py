@@ -525,7 +525,7 @@ class TaskTool(unittest.TestCase):
     def test_plan_budget_duplicate_crash_and_exact_short_batch_chain(self):
         self.budget_fixture(points=3)
         with self.budget_environment() as api:
-            fields = dict(repo='proj', task='docs', kind='lane', vendor='codex', round=1)
+            fields = dict(repo='proj', task='docs', kind='lane', vendor='codex', commit='head-1')
             first = api.budget_run(**fields)  # crash before launch: only a pending row survives
             self.assertEqual(self.run_rows(), [])
             self.assertEqual(api.budget_run(**fields)['id'], first['id'])
@@ -534,11 +534,11 @@ class TaskTool(unittest.TestCase):
             api.task_usage.run_log(self.home, first, 'finished')
             self.assertEqual(api.budget_run(**fields)['id'], first['id'])
             for number in (2, 3):
-                run = api.budget_run(**dict(fields, round=number))
+                run = api.budget_run(**dict(fields, commit=f'head-{number}'))
                 api.task_usage.run_log(self.home, run, 'finished')
             self.assertEqual(len(self.run_rows()), 3)
             with self.assertRaisesRegex(api.Stop, 'codex points exhausted'):
-                api.budget_run(**dict(fields, round=4))
+                api.budget_run(**dict(fields, commit='head-4'))
             self.assertEqual(api.budget_run(**fields)['id'], first['id'], 'duplicate stays free at the limit')
             before = {p: p.read_bytes() for p in (self.home / '.local/state/task').rglob('*') if p.is_file()}
             self.assertIn('codex used 3 left 0', api.plan_budget('chain'))
@@ -569,7 +569,7 @@ class TaskTool(unittest.TestCase):
         self.budget_fixture(points=20)
         with self.budget_environment() as api:
             def end(kind, outcome, reason):
-                row = api.budget_run(repo='proj', task='docs', kind=kind, vendor='codex')
+                row = api.budget_run(repo='proj', task='docs', kind=kind, vendor='codex', commit=str(len(self.run_rows())))
                 api.task_usage.run_log(self.home, row, outcome, reason=reason)
             end('lane', 'failed', 'same text')
             end('lane', 'interrupted', 'same text')
@@ -621,8 +621,12 @@ class TaskTool(unittest.TestCase):
         self.raw_task('lane', 'proj', '5', '--plan', 'chain')
         self.wait_for_lane(wt)
         self.assertEqual([(r['kind'], r['vendor']) for r in self.run_rows()], [('start', 'codex'), ('lane', 'codex')])
-        self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        self.raw_task('lane', 'proj', '5', '--plan', 'chain')
+        self.wait_for_lane(wt)
+        self.assertEqual(len(self.run_rows()), 2, 'completed start and same-commit lane stay free at the limit')
         self.commit_in(wt, 'b.txt')
+        self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
         self.raw_task('check', 'proj', '5')
         self.stub_reviewers()
         head = self.git(wt, 'rev-parse', 'HEAD')
@@ -665,6 +669,177 @@ class TaskTool(unittest.TestCase):
         self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
         self.assertEqual([(r['kind'], r['outcome']) for r in self.run_rows()], [('start', 'finished')])
 
+    def test_plan_budget_failed_start_reuses_task_key(self):
+        self.budget_fixture(points=1)
+        probe = self.home / 'failed-start.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import runpy
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            with mock.patch.dict(api['start'].__globals__, prepare_environment=mock.Mock(side_effect=RuntimeError('after creation'))):
+                api['main'](['start', 'proj', '5', '--builder', 'codex', '--plan', 'chain'])
+        '''))
+        result = subprocess.run([sys.executable, str(probe)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('after creation', result.stderr)
+        rows = self.run_rows()
+        self.assertEqual([r['outcome'] for r in rows], ['failed'])
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        self.assertEqual(self.run_rows(), rows)
+
+    def test_plan_budget_lane_and_review_keys_follow_commits(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=2)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        heads = []
+        for number in range(2):
+            if number:
+                self.commit_in(wt, 'b.txt')
+            heads.append(self.git(wt, 'rev-parse', 'HEAD'))
+            for _ in range(2):
+                self.raw_task('lane', 'proj', '5', '--plan', 'chain')
+                self.wait_for_lane(wt)
+            self.assertEqual(len(self.run_rows()), number + 1)
+        self.assertEqual([r['commit'] for r in self.run_rows()], heads)
+        self.stub_reviewers()
+        review_heads = []
+        for number in range(2):
+            if number:
+                self.commit_in(wt, 'c.txt')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            review_heads.append(head)
+            self.raw_task('check', 'proj', '5')
+            reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+            for _ in range(2):
+                self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
+                              env=dict(self.env, REVIEW_STUB_REPLY=reply))
+            rows = [r for r in self.run_rows() if r['kind'] == 'review']
+            self.assertEqual(len(rows), number + 1)
+        self.assertEqual([r['commit'] for r in rows], review_heads)
+        self.assertIn('codex used 2 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('claude used 2 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_reviewer_fallback_shares_reviewed_commit_draw(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
+                      env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                               REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
+                               REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply, REVIEW_STUB_EXIT='0'))
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
+        self.assertEqual(json.loads((self.state() / 'review.json').read_text())['reviewer'], 'codex')
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]['kind'], rows[0]['commit'], rows[0]['vendor']), ('review', head, 'claude'))
+        self.assertIn('claude used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('codex used 0 left 1', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_manual_review_prompt_and_record_never_carry_plan(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=0)
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'manual-review.md'
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n')
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'haiku', '--plan', 'chain')
+        self.raw_task('review', 'proj', '5', '--plan', 'chain')
+        pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+        self.assertEqual(len(pending), 1)
+        self.assertIsNone(json.loads(pending[0].read_text())['plan'])
+        # Even old stored routing metadata cannot smuggle a plan into a manual record.
+        route_path = self.state() / 'review-routing.json'
+        route = json.loads(route_path.read_text())
+        route['usage_run']['plan'] = 'chain'
+        route_path.write_text(json.dumps(route))
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--plan', 'chain')
+        self.assertTrue(all(r['plan'] is None for r in self.run_rows()))
+        self.assertIn('claude used 0 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual(list(pending[0].parent.glob('*.json')), [])
+
+    def test_plan_budget_no_plan_start_and_lane_match_main(self):
+        # Run main and this build through the same probes, using only this temporary HOME.
+        baseline = self.home / 'main-task'
+        baseline.write_text(self.git(ROOT, 'show', 'main:home/dot_local/bin/executable_task'))
+        wt, _ = self.started()
+        self.stub_models()
+        probe = self.home / 'no-plan-probe.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import json, os, runpy, subprocess, sys
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest import mock
+            sys.path.insert(0, {str(TOOL.parent)!r})
+            api = runpy.run_path(sys.argv[1])
+            namespace = api['main'].__globals__
+            events = []
+            def traced(name, original):
+                def call(*args, **kwargs):
+                    events.append(name)
+                    if name == 'guards' and events.count(name) == 2 and sys.argv[2] == 'guard':
+                        raise api['Stop']('resolved model refused')
+                    return original(*args, **kwargs)
+                return call
+            original_popen = subprocess.Popen
+            def spawn(argv, *args, **kwargs):
+                if '--_worker' in argv:
+                    events.append('spawn')
+                    if sys.argv[2] == 'crash': raise RuntimeError('spawn refused')
+                    return SimpleNamespace(pid=os.getpid())
+                return original_popen(argv, *args, **kwargs)
+            replacements = {{name: traced(name, namespace[name]) for name in
+                            ('guards', 'tier_guard', 'archive_lane_final', 'check_plan',
+                             'seed_worktree', 'prepare_environment', 'refresh_context')}}
+            replacements.update(plan_budget=mock.Mock(side_effect=AssertionError('no plan')),
+                                budget_run=mock.Mock(side_effect=AssertionError('no plan')))
+            try:
+                with mock.patch.dict(namespace, replacements), \\
+                        mock.patch.object(subprocess, 'Popen', side_effect=spawn), \\
+                        mock.patch.object(api['task_usage'], 'record_override', traced('override', api['task_usage'].record_override)), \\
+                        mock.patch.object(api['task_usage'], 'run_log', traced('run_log', api['task_usage'].run_log)):
+                    raise SystemExit(api['main'](sys.argv[3:]))
+            finally:
+                Path({str(self.home / 'events.json')!r}).write_text(json.dumps(events))
+        '''))
+        traces = {}
+        for source, tool in (('main', baseline), ('build', TOOL)):
+            for mode in ('start', 'success', 'crash', 'guard'):
+                if mode == 'start':
+                    command = ['start', 'proj', f'no-plan-{source}', '--builder', 'codex']
+                else:
+                    (wt / '.work/prompt.md').write_text('task')
+                    (wt / '.work/final.md').write_text('Previous final\n')
+                    (wt / '.work/report.md').write_text('Previous report\nBLOCKED: previous stop\n')
+                    (wt / '.work/lane.json').unlink(missing_ok=True)
+                    command = ['lane', 'proj', '5', '--tier', 'hard', '--model', 'gpt-6.1-sol',
+                               '--override', 'Jacopo 2026-10-23: parity probe', '--no-pace', '--no-boost']
+                result = subprocess.run([sys.executable, str(probe), str(tool), mode, *command],
+                                        env=self.env, cwd=self.home, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1 if mode in {'crash', 'guard'} else 0, result.stdout + result.stderr)
+                traces[source, mode] = json.loads((self.home / 'events.json').read_text())
+                pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+                self.assertEqual(len(pending), int(mode == 'success'))
+                for row in pending:
+                    self.assertIsNone(json.loads(row.read_text())['plan'])
+                    row.unlink()
+                if mode != 'start':
+                    # Each probe must start from the same pinned tier.
+                    record = json.loads((self.state() / 'task.json').read_text())
+                    record['tier'] = 'routine'
+                    record['revision'] = TASK_MODULE.record_revision(record)
+                    (self.state() / 'task.json').write_text(json.dumps(record))
+        for mode in ('start', 'success', 'crash', 'guard'):
+            self.assertEqual(traces['build', mode], traces['main', mode], mode)
+        success = traces['build', 'success']
+        self.assertLess(success.index('override'), success.index('archive_lane_final'))
+        self.assertLess(success.index('archive_lane_final'), success.index('spawn'))
+        self.assertLess(success.index('spawn'), success.index('run_log'))
+        self.assertNotIn('run_log', traces['build', 'start'])
+
     def test_plan_budget_refused_lane_preserves_override_and_final_records(self):
         wt, _ = self.started()
         self.stub_models()
@@ -680,8 +855,8 @@ class TaskTool(unittest.TestCase):
                                     expires='2000-01-01T00:00:00Z' if reason == 'expired' else None)
                 if reason == 'lane disabled':
                     with self.budget_environment() as api:
-                        for _ in range(2):
-                            run = api.budget_run(repo='proj', task='T-5', kind='lane', vendor='codex')
+                        for number in range(2):
+                            run = api.budget_run(repo='proj', task='T-5', kind='lane', vendor='codex', commit=str(number))
                             api.task_usage.run_log(self.home, run, 'failed')
                 rows = self.run_rows()
                 output = self.raw_task('lane', 'proj', '5', '--plan', 'chain', '--tier', 'design',
@@ -695,14 +870,15 @@ class TaskTool(unittest.TestCase):
                 self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
                 self.assertFalse((work / 'lane.json').exists())
 
-    def test_plan_budget_round_environment_cannot_make_a_retry_free(self):
+    def test_plan_budget_commit_key_ignores_round_environment(self):
         self.budget_fixture(points=1)
         with self.budget_environment() as api, mock.patch.dict(os.environ, TASK_PLAN_ROUND='1'):
-            fields = dict(repo='proj', task='docs', kind='lane', vendor='codex')
+            fields = dict(repo='proj', task='docs', kind='lane', vendor='codex', commit='first')
             run = api.budget_run(**fields)
             api.task_usage.run_log(self.home, run, 'finished')
+            self.assertEqual(api.budget_run(**fields)['id'], run['id'])
             with self.assertRaisesRegex(api.Stop, 'points exhausted'):
-                api.budget_run(**fields)
+                api.budget_run(**dict(fields, commit='second'))
             self.assertEqual(len(self.run_rows()), 1)
 
     def test_plan_budget_runner_launch_and_inheritance(self):
@@ -739,8 +915,8 @@ class TaskTool(unittest.TestCase):
         self.assertIn('expired', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
         self.budget_fixture(points=5)
         with self.budget_environment() as api:
-            for _ in range(2):
-                run = api.budget_run(repo='proj', task='old-batch', kind='runner-start', vendor='codex')
+            for number in range(2):
+                run = api.budget_run(repo='proj', task=f'old-batch-{number}', kind='runner-start', vendor='codex')
                 api.task_usage.run_log(self.home, run, 'failed')
         rows = self.run_rows()
         self.assertIn('runner-start disabled', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
