@@ -13,7 +13,7 @@ trap 'chmod -R u+w "$tmp"; rm -rf "$tmp"' EXIT
 # The package cap gate command and its policy file come from this checkout, as chezmoi (which sets
 # the executable bit on apply) and install.sh place them.
 mkdir -p "$tmp/bin"
-printf '#!/usr/bin/env bash\nexec /usr/bin/python3 %q "$@"\n' "$ROOT/ci/package-cap-fixture.py" > "$tmp/bin/package-cap-check"
+printf '#!/usr/bin/env bash\nexec /usr/bin/python3 %q "$@"\n' "$ROOT/ci/package-cap-check.py" > "$tmp/bin/package-cap-check"
 chmod 0755 "$tmp/bin/package-cap-check"
 export PATH="$tmp/bin:$PATH"
 export HOME="$tmp/home" XDG_CACHE_HOME="$tmp/home/.cache" PRE_COMMIT_HOME="$tmp/home/.cache/pre-commit"

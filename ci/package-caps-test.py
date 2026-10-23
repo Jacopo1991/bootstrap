@@ -69,7 +69,7 @@ class PolicyFile(unittest.TestCase):
         hook = config.split('- id: package-caps\n', 1)[1]
         entry = next(line.strip().removeprefix('entry: ') for line in hook.splitlines()
                      if line.strip().startswith('entry: '))
-        self.assertEqual(entry, 'python3 ci/package-cap-fixture.py')
+        self.assertEqual(entry, 'python3 ci/package-cap-check.py')
         self.assertIn('pass_filenames: false\n', hook)
         self.assertIn('always_run: true\n', hook)
         with tempfile.TemporaryDirectory() as temp:
@@ -145,10 +145,10 @@ class Manifests(unittest.TestCase):
         self.assertEqual(code, 0, (name, text, output))
         self.assertIn("1 manifest(s)", output, (name, output))
 
-    def refused(self, name: str, text: str, *expected: str):
+    def refused(self, name: str, text: str, *expected: str, reported_path=None):
         code, output = self.run_check(self.write(name, text))
         self.assertEqual(code, 1, (name, text, output))
-        self.assertIn(f"{name}:", output)
+        self.assertIn(f"{reported_path or name}:", output)
         for fragment in ("1.106.2", "security-incident-oct-21-2026", *expected):
             self.assertIn(fragment, output, (name, text, output))
 
@@ -166,6 +166,43 @@ class Manifests(unittest.TestCase):
             self.refused(name, "litellm==1.106.*\n", "pinned exactly")
             self.refused(name, "-e git+https://github.com/BerriAI/litellm@main#egg=litellm\n", "pinned exactly")
             self.refused(name, "litellm @ https://example.invalid/litellm-1.107.0.tar.gz\n", "pinned exactly")
+
+    def test_uncapped_requirements_are_ignored_line_by_line(self):
+        # B1: these are valid inputs for other tools, not this policy's concern.
+        examples = ('-e .', '--editable ./wheel', '--prefer-binary', '--unknown-option',
+                    '.', './wheel', 'git+https://example.invalid/repo#egg=',
+                    'git+https://example.invalid/repo#egg=numpy',
+                    'https://example.invalid/innocent.whl', 'https://[', 'numpy==$VERSION',
+                    'numpy', 'litellm-extra>=9', './other_litellm-9-py3-none-any.whl')
+        for name in ('requirements-dev.txt', 'constraints.in'):
+            for example in examples:
+                with self.subTest(name=name, example=example):
+                    self.allowed(name, example + '\n')
+                    # An unrelated line remains ignored beside an allowed pin.
+                    self.allowed(name, example + '\nlitellm==1.106.2\n')
+        self.refused('requirements.txt', '--editable git+https://example.invalid/repo#egg=litellm\n',
+                     'unverifiable editable source')
+
+    def test_uncapped_installer_arguments_are_ignored(self):
+        for args in ('--timeout 100 numpy', '--no-compile numpy', '--unknown-flag numpy',
+                     '-e .', '.', './wheel', 'git+https://example.invalid/repo#egg=',
+                     '--prefer-binary litellm==1.106.2',
+                     '--timeout 100 --no-compile litellm==1.106.2'):
+            with self.subTest(args=args):
+                self.allowed('Dockerfile', 'RUN pip install ' + args + '\n')
+                self.allowed('compose.yaml', 'services: {app: {command: ' + repr('pip install ' + args) + '}}\n')
+        for command in ('env pip install numpy', 'sh -c "pip install numpy"',
+                        'xargs pip install numpy', 'uv sync', 'pip --unknown install numpy',
+                        'pip --unknown install litellm==1.106.2'):
+            self.allowed('Dockerfile', 'RUN ' + command + '\n')
+
+    def test_uncapped_locks_and_images_are_ignored(self):
+        for name in ('uv.lock', 'poetry.lock'):
+            self.allowed(name, '[[package]]\nname="numpy"\nsource={git="https://example.invalid/repo"}\n')
+        self.allowed('Pipfile.lock', '{"default":{"numpy":{"git":"https://example.invalid/repo"}}}')
+        for image in ('numpy:latest', 'other/litellm:latest', '${IMAGE}', 'numpy:${TAG}'):
+            self.allowed('Dockerfile', 'FROM ' + image + '\n')
+            self.allowed('compose.yaml', 'services: {app: {image: "' + image + '"}}\n')
 
     def test_pyproject(self):
         self.allowed("pyproject.toml", '[project]\nname = "x"\ndependencies = ["requests", "litellm==1.106.2"]\n')
@@ -259,10 +296,45 @@ class Manifests(unittest.TestCase):
             self.refused(name, "FROM python:3.12\nRUN python -m pip install --no-cache-dir 'litellm>=1.100'\n", "pinned exactly")
             self.refused(name, 'FROM python:3.12\nRUN ["pipx", "install", "litellm"]\n', "pinned exactly")
 
+    def test_wrapped_capped_container_commands_fail_closed(self):
+        # B2: a wrapper is unevaluable even when its embedded pin looks allowed.
+        for version in ('1.106.2', '1.107.0'):
+            commands = [f'sh -c "pip install litellm=={version}"',
+                        f'env pip install litellm=={version}',
+                        f'xargs -r pip install litellm=={version}',
+                        f'["sh", "-c", "pip install litellm=={version}"]',
+                        f'["env", "pip", "install", "litellm=={version}"]',
+                        f'["xargs", "pip", "install", "litellm=={version}"]',
+                        f'sh -c "echo ready && pip install litellm=={version}"']
+            for command in commands:
+                with self.subTest(command=command):
+                    self.refused('Dockerfile', 'RUN ' + command + '\n',
+                                 'capped package command must be a readable exact install')
+                    self.refused('compose.yaml', 'services:\n  app:\n    command: ' + command + '\n',
+                                 'capped package command must be a readable exact install')
+        for command in ('pip install litellm==1.106.2', '["pip", "install", "litellm==1.106.2"]'):
+            self.allowed('Dockerfile', 'RUN ' + command + '\n')
+            self.allowed('compose.yaml', 'services: {app: {command: ' + command + '}}\n')
+        self.refused('compose.yaml', 'services: {app: {command: "pip install litellm==1.107.0"}}\n',
+                     'above the cap')
+        self.refused('compose.yaml', 'services: {app: {entrypoint: [sh, -c, "pip install litellm==1.107.0"]}}\n',
+                     'capped package command must be a readable exact install')
+
+    def test_artifact_identity_in_requirements_and_installer_operands(self):
+        for artifact in ('./litellm-1.106.2-py3-none-any.whl',
+                         'https://example.invalid/litellm-1.106.2-py3-none-any.whl'):
+            self.allowed('requirements.txt', artifact + '\n')
+            self.allowed('Dockerfile', 'RUN pip install ' + artifact + '\n')
+        for artifact in ('./litellm-1.107.0-py3-none-any.whl',
+                         'litellm@https://example.invalid/innocent-1.0-py3-none-any.whl',
+                         'git+https://example.invalid/repo#egg=litellm'):
+            self.refused('requirements.txt', artifact + '\n')
+            self.refused('Dockerfile', 'RUN pip install ' + artifact + '\n')
+
     def test_compose_files(self):
         for name in ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml", "compose.override.yaml", "docker-compose.prod.yml"):
             self.allowed(name, f'services:\n  db:\n    image: postgres:16\n  proxy:\n    image: "{IMAGE}:v1.106.2-stable"\n')
-            self.refused(name, "services:\n  proxy:\n    image: ${LITELLM_IMAGE}\n", "unresolved image")
+            self.refused(name, "services:\n  proxy:\n    image: ${LITELLM_IMAGE}\n", "unresolved capped image")
             self.refused(name, f"services:\n  proxy:\n    image: {IMAGE}:latest\n", "is refused")
             self.refused(name, f"services:\n  proxy:\n    image: {IMAGE}:main-stable\n", "is refused")
             self.refused(name, f"services:\n  proxy:\n    image: berriai/litellm:v1.107.0\n", "above the cap")
@@ -312,20 +384,23 @@ class Manifests(unittest.TestCase):
             self.assertEqual(code, 1, output)
             self.assertIn('deps.txt:1:', output)
             self.assertIn('above the cap 1.106.2', output)
-        for body in ('-r requirements.txt\n', '-r https://example.invalid/deps.txt\n', 'litellm==$VERSION\n'):
+        for body in ('-r https://example.invalid/litellm.txt\n', 'litellm==$VERSION\n'):
             self.refused('requirements.txt', body)
-        code, output = self.run_check(self.write('requirements.txt', '-r missing.txt\n'))
+        code, output = self.run_check(self.write('requirements.txt', '-r missing-litellm.txt\n'))
         self.assertEqual(code, 1, output)
-        self.assertIn('missing.txt:1: requirements include is unavailable', output)
+        self.assertIn('missing-litellm.txt:1: requirements include is unavailable', output)
         self.assertIn('1.106.2', output)
         self.assertIn('security-incident-oct-21-2026', output)
         self.write('nested.txt', 'litellm==1.104.0\n')
         self.write('deps.txt', '-c nested.txt\n')
         self.allowed('requirements.in', '-r deps.txt\n')
+        for include in ('-r requirements.txt', '-r https://example.invalid/deps.txt', '-r missing.txt'):
+            self.allowed('requirements.txt', include + '\n')
+        self.write('deps.txt', '-r requirements.txt\nlitellm==1.107.0\n')
+        self.refused('requirements.txt', '-r deps.txt\n', 'above the cap', reported_path='deps.txt')
         for operand in ('./litellm-1.107.0-py3-none-any.whl',
                         'https://example.invalid/litellm-1.107.0-py3-none-any.whl',
                         'git+https://example.invalid/litellm',
-                        'https://example.invalid/innocent.whl',
                         'litellm==1.106.2+custom', 'litellm==1.106.2.post1', 'litellm===1.106.2'):
             self.refused('requirements.txt', operand + '\n')
         self.allowed('requirements.txt', './litellm-1.106.2-py3-none-any.whl\n')
@@ -335,8 +410,8 @@ class Manifests(unittest.TestCase):
         self.refused('weird-compose.yaml', 'x: &proxy {image: berriai/litellm:latest}\nservices: {proxy: *proxy}\n')
         self.allowed('compose.yaml', 'services: {proxy: {image: "berriai/litellm:${TAG:-v1.106.2}"}}\n')
         self.refused('compose.yaml', 'services: {proxy: {image: "berriai/litellm:${TAG:-v1.107.0}"}}\n')
-        self.refused('compose.yaml', 'services: {proxy: {image: "${IMAGE}"}}\n')
-        for name in ('custom.Dockerfile.build', 'dockerfile-custom', 'odd-containerfile'):
+        self.allowed('compose.yaml', 'services: {proxy: {image: "${IMAGE}"}}\n')
+        for name in ('Dockerfile.build', 'custom.Dockerfile', 'Containerfile.build'):
             self.allowed(name, 'ARG TAG=v1.106.2\nFROM berriai/litellm:$TAG\n')
             self.refused(name, 'ARG TAG=v1.107.0\nFROM berriai/litellm:${TAG}\n')
             self.refused(name, 'ARG TAG\nFROM berriai/litellm:$TAG\n')
@@ -348,6 +423,16 @@ class Manifests(unittest.TestCase):
         cap.approved_digests.add('sha256:' + 'a' * 64)
         self.assertIsNone(cap.image_reason('berriai/litellm:v1.106.2@sha256:' + 'a' * 64))
         self.assertIsNotNone(cap.image_reason('berriai/litellm:v1.107.0@sha256:' + 'a' * 64))
+
+    def test_dockerfile_discovery_uses_filename_patterns(self):
+        for name in ('docs/dockerfile-notes.md', 'dockerfile-custom', 'odd-containerfile', 'custom.Dockerfile.build'):
+            code, output = self.run_check(self.write(name, 'FROM berriai/litellm:latest\n'))
+            self.assertEqual(code, 0, (name, output))
+            self.assertIn('0 manifest(s)', output)
+        # A compose build may explicitly reference a differently named Dockerfile.
+        self.write('build.recipe', 'RUN env pip install litellm==1.107.0\n')
+        self.refused('compose.yaml', 'services: {app: {build: {dockerfile: build.recipe}}}\n',
+                     'capped package command must be a readable exact install', reported_path='build.recipe')
 
     def test_lock_consistency_and_sources(self):
         self.write('uv.lock', '[[package]]\nname="litellm"\nversion="1.106.2"\n')

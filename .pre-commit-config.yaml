@@ -25,7 +25,7 @@ repos:
       - id: package-caps
         name: package-cap-check (capped packages pinned at or below their cap)
         # Bootstrap must check its own policy before this checkout is installed.
-        entry: python3 ci/package-cap-fixture.py
+        entry: python3 ci/package-cap-check.py
         language: system
         pass_filenames: false
         always_run: true

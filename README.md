@@ -1017,63 +1017,44 @@ PyPI and about six for npm (its database is about 200 MB).
 
 ### Package caps (the litellm lock rule)
 
-`system/agent-policy/package-caps.toml` is the one policy file for packages that must stay
-at or below a known-good version, with an exact pin, everywhere. Its first entry is
-`litellm`: cap `1.106.2` (PyPI, and the `ghcr.io/berriai/litellm` / `berriai/litellm`
-images), because `litellm==1.107.0` on PyPI and the `v1.107.0`, `latest`, `main-latest`
-and `main-stable` image tags were compromised on 2026-10-21 with credential-stealing
-malware (source: the [LiteLLM security incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
-Enforcement uses resolver constraints plus the offline repository gate:
+`system/agent-policy/package-caps.toml` caps `litellm` at `1.106.2`, with exact
+pins for PyPI and the `ghcr.io/berriai/litellm` / `berriai/litellm` images.
+Version `1.107.0` and the affected floating image tags were compromised on
+2026-10-21 ([incident note](https://docs.litellm.ai/blog/security-incident-oct-21-2026)).
+The rule rests on resolver constraints plus the offline repository gate:
 
-- **Resolver constraints:** `install.sh` generates
-  `/usr/local/lib/agent-policy/constraints.txt` from the policy. For the agent user,
-  pip's `[install] constraint` and `build-constraint` keys in
-  `~/.config/pip/pip.conf` point there, preserving unrelated settings. The managed
-  `~/.profile` exports `UV_CONSTRAINT` and `UV_BUILD_CONSTRAINT` for `uv pip install`,
-  `uv pip compile`, `uv tool install` and `uvx`. Offline synthetic-wheel tests with
-  pip 26.2.1 and uv 0.12.21 prove direct and transitive runtime conflicts for each path;
-  build-constraint keys are wired but build dependency resolution is not probed.
-  `uv lock`/`sync`/`run` ignore constraints in user `uv.toml`; `new-project` instead
-  writes generated `[tool.uv] constraint-dependencies` and
-  `build-constraint-dependencies` into the new code repository's `pyproject.toml`.
-  The project probe proves runtime conflicts for all three commands. Existing
-  projects need a separate PM task to add those workspace keys. Until then, their
-  project resolution has only the gate guard. `pipx`, Poetry, conda/mamba
-  and container images also have only the gate guard; no resolver
-  constraint mechanism is installed for them.
+- **Resolvers:** `install.sh` generates `/usr/local/lib/agent-policy/constraints.txt`.
+  Agent pip's `[install] constraint` and `build-constraint` keys point there;
+  `~/.profile` exports `UV_CONSTRAINT` and `UV_BUILD_CONSTRAINT` for `uv pip
+  install`/`compile`, `uv tool install` and `uvx`. `uv lock`/`sync`/`run` ignore
+  user-level constraints: `new-project` writes a complete `[project]` file with
+  generated `[tool.uv] constraint-dependencies` and `build-constraint-dependencies`.
+  The synthetic-wheel probes prove runtime conflicts on pip 26.2.1 and uv 0.12.21;
+  build dependency resolution is not probed.
 
-- **The gate, in every repository:** the `package-caps` hook of the standard pre-commit
-  config runs `package-cap-check` (`~/.local/bin`, from `home/dot_local/bin`) on every
-  commit. Bootstrap's own config runs `python3 ci/package-cap-fixture.py` from the
-  checkout, using its module and policy before installation; new repositories keep
-  the installed command. It fails when any tracked `requirements*.txt`/`*.in`, `constraints*.txt`/`*.in`,
-  `pyproject.toml`, `uv.lock`, `poetry.lock`, `Pipfile.lock`, Dockerfile (also `RUN pip
-  install` lines) or compose file names a capped package above its cap, without an exact
-  `==` pin (a range in `pyproject.toml` passes only when a `uv.lock` or `poetry.lock` next
-  to it pins an allowed version), or as an image that is untagged, `latest`, `main-*` or
-  above the cap. It follows local requirements/constraints includes, parses compose
-  YAML and static image defaults, and checks manifest/lock consistency and sources.
-  It also scans `setup.cfg`, refuses unevaluable capped-package mentions in
-  `setup.py`, and checks PEP 723 script metadata. Unresolved image variables,
-  unapproved digests, local versions and versions above the cap (including post
-  releases) fail. Run `package-cap-check` by hand in a checkout to check a whole
-  repository; the installed command reads only
-  `/usr/local/lib/agent-policy/package-caps.toml` and fails closed without it.
+- **Gate:** every standard pre-commit config runs `package-cap-check` over tracked
+  requirements/constraints (`.txt`/`.in`), pyproject, uv/Poetry/Pipenv locks,
+  Dockerfiles, compose YAML, setup metadata and PEP 723 scripts. Bootstrap uses
+  `python3 ci/package-cap-check.py` with its checkout's policy before installation.
+  It checks only capped names, follows readable local includes, and checks pins,
+  sources and manifest/lock consistency. Pyproject ranges need an adjacent allowed
+  lock pin. Capped image tags must be explicit allowed versions; unresolved capped
+  references, unapproved digests and local versions fail. A Dockerfile RUN segment
+  or compose command mentioning a capped name must be a readable exact install;
+  wrappers such as `sh -c`, `env` and `xargs` fail closed. Unrelated dependencies,
+  options and images are ignored. The installed command requires the root-owned
+  policy at `/usr/local/lib/agent-policy/package-caps.toml`.
 
-The agent policy hook keeps its ordinary command rules, so `uv sync` is allowed.
-The gate checks tracked dependency declarations and locks; for paths without
-resolver constraints, it does not prevent an ad hoc install before a commit.
+`pipx`, Poetry, conda/mamba, images and existing uv projects without workspace
+constraints have only the gate guard. It checks tracked declarations/locks at
+commit time; it does not block ad hoc installs. The agent hook keeps its ordinary
+command rules, including allowing `uv sync`.
 
-`install.sh` installs the file root-owned into `/usr/local/lib/agent-policy/` with the
-hook scripts. To cap another package, add one `[packages.<pypi-name>]` table with
-`max_version`, `images`, `reason`, `source` and `added`, then reinstall bootstrap to
-regenerate constraints. Existing
-repositories get the hook when their `.pre-commit-config.yaml` is replaced with the
-standard one (`pre-commit-enable` refuses to overwrite a differing file). Tests:
-`ci/package-caps-test.py` (every format, allowed and refused, policy parsed once per run),
-`ci/managed-policy-test.py` and `ci/agent-config-test.py` (ordinary hook behavior),
-`ci/package-cap-resolver-test.py` (the per-path synthetic-wheel probes),
-and `ci/pre-commit-test.sh` (the hook inside a real commit).
+To add a package, add `[packages.<pypi-name>]` with required keys `max_version`,
+`reason` and `source` (HTTPS). Optional keys are `images`, `added` and
+`approved_digests`. Reinstall bootstrap to regenerate constraints; the PM handles
+existing-project rollout. Gate and resolver tests are `ci/package-caps-test.py`
+and `ci/package-cap-resolver-test.py`.
 
 ## Skills, prompt reminders and the minutes watchdog
 

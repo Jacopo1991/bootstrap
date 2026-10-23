@@ -39,6 +39,13 @@ def normalize(name: str) -> str:
     return re.sub(r'[-_.]+', '-', name).lower()
 
 
+def mentions_cap(text: str, caps: dict[str, Cap]) -> bool:
+    """Recognize policy names in otherwise unevaluable dependency/command text."""
+    text = unquote(text)
+    return any(re.search(r'(?<![a-z0-9])' + re.escape(name).replace(r'\-', r'[-_.]+') +
+                         r'(?![a-z0-9])', text, re.I) for name in caps)
+
+
 def version_key(text: str) -> Version | None:
     try:
         version = Version(text)
@@ -191,30 +198,34 @@ class Checker:
         rules = '; '.join(f'{c.name} cap {c.max_version}: {c.reason}; {c.source}' for c in self.caps.values())
         self.findings.append(f'{path}:{line}: {reason} ({rules})')
 
-    def requirement(self, path: Path, line: int, text: str, *, artifact=False) -> None:
-        if '$' in text or '`' in text:
-            self.error(path, line, 'unresolved installation operand')
-            return
-        artifact = ' @ ' not in text and (text.endswith(('.whl', '.tar.gz', '.zip')) or '://' in text)
-        parsed = None if artifact else parse_requirement(text)
+    def requirement(self, path: Path, line: int, text: str) -> bool:
+        """Check named policy packages; return whether an allowed pin was read."""
+        if not mentions_cap(text, self.caps):
+            return False
+        is_artifact = ' @ ' not in text and (text.endswith(('.whl', '.tar.gz', '.zip')) or '://' in text)
+        named = parse_requirement(text)
+        parsed = named if not is_artifact or named and named[0] in self.caps else None
         if parsed is not None:
             name, version, _ = parsed
             if name in self.caps:
                 reason = self.caps[name].version_reason(version)
                 if reason:
                     self.error(path, line, reason)
-            return
+                return reason is None
+            return False
         # Wheel identity is verifiable from the standard filename, but named URL/
         # VCS requirements and unknown artifacts cannot establish trusted identity.
         filename = unquote(urlsplit(text).path).rsplit('/', 1)[-1]
         wheel = re.fullmatch(r'([A-Za-z0-9_.]+)-([^-]+)-(?:[^-]+-)?[^-]+-[^-]+-[^-]+\.whl', filename)
-        if wheel and normalize(wheel[1]) in self.caps:
-            reason = self.caps[normalize(wheel[1])].version_reason(wheel[2])
-            if reason:
-                self.error(path, line, reason)
-            return
-        # Refuse any unmodelled operand, even one whose filename hides the name.
-        self.error(path, line, 'unverifiable requirement/artifact; use an exact named registry pin')
+        if wheel:
+            if normalize(wheel[1]) in self.caps:
+                reason = self.caps[normalize(wheel[1])].version_reason(wheel[2])
+                if reason:
+                    self.error(path, line, reason)
+                return reason is None
+            return False
+        self.error(path, line, 'unverifiable requirement/artifact; package must be pinned exactly')
+        return False
 
     @staticmethod
     def logical_lines(path: Path) -> list[tuple[int, str]]:
@@ -233,11 +244,13 @@ class Checker:
 
     def include(self, path: Path, line: int, value: str) -> None:
         if not value or '$' in value or re.match(r'\w+://', value):
-            self.error(path, line, 'remote or unresolved requirements include refused')
+            if mentions_cap(value, self.caps):
+                self.error(path, line, 'remote or unresolved capped requirements include refused')
             return
         target = (path.parent / value).resolve()
         if target in self.active:
-            self.error(path, line, 'requirements include cycle refused')
+            return
+        if not target.is_file() and not mentions_cap(value, self.caps):
             return
         self.requirements_file(target)
 
@@ -259,10 +272,11 @@ class Checker:
                 if include:
                     self.include(path, number, include[1].strip().strip('\"\''))
                 elif text.startswith(('-e ', '--editable')):
-                    self.error(path, number, 'unverifiable editable source; package must be pinned exactly')
+                    if mentions_cap(text, self.caps):
+                        self.error(path, number, 'unverifiable editable source; package must be pinned exactly')
                 elif text.startswith('-'):
-                    if not text.startswith(('--index-url ', '--extra-index-url ', '--find-links ', '--no-index', '--trusted-host ')):
-                        self.error(path, number, 'unmodelled requirements option')
+                    if mentions_cap(text, self.caps):
+                        self.error(path, number, 'unmodelled capped requirements option')
                 else:
                     self.requirement(path, number, text.split(' --')[0])
         except (OSError, UnicodeError) as error:
@@ -387,7 +401,8 @@ class Checker:
     def image(self, path: Path, line: int, reference: str, variables=None) -> None:
         reference = self.interpolate(reference, variables or {})
         if '$' in reference:
-            self.error(path, line, 'unresolved image reference refused')
+            if mentions_cap(reference, self.caps):
+                self.error(path, line, 'unresolved capped image reference refused')
             return
         for cap in self.caps.values():
             reason = cap.image_reason(reference)
@@ -411,11 +426,29 @@ class Checker:
                     self.image(path, number, operands[0], variables)
             elif verb == 'RUN':
                 body = text.strip()[3:].strip()
-                segments = [json.loads(body)] if body.startswith('[') else [shlex.split(s) for s in re.split(r'&&|\|\||;|\|', body)]
-                for tokens in segments:
-                    reason = install_reason(tokens, path.parent, self.caps)
-                    if reason:
-                        self.error(path, number, reason)
+                self.command(path, number, json.loads(body) if body.startswith('[') else body)
+
+    def command(self, path: Path, line: int, value: str | list[str]) -> None:
+        # Quoted wrapper bodies stay one operand, so they cannot masquerade as
+        # a directly readable install. No attempt to execute/unwrap shell code.
+        if isinstance(value, str):
+            lexer = shlex.shlex(value, posix=True, punctuation_chars=';&|')
+            lexer.whitespace_split = True
+            lexer.commenters = ''  # Preserve VCS URL fragments such as #egg=litellm.
+            segments, current = [], []
+            for word in lexer:
+                if word in {'&&', '||', ';', '|'}:
+                    segments.append(current)
+                    current = []
+                else:
+                    current.append(word)
+            segments.append(current)
+        else:
+            segments = [value]
+        for tokens in segments:
+            reason = install_reason(tokens, path.parent, self.caps)
+            if reason:
+                self.error(path, line, reason)
 
     def compose(self, path: Path) -> None:
         import yaml
@@ -439,6 +472,8 @@ class Checker:
                             self.dockerfile(target)
                         else:
                             self.error(path, 1, 'referenced Dockerfile unavailable')
+                    elif key in {'command', 'entrypoint'} and isinstance(item, (str, list)):
+                        self.command(path, 1, item)
                     else:
                         visit(item)
             elif isinstance(value, list):
@@ -458,7 +493,7 @@ class Checker:
                 self.toml_lock(path)
             elif name == 'pipfile.lock':
                 self.pipfile_lock(path)
-            elif 'dockerfile' in name or 'containerfile' in name:
+            elif re.fullmatch(r'(?:dockerfile|containerfile)(?:\..+)?|.+\.(?:dockerfile|containerfile)', name):
                 self.dockerfile(path)
             elif path.suffix.lower() in {'.yml', '.yaml'}:
                 # Arbitrary compose filenames: structural detection, not a name regex.
@@ -498,16 +533,10 @@ class Checker:
 # Dockerfile RUN checks supply argv to these gate-only installer helpers.
 GLOBAL_VALUES = {'--python', '-p', '--directory', '--project', '--config-file', '--color',
                  '--cache-dir', '--log', '--proxy', '--timeout', '--retries', '--cert', '--client-cert'}
-FLAGS = {'-q', '--quiet', '-v', '--verbose', '--offline', '--no-progress', '--no-cache',
-         '--no-cache-dir', '--disable-pip-version-check', '--no-input', '--isolated', '-I', '-s', '-E'}
 INSTALL_VALUES = {'--index-url', '-i', '--extra-index-url', '--find-links', '-f', '--trusted-host',
                   '--python', '-p', '--cache-dir', '--group', '--only', '--extras', '--extra',
                   '--target', '-t', '--prefix', '--root', '--platform', '--python-version',
                   '--implementation', '--abi', '--keyring-provider', '--link-mode'}
-INSTALL_FLAGS = FLAGS | {'-U', '--upgrade', '--no-deps', '--pre', '--user', '--system',
-                        '--dry-run', '--ignore-installed', '--force-reinstall', '--no-build',
-                        '--no-index', '--no-build-isolation', '--dev', '--optional', '--exact',
-                        '--reinstall', '--force', '--require-hashes', '--no-warn-script-location'}
 
 
 def strip_globals(words: list[str]) -> list[str] | None:
@@ -520,77 +549,78 @@ def strip_globals(words: list[str]) -> list[str] | None:
                 if not words:
                     return None
                 words.pop(0)
-        elif key not in FLAGS and not re.fullmatch(r'-[qv]+', key):
-            return None
     return words
 
 
 def install_reason(tokens: list[str], cwd: Path, caps: dict[str, Cap]) -> str | None:
     if not tokens:
         return None
+    mentioned = mentions_cap(' '.join(tokens), caps)
+    unreadable = 'capped package command must be a readable exact install' if mentioned else None
     executable = Path(tokens[0]).name
     rest = tokens[1:]
     if re.fullmatch(r'python[0-9.]*', executable):
         while rest and rest[0] in {'-I', '-s', '-E', '-B', '-u'}:
             rest = rest[1:]
         if rest[:2] != ['-m', 'pip']:
-            return None
+            return unreadable
         executable, rest = 'pip', rest[2:]
     installers = {'pip', 'pip3', 'uv', 'uvx', 'pipx', 'poetry', 'conda', 'mamba', 'micromamba'}
     if executable not in installers:
-        return None
+        return unreadable
     rest = strip_globals(rest)
     if rest is None:
-        return 'installer options cannot be resolved safely'
+        return unreadable
     if executable in {'conda', 'mamba', 'micromamba'}:
-        return 'conda/mamba resolution is unsupported; use the capped pip/uv paths'
+        return unreadable
     if executable == 'uvx':
-        return 'uvx executes downloaded code; use an explicitly pinned uv tool install'
+        return unreadable
     if not rest:
-        return None
+        return unreadable
     sub = rest.pop(0)
     if executable == 'uv' and sub in {'pip', 'tool'}:
         rest = strip_globals(rest)
         if not rest:
-            return 'unresolved uv installer subcommand'
+            return unreadable
         sub = rest.pop(0)
     if (executable == 'uv' and sub in {'sync', 'run', 'lock'}) or (executable == 'poetry' and sub == 'install') or (executable == 'pipx' and sub == 'run'):
-        return 'project/tool resolution is refused here; the gate must check its lock and sources'
+        return unreadable
     if sub not in {'install', 'add', 'inject', 'compile', 'sync'}:
-        return None
+        return unreadable
     checker = Checker(caps)
     path = cwd / '<install>'
     index = 0
+    verified = False
     while index < len(rest):
         word = rest[index]
         key, equal, value = word.partition('=')
         include = key in {'-r', '-c', '--requirement', '--constraint', '--constraints', '--build-constraint', '--build-constraints', '--with-requirements'}
         if not include and re.match(r'^-[rc].+', word):
             include, key, equal, value = True, word[:2], '=', word[2:]
-        if '$' in word or '`' in word or any(c in word for c in '*?'):
-            return 'unresolved shell expansion in installer input refused'
         if include or key in INSTALL_VALUES:
             if not equal:
                 index += 1
                 if index >= len(rest):
-                    return 'installer option value is missing'
+                    return unreadable
                 value = rest[index]
-            if '$' in value or '`' in value:
-                return 'unresolved installer option value refused'
             if include:
                 checker.include(path, 1, value)
+            elif mentions_cap(value, caps):
+                return unreadable
         elif word == '--':
             pass
         elif word.startswith('-'):
-            if word not in INSTALL_FLAGS and not re.fullmatch(r'-[qv]+', word):
-                return f'unmodelled installer option {key} refused'
+            if mentions_cap(word, caps):
+                return unreadable
         else:
             if executable == 'poetry' and '@' in word and '://' not in word:
                 name, version = word.split('@', 1)
                 word = name + '==' + version.removeprefix('==')
-            checker.requirement(path, 1, word, artifact=True)
+            verified = checker.requirement(path, 1, word) or verified
         index += 1
-    return checker.findings[0] if checker.findings else None
+    if checker.findings:
+        return checker.findings[0]
+    return None if verified else unreadable
 
 
 def repository_files(root: Path) -> list[Path]:
@@ -615,7 +645,7 @@ def main(argv=None, *, policy_path=DEFAULT_POLICY) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--emit-constraints', action='store_true')
-    parser.add_argument('--uv-project', action='store_true')
+    parser.add_argument('--uv-project', metavar='NAME', help='emit a complete constrained project')
     parser.add_argument('paths', nargs='*', type=Path)
     args = parser.parse_args(argv)
     try:
@@ -627,6 +657,8 @@ def main(argv=None, *, policy_path=DEFAULT_POLICY) -> int:
         print('\n'.join(constraints(caps)))
         return 0
     if args.uv_project:
+        print('[project]\nname = ' + json.dumps(args.uv_project))
+        print('version = "0.1.0"\nrequires-python = ">=3.12"\ndependencies = []\n')
         print('[tool.uv]\nconstraint-dependencies = ' + json.dumps(constraints(caps)))
         print('build-constraint-dependencies = ' + json.dumps(constraints(caps)))
         return 0

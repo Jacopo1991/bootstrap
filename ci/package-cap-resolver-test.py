@@ -97,21 +97,47 @@ class ResolverCaps(unittest.TestCase):
 
     def test_new_project_metadata_covers_lock_sync_run(self):
         project = self.base / 'pyproject.toml'
-        project.write_text('[project]\nname="cap-fixture"\nversion="0.0.0"\nrequires-python=">=3.12"\ndependencies=["bootstrap-cap-parent==1.0"]\n')
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(caps.main(['--uv-project', 'cap-fixture'], policy_path=self.policy), 0)
+        # The exact generator output is a standalone project uv accepts. No
+        # pre-existing [project] table is supplied by the test or left to uv init.
+        project.write_text(output.getvalue())
+        standalone = self.run_command([self.uv, 'lock', '--dry-run', *self.common])
+        self.assertEqual(standalone.returncode, 0, standalone.stderr)
+        self.assertIn('name = "cap-fixture"', project.read_text())
+        project.write_text(output.getvalue().replace('dependencies = []',
+                           'dependencies = ["bootstrap-cap-parent==1.0"]'))
+        constrained = project.read_text()
+        # Control: exactly this project without its generated workspace caps.
+        project.write_text(constrained.split('[tool.uv]')[0])
         control = self.run_command([self.uv, 'lock', '--dry-run', *self.common])
         self.assertEqual(control.returncode, 0, control.stderr)
         self.assertIn('bootstrap-cap-probe v2.0', control.stderr)
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            self.assertEqual(caps.main(['--uv-project'], policy_path=self.policy), 0)
-        project.write_text(project.read_text() + '\n' + output.getvalue())
-        self.assertIn('package-cap-check --uv-project > "$code/pyproject.toml"',
-                      (ROOT / 'home/dot_local/bin/executable_new-project').read_text())
+        project.write_text(constrained)
+        script = (ROOT / 'home/dot_local/bin/executable_new-project').read_text()
+        self.assertIn('uv_project=$(package-cap-check --uv-project "$name")', script)
+        self.assertIn('printf \'%s\\n\' "$uv_project" > "$code/pyproject.toml"', script)
         for command in ([self.uv, 'lock', '--dry-run', *self.common],
                         [self.uv, 'sync', '--dry-run', *self.common],
                         [self.uv, 'run', *self.common, '--', sys.executable, '--version']):
             with self.subTest(command=command[:2]):
                 self.assert_conflict(command)
+
+    def test_new_project_generator_failure_leaves_no_directories(self):
+        # Fail before git init, creating only disposable command stubs, never repos.
+        bins = self.base / 'stubs'
+        bins.mkdir()
+        for name in ('pre-commit', 'gitleaks', 'lychee', 'osv-scanner', 'package-cap-check'):
+            stub = bins / name
+            stub.write_text('#!/bin/sh\nexit ' + ('13' if name == 'package-cap-check' else '0') + '\n')
+            stub.chmod(0o755)
+        self.env['PATH'] = str(bins) + os.pathsep + self.env['PATH']
+        result = self.run_command(['bash', str(ROOT / 'home/dot_local/bin/executable_new-project'),
+                                   'create', 'cap-fixture', '--local-only'])
+        self.assertEqual(result.returncode, 13, result.stdout + result.stderr)
+        self.assertFalse((Path(self.env['HOME']) / 'dev_workspace/cap-fixture').exists())
+        self.assertFalse((Path(self.env['HOME']) / 'cortex/cortex-kb-cap-fixture').exists())
 
 
 if __name__ == '__main__':

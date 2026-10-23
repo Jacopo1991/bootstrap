@@ -27,10 +27,11 @@ create)
   for tool in pre-commit gitleaks lychee osv-scanner package-cap-check; do
     command -v "$tool" >/dev/null || { echo "$tool is not on PATH; run the bootstrap install first. Nothing changed." >&2; exit 1; }
   done
-  mkdir -p "$code" "$kb"
   # Project resolution ignores user uv.toml constraints. Generate workspace
-  # metadata from the same installed policy before the repository's first gate.
-  package-cap-check --uv-project > "$code/pyproject.toml"
+  # metadata before creating anything, so a generator failure leaves no skeleton.
+  uv_project=$(package-cap-check --uv-project "$name")
+  mkdir -p "$code" "$kb"
+  printf '%s\n' "$uv_project" > "$code/pyproject.toml"
   git -C "$code" init -q -b main
   git -C "$kb" init -q -b main
 

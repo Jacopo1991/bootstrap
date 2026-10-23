@@ -10,7 +10,7 @@ trap 'rm -rf "$tmp"' EXIT
 # The package cap gate command and its policy file come from this checkout, as chezmoi (which sets
 # the executable bit on apply) and install.sh place them.
 mkdir -p "$tmp/bin"
-printf '#!/usr/bin/env bash\nexec /usr/bin/python3 %q "$@"\n' "$ROOT/ci/package-cap-fixture.py" > "$tmp/bin/package-cap-check"
+printf '#!/usr/bin/env bash\nexec /usr/bin/python3 %q "$@"\n' "$ROOT/ci/package-cap-check.py" > "$tmp/bin/package-cap-check"
 chmod 0755 "$tmp/bin/package-cap-check"
 export PATH="$tmp/bin:$PATH"
 # backlog is a node script behind a mise shim; keep mise pointed at the real home.
