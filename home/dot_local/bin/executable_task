@@ -2681,7 +2681,7 @@ def start_locked(args, repo):
     record_path = state / "task.json"
     state.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
-    if record_path.exists() and not args.refresh and read_json_object(record_path).get("branch"):
+    if record_path.exists() and not args.refresh and (read_json_object(record_path).get("branch") or not read_json_object(record_path).get("plan")):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
@@ -3368,7 +3368,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
 def review(args):
     if args.final and not args.run:
         raise Stop("--final requires --run")
-    task = Task(resolve_repo(args.repo), args.id)
+    task = Task(resolve_repo(args.repo), args.id); load_record(task)
     with (task_state(task) / "review.lock").open("a") as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise Stop("Review already running; retry after it finishes.")

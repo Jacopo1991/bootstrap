@@ -759,6 +759,51 @@ class TaskTool(unittest.TestCase):
                          [('chain', 'failed'), ('chain', 'finished')])
         self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
+    def test_plan_budget_no_plan_start_refuses_missing_branch_without_refresh(self):
+        self.started()
+        record_path = self.state() / 'task.json'
+        original = record_path.read_text()
+        damaged = json.loads(original)
+        damaged.pop('branch')
+        record_path.write_text(json.dumps(damaged))
+        before = record_path.read_bytes()
+        output = self.raw_task('start', 'proj', '5', '--builder', 'codex', code=1)
+        self.assertIn('damaged; ask the PM to refresh', output)
+        self.assertEqual(record_path.read_bytes(), before)
+        self.assertEqual(self.run_rows(), [])
+        # Also pin the late record check, after initial plan binding validation.
+        record_path.write_text(original)
+        probe = self.home / 'damage-start-record.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import json, runpy
+            from pathlib import Path
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            prepare = api['prepare_environment']
+            def damage(*args):
+                prepare(*args)
+                path = Path({str(record_path)!r})
+                record = json.loads(path.read_text())
+                record.pop('branch')
+                path.write_text(json.dumps(record))
+            with mock.patch.dict(api['start'].__globals__, prepare_environment=damage):
+                raise SystemExit(api['main'](['start', 'proj', '5', '--builder', 'codex']))
+        '''))
+        result = subprocess.run([sys.executable, str(probe)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('damaged; ask the PM to refresh', result.stderr)
+        self.assertEqual(record_path.read_bytes(), before)
+        self.assertEqual(self.run_rows(), [])
+
+    def test_plan_budget_review_unstarted_task_stops_before_opening_lock(self):
+        self.assertFalse(self.state().exists())
+        output = self.raw_task('review', 'proj', '5', '--run', code=1)
+        self.assertIn('No pinned task record', output)
+        self.assertNotIn('Traceback', output)
+        self.assertFalse((self.state() / 'review.lock').exists())
+        self.assertEqual(self.run_rows(), [])
+
     def test_plan_budget_refresh_repairs_damaged_record_and_preserves_binding(self):
         self.started()
         record_path = self.state() / 'task.json'
