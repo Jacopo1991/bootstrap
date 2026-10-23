@@ -18,7 +18,7 @@ expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
             "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "package-cap-check", "verify-enable", "gate-browser",
             "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
-            "task-watch", "agentdev-shell-mcp"}
+            "task-watch", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
 assert drift.EXPECTED_BINARIES == expected
 allowed_helpers = {"task_limits.py", "task_routing.py", "task_usage.py", "task_lock.py"}
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
@@ -95,4 +95,17 @@ with tempfile.TemporaryDirectory() as temp:
     assert drift.osv_db_findings(home, now) == []
     os.utime(stamp, (now - 16 * 86400, now - 16 * 86400))
     assert drift.osv_db_findings(home, now) == ["osv-db-stale"]
-print("PASS: foreign npm, uv, and global CLI installs and stale OSV data are reported as drift")
+# The Claude app connectors (shell and Backlog.md MCP) are drift in an agent session.
+with tempfile.TemporaryDirectory() as temp:
+    home = Path(temp)
+    (home / ".claude").mkdir()
+    settings = home / ".claude/settings.json"
+    settings.write_text(json.dumps({"mcpServers": {"qmd": {"command": "qmd", "args": ["mcp"]}}}))
+    assert not drift.backlog_mcp_references(home) and not drift.shell_connector_references(home)
+    for server in ({"command": "wsl.exe", "args": ["--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-company"]},
+                   {"command": "/home/agent/.local/bin/agentdev-backlog-mcp", "args": ["cortex-kb-orw"]},
+                   {"command": "npx", "args": ["backlog.md", "mcp", "start"]}):
+        settings.write_text(json.dumps({"mcpServers": {"kb": server}}))
+        assert drift.backlog_mcp_references(home), server
+        assert not drift.shell_connector_references(home), server
+print("PASS: foreign npm, uv, and global CLI installs, stale OSV data and connector registrations are reported as drift")
