@@ -71,6 +71,8 @@ TASK_SPEC = importlib.util.spec_from_loader(TASK_LOADER.name, TASK_LOADER)
 TASK_MODULE = importlib.util.module_from_spec(TASK_SPEC)
 sys.dont_write_bytecode = True
 TASK_SPEC.loader.exec_module(TASK_MODULE)
+# In-process helpers must never inspect the real ~/cortex repositories either.
+TASK_MODULE.CORTEX = Path(audit_state.name) / 'cortex'
 
 STUBS = {
     "just": """#!/bin/sh
@@ -1947,6 +1949,101 @@ class TaskTool(unittest.TestCase):
                     else:
                         meta = json.loads((self.state() / 'review.json').read_text())
                         self.assertEqual((meta['reviewer'], meta['model']), (vendor, model))
+
+    def assert_knowledge_paths(self, name=None):
+        default = self.kb
+        if name is not None:
+            self.kb = default.with_name(name)
+            default.rename(self.kb)
+            # A decoy proves callers use the key even when the default exists.
+            default.mkdir()
+            (default / 'INTENT.md').write_text('Wrong knowledge repository\n')
+            self.commit_in(self.repo, '.task.toml', f'knowledge = "{name}"\n')
+        plan = self.kb / 'INTENT.md'
+        self.assertIn('plan: ok', self.raw_task('plan', 'proj'))
+        plan.write_text('---\ncurrent: m-1\nrealign_every: 1\n---\nNamed goal\n')
+        self.assertIn('plan not signed', self.task('start', 'proj', '5', code=1))
+        self.assertIn('plan: ok', self.raw_task('plan', 'proj', '--sign'))
+        self.assertIn('signed_hash:', plan.read_text())
+        wt, _ = self.started()
+        record = json.loads((self.state() / 'task.json').read_text())
+        self.assertEqual(record['title'], 'Add the b file')
+        self.assertEqual(record['milestone'], 'm-1')
+        self.assertEqual(len(list((wt / '.work/context/backlog/tasks').glob('t-5 *'))), 1)
+        self.assertIn('Named goal', (wt / '.work/context/INTENT.md').read_text())
+        plan.write_text(plan.read_text() + 'Changed\n')
+        self.assertIn('changed since sign-off', self.task('start', 'proj', '5', '--refresh', code=1))
+        self.raw_task('note', 'proj', '5', 'improve', 'Named improvement')
+        self.assertIn('Named improvement', (self.kb / 'improvements.md').read_text())
+        status = self.raw_task('status', 'proj')
+        self.assertIn('changed since sign-off', status)
+        self.assertIn('open improvements: 1', status)
+        runner = self.home / 'runner.md'
+        runner.write_text('1. 5: builder codex, model gpt-6-luna\n2. direct: builder codex, model gpt-6-luna\n')
+        self.assertIn('stop at direct', self.raw_task('runner-check', 'proj', str(runner)))
+        stub = self.home / 'bin/codex'
+        stub.write_text('#!/usr/bin/env python3\nimport pathlib,sys\n'
+                        'pathlib.Path("prompt-copy").write_text(sys.stdin.read())\n'
+                        'print("partial reply")\nsys.exit(1)\n')
+        stub.chmod(0o755)
+        output = self.raw_task('realign', 'proj', code=1)
+        reply = Path(output.strip().split('Reply: ', 1)[1])
+        state_name = name if name is not None else 'proj'
+        self.assertEqual(reply.parent, self.home / '.local/state/task' / state_name / 'realign')
+        self.assertEqual(reply.read_text(), 'partial reply\n')
+        self.assertIn('Named goal', (self.kb / 'prompt-copy').read_text())
+        self.assertFalse((self.kb / 'history/realign').exists())
+        stub.write_text(stub.read_text().replace('sys.exit(1)', 'sys.exit(0)'))
+        self.raw_task('realign', 'proj')
+        self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
+        if name is not None:
+            self.assertEqual(list(default.iterdir()), [default / 'INTENT.md'])
+
+    def test_knowledge_default_paths(self):
+        self.assert_knowledge_paths()
+
+    def test_knowledge_named_paths(self):
+        self.assert_knowledge_paths('cortex-core')
+
+    def test_knowledge_prefixed_key_keeps_state_name(self):
+        self.assert_knowledge_paths('cortex-kb-custom')
+
+    def test_knowledge_rejects_paths_and_symlinks(self):
+        config = self.repo / '.task.toml'
+        for value in ('../outside', '..', '.', '/tmp/outside', str(self.kb),
+                      'nested/repo', '', 1, [], True):
+            with self.subTest(value=value):
+                config.write_text('knowledge = ' + json.dumps(value) + '\n')
+                for command in (('plan', 'proj'), ('plan', 'proj', '--sign'),
+                                ('start', 'proj', '5', '--builder', 'codex'), ('realign', 'proj')):
+                    self.assertIn('knowledge must be a single repository name under ~/cortex',
+                                  self.raw_task(*command, code=1))
+        (self.home / 'outside').mkdir()
+        for target in (self.kb, self.home / 'outside', self.home / 'missing'):
+            with self.subTest(target=target):
+                link = self.kb.with_name('linked')
+                link.symlink_to(target, target_is_directory=True)
+                config.write_text('knowledge = "linked"\n')
+                self.assertIn('symlinked target', self.raw_task('plan', 'proj', code=1))
+                link.unlink()
+        config.unlink()
+        self.kb.rename(self.home / 'original-kb')
+        self.kb.symlink_to(self.home / 'original-kb', target_is_directory=True)
+        self.assertIn('symlinked target', self.raw_task('plan', 'proj', code=1))
+
+    def test_knowledge_missing_repo_keeps_plan_exemption(self):
+        for name in (None, 'missing'):
+            with self.subTest(name=name):
+                if name is None:
+                    self.kb.rename(self.home / 'unused-kb')
+                else:
+                    (self.repo / '.task.toml').write_text(f'knowledge = "{name}"\n')
+                with mock.patch.object(TASK_MODULE, 'CORTEX', self.home / 'cortex'):
+                    task = TASK_MODULE.Task(self.repo, '5')
+                    TASK_MODULE.check_plan(task)
+                self.assertIn('No Backlog.md task', self.task('start', 'proj', '5', code=1))
+                self.task('start', 'proj', 'direct-' + (name or 'default'))
+                self.assertNotIn('plan: stop:', self.raw_task('status', 'proj'))
 
     def test_plan_refusals_exceptions_and_resume(self):
         plan = self.kb / 'INTENT.md'

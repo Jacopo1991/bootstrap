@@ -417,6 +417,17 @@ def real_worktree(repo: Path, path: Path) -> bool:
     return path.resolve() in listed and path.resolve() != repo.resolve()
 
 
+def knowledge_repo(repo):
+    config = task_config(repo)
+    name = config.get("knowledge", f"cortex-kb-{repo.name}")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise Stop(".task.toml knowledge must be a single repository name under ~/cortex; paths and '..' are refused.")
+    kb = CORTEX / name
+    if CORTEX.is_symlink() or kb.is_symlink():
+        raise Stop(".task.toml knowledge must not use a symlinked target under ~/cortex.")
+    return kb
+
+
 class Task:
     """A Backlog.md task (T-32) or a plain name."""
 
@@ -424,7 +435,7 @@ class Task:
         match = re.fullmatch(r"(?i)t?-?(\d+)", ident)
         self.repo = repo
         self.number = int(match.group(1)) if match else None
-        self.kb = CORTEX / f"cortex-kb-{repo.name}"
+        self.kb = knowledge_repo(repo)
         self.title = ""
         if self.number is not None:
             self.name = f"t{self.number}"
@@ -647,7 +658,7 @@ def decision_changed(kb, name, before="HEAD", after=None):
 
 
 def plan_info(repo):
-    kb = CORTEX / f"cortex-kb-{repo.name}"
+    kb = knowledge_repo(repo)
     path = kb / "INTENT.md"
     text = path.read_bytes().decode() if path.is_file() else ""
     current = frontmatter_value(text, "current").split(" #", 1)[0].strip()
@@ -766,10 +777,11 @@ def plan(args):
 
 
 def realign(args):
-    info = plan_info(resolve_repo(args.repo))
+    repo = resolve_repo(args.repo)
+    info = plan_info(repo)
     if not info["path"].is_file():
         raise Stop("Create INTENT.md before realignment")
-    task_lock.work(HOME, resolve_repo(args.repo))
+    task_lock.work(HOME, repo)
     prompt = ("Read-only drift review. Answer with Verdict: on plan | drifted | plan unclear, "
               "then evidence per merged task: does it serve current and its pass test; contradictions "
               "between INTENT, STATUS and decisions; and what the founder must decide. "
@@ -780,7 +792,7 @@ def realign(args):
     prompt += "\n## Tasks merged since sign-off\n" + "\n".join(info["merged"])
     directory = info["kb"] / "history/realign"
     reply = directory / ("realign-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".md")
-    state = HOME / ".local/state/task" / info["kb"].name.removeprefix("cortex-kb-") / "realign"
+    state = HOME / ".local/state/task" / task_config(repo).get("knowledge", repo.name) / "realign"
     state.mkdir(parents=True, exist_ok=True)
     failed_reply = state / reply.name
     with tempfile.TemporaryDirectory(dir=state) as temporary:
@@ -2299,7 +2311,7 @@ def runner_check(args):
                 problems.append(f"line {number}: {error}")
     if task_lines == 0:
         problems.append("no task lines found (format: N. <id>: builder <b>, model <m> or tier <t>[, seed <s>][, after: <id>])")
-    if (CORTEX / f"cortex-kb-{repo.name}").exists():
+    if knowledge_repo(repo).exists():
         info = plan_info(repo)
         remaining = info["limit"] - len(info["merged"])
         if pending and len(pending) > remaining:
@@ -4373,8 +4385,13 @@ def status(args):
             names = f"unavailable ({error})"
         print("  gate variants: " + names)
         print("  " + quality_summary(repo))
-        if (CORTEX / f"cortex-kb-{repo.name}").exists():
-            print("  " + plan_verdict(plan_info(repo)))
+        try:
+            kb = knowledge_repo(repo)
+            if kb.exists():
+                print("  " + plan_verdict(plan_info(repo)))
+        except Stop as error:
+            kb = None
+            print(f"  plan: unavailable ({error})")
         for record in sorted((repo / '.work').glob('runner-*.json')):
             data = json.loads(record.read_text())
             unit = data['unit']
@@ -4510,9 +4527,9 @@ def status(args):
             attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
                              f"{request.get('text', '')}")
         attention += stale_worktree_lines(repo)
-        improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
+        improvements = kb / "improvements.md" if kb else None
         open_count = 0
-        if improvements.is_file():
+        if improvements and improvements.is_file():
             open_count = sum(bool(re.search(r"\|\s*open\s*$", line, re.I))
                              for line in improvements.read_text().splitlines())
         print("  Needs attention:")

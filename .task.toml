@@ -1,3 +1,4 @@
 # bootstrap tests use only temporary state and stubs; they share nothing with project gates,
 # so this repo never waits for the machine-wide gate lock (founder go 2026-10-18).
 exclusive_gate = false
+knowledge = "cortex-core"
