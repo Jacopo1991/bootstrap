@@ -234,6 +234,54 @@ class Manifests(unittest.TestCase):
         self.write("poetry.lock", lock.format("1.106.3"))
         self.refused("pyproject.toml", '[tool.poetry.dependencies]\nlitellm = "^1.100"\n', "poetry.lock pins 1.106.3")
 
+    def test_uv_dependency_tables_and_uncapped_requirements(self):
+        for key in ('constraint-dependencies', 'build-constraint-dependencies', 'override-dependencies'):
+            for requirement in ('setuptools==80.9.0', 'setuptools @ https://example.invalid/setuptools.whl'):
+                self.allowed('pyproject.toml', '[tool.uv]\n' + key +
+                             ' = [{requirement = "' + requirement + '", hashes = ["sha256:abc"]}]\n')
+            for requirement, allowed in (('litellm<=1.106.2', True),
+                                         ('litellm==1.106.2', True),
+                                         ('litellm==1.107.0', False), ('litellm', False)):
+                text = '[tool.uv]\n' + key + ' = [{requirement = "' + requirement + '", hashes = []}]\n'
+                if allowed:
+                    self.allowed('pyproject.toml', text)
+                else:
+                    self.refused('pyproject.toml', text, 'unverified uv')
+        for table, key in (('project', 'dependencies'), ('build-system', 'requires'),
+                           ('project.optional-dependencies', 'test'), ('dependency-groups', 'test'),
+                           ('tool.uv', 'dev-dependencies')):
+            for requirement, allowed in (('setuptools==80.9.0', True), ('litellm==1.106.2', True),
+                                         ('litellm==1.107.0', False), ('litellm', False)):
+                text = '[' + table + ']\n' + key + ' = [{requirement = "' + requirement + '", hashes = []}]\n'
+                if allowed:
+                    self.allowed('pyproject.toml', text)
+                else:
+                    self.refused('pyproject.toml', text)
+
+    def test_uv_workspace_member_uses_owning_root_lock(self):
+        self.write('pyproject.toml', '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["packages/excluded"]\n')
+        member = 'packages/member/pyproject.toml'
+        project = '[project]\nname="member"\ndependencies=["litellm>=1.100"]\n'
+        lock = '[[package]]\nname="litellm"\nversion="{}"\n'
+        self.write('uv.lock', lock.format('1.106.2'))
+        self.allowed(member, project)
+        self.refused('unrelated/pyproject.toml', project, 'no uv.lock or poetry.lock')
+        self.refused('packages/excluded/pyproject.toml', project, 'no uv.lock or poetry.lock')
+        self.write('uv.lock', lock.format('1.107.0'))
+        self.refused(member, project, 'uv.lock pins 1.107.0')
+        # A stale member lock must not hide the owning workspace's resolution.
+        self.write('packages/member/uv.lock', lock.format('1.106.2'))
+        self.refused(member, project, 'uv.lock pins 1.107.0')
+        self.write('uv.lock', lock.format('1.104.0'))
+        self.refused(member, project.replace('>=1.100', '>=1.106'), 'manifest/lock mismatch')
+
+    def test_pep723_preserves_uv_source_metadata(self):
+        for dependencies in ('[]', '["litellm==1.106.2"]'):
+            prefix = '# /// script\n# dependencies = ' + dependencies + '\n'
+            self.allowed('script.py', prefix + '# [tool.uv.sources]\n# numpy = {path="./numpy"}\n# ///\n')
+            self.refused('script.py', prefix + '# [tool.uv.sources]\n# litellm = {path="./local"}\n# ///\n',
+                         'alternate uv source refused')
+
     def test_lock_files(self):
         for name in ("uv.lock", "poetry.lock"):
             self.allowed(name, '[[package]]\nname = "requests"\nversion = "2.32.0"\n\n[[package]]\nname = "litellm"\nversion = "1.104.0"\n')
@@ -480,6 +528,21 @@ class Manifests(unittest.TestCase):
             self.allowed(name, 'LiteLLM==1.106.2 litellm:v1.104.0\n')
             self.refused(name, 'litellm==1.106.2 litellm==1.107.0\n', 'above the cap')
             self.refused(name, 'other/litellm:latest\n', 'is refused')
+
+    def test_container_version_must_end_the_word(self):
+        for name in ('Dockerfile', 'compose.yaml'):
+            for operand in ('"litellm==1.10"7.0', "'litellm==1.10'7.0",
+                            'litellm==1.10\\7.0', '"litellm==1.10""7.0"',
+                            'litellm==1.10\\\n7.0', '"litellm==1.10"${SUFFIX}',
+                            '"berriai/litellm:v1.10"7.0', 'litellm==1.10`echo 7.0`'):
+                with self.subTest(name=name, operand=operand):
+                    self.refused(name, 'RUN pip install ' + operand + '\n', 'version token')
+            for operand in ('"litellm==1.106.2"', "'litellm==1.106.2'", 'litellm==1.106.2',
+                            '["litellm==1.106.2"]', '[litellm==1.106.2, 6379]',
+                            'litellm==1.106.2 && echo done', '"litellm==1.106.2"; echo done',
+                            '"berriai/litellm:v1.106.2"'):
+                with self.subTest(name=name, operand=operand):
+                    self.allowed(name, 'RUN ' + operand + '\n')
 
     def test_container_comments_and_numeric_compose_lists(self):
         for name in ('Dockerfile', 'compose.yaml'):

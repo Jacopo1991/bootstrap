@@ -36,13 +36,19 @@ class ResolverCaps(unittest.TestCase):
                     'UV_CACHE_DIR': str(self.base / 'cache'), 'UV_TOOL_DIR': str(self.base / 'tools'),
                     'UV_TOOL_BIN_DIR': str(self.base / 'bin'), 'UV_PYTHON_DOWNLOADS': 'never',
                     'PIP_DISABLE_PIP_VERSION_CHECK': '1'}
-        for name, version, requires in [('bootstrap_cap_probe', '2.0', ''),
+        for name, version, requires in [('bootstrap_cap_probe', '1.0', ''),
+                                        ('bootstrap_cap_probe', '2.0', ''),
+                                        ('bootstrap_cap_parent', '0.5', 'Requires-Dist: bootstrap-cap-probe==1.0\n'),
                                         ('bootstrap_cap_parent', '1.0', 'Requires-Dist: bootstrap-cap-probe==2.0\n')]:
             info = f'{name}-{version}.dist-info'
             with zipfile.ZipFile(self.wheels / f'{name}-{version}-py3-none-any.whl', 'w') as wheel:
                 wheel.writestr(f'{info}/METADATA', f'Metadata-Version: 2.3\nName: {name}\nVersion: {version}\n{requires}')
                 wheel.writestr(f'{info}/WHEEL', 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n')
                 wheel.writestr(f'{info}/RECORD', '')
+                wheel.writestr(f'{name}.py', 'from importlib.metadata import version\ndef main():\n'
+                               '    print("bootstrap-cap-probe==" + version("bootstrap-cap-probe"))\n')
+                wheel.writestr(f'{info}/entry_points.txt',
+                               f'[console_scripts]\nbootstrap-cap-parent = {name}:main\n')
         self.policy = self.base / 'package-caps.toml'
         self.policy.write_text('[packages.bootstrap-cap-probe]\nmax_version="1.0"\nreason="regression fixture"\nsource="https://example.invalid"\n')
         self.constraint = self.base / 'constraints.txt'
@@ -81,19 +87,41 @@ class ResolverCaps(unittest.TestCase):
         for key in ('UV_CONSTRAINT', 'UV_BUILD_CONSTRAINT'):
             self.assertIn(f'export {key}=/usr/local/lib/agent-policy/constraints.txt', profile)
             self.env[key] = str(self.constraint)
-        for requirement in ('bootstrap-cap-probe==2.0', 'bootstrap-cap-parent==1.0'):
-            requirements = self.base / 'requirements.txt'
-            requirements.write_text(requirement + '\n')
-            commands = [
-                [self.pip, 'install', '--dry-run', '--ignore-installed', '--no-index', '--only-binary=:all:', '--find-links', str(self.wheels), requirement],
-                [self.uv, 'pip', 'install', '--dry-run', '--python', sys.executable, *self.common, requirement],
-                [self.uv, 'pip', 'compile', *self.common, str(requirements)],
-                [self.uv, 'tool', 'install', '--python', sys.executable, *self.common, requirement],
-                [self.uvx, '--python', sys.executable, *self.common, '--from', requirement, 'bootstrap-cap-parent'],
-            ]
-            for command in commands:
-                with self.subTest(command=command[:3], requirement=requirement):
-                    self.assert_conflict(command)
+        for mode, requirements in (
+                ('conflict', ('bootstrap-cap-probe==2.0', 'bootstrap-cap-parent==1.0')),
+                ('allowed', ('bootstrap-cap-probe==1.0', 'bootstrap-cap-parent==0.5')),
+                ('unconstrained', ('bootstrap-cap-probe==2.0', 'bootstrap-cap-parent==1.0'))):
+            if mode == 'unconstrained':
+                config.write_text('[global]\ntimeout = 42\n')
+                for key in ('UV_CONSTRAINT', 'UV_BUILD_CONSTRAINT'):
+                    self.env.pop(key)
+            for index, requirement in enumerate(requirements):
+                # Each positive control resolves afresh and installs only fixture
+                # wheels into its own disposable tool environment.
+                self.env['UV_TOOL_DIR'] = str(self.base / f'tools-{mode}-{index}')
+                self.env['UV_TOOL_BIN_DIR'] = str(self.base / f'bin-{mode}-{index}')
+                self.env['UV_CACHE_DIR'] = str(self.base / f'cache-{mode}-{index}')
+                manifest = self.base / 'requirements.txt'
+                manifest.write_text(requirement + '\n')
+                commands = [
+                    [self.pip, 'install', '--dry-run', '--ignore-installed', '--no-index', '--only-binary=:all:', '--find-links', str(self.wheels), requirement],
+                    [self.uv, 'pip', 'install', '--dry-run', '--python', sys.executable, *self.common, requirement],
+                    [self.uv, 'pip', 'compile', *self.common, str(manifest)],
+                    [self.uv, 'tool', 'install', '--python', sys.executable, *self.common, requirement],
+                    [self.uvx, '--python', sys.executable, *self.common, '--from', requirement, 'bootstrap-cap-parent'],
+                ]
+                for command in commands:
+                    with self.subTest(mode=mode, command=command[:3], requirement=requirement):
+                        if mode == 'conflict':
+                            self.assert_conflict(command)
+                        else:
+                            result = self.run_command(command)
+                            output = result.stdout + result.stderr
+                            self.assertEqual(result.returncode, 0, (command, output))
+                            expected_version = '1.0' if mode == 'allowed' else '2.0'
+                            self.assertRegex(output.replace('_', '-'),
+                                             r'bootstrap-cap-probe(?:==|[ -]v?)' +
+                                             expected_version.replace('.', r'\.'))
 
     def test_new_project_metadata_covers_lock_sync_run(self):
         project = self.base / 'pyproject.toml'

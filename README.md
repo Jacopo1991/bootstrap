@@ -1221,11 +1221,15 @@ The rule rests on resolver constraints plus the offline repository gate:
   Dockerfiles, compose YAML, setup metadata and PEP 723 scripts. Bootstrap uses
   `python3 ci/package-cap-check.py` with its checkout's policy before installation.
   It checks only capped names, follows readable local includes, and checks pins,
-  sources and manifest/lock consistency. Pyproject ranges need an adjacent allowed
-  lock pin. Files named `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
+  sources and manifest/lock consistency, including PEP 723 uv sources and uv's
+  hash-bearing dependency tables. Pyproject ranges need an allowed lock pin in the
+  same project (the workspace-root `uv.lock` for uv members).
+  Files named `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
   `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository, use a
   text rule: every whole-token capped name must be immediately followed by an
   allowed exact pin (`litellm==1.106.2`) or image tag (`litellm:v1.106.2`).
+  A version must end the word; quote or escape concatenation after a safe version
+  prefix is refused.
   Letters, digits, `_`, `.` and `-` join tokens, so `langchain-litellm` is ignored.
   Comments and heredocs count; shell/YAML syntax, variables and `dockerfile:`
   references are not interpreted. Violations report the file and line;

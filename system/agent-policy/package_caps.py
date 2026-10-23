@@ -141,6 +141,13 @@ def parse_requirement(text: str) -> tuple[str, str | None, bool] | None:
     return normalize(req.name), version, version is not None
 
 
+def dependency_text(item) -> str:
+    """uv build constraints may carry a requirement alongside archive hashes."""
+    if isinstance(item, dict):
+        item = item.get('requirement', '')
+    return item if isinstance(item, str) else ''
+
+
 def poetry_spec(value) -> str | None:
     if isinstance(value, dict):
         if set(value) & {'git', 'path', 'url', 'file', 'source'}:
@@ -313,6 +320,26 @@ class Checker:
                     else:
                         self.requirement(path, 1, name + entry.get('version', ''))
 
+    @staticmethod
+    def uv_lock_path(path: Path) -> Path:
+        """Use a member's owning workspace lock, without leaving its repository."""
+        project = path.parent.resolve()
+        for parent in (project, *project.parents):
+            manifest = parent / 'pyproject.toml'
+            if manifest.is_file():
+                data = tomllib.loads(manifest.read_text(encoding='utf-8'))
+                workspace = data.get('tool', {}).get('uv', {}).get('workspace')
+                if workspace is not None:
+                    member = project == parent or any(
+                        project in parent.glob(pattern) for pattern in workspace.get('members', []))
+                    excluded = any(project in parent.glob(pattern) for pattern in workspace.get('exclude', []))
+                    if member and not excluded:
+                        return parent / 'uv.lock'
+                    break
+            if (parent / '.git').exists():
+                break
+        return path.with_name('uv.lock')
+
     def pyproject_data(self, path: Path, data: dict) -> None:
         project = data.get('project', {})
         uv = data.get('tool', {}).get('uv', {})
@@ -323,14 +350,14 @@ class Checker:
         declared: list[tuple[str, str | None]] = []
         for group in groups:
             for item in group:
-                if isinstance(item, str):
+                item = dependency_text(item)
+                if mentions_cap(item, self.caps):
                     try:
                         req = Requirement(item)
                         if normalize(req.name) in self.caps:
                             declared.append((normalize(req.name), None if req.url else str(req.specifier)))
                     except InvalidRequirement:
-                        if any(c.name in item.lower() for c in self.caps.values()):
-                            self.error(path, 1, 'unverifiable dependency declaration')
+                        self.error(path, 1, 'unverifiable dependency declaration')
         poetry = data.get('tool', {}).get('poetry', {})
         tables = [poetry.get('dependencies', {}), poetry.get('dev-dependencies', {})]
         tables += [g.get('dependencies', {}) for g in poetry.get('group', {}).values()]
@@ -339,7 +366,8 @@ class Checker:
         for name, source in uv.get('sources', {}).items():
             if normalize(name) in self.caps:
                 self.error(path, 1, f'{name}: alternate uv source refused')
-        locks = {n: self.lock_entries(path.with_name(n)) for n in ('uv.lock', 'poetry.lock') if path.with_name(n).is_file()}
+        lock_paths = [self.uv_lock_path(path), path.with_name('poetry.lock')]
+        locks = {p.name: self.lock_entries(p) for p in lock_paths if p.is_file()}
         for name, spec in declared:
             cap = self.caps[name]
             if spec is None:
@@ -368,7 +396,10 @@ class Checker:
         # Constraints are caps rather than installation declarations, and do not
         # themselves need a lock. Reject rules that could relax this policy.
         for key in ('constraint-dependencies', 'build-constraint-dependencies', 'override-dependencies'):
-            for text in uv.get(key, []):
+            for item in uv.get(key, []):
+                text = dependency_text(item)
+                if not mentions_cap(text, self.caps):
+                    continue
                 req = Requirement(text)
                 name = normalize(req.name)
                 if name in self.caps:
@@ -391,6 +422,10 @@ class Checker:
                 pin = re.match(r'''(==|:)([^\s"'`,;\[\]{}()<>|&\\]+)''', text[match.end():])
                 if pin is None:
                     reason = cap.version_reason(None)
+                elif not re.match(r'''["'\])}]*(?:\s|$|[,;<>|&])''', text[match.end() + pin.end():]):
+                    # Quotes/escapes can concatenate a safe prefix into a different
+                    # version. A closing delimiter must actually end the word.
+                    reason = 'version token does not end the word; quote/escape concatenation refused'
                 elif pin[1] == '==':
                     reason = cap.version_reason(pin[2])
                 else:
@@ -430,7 +465,8 @@ class Checker:
                     self.error(path, 1, 'executable setup.py dependency declaration cannot be evaluated')
                 for block in re.findall(r'(?m)^# /// script\s*\n(.*?)^# ///\s*$', text, re.S):
                     metadata = '\n'.join(row.removeprefix('#').removeprefix(' ') for row in block.splitlines())
-                    self.pyproject_data(path, {'project': tomllib.loads(metadata)})
+                    data = tomllib.loads(metadata)
+                    self.pyproject_data(path, {'project': data, 'tool': data.get('tool', {})})
                 if name != 'setup.py' and '# /// script' not in text:
                     return False
             else:
