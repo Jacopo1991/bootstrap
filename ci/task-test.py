@@ -172,7 +172,7 @@ REVIEW_STUB = """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 work = pathlib.Path.cwd() / '.work'
 (work / 'reviewer-call.json').write_text(json.dumps({
-    'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': sys.stdin.read(),
+    'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': sys.stdin.read(), 'pid': os.getpid(),
     'git_optional_locks': os.environ.get('GIT_OPTIONAL_LOCKS'),
     'env_names': sorted(os.environ),
 }))
@@ -200,7 +200,8 @@ if count == 1:
     reply = os.environ.get('REVIEW_STUB_FIRST_REPLY', reply)
 print(reply, end='', flush=True)
 print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
-time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
+delay = os.environ.get('REVIEW_STUB_DELAY', '0')
+time.sleep(float(os.environ.get('REVIEW_STUB_FIRST_DELAY', delay) if count == 1 else delay))
 code = os.environ.get('REVIEW_STUB_EXIT', '0')
 sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else code))
 """
@@ -689,8 +690,71 @@ class TaskTool(unittest.TestCase):
         self.assertIn('after creation', result.stderr)
         rows = self.run_rows()
         self.assertEqual([r['outcome'] for r in rows], ['failed'])
-        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        record = json.loads((self.state() / 'task.json').read_text())
+        self.assertEqual(record['plan'], 'chain')
+        self.assertEqual(record['revision'], TASK_MODULE.record_revision(record))
+        self.assertIn('Conflicting plan', self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'other', code=1))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex')
         self.assertEqual([r['outcome'] for r in self.run_rows()], ['failed', 'finished'])
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
+        self.stub_models()
+        wt = self.repo / '.worktrees/t5'
+        (wt / '.work/prompt.md').write_text('task')
+        self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', code=1))
+        self.assertFalse((wt / '.work/model-call.json').exists())
+
+    def test_plan_budget_failed_worktree_creation_keeps_binding_for_retry(self):
+        self.budget_fixture(points=1)
+        probe = self.home / 'failed-worktree.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import runpy
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            original = api['git']
+            def git(repo, *args):
+                if args[:2] == ('worktree', 'add'): raise RuntimeError('worktree creation failed')
+                return original(repo, *args)
+            with mock.patch.dict(api['start'].__globals__, git=git):
+                api['main'](['start', 'proj', '5', '--builder', 'codex', '--plan', 'chain'])
+        '''))
+        result = subprocess.run([sys.executable, str(probe)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('worktree creation failed', result.stderr)
+        self.assertFalse((self.repo / '.worktrees/t5').exists())
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
+        self.assertEqual([r['outcome'] for r in self.run_rows()], ['failed'])
+        self.assertIn('Conflicting plan', self.raw_task('start', 'proj', '5', '--builder', 'codex', code=1,
+                                                     env=dict(self.env, TASK_PLAN='other')))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex')
+        self.assertEqual([(r['plan'], r['outcome']) for r in self.run_rows()],
+                         [('chain', 'failed'), ('chain', 'finished')])
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_refresh_repairs_damaged_record_and_preserves_binding(self):
+        self.started()
+        record_path = self.state() / 'task.json'
+        self.budget_fixture(points=1)
+        for planned in (False, True):
+            with self.subTest(planned=planned):
+                if planned:
+                    self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain', '--refresh')
+                record = json.loads(record_path.read_text())
+                record['revision'] = 'damaged'
+                record_path.write_text(json.dumps(record))
+                self.assertIn('damaged', self.raw_task('start', 'proj', '5', '--builder', 'codex', code=1))
+                if planned:
+                    before = record_path.read_bytes()
+                    self.assertIn('Conflicting plan', self.raw_task('start', 'proj', '5', '--builder', 'codex',
+                                                                 '--refresh', '--plan', 'other', code=1))
+                    self.assertEqual(record_path.read_bytes(), before)
+                self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+                repaired = json.loads(record_path.read_text())
+                self.assertEqual(repaired['revision'], TASK_MODULE.record_revision(repaired))
+                self.assertEqual(repaired.get('plan'), 'chain' if planned else None)
+                self.assertEqual(len(self.run_rows()), 2 if planned else 0)
+        self.assertTrue(all(r['plan'] == 'chain' for r in self.run_rows()))
         self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
     def test_plan_budget_lane_and_review_keys_follow_commits(self):
@@ -852,6 +916,59 @@ class TaskTool(unittest.TestCase):
         self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
 
+    def test_plan_budget_fallback_refused_at_spawn_preserves_primary_charge(self):
+        wt, _ = self.started()
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        probe = self.home / 'refused-fallback.py'
+        for rule in ('expired', 'outside allowed', 'review disabled'):
+            with self.subTest(rule=rule):
+                plan = self.budget_fixture(points=10)
+                log = self.home / '.local/state/task/runs.jsonl'
+                log.unlink(missing_ok=True)
+                for pending in log.parent.glob('pending-runs/*.json'): pending.unlink()
+                for name in ('reviewer-count', 'reviewer-call.json'):
+                    (wt / '.work' / name).unlink(missing_ok=True)
+                mutation = {
+                    'expired': 'plan.write_text(plan.read_text().replace(\'expires = "\', \'expires = "2000-01-01T00:00:00Z" # \'))',
+                    'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
+                    'review disabled': "\n".join([
+                        "for number in range(2):",
+                        "    row = api['task_usage'].run_log(api['HOME'], plan='chain', repo='proj', task='seed-' + str(number), kind='review', vendor='codex', commit=str(number))",
+                        "    api['task_usage'].run_log(api['HOME'], row, 'failed')",
+                    ]),
+                }[rule]
+                probe.write_text(textwrap.dedent(f'''\
+                    import runpy, sys
+                    from pathlib import Path
+                    from unittest import mock
+                    api = runpy.run_path({str(TOOL)!r})
+                    original = api['atomic_json']
+                    plan = Path({str(plan)!r})
+                    changed = False
+                    def delayed(path, data):
+                        global changed
+                        original(path, data)
+                        if path.name == 'review-run.json' and data.get('usage_run', {{}}).get('vendor') == 'codex' and not changed:
+                            changed = True
+                ''') + textwrap.indent(mutation, '        ') + '\n' +
+                    "with mock.patch.dict(api['review'].__globals__, atomic_json=delayed):\n" +
+                    "    sys.exit(api['main'](['review', 'proj', '5', '--run', '--plan', 'chain']))\n")
+                result = subprocess.run([sys.executable, str(probe)], cwd=self.home,
+                                        env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                                                 REVIEW_STUB_FIRST_EXIT='2'), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(rule, result.stderr)
+                self.assertEqual((wt / '.work/reviewer-count').read_text(), '1', 'fallback never ran')
+                rows = self.run_rows()
+                self.assertEqual((rows[0]['vendor'], rows[0]['outcome']), ('claude', 'failed'))
+                reservations = list(log.parent.glob('pending-runs/*.json'))
+                self.assertEqual(len(reservations), 1)
+                fallback = json.loads(reservations[0].read_text())
+                self.assertEqual(fallback['replaces'], rows[0]['id'])
+                self.assertFalse(fallback.get('invoked', False))
+                self.assertIn('claude used 1 left 9', self.raw_task('plan-budget', 'chain'))
+
     def test_plan_budget_lane_rechecks_expiry_scope_and_breaker_at_model_spawn(self):
         wt, _ = self.started()
         self.stub_models()
@@ -951,6 +1068,54 @@ class TaskTool(unittest.TestCase):
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
         self.assertEqual(len(self.run_rows()), 1)
 
+    def test_plan_budget_review_child_keeps_execution_lock_after_parent_is_killed(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=10)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                for name in ('reviewer-count', 'reviewer-call.json'):
+                    (wt / '.work' / name).unlink(missing_ok=True)
+                env = dict(self.env, REVIEW_STUB_REPLY=reply, REVIEW_STUB_DELAY='30')
+                if fallback:
+                    env.update(REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                               REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_FIRST_DELAY='0')
+                parent = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run', '--plan', 'chain'],
+                                          env=env, cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                child = None
+                try:
+                    counter = wt / '.work/reviewer-count'
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        if counter.exists() and counter.read_text() == ('2' if fallback else '1'): break
+                        if parent.poll() is not None:
+                            output, errors = parent.communicate()
+                            self.fail(output + errors)
+                        time.sleep(.02)
+                    else:
+                        self.fail('reviewer did not start')
+                    child = json.loads((wt / '.work/reviewer-call.json').read_text())['pid']
+                    parent.kill()
+                    parent.communicate(timeout=10)
+                    os.kill(child, 0)
+                    before = {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()}
+                    self.assertIn('Review already running', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1))
+                    self.assertEqual(before, {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()})
+                    self.assertEqual(counter.read_text(), '2' if fallback else '1')
+                finally:
+                    if parent.poll() is None: parent.kill(); parent.communicate()
+                    if child is None and (wt / '.work/reviewer-call.json').exists():
+                        child = json.loads((wt / '.work/reviewer-call.json').read_text())['pid']
+                    if child is not None:
+                        try: os.kill(child, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                    self.wait_project_lock_free()
+                with (self.state() / 'review.lock').open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_plan_budget_file_points_and_lifetime_bounds(self):
         now = datetime.now(timezone.utc)
         class Clock(datetime):
@@ -970,6 +1135,9 @@ class TaskTool(unittest.TestCase):
                 (valid.replace((now + timedelta(days=31)).isoformat(), (now + timedelta(days=31, seconds=1)).isoformat()), '31 days'),
                 (f'created = "{(now - timedelta(seconds=1)).isoformat()}"\n' + valid, '31 days'),
                 ('created = "bad"\n' + valid, '31 days'),
+                (f'created = "{(now + timedelta(seconds=1)).isoformat()}"\n' + valid, 'future'),
+                ('created = "9999-01-01T00:00:00Z"\n' + valid.replace((now + timedelta(days=31)).isoformat(),
+                                                                               '9999-01-20T00:00:00Z'), 'future'),
             ):
                 with self.subTest(message=message):
                     path.write_text(invalid)

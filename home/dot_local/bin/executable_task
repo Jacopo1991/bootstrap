@@ -581,7 +581,7 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
         expiry = plan_time(str(plan["expires"]))
         if plan["id"] != ident or not expiry or expiry.utcoffset().total_seconds() != 0: raise ValueError("id or UTC expiry")
         created = plan_time(str(plan.get("created", utc_now())))
-        if not created or created.utcoffset().total_seconds() != 0 or expiry - created > timedelta(days=31): raise ValueError("expiry exceeds 31 days from created (or now)")
+        if not created or created.utcoffset().total_seconds() != 0 or created > datetime.now(timezone.utc) or expiry - created > timedelta(days=31): raise ValueError("created must not be future; expiry must be within 31 days from created (or now)")
         if set(plan["points"]) != set(task_usage.VENDORS) or not all(type(n) is int and 0 <= n <= 200 for n in plan["points"].values()): raise ValueError("integer points per vendor must be between 0 and 200")
         if not isinstance(plan["allowed"], dict) or not all(isinstance(v, list) and all(isinstance(t, str) for t in v) for v in plan["allowed"].values()): raise ValueError("allowed must map repositories to task lists")
         root = HOME / ".local/state/task"; log = root / "runs.jsonl"
@@ -592,8 +592,8 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
             rows = [json.loads(line) for line in stream] if stream else []
             rows += [json.loads(p.read_text()) for p in (root / "pending-runs").glob("*.json") if not any(r.get("run_id", r["id"]) == p.stem for r in rows if r.get("type") == "run")]
             rows = [r for r in rows if r.get("plan") == ident]
-            # A fallback transfers only its failed primary's draw, retaining both attempts.
-            replaced = {r.get("replaces") for r in rows}
+            # Transfer the primary draw only when its fallback is admitted to spawn.
+            replaced = {r.get("replaces") for r in rows if r.get("invoked")}
             charged = [r for r in rows if r["id"] not in replaced]
             used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in charged if r.get("vendor") == v and r.get("type") != "outcome"}) for v in task_usage.VENDORS}
             last, disabled = {}, set()
@@ -612,7 +612,6 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
                 if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
                 prior = next((r for r in reversed(charged) if all(r.get(k) == fields.get(k) for k in ("repo", "task", "kind", "commit", "vendor")) and r.get("type") != "outcome"), None)
                 if (not prior or reserve is False) and used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
-                # Revalidate and activate a reservation at spawn; completed attempts never recur.
                 if isinstance(reserve, dict): reserve["invoked"] = True; atomic_json(root / "pending-runs" / (reserve["id"] + ".json"), reserve); return reserve
                 if prior and reserve and not prior.get("outcome") and not prior.get("invoked"): return prior
                 return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
@@ -621,10 +620,12 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
         raise Stop(f"Missing or malformed plan/log {ident}: {error}") from error
 def budget_run(**fields):
     return plan_budget(os.environ["TASK_PLAN"], fields) if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, **fields)
-def bind_plan(task, args):
-    choices = {value for value in ((load_record(task, required=False) or {}).get("plan"), os.environ.get("TASK_PLAN"), getattr(args, "plan", None)) if value}
+def bind_plan(task, args, save=False):
+    record = read_json_object(task_state(task) / "task.json") if getattr(args, "refresh", False) else (load_record(task, required=False) or {})
+    choices = {value for value in (record.get("plan"), os.environ.get("TASK_PLAN"), getattr(args, "plan", None)) if value}
     if len(choices) > 1: raise Stop(f"Conflicting plan for {task.id}: {sorted(choices)}")
     if choices: os.environ["TASK_PLAN"] = choices.pop()
+    if save and os.environ.get("TASK_PLAN"): record["plan"] = os.environ["TASK_PLAN"]; record["revision"] = record_revision(record); atomic_json(task_state(task) / "task.json", record)
 def decision_content(text):
     """Ignore only the frontmatter status field."""
     lines = text.splitlines()
@@ -2556,6 +2557,7 @@ def start_locked(args, repo):
             print(f"warning: environment link {candidate} does not resolve.")
     for name in args.seed: seed_source(repo, name)
     task_tier(task_text, args.tier)
+    if os.environ.get("TASK_PLAN"): bind_plan(task, args, save=True)
     if task.path.exists():
         task.worktree()
         task_lock.work(HOME, repo, sha(task.path, "HEAD"))
@@ -2600,7 +2602,7 @@ def start_locked(args, repo):
     record_path = state / "task.json"
     state.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
-    if record_path.exists() and not args.refresh:
+    if record_path.exists() and not args.refresh and read_json_object(record_path).get("branch"):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
@@ -2627,8 +2629,6 @@ def start_locked(args, repo):
             report.write_text("# Task report\n\n## What changed\n\n(fill in)\n\n## How I verified\n\n(fill in)\n\n## Criteria\n\n" +
                               "\n".join(f"#{item['number']} not met: (fill in)" for item in criteria) +
                               "\n\n## Check\n\n(fill in)\n\n## Noticed, not done\n\n(none)\n")
-    if os.environ.get("TASK_PLAN") and record.get("plan") != os.environ["TASK_PLAN"]:
-        record["plan"] = os.environ["TASK_PLAN"]; record["revision"] = record_revision(record); atomic_json(record_path, record)
     seeds = list(dict.fromkeys(record.get("seeds", []) + args.seed))
     if seeds != record.get("seeds", []):
         record["seeds"] = seeds
@@ -3259,7 +3259,7 @@ def parse_review_reply(text, criteria):
     return verdict, commit, reviewer, judgments
 
 
-def run_reviewer(command, path, prompt_file, reply_file, replaces=None):
+def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=None):
     try:
         timeout = int(os.environ.get("TASK_REVIEW_TIMEOUT", "900"))
     except ValueError:
@@ -3283,7 +3283,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None):
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
-                                       pass_fds=task_lock.descriptors(),
+                                       pass_fds=task_lock.descriptors() + ((lock_fd,) if lock_fd is not None else ()),
                                        stderr=errors, start_new_session=True)
             task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
@@ -3321,7 +3321,7 @@ def review(args):
     with (task_state(task) / "review.lock").open("a") as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError: raise Stop("Review already running; retry after it finishes.")
-        return review_locked(args)
+        args.review_lock_fd = lock.fileno(); return review_locked(args)
 
 
 def review_locked(args):
@@ -3461,7 +3461,7 @@ def review_locked(args):
         used_fallback = False
         for attempt in range(2):
             try:
-                run_reviewer(command, path, prompt_file, reply_file)
+                run_reviewer(command, path, prompt_file, reply_file, lock_fd=args.review_lock_fd)
             except UsageLimit:
                 if used_fallback:
                     raise
@@ -3475,7 +3475,7 @@ def review_locked(args):
                     "vendor": reviewer_route[0], "model": reviewer_route[1],
                     "fallback_from": list(previous_route)})
                 command = reviewer_command(*reviewer_route)
-                run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if os.environ.get("TASK_PLAN") else None)
+                run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if os.environ.get("TASK_PLAN") else None, lock_fd=args.review_lock_fd)
             head = sha(path, "HEAD")
             try:
                 verdict, commit, _, _ = parse_review_reply(
