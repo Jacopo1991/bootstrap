@@ -7,9 +7,11 @@ for tool in backlog pre-commit gitleaks lychee osv-scanner; do
 done
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-# The package cap gate command and its policy file come from this checkout, as chezmoi and install.sh place them.
+# The package cap gate command and its policy file come from this checkout, as chezmoi (which sets
+# the executable bit on apply) and install.sh place them.
 mkdir -p "$tmp/bin"
-ln -s "$ROOT/home/dot_local/bin/executable_package-cap-check" "$tmp/bin/package-cap-check"
+printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/home/dot_local/bin/executable_package-cap-check" > "$tmp/bin/package-cap-check"
+chmod 0755 "$tmp/bin/package-cap-check"
 export PATH="$tmp/bin:$PATH" PACKAGE_CAPS_FILE="$ROOT/system/agent-policy/package-caps.toml"
 # backlog is a node script behind a mise shim; keep mise pointed at the real home.
 export MISE_DATA_DIR="${MISE_DATA_DIR:-$HOME/.local/share/mise}" MISE_CONFIG_DIR="${MISE_CONFIG_DIR:-$HOME/.config/mise}" MISE_CACHE_DIR="${MISE_CACHE_DIR:-$HOME/.cache/mise}"

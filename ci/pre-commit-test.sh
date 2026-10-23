@@ -10,9 +10,11 @@ done
 real_osv="${XDG_CACHE_HOME:-$HOME/.cache}/osv-scalibr"
 tmp=$(mktemp -d)
 trap 'chmod -R u+w "$tmp"; rm -rf "$tmp"' EXIT
-# The package cap gate command and its policy file come from this checkout, as chezmoi and install.sh place them.
+# The package cap gate command and its policy file come from this checkout, as chezmoi (which sets
+# the executable bit on apply) and install.sh place them.
 mkdir -p "$tmp/bin"
-ln -s "$ROOT/home/dot_local/bin/executable_package-cap-check" "$tmp/bin/package-cap-check"
+printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/home/dot_local/bin/executable_package-cap-check" > "$tmp/bin/package-cap-check"
+chmod 0755 "$tmp/bin/package-cap-check"
 export PATH="$tmp/bin:$PATH" PACKAGE_CAPS_FILE="$ROOT/system/agent-policy/package-caps.toml"
 export HOME="$tmp/home" XDG_CACHE_HOME="$tmp/home/.cache" PRE_COMMIT_HOME="$tmp/home/.cache/pre-commit"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.invalid
