@@ -52,6 +52,8 @@ run python3 ci/inventory-mirror-test.py
 run python3 ci/prune-revisions-test.py
 run bash ci/new-project-test.sh
 run bash ci/pre-commit-test.sh
+run python3 ci/package-caps-test.py
+run python3 ci/package-cap-resolver-test.py
 run python3 ci/osv-db-test.py
 run python3 ci/verification-pack-test.py
 run python3 ci/gate-browser-test.py
