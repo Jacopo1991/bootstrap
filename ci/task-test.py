@@ -704,6 +704,30 @@ class TaskTool(unittest.TestCase):
         self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', code=1))
         self.assertFalse((wt / '.work/model-call.json').exists())
 
+    def test_plan_budget_refused_start_allows_corrected_plan_before_binding(self):
+        self.budget_fixture('valid', points=10)
+        self.budget_fixture('outside', allowed={'proj': ['other']})
+        self.budget_fixture('expired', expires='2000-01-01T00:00:00Z')
+        self.budget_fixture('exhausted', points=0)
+        self.budget_fixture('malformed').write_text('id = [')
+        for ident, message in (('missing', 'Missing or malformed'), ('malformed', 'Missing or malformed'),
+                               ('outside', 'outside allowed'), ('expired', 'expired'),
+                               ('exhausted', 'points exhausted')):
+            with self.subTest(plan=ident):
+                name = 'refused-' + ident
+                rows = self.run_rows()
+                self.assertIn(message, self.raw_task('start', 'proj', name, '--builder', 'codex',
+                                                    '--plan', ident, code=1))
+                self.assertFalse((self.state(name) / 'task.json').exists(), 'no refused binding')
+                self.assertFalse((self.repo / '.worktrees' / name).exists())
+                self.assertEqual(self.run_rows(), rows)
+                self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+                self.raw_task('start', 'proj', name, '--builder', 'codex', '--plan', 'valid')
+                record = json.loads((self.state(name) / 'task.json').read_text())
+                self.assertEqual(record['plan'], 'valid')
+                self.assertEqual(record['revision'], TASK_MODULE.record_revision(record))
+                self.assertEqual(self.run_rows()[-1]['plan'], 'valid')
+
     def test_plan_budget_failed_worktree_creation_keeps_binding_for_retry(self):
         self.budget_fixture(points=1)
         probe = self.home / 'failed-worktree.py'
@@ -968,6 +992,26 @@ class TaskTool(unittest.TestCase):
                 self.assertEqual(fallback['replaces'], rows[0]['id'])
                 self.assertFalse(fallback.get('invoked', False))
                 self.assertIn('claude used 1 left 9', self.raw_task('plan-budget', 'chain'))
+                codex_used = 3 if rule == 'review disabled' else 1  # two concurrent seed keys
+                self.assertIn(f'codex used {codex_used} left {10 - codex_used}', self.raw_task('plan-budget', 'chain'))
+                if rule != 'review disabled':
+                    self.budget_fixture(points=10)  # restore expiry/scope in this fixture
+                self.raw_task('plan-budget', 'chain', '--clear', 'review')
+                (wt / '.work/reviewer-count').unlink()
+                head = self.git(wt, 'rev-parse', 'HEAD')
+                reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+                self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
+                              env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                                       REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
+                attempts = [r for r in self.run_rows() if r.get('task') == 'T-5']
+                self.assertEqual([(r['vendor'], r['outcome']) for r in attempts],
+                                 [('claude', 'failed'), ('claude', 'failed'), ('codex', 'finished')])
+                self.assertEqual(attempts[-1]['id'], fallback['id'], 'reuse the refused reservation')
+                self.assertNotEqual(attempts[0]['id'], attempts[1]['id'])
+                self.assertEqual(set(attempts[-1]['superseded']), {r['id'] for r in attempts[:-1]})
+                self.assertIn('claude used 0 left 10', self.raw_task('plan-budget', 'chain'))
+                self.assertIn(f'codex used {codex_used} left {10 - codex_used}', self.raw_task('plan-budget', 'chain'))
+                self.assertEqual(list(log.parent.glob('pending-runs/*.json')), [])
 
     def test_plan_budget_lane_rechecks_expiry_scope_and_breaker_at_model_spawn(self):
         wt, _ = self.started()

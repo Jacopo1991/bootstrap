@@ -593,7 +593,7 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
             rows += [json.loads(p.read_text()) for p in (root / "pending-runs").glob("*.json") if not any(r.get("run_id", r["id"]) == p.stem for r in rows if r.get("type") == "run")]
             rows = [r for r in rows if r.get("plan") == ident]
             # Transfer the primary draw only when its fallback is admitted to spawn.
-            replaced = {r.get("replaces") for r in rows if r.get("invoked")}
+            replaced = {ident for r in rows if r.get("invoked") for ident in [r.get("replaces"), *r.get("superseded", [])]}
             charged = [r for r in rows if r["id"] not in replaced]
             used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in charged if r.get("vendor") == v and r.get("type") != "outcome"}) for v in task_usage.VENDORS}
             last, disabled = {}, set()
@@ -613,7 +613,7 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
                 prior = next((r for r in reversed(charged) if all(r.get(k) == fields.get(k) for k in ("repo", "task", "kind", "commit", "vendor")) and r.get("type") != "outcome"), None)
                 if (not prior or reserve is False) and used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
                 if isinstance(reserve, dict): reserve["invoked"] = True; atomic_json(root / "pending-runs" / (reserve["id"] + ".json"), reserve); return reserve
-                if prior and reserve and not prior.get("outcome") and not prior.get("invoked"): return prior
+                if prior and reserve and not prior.get("outcome") and not prior.get("invoked"): prior["superseded"] = sorted(set(prior.get("superseded", []) + [prior.get("replaces"), fields.get("replaces")]) - {None}); atomic_json(root / "pending-runs" / (prior["id"] + ".json"), prior); return prior
                 return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
         return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(disabled)}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
@@ -2557,7 +2557,7 @@ def start_locked(args, repo):
             print(f"warning: environment link {candidate} does not resolve.")
     for name in args.seed: seed_source(repo, name)
     task_tier(task_text, args.tier)
-    if os.environ.get("TASK_PLAN"): bind_plan(task, args, save=True)
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=task.id, kind="start", vendor=args.builder), reserve=None); bind_plan(task, args, save=True)
     if task.path.exists():
         task.worktree()
         task_lock.work(HOME, repo, sha(task.path, "HEAD"))
