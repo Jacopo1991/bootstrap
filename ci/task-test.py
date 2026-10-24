@@ -231,7 +231,7 @@ class TaskTool(unittest.TestCase):
         commands = [
             ('start', 'proj', 'docs', '--builder', 'codex'),
             ('start', 'proj', 'docs', '--builder', 'codex', '--refresh'),
-            ('lane', 'proj', '5'), ('lane', 'proj', '5', '--_worker'),
+            ('lane', 'proj', '5'),
             ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
             ('merge', 'proj', '5', '--detach'), ('runner-start', 'proj', 'runner-b1.md'),
             ('check', 'proj', '5'), ('check', 'proj', '5', '--detach'),
@@ -525,6 +525,72 @@ class TaskTool(unittest.TestCase):
         self.assertFalse((work / 'model-call.json').exists())
         self.assertEqual(json.loads((work / 'lane.json').read_text())['state'], 'refused: hold')
 
+    def assert_hold_during_child_startup(self, kind):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('Do the task.\n')
+        ready, resume = self.home / 'child-ready', self.home / 'child-resume'
+        # Pause the actual launched child before main(), after the launcher has admitted it.
+        # Source already contains the asserted /etc fixture seam; modules stay read-only links.
+        tools = self.home / 'startup-tools'
+        tools.mkdir()
+        for sibling in TOOL.parent.iterdir():
+            if sibling != TOOL:
+                (tools / sibling.name).symlink_to(sibling)
+        tool = tools / TOOL.name
+        startup = textwrap.dedent(f'''\
+            if __name__ == '__main__' and ('--_worker' in sys.argv or os.environ.get('TASK_RUN_RECORD')):
+                Path({str(ready)!r}).touch()
+                deadline = time.monotonic() + 15
+                while not Path({str(resume)!r}).exists():
+                    if time.monotonic() >= deadline: raise RuntimeError('startup handshake timed out')
+                    time.sleep(.01)
+
+            ''')
+        source = TOOL.read_text()
+        entry = 'if __name__ == "__main__":'
+        self.assertEqual(source.count(entry), 1)
+        tool.write_text(source.replace(entry, startup + entry))
+        command = (['lane', 'proj', '5', '--no-boost'] if kind == 'lane'
+                   else ['check', 'proj', '5', '--detach'])
+        launched = subprocess.run([sys.executable, str(tool), *command], env=self.env,
+                                  cwd=wt, capture_output=True, text=True, timeout=10)
+        self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+        record = work / 'lane.json' if kind == 'lane' else self.state() / 'run.json'
+        try:
+            self.wait_runner_file(ready)
+            self.assertEqual(json.loads(record.read_text())['state'], 'running')
+            self.raw_task('hold', 'pull', 'hold during child startup')
+        finally:
+            resume.touch()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            run = json.loads(record.read_text())
+            if run['state'] != 'running' and not (self.state() / 'run.lock').exists():
+                break
+            time.sleep(.02)
+        self.assertEqual(run['state'], 'refused: hold')
+        self.assertTrue(run['ended_at'])
+        self.assertFalse((self.state() / 'run.lock').exists())
+        self.assertFalse((work / 'model-call.json').exists())
+        self.assertFalse((self.state() / 'check.json').exists())
+        self.assertIn('refused: hold', self.raw_task('wait', 'proj', '5'))
+        log = self.home / '.local/state/task/runs.jsonl'
+        rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        self.assertFalse(any(row.get('outcome') == 'interrupted' for row in rows), rows)
+        if kind == 'lane':
+            outcomes = [row for row in rows if row.get('outcome') and row.get('kind') == 'lane']
+            self.assertEqual(len(outcomes), 1, rows)
+            self.assertEqual(outcomes[0]['outcome'], 'failed')
+            self.assertEqual(outcomes[0]['reason'], 'refused: hold')
+
+    def test_hold_round6_lane_worker_startup_finalizes_refusal(self):
+        self.assert_hold_during_child_startup('lane')
+
+    def test_hold_round6_detached_check_startup_finalizes_refusal(self):
+        self.assert_hold_during_child_startup('check')
+
     def test_hold_round5_worker_stop_records_distinguish_hold(self):
         self.stub_models()
         wt, _ = self.started()
@@ -533,7 +599,7 @@ class TaskTool(unittest.TestCase):
         record = work / 'lane.json'
         config = wt / '.task.toml'
         args = SimpleNamespace(repo=str(self.repo), id='5', builder='codex', tier=None,
-                               model='gpt-6.1-sol', no_boost=True, _worker=True,
+                               model='gpt-6.1-sol', no_boost=True, _worker=True, effort='high',
                                timeout=None, override='')
         claude_root = self.home / 'claude-root'
         claude_root.mkdir(mode=0o700)

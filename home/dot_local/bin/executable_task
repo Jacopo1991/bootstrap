@@ -1056,7 +1056,7 @@ def redteam(args):
                    [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
                     "--allowedTools", "Read", "Grep", "Glob", "Bash(git --no-optional-locks:*)"])
         with temporary.open("w") as output_stream:
-            result = subprocess.run(command, cwd=path, input=brief, text=True, encoding="utf-8",
+            admit(); result = subprocess.run(command, cwd=path, input=brief, text=True, encoding="utf-8",
                                     stdout=output_stream if vendor == "claude" else None,
                                     env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
         if result.returncode or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
@@ -2717,7 +2717,7 @@ def start_locked(args, repo):
             task_lock.work(HOME, repo, base)
             create, source = ["--no-track", "-b", branch, str(task.path), base], f"{branch} from {label} {base[:7]}"
         args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
-        git(repo, "worktree", "add", "-q", *create)
+        admit(); git(repo, "worktree", "add", "-q", *create)
         print(f"Created {task.path} on {source}.")
     seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
@@ -3372,6 +3372,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     usage_run = None
     if os.environ.get("TASK_PLAN"): usage_run = budget_run(repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1], **({"commit": sha(path, "HEAD"), "replaces": replaces} if os.environ.get("TASK_PLAN") else {}))
     if os.environ.get("TASK_PLAN"): run["usage_run"] = usage_run
+    atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
@@ -3383,7 +3384,6 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
                                        stderr=errors, start_new_session=True)
             run["state"] = "running"
             if not usage_run: usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
-            atomic_json(run_file, run)
             task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
                 code = process.wait(timeout=timeout)
@@ -5180,7 +5180,7 @@ def main(argv=None):
     sub.add_argument("--repo")
     args = parser.parse_args(argv)
     if args.command in HOLD_WORK_COMMANDS or args.command == 'review' and args.run or args.command == 'plan' and args.sign:
-        try: admit()
+        try: admit() if not (getattr(args, '_worker', False) or os.environ.get('TASK_RUN_RECORD')) else None
         except Stop as error: print(f'task {args.command}: {error}', file=sys.stderr); return 1
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
