@@ -1351,15 +1351,31 @@ The fixed roots, relative to the agent HOME, are:
 The scanner is pinned to osv-scanner 2.6.0. Scans use `--offline`,
 `--offline-vulnerabilities`, `--no-resolve`, `--no-ignore` and the bundled
 `python/wheelegg` and `javascript/packagejson` plugins alongside default lockfile
-plugins. Gitignored environments are included. Scanner path exclusions omit
+plugins. Gitignored environments are included. Scanner path exclusions omit only
+top-level children of `~/dev_workspace` named
 customer-harness/CustomerHarness, typo3-dkm/typo3-dkm-plugin/Typo3/DKM,
-photo-organizer, secrets, project-data and .git directories (case insensitive).
+photo-organizer, secrets and project-data (case insensitive). Dependencies such as
+`node_modules/secrets` remain in scope. `.git`, `.worktrees` and `.work` are
+excluded at any depth within each scan root, also case insensitive. The service
+additionally masks the listed private repositories and `~/project-data` with
+`InaccessiblePaths=`; it leaves cortex and the security state directory accessible.
 Directory and file symlinks are not read by the scanner (covered by fixture canaries).
 Missing required roots and scan errors fail the run; an absent optional GPU
-environment is explicitly reported. Every scanned root must return packages.
+environment has status `absent`, does not fail the run and is never counted as
+clean. Every scanned root must return packages.
 The npm tree must include `@openai/codex`, pre-commit must include `pre-commit`,
-and Inspect must include `inspect-ai`. Error/fatal diagnostics and a package count
-below half of that root's count in the previous `latest.json` fail the run.
+and Inspect must include `inspect-ai`, with PEP 503 name normalisation.
+`dev_workspace` must include `@openai/codex`, present in the main bootstrap
+checkout's tracked `home/dot_local/share/bootstrap/npm/package-lock.json`.
+Error/fatal and `fserr` diagnostics fail the root. Fixture probes of scanner 2.6.0
+produce `fserr (non-permission error): ... not implemented` for a chmod-000 directory,
+and `Error during extraction:` for corrupt package.json and METADATA files.
+The count guard fails a root below half the highest count of its last 7 accepted
+runs. Rejected counts never enter history. Run `security-watch --accept-counts`
+after an intentional shrink: it performs the full scan with normal pings and exit
+codes, resetting history separately for roots that pass every other check.
+Empty roots, diagnostics and missing sentinels cannot be accepted. Resets appear
+in the report and STATUS.
 
 Exemptions use native `osv-scanner.toml` `[[IgnoredVulns]]` entries with an advisory
 `id`, `ignoreUntil` and `reason`. The only approved source is
@@ -1369,15 +1385,31 @@ more than 90 days ahead, and no other tables or fields. A symlink is refused.
 Every root receives one explicit `--config` pointing to the validated snapshot
 (or an empty file), so configs planted in projects or dependencies have no effect.
 JSON, Markdown and STATUS list the exemptions with reasons, expiry and whether
-they are effective. Expired exemptions expose the finding again.
+they are effective. Exemptions expire at the start of `ignoreUntil` in UTC;
+exemptions apply to all roots (the approved reasons must be understood globally).
+Expired exemptions expose the finding again.
 
 Dated JSON reports under `~/.local/state/security/` contain scanner findings and
 diagnostics per root; `latest.json` points to the latest result by content. A dated
 Markdown summary and the `## Security` section of `~/cortex/cortex-core/STATUS.md`
-show the result. The job replaces only that section, preserving adjacent sections.
+show package/advisory counts and advisory IDs per root (the first five IDs in
+STATUS). The job replaces only that section, preserving adjacent sections.
+Exemption IDs/reasons, advisory IDs and errors are collapsed to one line and
+limited to 200 characters in STATUS, with a leading `#` escaped.
+Atomic `counts.json` holds each root's last seven accepted counts, also carried
+by every dated JSON report. Missing, corrupt or non-dict latest/count state falls
+back to the newest valid dated report. Without one this is a first run with
+no baseline; the normal extraction, diagnostic and sentinel checks still apply.
+Dated JSON/Markdown pairs older than 60 days are pruned by filename timestamp,
+always retaining the newest valid dated report and the special state/config files.
+A non-blocking `state/run.lock` covers the entire run, including manual resets;
+overlapping runs exit with a clear error. This does not guard other writers of STATUS.
 It calls `job-ping security-watch 0` for a clean completed scan, or `1` for findings,
 refresh/scan errors or a failed status update. Provision `SECURITY_WATCH_URL` in the
 existing owner-managed pings file to receive these signals. No report body is sent.
+The requested service mask currently also hides job-ping's default
+`~/project-data/healthchecks/pings.env`; the PM must choose an approved accessible
+ping-file location before deployment. Fixture tests verify calls, not delivery.
 
 Refresh has a 30-minute budget and each of five roots has two minutes, within the
 45-minute unit timeout. An incomplete record replaces `latest.json` and the dated

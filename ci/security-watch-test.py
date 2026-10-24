@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Fixture-only installed-environment probe and security-watch checks."""
 import json
+import fcntl
 from datetime import datetime, timedelta, timezone
 import os
+import re
 from pathlib import Path
 import shutil
 import runpy
@@ -71,8 +73,11 @@ class InstalledProbe(unittest.TestCase):
                 data = json.loads(result.stdout)
                 packages = [p for source in data["results"] for p in source["packages"]]
                 if ecosystem == "PyPI":
-                    self.assertTrue({"pre_commit", "inspect_ai"} <=
-                                    {p["package"]["name"] for p in packages})
+                    names = {p["package"]["name"] for p in packages}
+                    print("Fixture venv scanner names:", sorted(names), flush=True)
+                    normalise = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+                    self.assertTrue({normalise(n) for n in ("pre_commit", "inspect_ai")} <=
+                                    {normalise(n) for n in names})
                 self.assertTrue(any(p["package"]["name"] == name and
                                     p["package"]["version"] == version and
                                     any(v["id"] == "PROBE-2026-1" for v in p["vulnerabilities"])
@@ -91,15 +96,18 @@ class DailyJob(unittest.TestCase):
         self.assertIsNotNone(scanner)
         (self.bin / "osv-scanner").symlink_to(scanner)
         self.env = {"PATH": f"{self.bin}:/usr/bin:/bin", "HOME": str(self.home),
-                    "XDG_CACHE_HOME": str(self.home / "cache"), "TMPDIR": str(self.home)}
+                    "XDG_CACHE_HOME": str(self.home / "cache"), "TMPDIR": str(self.home), "TZ": "UTC"}
         self.npm = self.home / ".local/share/bootstrap/npm"
         node_package(self.npm)
         node_package(self.npm, "@openai/codex")
         for relative in (".local/share/bootstrap/pre-commit/venv",
                          ".local/share/bootstrap/inspect/venv", "dev_workspace/public/.venv"):
             python_package(self.home / relative)
-        python_package(self.home / ".local/share/bootstrap/pre-commit/venv", "pre-commit")
-        python_package(self.home / ".local/share/bootstrap/inspect/venv", "inspect-ai")
+        python_package(self.home / ".local/share/bootstrap/pre-commit/venv", "pre_commit")
+        python_package(self.home / ".local/share/bootstrap/inspect/venv", "inspect_ai")
+        project = self.home / "dev_workspace/public"
+        (project / "package-lock.json").write_text(json.dumps({
+            "lockfileVersion": 3, "packages": {"node_modules/@openai/codex": {"version": "1.0.0"}}}))
         status = self.home / "cortex/cortex-core/STATUS.md"
         status.parent.mkdir(parents=True)
         status.write_text("# Status\n\n## Security\nold\n\n## Keep\nunchanged\n")
@@ -109,8 +117,8 @@ class DailyJob(unittest.TestCase):
         path.write_text("#!/bin/sh\n" + body)
         path.chmod(0o755)
 
-    def scan(self, **extra):
-        result = subprocess.run(["/usr/bin/python3", str(SCRIPT)], env=dict(self.env, **extra),
+    def scan(self, accept=False, **extra):
+        result = subprocess.run(["/usr/bin/python3", str(SCRIPT)] + (["--accept-counts"] if accept else []), env=dict(self.env, **extra),
                                 capture_output=True, text=True, timeout=60)
         self.report = json.loads((self.home / ".local/state/security/latest.json").read_text())
         return result
@@ -126,10 +134,10 @@ class DailyJob(unittest.TestCase):
     def test_findings_per_root_and_failure_ping(self):
         self.assertEqual(self.scan().returncode, 1)
         self.assertEqual([r["status"] for r in self.report["roots"]],
-                         ["findings", "findings", "findings", "not installed", "findings"])
+                         ["findings", "findings", "findings", "absent", "findings"])
         self.assertEqual(self.report["errors"], [])
-        self.assertEqual(self.report["last_clean_counts"],
-                         {r["root"]: r["package_count"] for r in self.report["roots"]
+        self.assertEqual(self.report["count_history"],
+                         {r["root"]: [r["package_count"]] for r in self.report["roots"]
                           if r["status"] == "findings"})
         self.assertEqual((self.home / "pings").read_text(), "security-watch 1\n")
 
@@ -200,7 +208,7 @@ class DailyJob(unittest.TestCase):
         self.assertNotIn("canary", sources)
         self.assertIn("public/.venv", sources)
         for source in self.report["roots"][-1]["results"]["results"]:
-            self.assertIn("public/.venv", source["source"]["path"])
+            self.assertIn("public/", source["source"]["path"])
 
     def test_photo_organizer_venv_is_never_read(self):
         self.approve()
@@ -249,6 +257,14 @@ class DailyJob(unittest.TestCase):
                 self.assertTrue(self.report["errors"])
                 self.assertFalse((self.home / "refresh").exists())
 
+    def test_wrong_toml_entry_type_is_recorded(self):
+        (self.npm / "osv-scanner.toml").write_text("IgnoredVulns = [1]\n")
+        result = self.scan()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.report["status"], "failed")
+        self.assertIn("not iterable", self.report["errors"][0])
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_project_and_nested_configs_cannot_suppress_findings(self):
         content = '[[IgnoredVulns]]\nid="PROBE-2026-1"\nreason="planted"\n'
         for relative in ("dev_workspace", "dev_workspace/public",
@@ -257,7 +273,8 @@ class DailyJob(unittest.TestCase):
         project = self.home / "dev_workspace/public"
         (project / "package-lock.json").write_text(json.dumps({
             "name": "fixture", "lockfileVersion": 3,
-            "packages": {"node_modules/probe-node": {"version": "1.0.0"}}}))
+            "packages": {"node_modules/probe-node": {"version": "1.0.0"},
+                         "node_modules/@openai/codex": {"version": "1.0.0"}}}))
         self.assertEqual(self.scan().returncode, 1)
         self.assertEqual(self.report["exemptions"], [])
         self.assertEqual(self.report["roots"][-1]["status"], "findings")
@@ -282,6 +299,9 @@ root = sys.argv[-1]
 with (Path.home() / "scans").open("a") as log:
     log.write(root + "\\n")
 mode = os.environ.get("SCAN_MODE", "empty")
+if mode == "odd" and "npm" in root:
+    print('[]')
+    sys.exit(0)
 if mode == "terminate":
     os.kill(os.getppid(), signal.SIGTERM)
     sys.exit(0)
@@ -289,7 +309,7 @@ names = ["@openai/codex", "pre-commit", "inspect-ai", "probe-python"]
 if mode == "missing-sentinel":
     names = ["unrelated"]
 if mode == "diagnostic":
-    print("ERROR extractor: unreadable directory", file=sys.stderr)
+    print(os.environ.get("DIAGNOSTIC", "ERROR extractor: unreadable directory"), file=sys.stderr)
 packages = [{"package": {"name": name, "version": "1.0", "ecosystem": "PyPI"}}
             for name in names]
 if "SCAN_COUNT" in os.environ:
@@ -316,29 +336,36 @@ print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]
         self.approve()
         (self.home / "dev_workspace/public/.venv/lib/python3.12/site-packages/"
          "probe_python-1.0.dist-info/METADATA").unlink()
+        (self.home / "dev_workspace/public/package-lock.json").unlink()
         self.assertEqual(self.scan().returncode, 1)
         self.assertEqual(self.report["roots"][-1]["status"], "error")
 
-    def test_package_count_drop_against_previous_latest(self):
+    def test_upgrade_without_counts_has_no_baseline(self):
         self.approve()
         for index in range(8):
             node_package(self.npm, f"extra-{index}")
         self.assertEqual(self.scan().returncode, 0)
         self.assertEqual(self.report["roots"][0]["package_count"], 10)
-        # Upgrade an older report: only its accepted root counts seed the map.
-        del self.report["last_clean_counts"]
+        # The original report shape had neither counts nor history.
+        self.report.pop("count_history", None)
+        self.report.pop("last_clean_counts", None)
+        for entry in self.report["roots"]:
+            entry.pop("package_count", None)
+        state = self.home / ".local/state/security"
+        for path in state.glob("*.json"):
+            path.unlink()
         (self.home / ".local/state/security/latest.json").write_text(json.dumps(self.report))
         for index in range(8):
             (self.npm / f"node_modules/extra-{index}/package.json").unlink()
-        self.assertEqual(self.scan().returncode, 1)
-        self.assertIn("sharp package count drop: 10 to 2", self.report["roots"][0]["error"])
+        self.assertEqual(self.scan().returncode, 0)
+        self.assertEqual(self.report["count_history"][".local/share/bootstrap/npm"], [2])
         self.assertEqual(self.report["roots"][1]["status"], "clean")
 
     def test_package_count_drop_keeps_last_clean_baseline(self):
         self.fake_scanner()
         self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="500").returncode, 0)
         self.assertEqual(self.report["roots"][-1]["package_count"], 500)
-        baseline = self.report["last_clean_counts"]
+        baseline = self.report["count_history"]
         for day in (2, 3):
             with self.subTest(day=day):
                 self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="10").returncode, 1)
@@ -346,11 +373,11 @@ print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]
                 self.assertEqual(entry["package_count"], 10)
                 self.assertEqual(entry["status"], "error")
                 self.assertIn("sharp package count drop: 500 to 10", entry["error"])
-                self.assertEqual(self.report["last_clean_counts"], baseline)
+                self.assertEqual(self.report["count_history"], baseline)
                 self.assertEqual((self.home / "pings").read_text().splitlines()[-1],
                                  "security-watch 1")
         self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="600").returncode, 0)
-        self.assertTrue(all(count == 600 for count in self.report["last_clean_counts"].values()))
+        self.assertTrue(all(count[-1] == 600 for count in self.report["count_history"].values()))
 
     def test_rejected_and_interrupted_scans_preserve_baseline(self):
         self.fake_scanner()
@@ -359,7 +386,7 @@ print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]
         for mode in ("empty", "diagnostic", "missing-sentinel", "terminate"):
             with self.subTest(mode=mode):
                 self.assertNotEqual(self.scan(SCAN_MODE=mode, SCAN_COUNT="5000").returncode, 0)
-                self.assertEqual(self.report["last_clean_counts"][root], 500)
+                self.assertEqual(self.report["count_history"][root], [500])
                 self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="10").returncode, 1)
                 self.assertIn("sharp package count drop: 500 to 10",
                               self.report["roots"][0]["error"])
@@ -393,7 +420,7 @@ print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]
     def test_initial_latest_is_incomplete_before_refresh_and_termination(self):
         self.approve()
         self.assertEqual(self.scan().returncode, 0)
-        baseline = self.report["last_clean_counts"]
+        baseline = self.report["count_history"]
         path = self.bin / "systemctl"
         path.write_text('''#!/usr/bin/python3
 import json, os, signal
@@ -407,7 +434,7 @@ os.kill(os.getppid(), signal.SIGTERM)
         self.assertTrue((self.home / "saw-incomplete").exists())
         self.assertEqual(self.report["status"], "incomplete")
         self.assertEqual(self.report["roots"], [])
-        self.assertEqual(self.report["last_clean_counts"], baseline)
+        self.assertEqual(self.report["count_history"], baseline)
         self.assertEqual((self.home / "pings").read_text().splitlines()[-1], "security-watch 1")
 
     def test_reports_precede_status_and_survive_decode_error(self):
@@ -438,8 +465,207 @@ os.kill(os.getppid(), signal.SIGTERM)
         self.assertTrue(any(": failed." in p.read_text()
                             for p in (self.home / ".local/state/security").glob("*.md")))
 
+    def test_workspace_sentinel_and_normalised_names(self):
+        self.approve()
+        self.assertEqual(self.scan().returncode, 0)
+        (self.home / "dev_workspace/public/package-lock.json").unlink()
+        self.assertEqual(self.scan().returncode, 1)
+        self.assertIn("missing sentinel", self.report["roots"][-1]["error"])
+        namespace = runpy.run_path(str(SCRIPT))
+        self.assertEqual(namespace["normalise"]("Pre_COMMIT"), "pre-commit")
+        lock = json.loads((ROOT / "home/dot_local/share/bootstrap/npm/package-lock.json").read_text())
+        self.assertIn("node_modules/@openai/codex", lock["packages"])
+
+    def test_high_water_window_and_reset(self):
+        self.fake_scanner()
+        for count, code in ((500, 0), (251, 0), (126, 1)):
+            self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT=str(count)).returncode, code)
+        self.assertIn("500 to 126", self.report["roots"][-1]["error"])
+        self.assertEqual(self.scan(accept=True, SCAN_MODE="healthy", SCAN_COUNT="126").returncode, 0)
+        self.assertTrue(all(h == [126] for h in self.report["count_history"].values()))
+        self.assertTrue(self.report["count_resets"])
+        self.assertIn("Count baseline reset", (self.home / "cortex/cortex-core/STATUS.md").read_text())
+        for mode in ("empty", "missing-sentinel", "diagnostic"):
+            self.assertEqual(self.scan(accept=True, SCAN_MODE=mode, SCAN_COUNT="2").returncode, 1)
+            self.assertEqual(self.report["count_resets"], [])
+            self.assertTrue(all(h == [126] for h in self.report["count_history"].values()))
+        for _ in range(8):
+            self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="100").returncode, 0)
+        self.assertTrue(all(h == [100] * 7 for h in self.report["count_history"].values()))
+        self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="50").returncode, 0)
+        self.assertEqual((self.home / "pings").read_text().splitlines()[-1], "security-watch 0")
+        self.assertEqual(self.scan(accept=True, SCAN_MODE="odd").returncode, 1)
+        self.assertNotIn(".local/share/bootstrap/npm", self.report["count_resets"])
+        self.assertIn("dev_workspace", self.report["count_resets"])
+        self.assertEqual((self.home / "pings").read_text().splitlines()[-1], "security-watch 1")
+
+    def test_work_git_exclusions_at_any_depth_and_dependency_secrets(self):
+        self.approve()
+        for name in (".work", ".worktrees", ".git"):
+            for variant in (name, name.upper()):
+                node_package(self.home / "dev_workspace/public/nested" / variant, "hidden-canary")
+        node_package(self.home / "dev_workspace/public", "secrets")
+        self.assertEqual(self.scan().returncode, 0)
+        packages = json.dumps(self.report["roots"][-1]["results"])
+        self.assertNotIn("hidden-canary", packages)
+        self.assertIn('"name": "secrets"', packages)
+
+    def test_real_diagnostics(self):
+        self.approve()
+        for case, wording in (("unreadable", "fserr (non-permission error):"),
+                              ("json", "Error during extraction:"),
+                              ("metadata", "Name or Version is empty")):
+            with self.subTest(case=case):
+                target = self.npm / case
+                node_package(target, "control")
+                if case == "unreadable":
+                    node_package(target / "blocked")
+                    (target / "blocked").chmod(0)
+                elif case == "json":
+                    (target / "node_modules/control/package.json").write_text("{broken")
+                else:
+                    python_package(target)
+                    next(target.glob("lib/**/METADATA")).write_text("not metadata")
+                try:
+                    self.assertEqual(self.scan().returncode, 1)
+                    entry = self.report["roots"][0]
+                    print("Real diagnostic", case, repr(entry["diagnostics"]), flush=True)
+                    self.assertIn(wording, entry["diagnostics"])
+                    self.assertEqual(entry["status"], "error")
+                finally:
+                    if case == "unreadable": (target / "blocked").chmod(0o700)
+                    shutil.rmtree(target)
+
+    def test_state_fallback_and_separate_atomic_counts(self):
+        self.fake_scanner()
+        self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="500").returncode, 0)
+        state = self.home / ".local/state/security"
+        self.assertEqual(json.loads((state / "counts.json").read_text())["count_history"], self.report["count_history"])
+        for payload in (None, "{broken", "[]", '"string"', '{"run":"nonsense"}'):
+            for name in ("latest.json", "counts.json"):
+                path = state / name
+                if payload is None: path.unlink(missing_ok=True)
+                else: path.write_text(payload)
+            (state / "9999-12-31T00-00-00+00-00.json").write_text('{"run":"bad","count_history":{}}')
+            (state / "not-a-date.json").write_text(json.dumps({"run": datetime.now(timezone.utc).isoformat(), "count_history": {}}))
+            self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="10").returncode, 1)
+            self.assertIn("500 to 10", self.report["roots"][-1]["error"])
+            self.assertTrue(all(h == [500] for h in self.report["count_history"].values()))
+        self.assertFalse(list(state.glob("*.tmp")))
+
+    def test_unexpected_exceptions_recorded_and_other_roots_continue(self):
+        self.fake_scanner()
+        self.assertEqual(self.scan(SCAN_MODE="odd").returncode, 1)
+        self.assertEqual(self.report["roots"][0]["status"], "error")
+        self.assertEqual(self.report["roots"][-1]["status"], "clean")
+        self.assertIn("has no attribute 'get'", self.report["errors"][0])
+        namespace = runpy.run_path(str(SCRIPT))
+        old_umask = os.umask(0o077)
+        self.addCleanup(os.umask, old_umask)
+        with patch.dict(os.environ, self.env, clear=True), patch.dict(namespace["main"].__globals__,
+                approved_config=lambda *args: (_ for _ in ()).throw(AttributeError("odd outer failure"))):
+            self.assertEqual(namespace["main"](), 1)
+        report = json.loads((self.home / ".local/state/security/latest.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("odd outer failure", report["errors"])
+
+    def test_run_lock_rejects_overlap_and_unique_temporary_files(self):
+        state = self.home / ".local/state/security"
+        state.mkdir(parents=True)
+        with (state / "run.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = subprocess.run(["/usr/bin/python3", str(SCRIPT)], env=self.env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("already running", result.stderr)
+            self.assertFalse((self.home / "refresh").exists())
+        namespace = runpy.run_path(str(SCRIPT))
+        stale = state / "unique.tmp"
+        stale.write_text("keep")
+        namespace["write"](state / "unique", "new")
+        self.assertEqual(stale.read_text(), "keep")
+
+    def test_status_sanitises_errors_exemptions_and_ids(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        poison = "# forged\n\n## Keep\n" + "x" * 300
+        report = {"run": "today", "status": "failed", "roots": [
+            {"root": "dev_workspace", "status": "findings", "package_count": 7, "advisory_ids": [poison] * 8}],
+            "errors": [poison], "exemptions": [{"id": poison, "reason": poison,
+            "ignoreUntil": "tomorrow", "effective": True}], "count_resets": []}
+        section = namespace["summary"](report, "report.json")
+        self.assertNotIn("\n## Keep", section)
+        self.assertNotIn("x" * 200, section)
+        self.assertIn("\\# forged", section)
+        self.assertIn("7 packages", section)
+        self.assertIn("exemptions apply to all roots", section)
+        self.assertEqual(section.count("\\# forged"), 8)  # five IDs, error, ID, reason
+        self.assertEqual(namespace["summary"](report, "report.json", limit=None).count("\\# forged"), 11)
+
+    def test_today_expiry_boundary_and_advisory_summaries(self):
+        self.ignore(datetime.now(timezone.utc).date().isoformat())
+        self.assertEqual(self.scan().returncode, 1)
+        self.assertFalse(self.report["exemptions"][0]["effective"])
+        for entry in self.report["roots"]:
+            if entry["status"] == "findings":
+                self.assertEqual(entry["advisory_ids"], ["PROBE-2026-1"])
+        state = self.home / ".local/state/security"
+        self.assertIn("PROBE-2026-1", next(state.glob("*.md")).read_text())
+        self.assertIn("PROBE-2026-1", (self.home / "cortex/cortex-core/STATUS.md").read_text())
+
+    def test_prune_pairs_keeps_newest_valid_and_special_files(self):
+        self.fake_scanner()
+        self.assertEqual(self.scan(SCAN_MODE="healthy").returncode, 0)
+        state = self.home / ".local/state/security"
+        namespace = runpy.run_path(str(SCRIPT))
+        old = datetime.now(timezone.utc) - timedelta(days=90)
+        paths = []
+        for offset in (0, 1):
+            run = (old + timedelta(days=offset)).isoformat()
+            path = state / (run.replace(":", "-") + ".json")
+            path.write_text(json.dumps(dict(self.report, run=run)))
+            path.with_suffix(".md").write_text("old")
+            paths.append(path)
+        for path in state.glob("*.json"):
+            if path not in paths and path.name not in ("latest.json", "counts.json"): path.unlink()
+        namespace["prune"](state)
+        self.assertFalse(paths[0].exists())
+        self.assertFalse(paths[0].with_suffix(".md").exists())
+        self.assertTrue(paths[1].exists())
+        self.assertTrue(paths[1].with_suffix(".md").exists())
+        for name in ("latest.json", "counts.json", "scan-config.toml"):
+            self.assertTrue((state / name).exists())
+
+    def test_real_symlink_and_regular_file_controls(self):
+        self.approve()
+        target = self.home / "outside"
+        node_package(target, "link-control")
+        public = self.home / "dev_workspace/public"
+        (public / "linked-directory").symlink_to(target, target_is_directory=True)
+        linked = public / "node_modules/link-control/package.json"
+        linked.parent.mkdir(parents=True)
+        linked.symlink_to(target / "node_modules/link-control/package.json")
+        self.assertEqual(self.scan().returncode, 0)
+        self.assertNotIn('"name": "link-control"', json.dumps(self.report["roots"][-1]))
+        print("2.6.0 follows neither file nor directory links; regular-file control follows", flush=True)
+        linked.unlink()
+        linked.write_text((target / "node_modules/link-control/package.json").read_text())
+        self.assertEqual(self.scan().returncode, 0)
+        self.assertIn('"name": "link-control"', json.dumps(self.report["roots"][-1]))
+
 
 class Wiring(unittest.TestCase):
+    def test_private_unit_parity_and_write_locations(self):
+        namespace = runpy.run_path(str(SCRIPT))
+        unit = (ROOT / "home/dot_config/systemd/user/security-watch.service").read_text()
+        paths = [line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("InaccessiblePaths=")]
+        self.assertEqual(set(paths), {"-%h/dev_workspace/" + name for name in namespace["EXCLUDES"]} | {"-%h/project-data"})
+        self.assertFalse(any("/cortex" in p or "/.local/state" in p for p in paths))
+
+    def test_version_constant_and_readme(self):
+        self.assertEqual(SCRIPT.read_text().count("2.6.0"), 1)
+        readme = (ROOT / "README.md").read_text()
+        for phrase in ("--accept-counts", "last 7 accepted", "exemptions apply to all roots", "no baseline", "absent"):
+            self.assertIn(phrase, readme)
     def test_daily_units_and_gate(self):
         units = ROOT / "home/dot_config/systemd/user"
         timer = (units / "osv-db-refresh.timer").read_text()

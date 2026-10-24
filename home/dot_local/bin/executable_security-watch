@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Daily OSV scan. Extraction, traversal and exemptions belong to osv-scanner."""
 from datetime import date, datetime, timedelta, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 # Paths are relative to HOME. GPU is optional; the other installed roots are required.
@@ -17,9 +19,19 @@ ROOTS = ((".local/share/bootstrap/npm", False),
          (".local/share/bootstrap/gpu-venv", True),
          ("dev_workspace", False))
 EXCLUDES = ("customer-harness", "CustomerHarness", "typo3-dkm-plugin", "typo3-dkm",
-            "Typo3", "DKM", "photo-organizer", "secrets", "project-data", ".git")
+            "Typo3", "DKM", "photo-organizer", "secrets", "project-data")
+VERSION = "2.6.0"
 SENTINELS = {ROOTS[0][0]: "@openai/codex", ROOTS[1][0]: "pre-commit",
-             ROOTS[2][0]: "inspect-ai"}
+             ROOTS[2][0]: "inspect-ai", "dev_workspace": "@openai/codex"}
+DATED = r"\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}(?:\.\d+)?\+00-00\.json"
+
+
+def normalise(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def sanitise(value):
+    return re.sub(r"^#", r"\\#", " ".join(str(value).split())[:200])
 
 
 def run(args, timeout):
@@ -27,20 +39,63 @@ def run(args, timeout):
 
 
 def write(path, content):
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(content)
-    temporary.replace(path)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, suffix=".tmp", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(content)
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
-def summary(report, dated):
+def summary(report, dated, limit=5):
     lines = ["## Security", "", f"OSV scan {report['run']}: {report['status']}.",
              f"Report: {dated}", ""]
-    lines += [f"- `{r['root']}`: {r['status']}" for r in report["roots"]]
-    lines += ["- Error: " + e.replace("\n", " ") for e in report["errors"]]
-    lines += [f"- Exemption `{e['id']}` until {e['ignoreUntil']} "
-              f"({'effective' if e['effective'] else 'expired'}): {e['reason']}"
+    lines += [f"- `{r['root']}`: {r['status']}; {r.get('package_count', 0)} packages; "
+              f"{len(r.get('advisory_ids', []))} advisories: " +
+              ", ".join(sanitise(v) for v in r.get("advisory_ids", [])[:limit]) for r in report["roots"]]
+    lines += ["- Error: " + sanitise(e) for e in report["errors"]]
+    lines += ["- Count baseline reset: " + r for r in report.get("count_resets", [])]
+    lines += ["", "exemptions apply to all roots."]
+    lines += [f"- Exemption `{sanitise(e['id'])}` until {e['ignoreUntil']} "
+              f"({'effective' if e['effective'] else 'expired'}): {sanitise(e['reason'])}"
               for e in report.get("exemptions", [])]
     return "\n".join(lines) + "\n"
+
+
+def read_state(path, history=False):
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict) or datetime.fromisoformat(data["run"]).tzinfo is None:
+            return None
+        if history or "count_history" in data:
+            counts = data["count_history"]
+            if not isinstance(counts, dict) or any(
+                    not isinstance(k, str) or not isinstance(v, list) or not 1 <= len(v) <= 7
+                    or any(type(n) is not int or n <= 0 for n in v) for k, v in counts.items()):
+                return None
+        return data
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def dated_reports(state):
+    return sorted((p for p in state.iterdir() if re.fullmatch(DATED, p.name)), reverse=True)
+
+
+def prune(state):
+    reports = dated_reports(state)
+    newest = next((p for p in reports if read_state(p, True) is not None), None)
+    for path in reports:
+        stamp = path.stem  # Date is kept; only time separators change.
+        try:
+            stamp = datetime.fromisoformat(stamp[:11] + stamp[11:].replace("-", ":"))
+        except ValueError:
+            continue
+        if path != newest and stamp < datetime.now(timezone.utc) - timedelta(days=60):
+            path.unlink()
+            path.with_suffix(".md").unlink(missing_ok=True)
 
 
 def approved_config(home, state, report):
@@ -61,20 +116,29 @@ def approved_config(home, state, report):
         expiry = entry["ignoreUntil"]
         if type(expiry) is not date or expiry > today + timedelta(days=90):
             raise ValueError("ignoreUntil must be a TOML date no more than 90 days out")
-        exemptions.append(dict(entry, ignoreUntil=expiry.isoformat(), effective=expiry >= today))
+        exemptions.append(dict(entry, ignoreUntil=expiry.isoformat(), effective=expiry > today))
     report["exemptions"] = exemptions
     config = state / "scan-config.toml"
     write(config, content)  # One validated snapshot for every root, including an empty file.
     return config
 
 
-def main():
+def main(accept_counts=False):
     os.umask(0o077)
     home = Path.home()
     state = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "security"
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    report = {"run": now, "status": "incomplete", "roots": [], "errors": []}
+    with (state / "run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("security-watch already running (run.lock)")
+        return scan_roots(home, state, accept_counts)
+
+
+def scan_roots(home, state, accept_counts):
+    now = datetime.now(timezone.utc).isoformat()
+    report = {"run": now, "status": "incomplete", "roots": [], "errors": [], "count_resets": []}
     result = 1
     completed = False
     dated = state / (now.replace(":", "-") + ".json")
@@ -83,20 +147,14 @@ def main():
         body = json.dumps(report, indent=2) + "\n"
         write(dated, body)
         write(state / "latest.json", body)
-        write(dated.with_suffix(".md"), summary(report, dated))
+        write(dated.with_suffix(".md"), summary(report, dated, limit=None))
+        write(state / "counts.json", json.dumps({"run": now, "count_history": counts}) + "\n")
 
-    previous = {}
-    try:
-        previous = json.loads((state / "latest.json").read_text())
-    except FileNotFoundError:
-        pass
-    except (OSError, ValueError) as error:
-        report["errors"].append("previous report unreadable: " + str(error))
-    # Carry accepted counts even when the next report is incomplete or a root fails.
-    # Older reports have no map: seed it only from roots that passed every check.
-    counts = report["last_clean_counts"] = previous.get("last_clean_counts", {
-        r["root"]: r["package_count"] for r in previous.get("roots", [])
-        if r.get("status") in ("clean", "findings") and r.get("package_count", 0) > 0})
+    fallback = next((data for p in dated_reports(state)
+                     if (data := read_state(p, True)) is not None), {})
+    previous = read_state(state / "latest.json") or fallback
+    saved = read_state(state / "counts.json", True) or fallback
+    counts = report["count_history"] = saved.get("count_history", previous.get("count_history", {}))
     persist()
     try:
         config = approved_config(home, state, report)
@@ -104,14 +162,14 @@ def main():
         if refresh.returncode:
             report["errors"].append("osv-db-refresh.service failed: " + refresh.stderr)
         version = run(["osv-scanner", "--version"], 30)
-        if version.returncode or "osv-scanner version: 2.6.0" not in version.stdout:
-            raise RuntimeError("osv-scanner 2.6.0 is required")
+        if version.returncode or f"osv-scanner version: {VERSION}" not in version.stdout:
+            raise RuntimeError(f"osv-scanner {VERSION} is required")
         for relative, optional in ROOTS:
             root = home / relative
             entry = {"root": relative, "status": "incomplete"}
             report["roots"].append(entry)
             if optional and not root.exists():
-                entry["status"] = "not installed"
+                entry["status"] = "absent"
                 continue
             try:
                 if not root.is_dir() or root.is_symlink():
@@ -120,32 +178,41 @@ def main():
                         "--offline-vulnerabilities", "--no-resolve", "--no-ignore", "-r",
                         "--experimental-plugins=python/wheelegg,javascript/packagejson",
                         "--format=json", "--all-packages", "--config", str(config)]
-                for excluded in EXCLUDES:
-                    args += ["--experimental-exclude", "r:(?i)/" + re.escape(excluded) + "(/|$)"]
+                prefix = re.escape(str(root).lstrip("/")) + "/"
+                patterns = [prefix + r"(?:.*/)?" + re.escape(n) + "(/|$)" for n in (".git", ".worktrees", ".work")]
+                if relative == "dev_workspace":
+                    patterns += [prefix + re.escape(n) + "(/|$)" for n in EXCLUDES]
+                for pattern in patterns:
+                    args += ["--experimental-exclude", "r:(?i)^" + pattern]
                 scan = run(args + [str(root)], 120)
                 entry.update(exit=scan.returncode, diagnostics=scan.stderr)
                 data = json.loads(scan.stdout)
                 if scan.returncode not in (0, 1) or not isinstance(data.get("results"), list):
                     raise RuntimeError("scanner failed or returned invalid results")
-                packages = [p["package"] for source in data["results"] for p in source["packages"]]
-                entry.update(results=data, package_count=len(packages))
+                found = [p for source in data["results"] for p in source["packages"]]
+                packages = [p["package"] for p in found]
+                entry.update(results=data, package_count=len(packages), advisory_ids=sorted({
+                    v["id"] for p in found for v in p.get("vulnerabilities", [])}))
                 if not packages:
                     raise RuntimeError("empty package results")
-                if re.search(r"(?im)\b(?:error|fatal)\b", scan.stderr):
+                if re.search(r"(?im)^fserr |\b(?:error|fatal)\b", scan.stderr):
                     raise RuntimeError("scanner diagnostics contain errors")
-                if relative in SENTINELS and not any(p["name"] == SENTINELS[relative] for p in packages):
+                if relative in SENTINELS and not any(normalise(p["name"]) == normalise(SENTINELS[relative]) for p in packages):
                     raise RuntimeError("missing sentinel package: " + SENTINELS[relative])
-                baseline = counts.get(relative, 0)
-                if len(packages) < baseline / 2:
+                history = counts.get(relative, [])
+                baseline = max(history, default=0)
+                if len(packages) < baseline / 2 and not accept_counts:
                     raise RuntimeError(f"sharp package count drop: {baseline} to {len(packages)}")
                 entry.update(status="findings" if scan.returncode else "clean", results=data)
-                counts[relative] = len(packages)
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
+                counts[relative] = ([len(packages)] if accept_counts else (history + [len(packages)])[-7:])
+                if accept_counts:
+                    report["count_resets"].append(relative)
+            except Exception as error:
                 entry.update(status="error", error=str(error))
                 report["errors"].append(relative + ": " + str(error))
         result = int(bool(report["errors"]) or any(r["status"] == "findings" for r in report["roots"]))
         completed = True
-    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+    except Exception as error:
         report["errors"].append(str(error))
         completed = True
     finally:
@@ -158,7 +225,8 @@ def main():
             pattern = r"(?ms)^## Security\n.*?(?=^## |\Z)"
             text = re.sub(pattern, lambda match: section + "\n", text) if re.search(pattern, text) else text.rstrip() + "\n\n" + section
             write(status, text)
-        except (OSError, UnicodeError) as error:
+            prune(state)
+        except Exception as error:
             result = 1
             if completed:
                 report["status"] = "failed"
@@ -175,8 +243,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, terminated)
     outcome = 1
     try:
-        outcome = main()
-    except (OSError, RuntimeError) as error:
+        if sys.argv[1:] not in ([], ["--accept-counts"]):
+            raise ValueError("usage: security-watch [--accept-counts]")
+        outcome = main("--accept-counts" in sys.argv)
+    except Exception as error:
         print("security-watch: " + str(error), file=sys.stderr)
     finally:
         try:
