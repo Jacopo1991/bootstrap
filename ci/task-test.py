@@ -529,11 +529,51 @@ class TaskTool(unittest.TestCase):
         self.assertFalse((work / 'model-call.json').exists())
         self.assertEqual(json.loads((work / 'lane.json').read_text())['state'], 'refused: hold')
 
-    def assert_hold_during_child_startup(self, kind):
+    def test_hold_round7_run_record_does_not_bypass_command_entry(self):
+        commands = [('start', 'proj', 'docs', '--builder', 'codex'),
+                    ('lane', 'proj', '5'), ('runner-start', 'proj', 'runner.md'),
+                    ('realign', 'proj'), ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
+                    ('repair', 'proj'), ('plan', 'proj', '--sign'),
+                    ('review', 'proj', '5', '--run')]
+        self.assertEqual({c[0] for c in commands} - {'plan', 'review'},
+                         TASK_MODULE.HOLD_WORK_COMMANDS - {'check', 'merge'})
+        self.raw_task('hold', 'pull', 'entry hold with ambient run record')
+        for command in commands:
+            with self.subTest(command=command):
+                output = self.raw_task(*command, code=1,
+                    env=dict(self.env, TASK_RUN_RECORD=str(self.home / 'ambient-run.json')))
+                self.assertIn('entry hold with ambient run record', output)
+                self.assertIn('refused: hold', output)
+        self.assertFalse((self.home / 'ambient-run.json').exists())
+
+    def test_hold_round7_reviewer_plan_reservation_is_removed_without_charge(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        prompt, reply = wt / '.work/review-prompt.md', wt / '.work/review-response.md'
+        prompt.write_text('Review the task.\n')
+        before = self.run_rows()
+        self.raw_task('hold', 'pull', 'hold at planned reviewer launch')
+        with self.budget_environment() as api, mock.patch.object(api.subprocess, 'Popen') as launch:
+            for _ in range(2):
+                with self.assertRaisesRegex(api.HoldRefused, 'refused: hold'):
+                    api.run_reviewer('codex exec -m gpt-6-luna', wt, prompt, reply)
+                self.assertEqual(self.run_rows(), before)
+                self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+                self.assertIn('codex used 0 left 1', api.plan_budget('chain'))
+                self.assertIn('disabled []', api.plan_budget('chain'))
+            launch.assert_not_called()
+        self.assertEqual(json.loads(reply.with_name('review-run.json').read_text())['state'], 'refused: hold')
+
+    def assert_hold_during_child_startup(self, kind, plan=False):
         self.stub_models()
         wt, _ = self.started()
         work = wt / '.work'
         (work / 'prompt.md').write_text('Do the task.\n')
+        rounds = self.state() / 'rounds.json'
+        rounds.write_text(json.dumps(dict(used=1, extra=0, previous='preserve')))
+        rounds_before = json.loads(rounds.read_text())
+        before = self.run_rows()
+        if plan: self.budget_fixture(points=1)
         ready, resume = self.home / 'child-ready', self.home / 'child-resume'
         # Pause the actual launched child before main(), after the launcher has admitted it.
         # Source already contains the asserted /etc fixture seam; modules stay read-only links.
@@ -557,8 +597,8 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(source.count(entry), 1)
         tool.write_text(source.replace(entry, startup + entry))
         command = (['lane', 'proj', '5', '--no-boost'] if kind == 'lane'
-                   else ['check', 'proj', '5', '--detach'])
-        launched = subprocess.run([sys.executable, str(tool), *command], env=self.env,
+                   else [kind, 'proj', '5', '--detach'])
+        launched = subprocess.run([sys.executable, str(tool), *command], env=dict(self.env, TASK_PLAN='chain') if plan else self.env,
                                   cwd=wt, capture_output=True, text=True, timeout=10)
         self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
         record = work / 'lane.json' if kind == 'lane' else self.state() / 'run.json'
@@ -584,6 +624,12 @@ class TaskTool(unittest.TestCase):
         rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         self.assertFalse(any(row.get('outcome') == 'interrupted' for row in rows), rows)
         if kind == 'lane':
+            self.assertEqual(json.loads(rounds.read_text()), rounds_before)
+        if plan:
+            self.assertEqual(rows, before)
+            self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+            self.assertIn('codex used 0 left 1', self.raw_task('plan-budget', 'chain'))
+        elif kind == 'lane':
             outcomes = [row for row in rows if row.get('outcome') and row.get('kind') == 'lane']
             self.assertEqual(len(outcomes), 1, rows)
             self.assertEqual(outcomes[0]['outcome'], 'failed')
@@ -594,6 +640,12 @@ class TaskTool(unittest.TestCase):
 
     def test_hold_round6_detached_check_startup_finalizes_refusal(self):
         self.assert_hold_during_child_startup('check')
+
+    def test_hold_round7_planned_worker_startup_restores_round_and_reservation(self):
+        self.assert_hold_during_child_startup('lane', plan=True)
+
+    def test_hold_round7_detached_merge_startup_finalizes_refusal(self):
+        self.assert_hold_during_child_startup('merge')
 
     def test_hold_round5_worker_stop_records_distinguish_hold(self):
         self.stub_models()
