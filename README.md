@@ -1405,11 +1405,14 @@ always retaining the newest valid dated report and the special state/config file
 A non-blocking `state/run.lock` covers the entire run, including manual resets;
 overlapping runs exit with a clear error. This does not guard other writers of STATUS.
 It calls `job-ping security-watch 0` for a clean completed scan, or `1` for findings,
-refresh/scan errors or a failed status update. Provision `SECURITY_WATCH_URL` in the
-existing owner-managed pings file to receive these signals. No report body is sent.
-The requested service mask currently also hides job-ping's default
-`~/project-data/healthchecks/pings.env`; the PM must choose an approved accessible
-ping-file location before deployment. Fixture tests verify calls, not delivery.
+refresh/scan errors or a failed status update. Pings pending: `SECURITY_WATCH_URL` must be
+added to the existing owner-managed pings file (Jacopo's action); until then failures show
+in STATUS and the journal. No report body is sent.
+The unit masks `~/project-data` read-only (`TemporaryFileSystem=`) and binds back only
+`~/project-data/healthchecks` (`BindReadOnlyPaths=`), so job-ping's default `pings.env` stays
+readable. job-ping is best effort by design: it always exits 0, so no wrapper change is needed,
+and a missing key or unreachable endpoint never fails the scan. Fixture tests verify calls,
+not delivery; the live proof reads the unit's view of the pings path after install.
 
 Refresh has a 30-minute budget and each of five roots has two minutes, within the
 45-minute unit timeout. An incomplete record replaces `latest.json` and the dated

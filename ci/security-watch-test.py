@@ -657,9 +657,22 @@ class Wiring(unittest.TestCase):
     def test_private_unit_parity_and_write_locations(self):
         namespace = runpy.run_path(str(SCRIPT))
         unit = (ROOT / "home/dot_config/systemd/user/security-watch.service").read_text()
+        directives = dict(line.split("=", 1) for line in unit.splitlines() if "=" in line and not line.startswith("#"))
         paths = [line.split("=", 1)[1] for line in unit.splitlines() if line.startswith("InaccessiblePaths=")]
-        self.assertEqual(set(paths), {"-%h/dev_workspace/" + name for name in namespace["EXCLUDES"]} | {"-%h/project-data"})
+        self.assertEqual(set(paths), {"-%h/dev_workspace/" + name for name in namespace["EXCLUDES"]})
         self.assertFalse(any("/cortex" in p or "/.local/state" in p for p in paths))
+        # ~/project-data is masked read-only, and only its healthchecks directory is bound back.
+        self.assertEqual(unit.count("TemporaryFileSystem="), 1)
+        self.assertEqual(directives["TemporaryFileSystem"], "%h/project-data:ro")
+        self.assertEqual(unit.count("BindReadOnlyPaths="), 1)
+        self.assertEqual(directives["BindReadOnlyPaths"], "-%h/project-data/healthchecks")
+        self.assertNotIn("BindPaths=", unit)
+        # job-ping's default pings file must sit under the bound directory, not under any mask.
+        home_relative = lambda value: value.removeprefix("-").removeprefix("%h/")
+        pings = "project-data/healthchecks/pings.env"
+        self.assertIn("$HOME/" + pings, (ROOT / "home/dot_local/bin/executable_job-ping").read_text())
+        self.assertTrue(pings.startswith(home_relative(directives["BindReadOnlyPaths"]) + "/"))
+        self.assertFalse(any(pings.startswith(home_relative(p) + "/") for p in paths))
 
     def test_version_constant_and_readme(self):
         self.assertEqual(SCRIPT.read_text().count("2.6.0"), 1)

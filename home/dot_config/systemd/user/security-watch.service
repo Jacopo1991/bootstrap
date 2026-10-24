@@ -19,5 +19,8 @@ InaccessiblePaths=-%h/dev_workspace/DKM
 InaccessiblePaths=-%h/dev_workspace/photo-organizer
 InaccessiblePaths=-%h/dev_workspace/secrets
 InaccessiblePaths=-%h/dev_workspace/project-data
-InaccessiblePaths=-%h/project-data
+# Hide ~/project-data (runtime data), then bind back only the Healthchecks pings directory
+# (job-ping reads its pings.env there), read-only.
+TemporaryFileSystem=%h/project-data:ro
+BindReadOnlyPaths=-%h/project-data/healthchecks
 TimeoutStartSec=45min
