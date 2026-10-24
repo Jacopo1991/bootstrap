@@ -10,6 +10,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -460,6 +461,45 @@ class Usage(unittest.TestCase):
 
     def busy(self, vendor, at=NOW, pid=None):
         usage.claim(self.home, vendor, "lane", os.getpid() if pid is None else pid, at)
+
+    def test_claim_identity_and_pruning_including_legacy_files(self):
+        directory = self.home / '.local/state/task/usage/running/claude'
+        self.busy('claude')
+        path = directory / f'{os.getpid()}.json'
+        entry = json.loads(path.read_text())
+        fields = Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()
+        self.assertEqual(entry['start'], fields[19])
+        self.assertEqual(usage.running(self.home, 'claude'), 1)
+        # The PID is still alive, but its saved identity belongs to another process.
+        entry['start'] = str(int(entry['start']) + 1)
+        path.write_text(json.dumps(entry))
+        self.assertEqual(usage.running(self.home, 'claude'), 0)
+        self.assertFalse(path.exists())
+        for data in ({'pid': os.getpid(), 'at': NOW.isoformat()},
+                     dict(entry, pid=DEAD), {}, dict(entry, pid='invalid')):
+            path.write_text(json.dumps(data))
+            self.assertEqual(list(usage._claims(self.home, 'claude')), [])
+            self.assertFalse(path.exists())
+        self.busy('claude', pid=DEAD)
+        self.assertEqual(usage.running(self.home, 'claude'), 0)
+        self.assertEqual(list(directory.glob('*.json')), [])
+
+    def test_process_start_handles_parentheses_and_dead_processes(self):
+        stat = '123 (name with ) parentheses) S ' + ' '.join(['0'] * 18 + ['456'])
+        with mock.patch.object(Path, 'read_text', return_value=stat):
+            self.assertEqual(usage.process_start(123), '456')
+        with mock.patch.object(Path, 'read_text', return_value=stat.replace(') S ', ') Z ')):
+            self.assertIsNone(usage.process_start(123))
+        self.assertIsNone(usage.process_start(DEAD))
+
+    def test_release_preserves_stale_reading_history(self):
+        self.five('claude', 10, age=timedelta(minutes=46))
+        self.busy('claude')
+        usage.release(self.home, 'claude', os.getpid())
+        usage.release(self.home, 'claude', os.getpid())  # idempotent
+        self.assertEqual(usage.running(self.home, 'claude'), 0)
+        self.assertTrue(self.verdict()['stale'])
+        self.assertEqual(usage.gate(self.home, 'lane', 'claude', 'routine', 'p', 't', NOW)['hold'], '')
 
     def test_five_hour_bands_per_vendor(self):
         # Reserve claude 25 -> exhausted at 75, warning at 60; codex 10 -> 90 and 75.
