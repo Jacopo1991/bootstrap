@@ -2273,10 +2273,11 @@ def advisory_check_lock(path: Path):
 def check_step_environment(run_id):
     """Keep local mock traffic off the sandbox proxy without changing proxy settings."""
     child_env = dict(agent_environment(), TASK_RUN_ID=run_id)
-    bypass = ("localhost", "127.0.0.1", "::1")
+    child_env.update({key: value for key, value in os.environ.items()
+                      if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}})
     for name in ("NO_PROXY", "no_proxy"):
         existing = child_env.get(name, "")
-        child_env[name] = ",".join(part for part in (existing.rstrip(","), *bypass) if part)
+        child_env[name] = ",".join(part for part in (existing.rstrip(","), "localhost", "127.0.0.1", "::1") if part)
     return child_env
 
 
@@ -2286,7 +2287,6 @@ def trusted_check_environment(path, run_id, gate_environment):
                    if key in allowed or key.startswith("LC_")}
     environment.update(configured_environment(path))
     environment.update(gate_environment)
-    # Keep cancellation of descendants in new sessions without inheriting TASK_RUN_*.
     environment["TASK_GATE_RUN_ID"] = run_id
     return environment
 
