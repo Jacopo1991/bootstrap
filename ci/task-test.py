@@ -203,6 +203,10 @@ if count == 1:
 print(reply, end='', flush=True)
 print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
 delay = os.environ.get('REVIEW_STUB_DELAY', '0')
+if os.environ.get('REVIEW_STUB_CHILD'):
+    import subprocess
+    child = subprocess.Popen(['sleep', '30'])
+    (work / 'reviewer-child.pid').write_text(str(child.pid))
 time.sleep(float(os.environ.get('REVIEW_STUB_FIRST_DELAY', delay) if count == 1 else delay))
 code = os.environ.get('REVIEW_STUB_EXIT', '0')
 sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else code))
@@ -1150,6 +1154,7 @@ class TaskTool(unittest.TestCase):
                 pending = list(log.parent.glob('pending-runs/*.json'))
                 self.assertEqual(len(pending), 1, 'refusal preserves the existing reservation without a new attempt')
                 self.assertFalse(json.loads(pending[0].read_text()).get('invoked', False))
+                self.assertEqual(list((self.home / '.local/state/task/usage/running').glob('*/*.json')), [])
 
     def test_plan_budget_review_rechecks_reservation_before_spawn(self):
         wt, _ = self.started()
@@ -1167,6 +1172,7 @@ class TaskTool(unittest.TestCase):
             with mock.patch.object(api, 'atomic_json', side_effect=delayed):
                 with self.assertRaisesRegex(api.Stop, 'expired'):
                     api.run_reviewer('claude -p --model haiku', wt, prompt, reply)
+        self.assertEqual(list((self.home / '.local/state/task/usage/running').glob('*/*.json')), [])
         self.assertFalse((wt / '.work/reviewer-call.json').exists())
         self.assertEqual(self.run_rows(), [])
         pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
@@ -3734,10 +3740,12 @@ store.write_text(json.dumps(prs))
                 break
             time.sleep(0.02)
         self.assertEqual(run["state"], "timed_out")
+        self.assertFalse((self.home / f'.local/state/task/usage/running/codex/{run["pid"]}.json').exists())
         self.assertIsNone(run['exit_code'])
         self.assertIn('lane timed_out', self.raw_task('status', 'proj').split('Needs attention:')[1])
         self.assertTrue((wt / '.work/descendant.pid').exists())
         self.assert_group_stopped(run['pid'])
+        self.assert_group_stopped(run['child_pgid'])
         self.assertTrue(wt.exists())
         (wt / '.work/descendant.pid').unlink()
         self.raw_task("lane", "proj", "5", env=env)
@@ -3750,7 +3758,9 @@ store.write_text(json.dumps(prs))
         out = self.raw_task("cancel", "proj", "5")
         self.assertIn("process group", out)
         self.assertEqual(json.loads((wt / ".work/lane.json").read_text())["state"], "cancelled")
+        self.assertFalse((self.home / f'.local/state/task/usage/running/codex/{cancelled["pid"]}.json').exists())
         self.assert_group_stopped(cancelled['pid'])
+        self.assert_group_stopped(cancelled['child_pgid'])
         self.raw_task("lane", "proj", "5")
         self.wait_for_lane(wt)
 
@@ -6355,6 +6365,7 @@ store.write_text(json.dumps(prs))
             release.touch()
             record = self.wait_for_lane(wt)
         self.assertEqual(record["exit_code"], 0)
+        self.assertFalse((self.home / f'.local/state/task/usage/running/codex/{record["pid"]}.json').exists())
         self.assertFalse(recorded.exists(), "the Codex lane's recorded temporary directory is removed")
         self.assertEqual((wt / ".work/final.md").read_text(), "codex-final: Read the pinned task context in .work/context/ before working.\n\n" + prompt)
         self.assertIn("codex-log", (wt / ".work/lane.log").read_text())
@@ -6545,6 +6556,7 @@ store.write_text(json.dumps(prs))
         self.raw_task("lane", "proj", "5", "--builder", "claude")
         record = self.wait_for_lane(wt)
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
+        self.assertFalse((self.home / f'.local/state/task/usage/running/claude/{record["pid"]}.json').exists())
         self.assertEqual(call["args"], ["-p", "--output-format", "stream-json", "--verbose",
                                        "--model", "sonnet", "--effort", "high",
                                        "--permission-mode", "acceptEdits", "--allowedTools",
@@ -6802,6 +6814,75 @@ store.write_text(json.dumps(prs))
         self.assertEqual(len(terminal), 1)
         self.assertEqual(json.loads(record.read_text())["state"], "finished")
 
+    def test_worker_signals_interrupt_release_claim_and_stop_builder_group(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 4\n')
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('task')
+        env = dict(self.env, LANE_STUB_RELEASE=str(self.home / 'never-release'))
+        for vendor in ('codex', 'claude'):
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                with self.subTest(vendor=vendor, signal=sig):
+                    for name in ('model-call.json', 'descendant.pid'):
+                        (work / name).unlink(missing_ok=True)
+                    self.raw_task('lane', 'proj', '5', '--builder', vendor, env=env)
+                    self.wait_for_lane(wt, finished=False)
+                    deadline = time.monotonic() + 5
+                    while not (work / 'descendant.pid').exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue((work / 'descendant.pid').exists())
+                    run = json.loads((work / 'lane.json').read_text())
+                    child_group = run['child_pgid']
+                    claim = self.home / f'.local/state/task/usage/running/{vendor}/{run["pid"]}.json'
+                    self.assertTrue(claim.exists())
+                    # Signal only the worker; cleanup must stop its separately running builder.
+                    os.kill(run['pid'], sig)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        run = json.loads((work / 'lane.json').read_text())
+                        if run['state'] != 'running':
+                            break
+                        time.sleep(0.02)
+                    self.assertEqual((run['state'], run['exit_code']), ('interrupted', None))
+                    self.assertFalse(claim.exists())
+                    self.assert_group_stopped(child_group)
+                    self.assert_group_stopped(run['pid'])
+                    logs = [json.loads(line) for line in (self.home / '.local/state/task/runs.jsonl').read_text().splitlines()]
+                    self.assertEqual(logs[-1]['outcome'], 'interrupted')
+
+    def test_reviewer_signals_stop_live_group_before_releasing_claim(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        work = wt / '.work'
+        env = dict(self.env, REVIEW_STUB_DELAY='30', REVIEW_STUB_CHILD='1')
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=sig):
+                (work / 'reviewer-child.pid').unlink(missing_ok=True)
+                with (self.home / 'review-process.log').open('w') as output:
+                    process = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run'],
+                                               cwd=self.home, env=env, stdout=output, stderr=output)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not (work / 'reviewer-child.pid').exists() and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        self.assertTrue((work / 'reviewer-child.pid').exists(),
+                                        (self.home / 'review-process.log').read_text())
+                        child = json.loads((work / 'reviewer-call.json').read_text())['pid']
+                        claim = self.home / f'.local/state/task/usage/running/claude/{child}.json'
+                        self.assertTrue(claim.exists())
+                        process.send_signal(sig)
+                        process.wait(timeout=5)
+                        self.assertNotEqual(process.returncode, 0)
+                        self.assertFalse(claim.exists())
+                        self.assert_group_stopped(child)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
+
     def test_lane_finalization_cleanup_order_and_failure(self):
         record = self.home / "lane.json"
         root = self.home / "claude-temp"
@@ -6817,25 +6898,62 @@ store.write_text(json.dumps(prs))
                         temporary.rmdir()
                     elif missing == "outer":
                         shutil.rmtree(outer)
-                    run = {"state": "running", "temporary": str(temporary)}
+                    TASK_MODULE.task_usage.claim(self.home, 'claude', 'lane', os.getpid())
+                    claim = self.home / f'.local/state/task/usage/running/claude/{os.getpid()}.json'
+                    run = {"state": "running", "temporary": str(temporary), 'builder': 'claude', 'pid': os.getpid()}
                     record.write_text(json.dumps(run))
                     publish = TASK_MODULE.atomic_json
 
                     def observe(path, value):
                         self.assertFalse(temporary.exists())
+                        self.assertFalse(claim.exists())
                         self.assertEqual(json.loads(record.read_text())["state"], "running")
                         publish(path, value)
 
                     with mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
+                            mock.patch.object(TASK_MODULE, 'HOME', self.home), \
                             mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
                         TASK_MODULE.finalize_lane_record(record, run, state)
                     self.assertEqual(json.loads(record.read_text())["state"], state)
+
             for error in (PermissionError("denied"), TASK_MODULE.Stop("unsafe path")):
                 with self.subTest(state=state, error=type(error).__name__), \
                         mock.patch.object(TASK_MODULE, "cleanup_lane_temporary", side_effect=error), \
                         contextlib.redirect_stderr(io.StringIO()):
                     TASK_MODULE.finalize_lane_record(record, {}, state)
                     self.assertEqual(json.loads(record.read_text())["state"], state)
+
+    def test_reviewer_releases_claim_on_success_failure_interruption_and_refusal(self):
+        wt, _ = self.started()
+        prompt, reply = self.state() / 'prompt.md', self.state() / 'reply.md'
+        prompt.write_text('review')
+        claim = self.home / f'.local/state/task/usage/running/claude/{os.getpid()}.json'
+        for result in (0, 3, KeyboardInterrupt(), subprocess.TimeoutExpired('claude', 1), OSError('refused')):
+            with self.subTest(result=result):
+                process = mock.Mock(pid=os.getpid())
+                def wait(**kwargs):
+                    self.assertTrue(claim.exists())
+                    if isinstance(result, BaseException):
+                        raise result
+                    return result
+                process.wait.side_effect = wait
+                # A timeout's second wait reaps the killed child.
+                if isinstance(result, subprocess.TimeoutExpired):
+                    def timed_wait(**kwargs):
+                        if kwargs:
+                            return wait(**kwargs)
+                        return -9
+                    process.wait.side_effect = timed_wait
+                spawn = {'side_effect': result} if isinstance(result, OSError) else {'return_value': process}
+                expected = contextlib.nullcontext() if result == 0 else self.assertRaises(
+                    KeyboardInterrupt if isinstance(result, KeyboardInterrupt) else TASK_MODULE.Stop)
+                with mock.patch.dict(os.environ, self.env, clear=True), \
+                        mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                        mock.patch.object(TASK_MODULE.subprocess, 'Popen', **spawn), \
+                        mock.patch.object(TASK_MODULE, 'main_repo', return_value=self.repo), \
+                        mock.patch.object(TASK_MODULE.os, 'killpg'), expected:
+                    TASK_MODULE.run_reviewer('claude -p --model haiku', wt, prompt, reply)
+                self.assertFalse(claim.exists())
 
     def test_claude_lane_accepts_opus_and_records_selected_model(self):
         self.stub_models()
