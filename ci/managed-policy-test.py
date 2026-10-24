@@ -275,7 +275,8 @@ with tempfile.TemporaryDirectory() as temp:
     # command is absent; reconstruct the executable-location inspection described
     # there as a plain lookup of the task, gate and installer tools.
     with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
-        for command in ("npm help config", "command -v task just uv npm"):
+        # type only reports command information, including with --all.
+        for command in ("npm help config", "command -v task just uv npm", "type --all task"):
             assert judge(command) is None, (command, judge(command))
         for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun"):
             for action in ("help", "help install", "--help", "-h", "--version", "-v"):
@@ -286,7 +287,7 @@ with tempfile.TemporaryDirectory() as temp:
         for command in ("xargs npm install", "setsid npm install", "nohup npm install",
                         "env -S 'npm install'", "sh -c 'npm install'",
                         "command npm install", "command -v task -- npm install",
-                        "command -v", "command -v --help", "type --all task"):
+                        "command -v", "command -v --help"):
             assert judge(command), command
     # Help must not need a package manifest or inspect executable lifecycle hooks.
     with patch.object(policy, "program_text", side_effect=AssertionError("help read a recipe")):
@@ -483,8 +484,8 @@ with tempfile.TemporaryDirectory() as temp:
     def outside_temp():
         stack = [patch.object(policy, "LANE_TEMP_ROOTS", ()),
                  patch.object(policy, "scratch_root", return_value=None),
-                 patch.dict(os.environ)]
-        os.environ.pop("TMPDIR", None)
+                 patch.dict(os.environ, {key: value for key, value in os.environ.items()
+                                         if key != "TMPDIR"}, clear=True)]
         return stack
 
     outside = make_venv(base / "outside-venv")
