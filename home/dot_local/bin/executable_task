@@ -1769,9 +1769,19 @@ def cleanup_lane_temporary(temporary):
             pass  # An outer lane may finish concurrently.
 
 
+def stop_child_group(process):
+    # Kill the whole private group, including descendants, before releasing its claim.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait()
+
+
 def finalize_lane_record(path, run, state, **fields):
     # A terminal record is the completion signal to waiters and batch runners.
     # Cleanup must precede publication, but a cleanup failure must not hide exit.
+    task_usage.release(HOME, run.get("builder"), run.get("pid"))
     try:
         cleanup_lane_temporary(run.get("temporary"))
     except (OSError, Stop) as error:
@@ -2048,6 +2058,7 @@ def lane(args):
             return 0
     code, result = 1, "finished"
     timed_out = False
+    interrupted = False
     temporary = None
     try:
         environment = lane_environment(task, builder)
@@ -2072,8 +2083,10 @@ def lane(args):
                 admit()
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          pass_fds=task_lock.descriptors(),
-                                         stdout=subprocess.PIPE if output else None)
+                                         stdout=subprocess.PIPE if output else None, start_new_session=True)
                 try:
+                    run["child_pgid"] = child.pid
+                    atomic_json(lane_record, run)
                     deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
                     with selectors.DefaultSelector() as reader:
                         if output:
@@ -2103,15 +2116,23 @@ def lane(args):
                     code = child.wait()
                 except subprocess.TimeoutExpired:
                     timed_out = True
+                    stop_child_group(child)
                     finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
+                except (SystemExit, KeyboardInterrupt):
+                    interrupted = True
+                    stop_child_group(child)
+                    raise
+    except (SystemExit, KeyboardInterrupt):
+        interrupted = True
+        raise
     except HoldRefused:
         result = "refused: hold"; raise
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        finalize_lane_record(lane_record, run, "timed_out" if timed_out else result,
-                             exit_code=None if timed_out else code)
+        finalize_lane_record(lane_record, run, "interrupted" if interrupted else "timed_out" if timed_out else result,
+                             exit_code=None if interrupted or timed_out else code)
     return code
 
 
@@ -3375,6 +3396,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
+    process = None
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
@@ -3402,6 +3424,9 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
     finally:
+        if process is not None and process.poll() is None:
+            stop_child_group(process)
+        task_usage.release(HOME, run["builder"], process.pid if process else None)
         if raw != reply_file and raw.is_file():
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
@@ -4826,6 +4851,9 @@ def cancel(args):
         lane_run = {}
     if lane_run.get("state") == "running" and pid_alive(lane_run.get("pid")):
         try:
+            if lane_run.get("child_pgid"):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(int(lane_run["child_pgid"]), signal.SIGKILL)
             os.killpg(int(lane_run["pid"]), signal.SIGKILL)
         except (ProcessLookupError, PermissionError) as error:
             finalize_lane_record(lane_path, lane_run, "interrupted")
@@ -5196,7 +5224,11 @@ def main(argv=None):
         except Stop as stop:
             print(f"task {args.command}: {stop}", file=sys.stderr)
             return 1
+    handlers = {}
     try:
+        if args.command == "review" or (args.command == "lane" and args._worker):
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                handlers[sig] = signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
         task_lock.before_work(args, HOME, resolve_repo)
         if args.command == "note":
             if args.kind != "setup-done":
@@ -5274,6 +5306,11 @@ def main(argv=None):
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1
+    finally:
+        if args.command == "lane" and args._worker:
+            task_usage.release(HOME, args.builder, os.getpid())
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
