@@ -20,7 +20,7 @@ EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleak
                      "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just",
                      "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
                      "verify-enable", "gate-browser", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch",
-                     "task-watch", "job-ping", "agentdev-shell-mcp"}
+                     "task-watch", "job-ping", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
 VERSION_COMMANDS = {
     "claude": ["claude", "--version"],
     "codex": ["codex", "--version"],
@@ -141,8 +141,13 @@ SHELL_CONNECTOR_MARKERS = ("agentdev-shell", "desktop-commander", "desktopcomman
                            "wonderwhy-er", "claude-server-commander")
 
 
-def shell_connector_references(home: Path) -> bool:
-    servers: list[object] = []
+# The Backlog.md MCP launcher is for the Claude app's Control Room page only; agent sessions
+# use the backlog CLI.
+BACKLOG_MCP_MARKERS = ("agentdev-backlog",)
+
+
+def agent_session_servers(home: Path) -> list[tuple[str, object]]:
+    servers: list[tuple[str, object]] = []
     codex_path = home / ".codex" / "config.toml"
     if codex_path.exists():
         config = tomllib.loads(codex_path.read_text(encoding="utf-8"))
@@ -153,8 +158,21 @@ def shell_connector_references(home: Path) -> bool:
             servers.extend((config.get("mcpServers") or {}).items())
             for project in (config.get("projects") or {}).values():
                 servers.extend(((project or {}).get("mcpServers") or {}).items())
-    text = json.dumps(servers).lower()
+    return servers
+
+
+def shell_connector_references(home: Path) -> bool:
+    text = json.dumps(agent_session_servers(home)).lower()
     return any(marker in text for marker in SHELL_CONNECTOR_MARKERS)
+
+
+def backlog_mcp_references(home: Path) -> bool:
+    """The launcher, or Backlog.md's own `mcp` command started directly."""
+    for server in agent_session_servers(home):
+        text = json.dumps(server).lower()
+        if any(marker in text for marker in BACKLOG_MCP_MARKERS) or ("backlog" in text and '"mcp"' in text):
+            return True
+    return False
 
 
 def configured_plugin_names(home: Path) -> set[str]:
@@ -267,6 +285,8 @@ def scan(root: Path, home: Path) -> list[str]:
         findings.add("mcp-outside-empty-baseline:" + name)
     if shell_connector_references(home):
         findings.add("shell-connector-in-agent-session")
+    if backlog_mcp_references(home):
+        findings.add("backlog-mcp-in-agent-session")
     for name in configured_plugin_names(home):
         findings.add("plugin-outside-empty-baseline:" + name)
     return sorted(findings)

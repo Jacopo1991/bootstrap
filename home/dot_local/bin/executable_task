@@ -1,49 +1,9 @@
 #!/usr/bin/env python3
-"""task lifecycle for one task; private evidence lives in ~/.local/state/task.
-
-The sandbox protects private task state from lanes running as the same Unix user.
-Write capability there determines trust; vendor environment markers do not.
-
-  task start <repo> <id> --builder codex|claude [--tier routine|hard|design] [--refresh] [--no-verify <reason>] [--seed <name>]... [--override "Jacopo YYYY-MM-DD: <request>"]
-  task runner-check <repo> <file>
-  task runner-start <repo> <runner-file> [--no-pace]
-  task hold [pull <reason> [--holder <name>] | release]
-  task lane <repo> <id> [--tier routine|hard|design] [--model gpt-6-luna|gpt-6.1-sol|gpt-6-astra|haiku|sonnet|opus|fable] [--builder codex|claude] [--timeout <minutes>] [--no-boost] [--no-pace] [--override "Jacopo YYYY-MM-DD: <request>"]
-    Claude also accepts claude-sonnet-5-5, claude-opus-5-5, claude-fable-5-1.
-    --builder overrides the pinned builder and updates subsequent review routing.
-    --seed copies a plain file/directory name from the main checkout's .work/; repeatable.
-      Defaults: gpt-6-luna for codex; sonnet for claude.
-  task check [[<repo>] <id>] [--detach] [--lock-wait <minutes>]
-  task review <repo> <id> [--request <file>] [--append-prompt <text>] [--run | --record <file>] [--no-check <reason>] [--reviewer <vendor> <model>] [--no-pace]
-  task usage [--weekly-line]
-    Vendor usage, pace verdict and the usage-pacing policy applied; lane, review and batch starts obey it
-    (exit 4 = held back). --no-pace skips the check for one command and is logged. See README.
-  task merge <repo> <id> [--keep] [--override <reason>] [--detach] [--lock-wait <minutes>]
-  task cancel <repo> <id>
-  task close <repo> <id> -m <summary> --retro <text> [--partial] [--no-merge <reason>]
-  task note <repo> <id> improve|intervention|setup <text>
-  task note - - setup-done <n>; task note <repo> - pm-run start|end [finished|failed|interrupted] [reason] (TASK_VENDOR, TASK_MODEL, TASK_EFFORT, TASK_TIER, TASK_PLAN)
-  task status [<repo>]
-  task boost [--claude-until <ISO datetime>] [--codex-until <ISO datetime>]
-  task boost off [--claude] [--codex]
-    Boost enables tier routing and extra batch capacity; routine and reviews keep their models.
-    Explicit --model wins, except gpt-6-astra needs Tier: design and fable Tier: hard; --tier never changes the recorded tier; only --override "Jacopo YYYY-MM-DD: <request>" on task lane or task start (ledgered) permits either. Configure ~/.config/task/routing.json to override the table.
-  task repair [<repo>]
-  task wait <repo> <id> [--max <minutes>]
-  task denials [--days N] [--rule R] [--repo R]
-
-<repo> is a folder name in ~/dev_workspace or a path. <id> is a Backlog.md task (T-32, t32, 32)
-or a plain name for work without a task. `task start` pins criteria and Verify commands; `task
-check` runs the gate and pinned verification; review and merge are PM actions.
-Sessions unable to write ~/.local/state/task are advisory lanes. The PM shell and
-an unsandboxed batch runner are trusted. Always launch builders via `task lane`;
-it keeps the builders sandboxed, including when the runner itself uses bypass.
-"""
+"""Task lifecycle; private state write capability determines trust. See README and --help."""
 import argparse
 import contextlib
 from contextlib import contextmanager
 from contextvars import ContextVar
-from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import hashlib
 import json
@@ -61,7 +21,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -72,7 +32,7 @@ from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits,
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 JACOPO_HOLD = Path("/etc/agent-hold")
-HOLD_WORK_COMMANDS = {"start", "lane", "check", "merge", "runner-start", "realign", "close", "gate-drill", "repair"}
+HOLD_WORK_COMMANDS = {"start", "lane", "check", "merge", "runner-start", "realign", "close", "repair"}
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
 GATE_SLOT = ContextVar("gate_slot", default=None)
@@ -432,6 +392,17 @@ def real_worktree(repo: Path, path: Path) -> bool:
     return path.resolve() in listed and path.resolve() != repo.resolve()
 
 
+def knowledge_repo(repo):
+    config = task_config(repo)
+    name = config.get("knowledge", f"cortex-kb-{repo.name}")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+        raise Stop(".task.toml knowledge must be a single repository name under ~/cortex; paths and '..' are refused.")
+    kb = CORTEX / name
+    if CORTEX.is_symlink() or kb.is_symlink():
+        raise Stop(".task.toml knowledge must not use a symlinked target under ~/cortex.")
+    return kb
+
+
 class Task:
     """A Backlog.md task (T-32) or a plain name."""
 
@@ -439,7 +410,7 @@ class Task:
         match = re.fullmatch(r"(?i)t?-?(\d+)", ident)
         self.repo = repo
         self.number = int(match.group(1)) if match else None
-        self.kb = CORTEX / f"cortex-kb-{repo.name}"
+        self.kb = knowledge_repo(repo)
         self.title = ""
         if self.number is not None:
             self.name = f"t{self.number}"
@@ -550,9 +521,11 @@ def boost(args):
 
 
 def boost_line():
-    active = active_boosts()
-    return ("boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(active.items()))
-            + " (tier routing + batch capacity; routine and reviews unchanged)" if active else "")
+    paused = {}
+    boosts = active(HOME, paused)
+    lines = (["boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(boosts.items()))
+              + " (tier routing + batch capacity; deeper hard/final reviews)"] if boosts else [])
+    return "\n".join(lines + list(paused.values()))
 
 
 def usage(args):
@@ -587,6 +560,60 @@ def plan_time(value):
         return None
 
 
+def plan_budget(ident, fields=None, clear=None, reserve=True):
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", ident): raise ValueError("invalid id")
+        with (CORTEX / "cortex-kb-company/plans" / f"{ident}.toml").open("rb") as source: content = source.read(16385)
+        if len(content) > 16384: raise ValueError("plan exceeds 16 KiB")
+        plan = tomllib.loads(content.decode("utf-8"))
+        expiry = plan_time(str(plan["expires"]))
+        if plan["id"] != ident or not expiry or expiry.utcoffset().total_seconds() != 0: raise ValueError("id or UTC expiry")
+        created = plan_time(str(plan.get("created", utc_now())))
+        if not created or created.utcoffset().total_seconds() != 0 or created > datetime.now(timezone.utc) or expiry - created > timedelta(days=31): raise ValueError("created must not be future; expiry must be within 31 days from created (or now)")
+        if set(plan["points"]) != set(task_usage.VENDORS) or not all(type(n) is int and 0 <= n <= 200 for n in plan["points"].values()): raise ValueError("integer points per vendor must be between 0 and 200")
+        if not isinstance(plan["allowed"], dict) or not all(isinstance(v, list) and all(isinstance(t, str) for t in v) for v in plan["allowed"].values()): raise ValueError("allowed must map repositories to task lists")
+        root = HOME / ".local/state/task"; log = root / "runs.jsonl"
+        if clear: require_pm(argparse.Namespace(command="plan-budget"))
+        if fields or clear: root.mkdir(parents=True, exist_ok=True)
+        with (log.open("a+" if fields or clear else "r") if log.exists() or fields or clear else contextlib.nullcontext(None)) as stream:
+            if stream: fcntl.flock(stream, fcntl.LOCK_EX if fields or clear else fcntl.LOCK_SH); stream.seek(0)
+            rows = [json.loads(line) for line in stream] if stream else []
+            rows += [json.loads(p.read_text()) for p in (root / "pending-runs").glob("*.json") if not any(r.get("run_id", r["id"]) == p.stem for r in rows if r.get("type") == "run")]
+            rows = [r for r in rows if r.get("plan") == ident]
+            # Transfer the primary draw only when its fallback is admitted to spawn.
+            replaced = {ident for r in rows if r.get("invoked") for ident in [r.get("replaces"), *r.get("superseded", [])]}
+            charged = [r for r in rows if r["id"] not in replaced]
+            used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in charged if r.get("vendor") == v and r.get("type") != "outcome"}) for v in task_usage.VENDORS}
+            last, disabled = {}, set()
+            for row in rows:
+                kind, outcome = row.get("kind"), row.get("outcome")
+                if outcome == "cleared": disabled.discard(kind); last.pop(kind, None)
+                elif outcome in {"finished", "failed", "interrupted"}:
+                    if outcome in {"failed", "interrupted"} and last.get(kind) == outcome: disabled.add(kind)
+                    last[kind] = outcome
+            if clear:
+                stream.write(json.dumps(dict(id=secrets.token_hex(12), plan=ident, kind=clear, outcome="cleared", start=utc_now(), type="control")) + "\n"); return
+            if fields:
+                if datetime.now(timezone.utc) >= expiry: raise Stop(f"Plan {ident}: expired")
+                allowed = plan["allowed"].get(fields["repo"], [])
+                if "*" not in allowed and any(t.lower() not in [a.lower() for a in allowed] for t in fields.get("tasks", [fields["task"]])): raise Stop(f"Plan {ident}: outside allowed work")
+                if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
+                prior = next((r for r in reversed(charged) if all(r.get(k) == fields.get(k) for k in ("repo", "task", "kind", "commit", "vendor")) and r.get("type") != "outcome"), None)
+                if (not prior or reserve is False) and used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
+                if isinstance(reserve, dict): reserve["invoked"] = True; atomic_json(root / "pending-runs" / (reserve["id"] + ".json"), reserve); return reserve
+                if prior and reserve and not prior.get("outcome") and not prior.get("invoked"): prior["superseded"] = sorted(set(prior.get("superseded", []) + [prior.get("replaces"), fields.get("replaces")]) - {None}); atomic_json(root / "pending-runs" / (prior["id"] + ".json"), prior); return prior
+                return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
+        return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(disabled)}"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Stop(f"Missing or malformed plan/log {ident}: {error}") from error
+def budget_run(**fields):
+    return plan_budget(os.environ["TASK_PLAN"], fields) if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, **fields)
+def bind_plan(task, args, save=False):
+    record = read_json_object(task_state(task) / "task.json") if getattr(args, "refresh", False) else (load_record(task, required=False) or {})
+    choices = {value for value in (record.get("plan"), os.environ.get("TASK_PLAN"), getattr(args, "plan", None)) if value}
+    if len(choices) > 1: raise Stop(f"Conflicting plan for {task.id}: {sorted(choices)}")
+    if choices: os.environ["TASK_PLAN"] = choices.pop()
+    if save and os.environ.get("TASK_PLAN"): record["plan"] = os.environ["TASK_PLAN"]; record["revision"] = record_revision(record); atomic_json(task_state(task) / "task.json", record)
 def decision_content(text):
     """Ignore only the frontmatter status field."""
     lines = text.splitlines()
@@ -660,7 +687,7 @@ def decision_changed(kb, name, before="HEAD", after=None):
 
 
 def plan_info(repo):
-    kb = CORTEX / f"cortex-kb-{repo.name}"
+    kb = knowledge_repo(repo)
     path = kb / "INTENT.md"
     text = path.read_bytes().decode() if path.is_file() else ""
     current = frontmatter_value(text, "current").split(" #", 1)[0].strip()
@@ -779,10 +806,11 @@ def plan(args):
 
 
 def realign(args):
-    info = plan_info(resolve_repo(args.repo))
+    repo = resolve_repo(args.repo)
+    info = plan_info(repo)
     if not info["path"].is_file():
         raise Stop("Create INTENT.md before realignment")
-    task_lock.work(HOME, resolve_repo(args.repo))
+    task_lock.work(HOME, repo)
     prompt = ("Read-only drift review. Answer with Verdict: on plan | drifted | plan unclear, "
               "then evidence per merged task: does it serve current and its pass test; contradictions "
               "between INTENT, STATUS and decisions; and what the founder must decide. "
@@ -793,7 +821,7 @@ def realign(args):
     prompt += "\n## Tasks merged since sign-off\n" + "\n".join(info["merged"])
     directory = info["kb"] / "history/realign"
     reply = directory / ("realign-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + ".md")
-    state = HOME / ".local/state/task" / info["kb"].name.removeprefix("cortex-kb-") / "realign"
+    state = HOME / ".local/state/task" / task_config(repo).get("knowledge", repo.name) / "realign"
     state.mkdir(parents=True, exist_ok=True)
     failed_reply = state / reply.name
     with tempfile.TemporaryDirectory(dir=state) as temporary:
@@ -960,6 +988,94 @@ def record_revision(record):
 
 def task_state(task: Task) -> Path:
     return HOME / ".local/state/task" / task.repo.name / task.name
+
+
+def risk_context(task, path, record, policy=None):
+    try:
+        policy = policy if policy is not None else task_usage.policy(HOME)["review"]
+    except ValueError as error:
+        raise Stop(str(error)) from error
+    base = default_branch(task.repo)
+    base = f"origin/{base}" if has_origin(task.repo) else base
+    paths = git(path, "diff", "--name-only", "--no-renames", "-z", f"{base}...HEAD", "--").split("\0")
+    return task_usage.risk_paths(task.repo.name, record or {}, paths, policy)
+
+
+def change_risk(task, path, record, risk, reason):
+    if risk == "high" and not (reason or "").strip():
+        raise Stop("risk high requires a one-line reason")
+    if reason and (len(reason.splitlines()) != 1 or not reason.strip()):
+        raise Stop("risk reason must be one nonempty line")
+    forced = risk_context(task, path, record)[2]
+    if risk != "high" and forced:
+        raise Stop(f"risk high is forced by {forced}; cannot lower to {risk}")
+    old = record.get("risk", "normal")
+    record.update(risk=risk, risk_reason=reason or "")
+    record["revision"] = record_revision(record)
+    atomic_json(task_state(task) / "task.json", record)
+    task_usage.record_override(HOME, task.repo.name, task.id, None, record.get("tier", "routine"),
+                               reason or "PM risk choice", kind="risk_change", old_risk=old, risk=risk)
+
+
+def risk(args):
+    task = Task(resolve_repo(args.repo), args.id)
+    path = task.worktree()
+    task_lock.work(HOME, task.repo, sha(path, "HEAD"))
+    change_risk(task, path, load_record(task), args.risk, args.reason)
+    print(f"Risk set to {args.risk} for {task.id}.")
+
+
+def redteam(args):
+    task = Task(resolve_repo(args.repo), args.id)
+    path = task.worktree()
+    record = load_record(task)
+    risk, policy, _ = risk_context(task, path, record)
+    if risk != "high":
+        raise Stop(f"risk {risk}: red-team is allowed only for high tasks")
+    head = sha(path, "HEAD")
+    state = task_state(task)
+    output = state / f"redteam-{head}.md"
+    task_lock.work(HOME, task.repo, head)
+    temporary = output.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        brief = Path(args.brief).read_text(encoding="utf-8")
+        if not brief.strip():
+            raise Stop("risk high: --brief must contain nonempty UTF-8 text")
+        wrapper = HOME / "cortex/cortex-core/skills/company/references/red-team-brief.md"
+        wrapped = wrapper.is_file()
+        if wrapped:
+            brief = wrapper.read_text(encoding="utf-8") + "\n\n" + brief
+        vendor = "claude" if record["builder"] == "codex" else "codex"
+        model = policy["red_team_model_claude" if vendor == "claude" else "red_team_model"]
+        binary = shutil.which(vendor)
+        if not binary:
+            raise Stop(f"risk high: {vendor} is not available on PATH")
+        command = ([binary, "exec", "--sandbox", "read-only", "-m", model,
+                                 "-c", "model_reasoning_effort=high", "--skip-git-repo-check", "-C", str(path),
+                                 "-o", str(temporary), "-"] if vendor == "codex" else
+                   [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
+                    "--allowedTools", "Read", "Grep", "Glob", "Bash(git --no-optional-locks:*)"])
+        with temporary.open("w") as output_stream:
+            result = subprocess.run(command, cwd=path, input=brief, text=True, encoding="utf-8",
+                                    stdout=output_stream if vendor == "claude" else None,
+                                    env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
+        if result.returncode or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
+            raise Stop("risk high: red-team failed or head changed; no output recorded")
+        temporary.replace(output)
+        atomic_json(state / "redteam.json", dict(commit=head, output=str(output), time=utc_now(),
+                                                vendor=vendor, model=model, ambition_wrapper=wrapped))
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+        raise Stop(f"risk high: red-team failed: {error}") from error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as error:
+            raise Stop(f"risk high: cannot clean red-team temporary output: {error}") from error
+    print(f"Red-team recorded at {head}: {output}")
+
+
+def deeper_review(model):
+    return model in {*task_usage.DEEPER.values(), *TOP_ONLY} or any(name in model.lower() for name in ("opus", "fable"))
 
 
 def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=False):
@@ -1586,7 +1702,7 @@ def require_pm(args):
     """Refuse before dispatch, locks, records or detached processes can be written."""
     if not task_state_writable():
         raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel"}:
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam"}:
         task = Task(resolve_repo(args.repo), args.id)
         if not task_state_writable(task):
             raise Stop("Private task state is not writable; run this from the PM shell or a batch runner.")
@@ -1662,7 +1778,9 @@ def finalize_lane_record(path, run, state, **fields):
         print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
     finally:
         run.update(state=state, ended_at=utc_now(), **fields)
-        if run.get("usage_run"):
+        usage_run = run.get("usage_run")
+        if usage_run and usage_run.get("plan"): usage_run.update(read_json_object(HOME / ".local/state/task/pending-runs" / (usage_run["id"] + ".json")))
+        if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")):
             task_usage.run_log(HOME, run["usage_run"], "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
         atomic_json(path, run)
 
@@ -1809,6 +1927,7 @@ def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
     path = task.worktree()
     record = load_record(task)
+    bind_plan(task, args)
     refresh_context(task)
     builder = args.builder or record["builder"]
     recorded = record.get("tier", "routine")
@@ -1847,8 +1966,8 @@ def lane(args):
     task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
     command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
-                "-c", "model_reasoning_effort=high", "--output-last-message", str(final), "-"] if builder == "codex" else
-               ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", "high",
+                "-c", f"model_reasoning_effort={args.effort}", "--output-last-message", str(final), "-"] if builder == "codex" else
+               ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", args.effort,
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
@@ -1865,9 +1984,24 @@ def lane(args):
                 previous = {}
             if previous.get("state") == "running" and pid_alive(previous.get("pid")):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
+            risk, limits, _ = risk_context(task, path, record)
+            rounds = read_json_object(task_state(task) / "rounds.json")
+            used = rounds.get("used", (previous.get("usage_run") or {}).get("round", 0))
+            extra = rounds.get("extra", 0)
+            if args.extra_round is not None and not args.extra_round.strip():
+                raise Stop(f"risk {risk}: --extra-round needs a nonempty reason")
+            if args.extra_round is not None and used < limits["max_rounds"] + extra:
+                raise Stop(f"risk {risk}: --extra-round is allowed only when the round limit is reached")
+            if used >= limits["max_rounds"] + extra:
+                if not args.extra_round or not limits["extra_rounds"]:
+                    raise Stop(f"risk {risk}: maximum {limits['max_rounds'] + extra} build/fix rounds; use --extra-round REASON")
+                if extra >= limits["extra_rounds"]:
+                    raise Stop(f"risk {risk}: extra rounds exhausted ({extra}/{limits['extra_rounds']} granted)")
+                extra += 1
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
+            if os.environ.get("TASK_PLAN"): guards(tier, recorded, model, args.override); usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", commit=sha(path, "HEAD"), vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1)
             if tier_changed:
                 task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
                 print(f"override recorded: tier {recorded} to {tier} ({args.override})")
@@ -1876,7 +2010,7 @@ def lane(args):
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
-                      "--builder", builder, "--model", model, "--tier", tier, "--no-boost", "--_worker"]
+                      "--builder", builder, "--model", model, "--tier", tier, "--effort", args.effort, "--no-boost", "--_worker"]
             if args.override:
                 worker.extend(["--override", args.override])
             if args.timeout is not None:
@@ -1892,9 +2026,12 @@ def lane(args):
             except HoldRefused:
                 atomic_json(lane_record, dict(state='refused: hold', ended_at=utc_now()))
                 raise
+            atomic_json(task_state(task) / "rounds.json", dict(used=used + 1, extra=extra))
+            if extra != rounds.get("extra", 0):
+                task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid,
-                                      "usage_run": task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier),
+                                      "usage_run": usage_run if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1),
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
             if builder != record["builder"] or tier != record.get("tier", "routine"):
@@ -1931,6 +2068,7 @@ def lane(args):
                     (work / "lane.jsonl").open("wb") if builder == "claude" else contextlib.nullcontext() as raw:
                 # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
                 stream = task_usage.ClaudeStream(HOME) if raw else None
+                if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], run["usage_run"], reserve=run["usage_run"])
                 admit()
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          pass_fds=task_lock.descriptors(),
@@ -2326,7 +2464,7 @@ def runner_check(args):
                 problems.append(f"line {number}: {error}")
     if task_lines == 0:
         problems.append("no task lines found (format: N. <id>: builder <b>, model <m> or tier <t>[, seed <s>][, after: <id>])")
-    if (CORTEX / f"cortex-kb-{repo.name}").exists():
+    if knowledge_repo(repo).exists():
         info = plan_info(repo)
         remaining = info["limit"] - len(info["merged"])
         if pending and len(pending) > remaining:
@@ -2335,6 +2473,7 @@ def runner_check(args):
         print("\n".join(problems))
         return 1
     print(f"runner file OK ({task_lines} tasks)")
+    args.plan_tasks = sorted(seen_tasks)
     return 0
 
 
@@ -2396,6 +2535,7 @@ def runner_start(args):
         raise Stop('Runner file must be named runner-<batch>.md.')
     if runner_check(args):
         return 1
+    for ident in args.plan_tasks: bind_plan(Task(repo, ident), args)
     batch = match[1]
     unit = runner_unit(repo, batch)
     work = repo / '.work'
@@ -2413,6 +2553,7 @@ def runner_start(args):
         raise Stop('task-batch is unavailable.')
     holder = os.environ['TASK_HOLDER']
     task_lock.work(HOME, repo)
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=batch, tasks=args.plan_tasks, kind="runner-start", vendor=os.environ.get("TASK_VENDOR", "codex")), reserve=False)
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
@@ -2429,6 +2570,7 @@ def runner_start(args):
               f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
               '--setenv=PATH=' + os.environ.get('PATH', ''),
               '--setenv=TASK_HOLDER=' + holder,
+              *(['--setenv=TASK_PLAN=' + os.environ['TASK_PLAN']] if os.environ.get('TASK_PLAN') else []),
               *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
     try:
         admit()
@@ -2466,13 +2608,25 @@ def start(args):
     common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     with (common / "task-start.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return start_locked(args, repo)
+        try: return start_locked(args, repo)
+        finally:
+            if getattr(args, "usage_run", None): task_usage.run_log(HOME, args.usage_run, "failed" if sys.exc_info()[0] else "finished")
 
 
 def start_locked(args, repo):
     lane_contract_source()
     ensure_origin_head(repo)
     task = Task(repo, args.id)
+    bind_plan(task, args)
+    previous = read_json_object(task_state(task) / "task.json")
+    if args.risk == "high" and not (args.risk_reason or "").strip():
+        raise Stop("risk high requires --risk-reason with a one-line reason")
+    if args.risk_reason is not None and (not args.risk_reason.strip() or len(args.risk_reason.splitlines()) != 1):
+        raise Stop("--risk-reason must be one nonempty line")
+    if args.risk and args.risk != "high" and task.path.exists():
+        forced = risk_context(task, task.path, previous)[2]
+        if forced:
+            raise Stop(f"risk high is forced by {forced}; cannot lower to {args.risk}")
     if args.off_plan is not None and not args.refresh and (task_state(task) / "task.json").is_file():
         raise Stop("--off-plan on a resumed task requires --refresh")
     off_plan = args.off_plan
@@ -2532,9 +2686,11 @@ def start_locked(args, repo):
             print(f"warning: environment link {candidate} does not resolve.")
     for name in args.seed: seed_source(repo, name)
     task_tier(task_text, args.tier)
+    if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=task.id, kind="start", vendor=args.builder), reserve=None); bind_plan(task, args, save=True)
     if task.path.exists():
         task.worktree()
         task_lock.work(HOME, repo, sha(task.path, "HEAD"))
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
         print(f"{task.path} already exists.")
     else:
         default = default_branch(repo)
@@ -2542,8 +2698,7 @@ def start_locked(args, repo):
         branch, remote_only = task.existing_branch()
         if branch and remote_only:
             task_lock.work(HOME, repo, sha(repo, f"origin/{branch}"))
-            git(repo, "worktree", "add", "-q", "--track", "-b", branch, str(task.path), f"origin/{branch}")
-            print(f"Created {task.path} on {branch}, from origin's existing branch.")
+            create, source = ["--track", "-b", branch, str(task.path), f"origin/{branch}"], f"{branch}, from origin's existing branch"
         elif branch:
             for block in git(repo, "worktree", "list", "--porcelain").split("\n\n"):
                 lines = block.splitlines()
@@ -2555,14 +2710,15 @@ def start_locked(args, repo):
                     raise Stop(f"Branch {branch} is already checked out at {checked_out}; "
                                f"move or free that worktree before `task start` can adopt it at {task.path}.")
             task_lock.work(HOME, repo, sha(repo, branch))
-            git(repo, "worktree", "add", "-q", str(task.path), branch)
-            print(f"Created {task.path} on the existing branch {branch}.")
+            create, source = [str(task.path), branch], f"the existing branch {branch}"
         else:
             base, label = base_commit(repo, default)
             branch = task.branch_name()
             task_lock.work(HOME, repo, base)
-            git(repo, "worktree", "add", "-q", "--no-track", "-b", branch, str(task.path), base)
-            print(f"Created {task.path} on {branch} from {label} {base[:7]}.")
+            create, source = ["--no-track", "-b", branch, str(task.path), base], f"{branch} from {label} {base[:7]}"
+        args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
+        git(repo, "worktree", "add", "-q", *create)
+        print(f"Created {task.path} on {source}.")
     seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
     exclude(task.path, ".work/")
@@ -2575,7 +2731,7 @@ def start_locked(args, repo):
     record_path = state / "task.json"
     state.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
-    if record_path.exists() and not args.refresh:
+    if record_path.exists() and not args.refresh and (read_json_object(record_path).get("branch") or not read_json_object(record_path).get("plan")):
         record = load_record(task)
         if record.get("branch") != branch:
             raise Stop("The worktree branch differs from its pinned record; use --refresh after PM review.")
@@ -2587,10 +2743,12 @@ def start_locked(args, repo):
         previous_seeds = read_json_object(record_path).get("seeds", []) if record_path.exists() else []
         record = {"id": task.id, "title": task.title, "branch": branch, "base_sha": base,
                   "tier": task_tier(task_text, args.tier),
+                  "risk": previous.get("risk", "normal"), "risk_reason": previous.get("risk_reason", ""),
                   "builder": args.builder, "started_at": utc_now(), "criteria": criteria,
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone"),
-                  "seeds": list(dict.fromkeys(previous_seeds + args.seed))}
+                  "seeds": list(dict.fromkeys(previous_seeds + args.seed)),
+                  **({"plan": os.environ["TASK_PLAN"]} if os.environ.get("TASK_PLAN") else {})}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
         if args.refresh:
@@ -2601,6 +2759,8 @@ def start_locked(args, repo):
             report.write_text("# Task report\n\n## What changed\n\n(fill in)\n\n## How I verified\n\n(fill in)\n\n## Criteria\n\n" +
                               "\n".join(f"#{item['number']} not met: (fill in)" for item in criteria) +
                               "\n\n## Check\n\n(fill in)\n\n## Noticed, not done\n\n(none)\n")
+    if args.risk:
+        change_risk(task, task.path, record, args.risk, args.risk_reason)
     seeds = list(dict.fromkeys(record.get("seeds", []) + args.seed))
     if seeds != record.get("seeds", []):
         record["seeds"] = seeds
@@ -2693,7 +2853,7 @@ def advisory_temporary_parent(path):
 
 
 def run_check(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-              advisory=False, pre_commit_all_files=False, cancelled=None, variant=None):
+              advisory=False, variant=None):
     variants = gate_variants(path)
     configured_environment(path)  # Validate the base even when a variant overrides it.
     if variant is not None:
@@ -2704,11 +2864,11 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
         variants = {variant: variants[variant]}
     if variants:
         return run_check_matrix(path, base, record, state, evidence_name, display_log,
-                                advisory, pre_commit_all_files, cancelled, variants)
+                                advisory, variants)
     if advisory:
         with tempfile.TemporaryDirectory(prefix="check-", dir=advisory_temporary_parent(path)) as temporary:
             return run_check_steps(path, base, record, state, evidence_name, display_log, advisory=True,
-                                   gate_environment={"TMPDIR": temporary}, cancelled=cancelled)
+                                   gate_environment={"TMPDIR": temporary})
     # Do not inherit TMPDIR: callers may point it inside a checkout.
     temporary_root = gate_temporary_root()
     sweep_gate_temporary(temporary_root)
@@ -2718,12 +2878,11 @@ def run_check(path, base, record=None, state=None, evidence_name="check.json", d
             environment = {"TMPDIR": temporary, "TASK_GATE_SLOT": str(slot),
                            "TASK_GATE_PORT_BASE": str(20000 + 200 * slot)}
             return run_check_steps(path, base, record, state, evidence_name, display_log,
-                                   gate_environment=environment, pre_commit_all_files=pre_commit_all_files,
-                                   cancelled=cancelled)
+                                   gate_environment=environment)
 
 
 def run_check_matrix(path, base, record, state, evidence_name, display_log,
-                     advisory, pre_commit_all_files, cancelled, variants):
+                     advisory, variants):
     work = path / ".work"
     work.mkdir(exist_ok=True)
     destination = work if advisory else (state or task_state(Task(main_repo(path), path.name)))
@@ -2732,7 +2891,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     logs = []
     templates = {entry["name"]: entry.get("env", {})
                  for entry in task_config(path).get("gate_variant", [])}
-    # Reserve the port range once, including for drills without an exclusive slot.
+    # Reserve the port range once for the whole matrix.
     with gate_port_index(path) as slot:
         for name, environment in variants.items():
             # Advisory checks need a writable parent outside the checkout, like the lane's TMPDIR.
@@ -2744,8 +2903,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
                 evidence = []
                 passed = run_check_steps(
                     path, base, record, state, evidence_name, display_log, advisory=advisory,
-                    gate_environment=gate_environment, pre_commit_all_files=pre_commit_all_files,
-                    cancelled=cancelled, evidence_sink=evidence)
+                    gate_environment=gate_environment, evidence_sink=evidence)
                 results.append(dict(evidence[0], name=name, environment=environment,
                                     environment_template=templates.get(name, {})))
                 logs.append(f"=== variant {name} ===\n" + check_log_path(path, state, evidence_name, advisory).read_text())
@@ -2765,16 +2923,10 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
 
 
 def run_check_steps(path, base, record=None, state=None, evidence_name="check.json", display_log=None,
-                    advisory=False, gate_environment=None, pre_commit_all_files=False, cancelled=None,
-                    evidence_sink=None):
-    """Run the repository's gate in <path>; return True when it passes.
-
-    pre-commit checks the commits since <base>; with pre_commit_all_files (the drill, which
-    has no base) it checks every file instead of being skipped.
-    """
+                    advisory=False, gate_environment=None, evidence_sink=None):
+    """Run the repository's gate; pre-commit checks the commits since <base>."""
     if not advisory and gate_environment is None:
-        return run_check(path, base, record, state, evidence_name, display_log,
-                         pre_commit_all_files=pre_commit_all_files, cancelled=cancelled)
+        return run_check(path, base, record, state, evidence_name, display_log)
     if not (path / "justfile").exists() and not (path / "Justfile").exists():
         raise Stop(f"No justfile in {path}; the repository needs a `just check` recipe.")
     exclude(path, ".work/")
@@ -2794,14 +2946,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         steps = [["just", "check"]]
         if record:
             steps.extend([["bash", "-c", command] for command in record.get("verify", [])])
-        if (path / ".pre-commit-config.yaml").exists():
-            if pre_commit_all_files:
-                steps.append(["pre-commit", "run", "--all-files"])
-            elif base:
-                steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
+        if base and (path / ".pre-commit-config.yaml").exists():
+            steps.append(["pre-commit", "run", "--from-ref", base, "--to-ref", "HEAD"])
         for step in steps:
-            if cancelled and cancelled():
-                raise Stop("Drill interrupted.")
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
             configured, timeout, durations = step_timeout(path, step)
@@ -2825,29 +2972,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                 if state:
                     set_child_group(state, process.pid)
                 try:
-                    if cancelled is None:
-                        code = process.wait(timeout=timeout)
-                    else:
-                        deadline = time.monotonic() + timeout
-                        while True:
-                            if cancelled():
-                                try:
-                                    os.killpg(process.pid, signal.SIGTERM)
-                                    time.sleep(0.2)
-                                    # Descendants may survive even if the leader exits.
-                                    os.killpg(process.pid, signal.SIGKILL)
-                                except ProcessLookupError:
-                                    pass
-                                process.wait()
-                                if state:
-                                    set_child_group(state, None)
-                                raise Stop("Drill interrupted.")
-                            try:
-                                code = process.wait(timeout=min(0.1, max(0, deadline - time.monotonic())))
-                                break
-                            except subprocess.TimeoutExpired:
-                                if time.monotonic() >= deadline:
-                                    raise
+                    code = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
@@ -2939,6 +3064,8 @@ def check(args):
             "and commit, then rerun `task check`. Never `git add -f` under .work/."
         )
     record = load_record(task, required=False)
+    risk, _, forced = risk_context(task, path, record)
+    print(f"Risk: {risk}" + (f" (forced by {forced})" if forced else ""))
     if task.number is not None and record is None:
         raise Stop("This worktree has no pinned task record; PM must run `task start ... --refresh --builder ...` first.")
     base, label = base_commit(repo, default_branch(repo))
@@ -3227,7 +3354,7 @@ def parse_review_reply(text, criteria):
     return verdict, commit, reviewer, judgments
 
 
-def run_reviewer(command, path, prompt_file, reply_file):
+def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=None):
     try:
         timeout = int(os.environ.get("TASK_REVIEW_TIMEOUT", "900"))
     except ValueError:
@@ -3243,16 +3370,19 @@ def run_reviewer(command, path, prompt_file, reply_file):
     stderr_file = reply_file.with_name("review-stderr.log")
     run = {"builder": argv[0], "state": "running", "exit_code": None}
     usage_run = None
+    if os.environ.get("TASK_PLAN"): usage_run = budget_run(repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1], **({"commit": sha(path, "HEAD"), "replaces": replaces} if os.environ.get("TASK_PLAN") else {}))
+    if os.environ.get("TASK_PLAN"): run["usage_run"] = usage_run
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
+            if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
             admit()
             process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
-                                       pass_fds=task_lock.descriptors(),
+                                       pass_fds=task_lock.descriptors() + ((lock_fd,) if lock_fd is not None else ()),
                                        stderr=errors, start_new_session=True)
             run["state"] = "running"
-            usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
+            if not usage_run: usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
             atomic_json(run_file, run)
             task_usage.claim(HOME, run["builder"], "review", process.pid)
             try:
@@ -3276,7 +3406,7 @@ def run_reviewer(command, path, prompt_file, reply_file):
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
-        if usage_run: task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
+        if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")): task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
@@ -3288,10 +3418,26 @@ def run_reviewer(command, path, prompt_file, reply_file):
 
 
 def review(args):
+    if args.final and not args.run:
+        raise Stop("--final requires --run")
+    task = Task(resolve_repo(args.repo), args.id); load_record(task)
+    with (task_state(task) / "review.lock").open("a") as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError: raise Stop("Review already running; retry after it finishes.")
+        args.review_lock_fd = lock.fileno(); return review_locked(args)
+
+
+def review_locked(args):
     repo = resolve_repo(args.repo)
     task = Task(repo, args.id)
     path = task.worktree()
     record = load_record(task)
+    bind_plan(task, args)
+    risk, review_policy, _ = risk_context(task, path, record)
+    if risk == "low":
+        raise Stop("risk low: trusted check only; review is not allowed")
+    if risk != "high" and args.reviewer and deeper_review(args.reviewer[1]):
+        raise Stop(f"risk {risk}: deeper review is allowed only for high tasks; reviews never use {args.reviewer[1]}; no override applies")
     head = sha(path, "HEAD")
     state = task_state(task)
     checked = review_check(task, path, head, record)
@@ -3304,7 +3450,6 @@ def review(args):
             stream.write(json.dumps(dict(head=head, time=utc_now(), reason=args.no_check)) + "\n")
     task_text = task.file.read_text() if task.file else ""
     request_text = ""
-    request_label = "Original request:"
     lane_prompt = path / ".work/prompt.md"
     original = path / ".work/request.md"
     latest_text = lane_prompt.read_text() if lane_prompt.is_file() else ""
@@ -3318,15 +3463,14 @@ def review(args):
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
-        reviewer_route = (("claude", "haiku") if record["builder"] == "codex"
-                          else ("codex", "gpt-6-luna"))
-        if reviewer_route[0] == record["builder"]:
-            raise Stop("reviewer vendor must differ from builder")
+        reviewer_route = ("claude" if record["builder"] == "codex" else "codex", review_policy[record["builder"]])
+        if risk != "high" and deeper_review(reviewer_route[1]):
+            raise Stop(f"risk {risk}: policy must select a cheap reviewer; deeper review requires high")
         if args.run:
             decision = pace_check(args, "review", reviewer_route[0], "routine", task)
             if decision and decision["hold"]:
                 return 4
-            if decision and decision["spend"]:
+            if risk == "high" and reviewer_route[0] in active_boosts() and (record.get("tier") == "hard" or args.final):
                 reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
@@ -3364,7 +3508,7 @@ def review(args):
                            "In a re-review, new non-defect findings on code unchanged since the previous "
                            "review are Notes only."])
         if request_text:
-            prompt.extend([request_label, request_text.rstrip()])
+            prompt.extend(["Original request:", request_text.rstrip()])
         if latest_text and latest_text != request_text:
             prompt.extend(["Latest fix-round instructions to the builder (context only; judge the whole change against the original request):",
                            latest_text.rstrip()])
@@ -3372,8 +3516,7 @@ def review(args):
             prompt.append("Pinned verification commands: " + " ; ".join(record["verify"]))
         if record["criteria"]:
             prompt.append("Criteria:")
-            for item in record["criteria"]:
-                prompt.append(f"#{item['number']} {item['text']}")
+            prompt.extend(f"#{item['number']} {item['text']}" for item in record["criteria"])
         else:
             prompt.append("Criteria: none; judge the stated request above against the diff.")
         review_base = sha(task.repo, f"origin/{default_branch(task.repo)}" if has_origin(task.repo)
@@ -3386,10 +3529,8 @@ def review(args):
         prompt.append(f"Reviewer instructions: read {report_path} alongside the diff; "
                       "read-only review; use `git --no-optional-locks diff`, "
                       "`git --no-optional-locks log`, and `git --no-optional-locks show` to inspect changes.")
-        if record["criteria"]:
-            prompt.append("Reviewer brief: what is missing; how will this fail in real use; will people actually use it?")
-        else:
-            prompt.append("Reviewer brief: judge the stated request above against the diff; explain whether the change meets it.")
+        prompt.append("Reviewer brief: " + ("what is missing; how will this fail in real use; will people actually use it?"
+                      if record["criteria"] else "judge the stated request above against the diff; explain whether the change meets it."))
         contract = path / ".work/context/lane-contract.md"
         prompt.append(f"Mandatory read: {contract if contract.is_file() else lane_contract_source()}. Reply in its review "
                       "block with the full 40-character Commit sha" + (", then one line per criterion: "
@@ -3397,9 +3538,8 @@ def review(args):
         if args.append_prompt:
             prompt.append(args.append_prompt)
         prompt_text = "\n".join(prompt) + "\n"
-        state = task_state(task)
         state.mkdir(parents=True, exist_ok=True)
-        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1])})
+        atomic_json(state / "review-routing.json", {"vendor": reviewer_route[0], "model": reviewer_route[1], "usage_run": None if args.run else task_usage.run_log(HOME, repo=repo.name, task=task.id, kind="review", vendor=reviewer_route[0], model=reviewer_route[1], plan=None)})
         prompt_file = state / "review-prompt.md"
         reply_file = state / "review-response.md"
         prompt_file.write_text(prompt_text)
@@ -3408,10 +3548,10 @@ def review(args):
         def reviewer_command(vendor, model):
             if vendor == "claude":
                 events = "--output-format stream-json --verbose " if args.run else ""
-                return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {model} --effort high "
+                return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
                         "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
             return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
-                    f"-m {model} -c model_reasoning_effort=high -")
+                    f"-m {shlex.quote(model)} -c model_reasoning_effort=high -")
         command = reviewer_command(*reviewer_route)
         if not args.run:
             print(prompt_text, end="")
@@ -3423,7 +3563,7 @@ def review(args):
         used_fallback = False
         for attempt in range(2):
             try:
-                run_reviewer(command, path, prompt_file, reply_file)
+                run_reviewer(command, path, prompt_file, reply_file, lock_fd=args.review_lock_fd)
             except UsageLimit:
                 if used_fallback:
                     raise
@@ -3437,7 +3577,7 @@ def review(args):
                     "vendor": reviewer_route[0], "model": reviewer_route[1],
                     "fallback_from": list(previous_route)})
                 command = reviewer_command(*reviewer_route)
-                run_reviewer(command, path, prompt_file, reply_file)
+                run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if os.environ.get("TASK_PLAN") else None, lock_fd=args.review_lock_fd)
             head = sha(path, "HEAD")
             try:
                 verdict, commit, _, _ = parse_review_reply(
@@ -3452,7 +3592,6 @@ def review(args):
             if attempt or used_fallback:
                 raise Stop("review produced no verdict; rerun `task review`")
         args.record = str(reply_file)
-        head = sha(path, "HEAD")
     try:
         text = Path(args.record).read_text()
     except OSError as error:
@@ -3467,7 +3606,6 @@ def review(args):
         raise Stop(f"Review rejected: {error}.")
     problems = []
     if not verdict: problems.append("missing Verdict: PASS|FAIL")
-    state = task_state(task)
     try:
         route = json.loads((state / "review-routing.json").read_text())
         routed_reviewer = (route["vendor"], route["model"])
@@ -3486,6 +3624,8 @@ def review(args):
     if (routed_reviewer and routed_reviewer[0].lower() == record["builder"]
             and not (args.run and used_fallback)):
         problems.append("reviewer vendor must differ from builder")
+    if routed_reviewer and risk != "high" and deeper_review(routed_reviewer[1]):
+        problems.append(f"risk {risk}: deeper review is allowed only for high tasks")
     if reviewer and reviewer[0].lower() == record["builder"]:
         print(f"WARNING: reply Reviewer: line names builder vendor '{reviewer[0]}'; using routed reviewer identity.")
     resolved_review = None
@@ -3507,7 +3647,7 @@ def review(args):
     save_review_history(state, meta, text)
     atomic_json(state / "review.json", meta)
     if not args.run:
-        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, plan=os.environ.get("TASK_PLAN"), ccusage_tokens=None)), "finished")
+        task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, ccusage_tokens=None)) | dict(plan=None), "finished")
     task_event(task, "review")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     if args.run:
@@ -3539,6 +3679,9 @@ def current_report(content):
 def merge_gate(task, path, head):
     missing = []
     record = load_record(task)
+    risk, _, _ = risk_context(task, path, record)
+    if risk == "low":
+        return record
     state = task_state(task)
     try:
         review = json.loads((state / "review.json").read_text())
@@ -3549,7 +3692,9 @@ def merge_gate(task, path, head):
             or review.get("record_revision") != record["revision"]
             or any(v != "pass" for v in review.get("judgments", {}).values())
             or review.get("reviewer") == record["builder"]):
-        missing.append("recorded PASS review for lane head with every criterion pass by the other vendor")
+        missing.append(f"risk {risk}: recorded PASS review for lane head with every criterion pass by the other vendor")
+    if risk == "normal" and deeper_review(review.get("model", "")):
+        missing.append("risk normal: a cheap review is required; deeper review is allowed only for high tasks")
     report = path / ".work/report.md"
     content = current_report(report.read_text()) if report.is_file() else ""
     if not report.is_file() or re.search(r"(?i)\(fill in\)|^\s*$", content, re.M):
@@ -3718,11 +3863,21 @@ def merge(args):
     if lane_head != record.get('base_sha') and is_ancestor(repo, lane_head, base):
         repair_published(task, base)
         return 0
+    risk, _, _ = risk_context(task, path, record)
+    if args.no_redteam is not None and not args.no_redteam.strip():
+        raise Stop(f"risk {risk}: --no-redteam requires a nonempty reason")
+    redteam = read_json_object(archive / "redteam.json")
+    redteam_waived = risk == "high" and (redteam.get("commit") != lane_head or not Path(redteam.get("output", "")).is_file() or not Path(redteam["output"]).read_text().strip())
+    if redteam_waived:
+        if not args.no_redteam:
+            raise Stop("risk high: merge requires red-team output at the reviewed head or --no-redteam REASON")
+    requirements_passed, gate_passed = True, True
     try:
         record = merge_gate(task, path, lane_head)
     except Stop as error:
         if not args.override:
             raise
+        requirements_passed = False
         atomic_json(archive / "exception.json", {"reason": args.override, "time": utc_now(),
                                                    "missing_gate": True,
                                                    "waived": [{"step": item, "reason": args.override}
@@ -3747,6 +3902,7 @@ def merge(args):
             else:
                 reusable, reuse_reason = can_reuse_lane_check(task, repo, lane_head, base, record)
             if reusable:
+                gate_passed = True
                 print(f"reuse decision: reusing trusted lane check: {reuse_reason}")
                 completed_step(task, "gate")
                 tree = git(repo, "rev-parse", f"{lane_head}^{{tree}}")
@@ -3844,6 +4000,9 @@ def merge(args):
     task_lock.verify(HOME, repo)
     atomic_json(archive / "merge.json", {"head": lane_head, "commit": commit,
                                         "time": datetime.now(timezone.utc).isoformat()})
+    if redteam_waived and requirements_passed and gate_passed:
+        task_usage.record_override(HOME, repo.name, task.id, None, record.get("tier", "routine"),
+                                   args.no_redteam, kind="no_redteam", risk=risk, commit=lane_head)
     task_usage.run_outcome(HOME, repo.name, task.id, "merged")
     try:
         review = json.loads((archive / "review.json").read_text())
@@ -4171,14 +4330,29 @@ def close(args):
     except (OSError, json.JSONDecodeError):
         raise Stop("Close requires the pinned task record from `task start`.")
     exception_path = archive / "exception.json"
+    merge_evidence = read_json_object(archive / "merge.json")
+    review = read_json_object(archive / "review.json")
+    head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else merge_evidence.get("head") or review.get("commit")
+    paths = git(repo, "diff", "--name-only", "--no-renames", "-z", f"{record['base_sha']}...{head}", "--").split("\0") if head and record.get("base_sha") else []
     try:
-        review = json.loads((archive / "review.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        if exception_path.is_file() or args.no_merge:
-            review = {}
-        else:
-            raise Stop("Close requires a recorded review, or an explicit merge exception.")
+        risk, _, _ = task_usage.risk_paths(repo.name, record, paths, task_usage.policy(HOME)["review"])
+    except ValueError as error:
+        raise Stop(str(error)) from error
+    if not review and risk != "low" and not exception_path.is_file() and not args.no_merge:
+        raise Stop("Close requires a recorded review, or an explicit merge exception.")
     passed = {int(n) for n, verdict in review.get("judgments", {}).items() if verdict == "pass"}
+    if risk == "low":
+        passed = {item["number"] for item in record.get("criteria", [])}
+    if risk == "normal" and deeper_review(review.get("model", "")):
+        raise Stop("risk normal: close requires a cheap review")
+    if risk == "high" and not args.partial:
+        if (review.get("verdict") != "PASS" or review.get("commit") != head
+                or review.get("record_revision") != record.get("revision")
+                or review.get("reviewer") == record.get("builder")):
+            raise Stop("risk high: close requires a current PASS review by the other vendor")
+        redteam = read_json_object(archive / "redteam.json")
+        if not head or redteam.get("commit") != head or not task_usage._text(Path(redteam.get("output", ""))):
+            raise Stop("risk high: close requires red-team output at the task head")
     criteria = [str(item["number"]) for item in record.get("criteria", []) if item["number"] in passed]
     not_passed = [str(item["number"]) for item in record.get("criteria", []) if item["number"] not in passed]
     if not_passed and not args.partial and not exception_path.is_file() and not args.no_merge:
@@ -4199,11 +4373,7 @@ def close(args):
             r"(?i)went well\s*[:/].*went wrong\s*[:/].*change\s*[:/]", args.retro)) == 0:
         raise Stop("This task needs a three-part retro: went well / went wrong / change.")
     status = "In Progress" if args.partial else "Done"
-    try:
-        merge_evidence = json.loads((archive / "merge.json").read_text())
-    except (OSError, ValueError):
-        merge_evidence = {}
-    head = sha(task.path, "HEAD") if real_worktree(repo, task.path) else review.get("commit")
+    head = head or review.get("commit")
     if not args.partial and (not head or merge_evidence.get("head") != head):
         if not args.no_merge:
             print("Notice: merge not recorded for the task head.")
@@ -4391,7 +4561,15 @@ def stale_worktree_lines(repo):
 
 
 def status(args):
+    policy, _, notes = task_usage.assessments(HOME, datetime.now(timezone.utc))
+    for warning in notes:
+        print(warning)
     print("\n".join(task_usage.run_summary(HOME)))
+    for path in sorted((CORTEX / "cortex-kb-company/plans").glob("*.toml")):
+        try:
+            line = plan_budget(path.stem)
+            if datetime.now(timezone.utc) < plan_time(str(tomllib.loads(path.read_text())["expires"])): print(line)
+        except (Stop, OSError, ValueError, KeyError, TypeError): print(f"plan {path.stem}: malformed")
     active = boost_line()
     if active:
         print(active)
@@ -4423,8 +4601,13 @@ def status(args):
             names = f"unavailable ({error})"
         print("  gate variants: " + names)
         print("  " + quality_summary(repo))
-        if (CORTEX / f"cortex-kb-{repo.name}").exists():
-            print("  " + plan_verdict(plan_info(repo)))
+        try:
+            kb = knowledge_repo(repo)
+            if kb.exists():
+                print("  " + plan_verdict(plan_info(repo)))
+        except Stop as error:
+            kb = None
+            print(f"  plan: unavailable ({error})")
         for record in sorted((repo / '.work').glob('runner-*.json')):
             data = json.loads(record.read_text())
             unit = data['unit']
@@ -4496,11 +4679,17 @@ def status(args):
                 except (ValueError, TypeError): pass
             idle = max(0, int(time.time() - last))
             idle_label = f"{idle // 3600}h" if idle >= 3600 else f"{idle // 60}m"
-            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} tier={record.get('tier', 'routine') if record else 'routine'} head={head[:7]} "
+            risk, _, forced = risk_context(task, path, record, policy["review"])
+            redteam = read_json_object(state / "redteam.json")
+            print(f"  {path.name}: builder={record.get('builder', '?') if record else '?'} tier={record.get('tier', 'routine') if record else 'routine'} risk={risk} head={head[:7]} "
                   f"{run_label} "
                   f"review={review_data.get('verdict', 'missing')} "
                   f"{'matches' if review_data.get('commit') == head else 'stale'} "
                   f"report={'present' if report else 'missing'} idle={idle_label} branch={branch}")
+            if forced:
+                print(f"    risk high forced by {forced}")
+            if redteam:
+                print(f"    redteam={redteam.get('output')} {'matches' if redteam.get('commit') == head else 'stale'}")
             if check.get("log"):
                 print(f"    trusted check log: {check['log']}")
             if lane_check.get("advisory"):
@@ -4560,9 +4749,9 @@ def status(args):
             attention.append(f"setup request #{request['id']} (task {request.get('task') or '-'}): "
                              f"{request.get('text', '')}")
         attention += stale_worktree_lines(repo)
-        improvements = CORTEX / f"cortex-kb-{repo.name}" / "improvements.md"
+        improvements = kb / "improvements.md" if kb else None
         open_count = 0
-        if improvements.is_file():
+        if improvements and improvements.is_file():
             open_count = sum(bool(re.search(r"\|\s*open\s*$", line, re.I))
                              for line in improvements.read_text().splitlines())
         print("  Needs attention:")
@@ -4713,91 +4902,6 @@ def cancel(args):
     return 0
 
 
-def prune_archive(repo, dry_run=False):
-    root = HOME / '.local/state/task/archive' / repo.name
-    if any(item.is_symlink() for item in (root, *root.parents)):
-        return
-    entries, sizes, errors = archive_inventory(root)
-    records, invalid = {}, set()
-    for manifest, info in entries:
-        if manifest.name != 'manifest.json' or '.work' in manifest.relative_to(root).parts:
-            continue
-        try:
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError('manifest is not a regular file')
-            record = json.loads(manifest.read_text())
-            if not isinstance(record, dict) or not isinstance(record.get('pruned', []), list):
-                raise ValueError('manifest must be an object with a pruned list')
-            records[manifest.parent] = record
-        except (OSError, ValueError, TypeError) as error:
-            print(f'archive: cannot prune {manifest.parent}: {error}')
-            invalid.add(manifest.parent)
-    entries = [(item, info) for item, info in entries
-               if not any(parent == item or parent in item.parents for parent in invalid)]
-    known = {item: info for item, info in entries}
-    allocated = {item: info.st_blocks * 512 for item, info in entries}
-    for item, _info in reversed(entries):
-        if item != root:
-            allocated[item.parent] = allocated.get(item.parent, 0) + allocated[item]
-    # Temporary snapshots are handled whole, before finished-archive filtering.
-    try:
-        live_gate = bool(gate_holders())
-    except FileNotFoundError:
-        live_gate = False
-    temporary, freed, finishing = set(), 0, {}
-    for item, info in entries:
-        if item.parent in temporary:
-            temporary.add(item)
-            continue
-        if not stat.S_ISDIR(info.st_mode):
-            continue
-        pending = item.name.startswith('.pending-')
-        gate = gate_worktree_match(item.name)
-        if not pending and not gate:
-            continue
-        if any(path == item or item in path.parents for path in errors):
-            continue
-        if gate and live_gate:
-            temporary.add(item)
-            continue
-        if pending and not any(
-                sibling.parent == item.parent and stat.S_ISDIR(sibling_info.st_mode) and
-                not sibling.name.startswith('.') and
-                stat.S_ISREG(known[sibling / 'manifest.json'].st_mode)
-                for sibling, sibling_info in entries if sibling / 'manifest.json' in known):
-            destination = item.with_name(f"{item.parent.name}-{item.name.removeprefix('.pending-')}")
-            print(f"{'Would finish' if dry_run else 'Finishing'} {item} as {destination}")
-            finishing[item] = destination
-            if not dry_run:
-                contents, content_sizes, content_errors = archive_inventory(item)
-                manifest = item / 'manifest.json'
-                record = records.get(item, {})
-                record.setdefault('note', 'finished by repair')
-                record.setdefault('contents', [{'path': str(path.relative_to(item)),
-                                  'size': content_sizes.get(path, 0)}
-                                 for path, _info in contents if path != item])
-                record.setdefault('skipped', []).extend(
-                    {'path': str(path.relative_to(item)), 'reason': error}
-                    for path, error in content_errors.items())
-                atomic_json(manifest, record)
-            continue
-        temporary.add(item)
-        freed += allocated.get(item, 0)
-        print(f"{'Would remove' if dry_run else 'Removing'} {item} ({allocated.get(item, 0)} bytes)")
-        if not dry_run:
-            shutil.rmtree(item)
-    if not dry_run:
-        for pending, destination in finishing.items():
-            pending.rename(destination)
-    report = []
-    snapshots = (set(records) | set(finishing)) - temporary - invalid
-    if not dry_run:
-        snapshots = {finishing.get(item, item) for item in snapshots}
-    prune_evidence_archive(root, not dry_run, report, snapshots=snapshots)
-    print('\n'.join(report))
-    print(f"{'Would free' if dry_run else 'Freed'} {freed} bytes.")
-
-
 def repair_published(task, base):
     if task.path.exists() and not real_worktree(task.repo, task.path):
         print(f"{task.path}: not a worktree; left as is")
@@ -4870,9 +4974,6 @@ def repair(args):
     repos = [resolve_repo(args.repo)] if args.repo else sorted(
         p for p in WORKSPACE.iterdir() if (p / ".git").exists())
     for repo in repos:
-        if getattr(args, 'prune_archive', False):
-            prune_archive(repo, args.dry_run)
-            continue
         prune_stale_gate_worktrees(repo)
         try:
             fetch(repo)
@@ -4928,158 +5029,6 @@ def wait_task(args):
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
-def prune_drill_worktrees(repo):
-    for path in (repo / ".worktrees").glob(".*drill-*"):
-        old = re.fullmatch(r"\.task-drill-\d{19}-(\d+)-\d+-(concurrent|solo)", path.name)
-        new = re.fullmatch(r"\.drill-[0-9a-f]{6}-\d+-(group|solo)", path.name)
-        if not old and not new:
-            continue
-        owner = path / ".work/drill.pid"
-        pid = old.group(1) if old else owner.read_text().strip() if owner.is_file() else ""
-        if pid.isdigit() and pid_alive(pid):
-            continue
-        result = run_git(repo, "worktree", "remove", "--force", str(path))
-        if result.returncode:
-            raise Stop(f"Cannot remove drill worktree {path}: {result.stderr}")
-
-
-def gate_drill(args):
-    """Measure real cross-repository clashes without consuming gate slots."""
-    repos = list(dict.fromkeys(resolve_repo(name) for name in args.repos))
-    for repo in repos:
-        prune_drill_worktrees(repo)
-    cli_seeds = {repo: [] for repo in repos}
-    for value in args.seed:
-        repo_name, separator, name = value.partition(":")
-        if not separator or not name:
-            raise Stop("gate-drill --seed requires <repo>:<name>.")
-        repo = resolve_repo(repo_name)
-        if repo not in cli_seeds:
-            raise Stop(f"Seed repository {repo_name} is not in this drill.")
-        cli_seeds[repo].append(name)
-    for repo in repos: task_lock.work(HOME, repo)
-    archive = HOME / ".local/state/task/gate-drill" / (str(time.time_ns()) + f"-{os.getpid()}")
-    archive.mkdir(parents=True)
-    run_name = secrets.token_hex(3)
-    worktrees = []
-    interrupted = False
-
-    def interrupt(signum, frame):
-        nonlocal interrupted
-        interrupted = True
-
-    previous_handlers = {sig: signal.signal(sig, interrupt)
-                         for sig in (signal.SIGTERM, signal.SIGINT)}
-
-    def prepare(repo, index, phase):
-        parent = repo / ".worktrees"
-        parent.mkdir(exist_ok=True)
-        mode = "solo" if phase == "solo" else "group"
-        path = parent / f".drill-{run_name}-{index}-{mode}"
-        base, _ = base_commit(repo, default_branch(repo))
-        git(repo, "worktree", "add", "-q", "--detach", str(path), base)
-        worktrees.append((repo, path))
-        (path / ".work").mkdir(exist_ok=True)
-        (path / ".work/drill.pid").write_text(str(os.getpid()))
-        prepare_environment(repo, path)
-        names = task_config(path).get("drill_seeds", [])
-        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
-            raise Stop(".task.toml drill_seeds must be a list of seed names.")
-        names = list(dict.fromkeys(names + cli_seeds[repo]))
-        for name in names:
-            try:
-                seed_source(repo, name)
-            except Stop as error:
-                if str(error).startswith("Seed does not exist:"):
-                    raise Stop(f"missing seed {name}") from None
-                raise
-        seed_worktree(repo, path, names)
-        return path
-
-    def prepare_measure(repo, index, phase):
-        try:
-            if interrupted:
-                raise Stop("Drill interrupted.")
-            return measure(prepare(repo, index, phase), index, phase)
-        except (Stop, OSError) as error:
-            return {"result": "failed", "duration": 0, "error": str(error)}
-        except ValueError:
-            return {"result": "failed", "duration": 0, "error": f"Cannot read drill inputs for {repo}."}
-
-    def measure(path, index, phase):
-        # Drill runs hold no slot; run_check reserves a free port index above the slots.
-        # The full default gate runs: `just check`, then pre-commit over all files when the
-        # repository has a pre-commit config (a drill has no base range to check).
-        token = GATE_SLOT.set(None)
-        started = time.monotonic()
-        try:
-            passed = run_check(path, "", state=archive / f"{index}-{phase}",
-                               evidence_name="drill-check.json", pre_commit_all_files=True,
-                               cancelled=lambda: interrupted)
-            return {"result": "passed" if passed else "failed",
-                    "duration": round(time.monotonic() - started, 3)}
-        except (Stop, OSError) as error:
-            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
-                    "error": str(error)}
-        except ValueError:
-            return {"result": "failed", "duration": round(time.monotonic() - started, 3),
-                    "error": f"Cannot read drill inputs in {path}."}
-        finally:
-            GATE_SLOT.reset(token)
-
-    rows = []
-    try:
-        with ThreadPoolExecutor(max_workers=len(repos)) as pool:
-            futures = [pool.submit(prepare_measure, repo, index, "concurrent")
-                       for index, repo in enumerate(repos)]
-            concurrent = [future.result() for future in futures]
-        if interrupted:
-            raise Stop("Drill interrupted.")
-        for index, (repo, result) in enumerate(zip(repos, concurrent)):
-            row = {"repo": repo.name, "concurrent": result,
-                   "solo": prepare_measure(repo, index, "solo"), "verdict": "ok"}
-            if row["solo"]["result"] != "passed":
-                row["verdict"] = "failing-alone"
-            elif result["result"] != "passed":
-                row["verdict"] = "clash"
-            rows.append(row)
-            if interrupted:
-                raise Stop("Drill interrupted.")
-        table = ["repo | concurrent (seconds) | solo (seconds) | verdict"]
-        for row in rows:
-            def cell(result):
-                return f"{result['result']} ({result['duration']})" if result else "-"
-            table.append(f"{row['repo']} | {cell(row['concurrent'])} | {cell(row['solo'])} | {row['verdict']}")
-            for phase in ("concurrent", "solo"):
-                if row[phase] and row[phase].get("error"):
-                    table.append(f"  {phase}: {row[phase]['error']}")
-        table.append("Summary:")
-        for row in rows:
-            solo = "PASS" if row["solo"]["result"] == "passed" else "FAIL"
-            together = "PASS" if row["concurrent"]["result"] == "passed" else "FAIL"
-            note = " (pre-existing failure, not a concurrency clash)" if row["verdict"] == "failing-alone" else ""
-            table.append(f"{row['repo']}: solo: {solo}, together: {together}, verdict: {row['verdict']}{note}")
-        atomic_json(archive / "results.json", rows)
-        (archive / "results.txt").write_text("\n".join(table) + "\n")
-        print("\n".join(table), flush=True)
-        print(f"Drill evidence: {archive}")
-        return int(any(row["verdict"] != "ok" for row in rows))
-    finally:
-        try:
-            errors = []
-            for repo, path in reversed(worktrees):
-                result = run_git(repo, "worktree", "remove", "--force", str(path))
-                if result.returncode:
-                    errors.append(f"Cannot remove drill worktree {path}: {result.stderr}")
-            if errors:
-                raise Stop("\n".join(errors))
-            if interrupted:
-                raise Stop("Drill interrupted.")
-        finally:
-            for sig, handler in previous_handlers.items():
-                signal.signal(sig, handler)
-
-
 def hold_status():
     held = []
     for path, release in ((JACOPO_HOLD, 'Jacopo: sudo agent-hold release'),
@@ -5124,19 +5073,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    sub = commands.add_parser("gate-drill", help="PM-only concurrent full-gate clash drill")
-    sub.add_argument("repos", nargs="+")
-    sub.add_argument("--seed", action="append", default=[], metavar="REPO:NAME",
-                     help="copy main checkout .work/NAME into each drill worktree; adds to .task.toml drill_seeds")
-    for name in ("start", "lane", "merge", "close", "review", "cancel", "wait"):
+    for name in ("start", "lane", "merge", "close", "review", "cancel", "wait", "risk", "redteam"):
         sub = commands.add_parser(name)
         sub.add_argument("repo")
         sub.add_argument("id")
+        if name in {"start", "lane", "review"}: sub.add_argument("--plan")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
         if name in {"start", "lane"}:
             sub.add_argument("--tier", choices=TIERS, help="task Tier line or routine by default")
         if name == "start":
+            sub.add_argument("--risk", choices=("high", "normal", "low"))
+            sub.add_argument("--risk-reason", metavar="TEXT")
             sub.add_argument("--override", metavar="REQUEST", default="",
                              help="Jacopo's request and date; permits --tier to change the recorded tier (ledgered)")
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
@@ -5145,6 +5093,8 @@ def main(argv=None):
             sub.add_argument("--no-verify", metavar="REASON")
             sub.add_argument("--off-plan", metavar="REASON")
         if name == "lane":
+            sub.add_argument("--effort", choices=("low", "medium", "high"), default="high")
+            sub.add_argument("--extra-round", metavar="REASON")
             sub.add_argument("--no-boost", action="store_true")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
@@ -5154,6 +5104,7 @@ def main(argv=None):
             sub.add_argument("--model", help="Claude aliases haiku|sonnet|opus|fable or full claude-*-5-* ids; Codex gpt-6-luna|gpt-6.1-sol|gpt-6-astra")
             sub.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
         if name == "merge":
+            sub.add_argument("--no-redteam", metavar="REASON")
             sub.add_argument("--lock-wait", type=float, default=45, help="gate lock wait in minutes (default 45)")
             sub.add_argument("--keep", action="store_true", help="keep the worktree and branch")
             sub.add_argument("--override", metavar="REASON")
@@ -5168,13 +5119,19 @@ def main(argv=None):
             mode.add_argument("--run", action="store_true",
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
+            sub.add_argument("--final", action="store_true", help="mark this run as the task's final review round")
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--no-check", metavar="REASON", help="record an override of the passing-check prerequisite")
             sub.add_argument("--append-prompt", metavar="TEXT", help="append an instruction to the reviewer prompt")
             sub.add_argument("--reviewer", nargs=2, metavar=("VENDOR", "MODEL"),
                              help="reviewer identity for manually supplied reviews")
-    sub = commands.add_parser("boost", help="temporary tier routing and extra batch capacity; reviews unchanged")
+        if name == "risk":
+            sub.add_argument("risk", choices=("high", "normal", "low"))
+            sub.add_argument("--reason", metavar="TEXT")
+        if name == "redteam":
+            sub.add_argument("--brief", required=True, metavar="FILE")
+    sub = commands.add_parser("boost", help="temporary tier routing, extra batch capacity and deeper hard/final reviews")
     sub.add_argument("action", nargs="?", choices=("off",))
     sub.add_argument("--claude-until")
     sub.add_argument("--codex-until")
@@ -5192,6 +5149,9 @@ def main(argv=None):
     sub.add_argument("repo")
     sub.add_argument("file")
     sub.add_argument("--no-pace", action="store_true", help="run the batch without usage pacing (logged)")
+    sub.add_argument("--plan")
+    sub = commands.add_parser("plan-budget")
+    sub.add_argument("id"); sub.add_argument("--clear")
     task_lock.configure(commands)
     sub = commands.add_parser('hold', help='show, pull or release the agent hold (drain only)')
     sub.add_argument('action', nargs='?', choices=('pull', 'release'))
@@ -5214,8 +5174,6 @@ def main(argv=None):
     sub.add_argument("repo", nargs="?")
     sub = commands.add_parser("repair", help="explicitly repair stale task state and gate worktrees")
     sub.add_argument("repo", nargs="?")
-    sub.add_argument("--prune-archive", action="store_true")
-    sub.add_argument("--dry-run", action="store_true")
     sub = commands.add_parser("denials")
     sub.add_argument("--days", type=int, default=30)
     sub.add_argument("--rule")
@@ -5232,7 +5190,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "note", "repair", "realign", "runner-start", "gate-drill"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -5288,13 +5246,14 @@ def main(argv=None):
             signal.signal(signal.SIGTERM, handle_interruption)
         result = 1
         try:
-            result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
-                      "review": review, "cancel": cancel, "note": note, "status": status,
-                      "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                      "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
-                      "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo),
-                      "hold": hold,
-                      "gate-drill": gate_drill}[args.command](args) or 0
+            with task_usage.command_readings():
+                result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
+                          "review": review, "risk": risk, "redteam": redteam, "cancel": cancel, "note": note, "status": status,
+                          "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
+                          "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
+                          "plan-budget": lambda a: print(plan_budget(a.id, clear=a.clear)) if not a.clear else plan_budget(a.id, clear=a.clear),
+                          "hold": hold,
+                          "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo)}[args.command](args) or 0
         finally:
             if lock:
                 run_path = lock.parent / "run.json"

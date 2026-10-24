@@ -86,6 +86,8 @@ TASK_SPEC = importlib.util.spec_from_loader(TASK_LOADER.name, TASK_LOADER)
 TASK_MODULE = importlib.util.module_from_spec(TASK_SPEC)
 sys.dont_write_bytecode = True
 TASK_SPEC.loader.exec_module(TASK_MODULE)
+# In-process helpers must never inspect the real ~/cortex repositories either.
+TASK_MODULE.CORTEX = Path(audit_state.name) / 'cortex'
 
 STUBS = {
     "just": """#!/bin/sh
@@ -187,7 +189,7 @@ REVIEW_STUB = """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 work = pathlib.Path.cwd() / '.work'
 (work / 'reviewer-call.json').write_text(json.dumps({
-    'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': sys.stdin.read(),
+    'args': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': sys.stdin.read(), 'pid': os.getpid(),
     'git_optional_locks': os.environ.get('GIT_OPTIONAL_LOCKS'),
     'env_names': sorted(os.environ),
 }))
@@ -217,7 +219,8 @@ print(reply, end='', flush=True)
 print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
 if os.environ.get('REVIEW_STUB_HOLD'):
     (pathlib.Path.home() / '.local/state/task/hold').write_text('hold before reviewer retry')
-time.sleep(float(os.environ.get('REVIEW_STUB_DELAY', '0')))
+delay = os.environ.get('REVIEW_STUB_DELAY', '0')
+time.sleep(float(os.environ.get('REVIEW_STUB_FIRST_DELAY', delay) if count == 1 else delay))
 code = os.environ.get('REVIEW_STUB_EXIT', '0')
 sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else code))
 """
@@ -234,10 +237,10 @@ class TaskTool(unittest.TestCase):
             ('check', 'proj', '5'), ('check', 'proj', '5', '--detach'),
             ('check',), ('check', '--detach'), ('repair', 'proj'),
             ('realign', 'proj'), ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
-            ('gate-drill', 'proj'), ('plan', 'proj', '--sign'),
+            ('plan', 'proj', '--sign'),
         ]
         self.assertEqual(TASK_MODULE.HOLD_WORK_COMMANDS,
-                         {'start', 'lane', 'check', 'merge', 'runner-start', 'realign', 'close', 'gate-drill', 'repair'})
+                         {'start', 'lane', 'check', 'merge', 'runner-start', 'realign', 'close', 'repair'})
         runner = self.runner_fixture('setsid')
         agent = self.home / '.local/state/task/hold'
         for marker in (HOLD_FIXTURE, agent):
@@ -783,24 +786,6 @@ class TaskTool(unittest.TestCase):
                     self.assertTrue((runner.parent / 'runner-call').exists())
                     (runner.parent / 'runner-call').unlink()
 
-    def test_hold_between_drill_phases_prevents_new_launch(self):
-        just = self.home / 'bin/just'
-        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
-            import pathlib, sys
-            assert sys.argv[1:] == ['check']
-            home = pathlib.Path.home()
-            with (home / 'drill-launches').open('a') as output:
-                output.write('launched\\n')
-            (home / '.local/state/task/hold').write_text('hold between drill phases')
-            print('OK')
-            '''))
-        output = self.raw_task('gate-drill', 'proj', code=1)
-        self.assertIn('hold between drill phases', output)
-        self.assertEqual((self.home / 'drill-launches').read_text(), 'launched\n')
-        rows = json.loads(next((self.home / '.local/state/task/gate-drill').glob('*/results.json')).read_text())
-        self.assertEqual(rows[0]['concurrent']['result'], 'passed')
-        self.assertEqual(rows[0]['solo']['result'], 'failed')
-        self.assertEqual(len(self.git(self.repo, 'worktree', 'list').splitlines()), 1)
 
     def test_project_lock_contention_commands_and_read_only_status(self):
         self.started()
@@ -809,8 +794,9 @@ class TaskTool(unittest.TestCase):
             ('start', 'proj', 'new-task', '--builder', 'codex'),
             ('lane', 'proj', '5'), ('runner-start', 'proj', 'runner-demo.md'),
             ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
+            ('risk', 'proj', '5', 'low'), ('redteam', 'proj', '5', '--brief', 'brief.md'),
             ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
-            ('check', 'proj', '5'), ('gate-drill', 'proj'), ('realign', 'proj'),
+            ('check', 'proj', '5'), ('realign', 'proj'),
         ]
         env = dict(self.env, TASK_HOLDER='seat-b')
         for command in commands:
@@ -1101,7 +1087,1012 @@ class TaskTool(unittest.TestCase):
         path = self.home / '.local/state/task/runs.jsonl'
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def budget_fixture(self, ident='chain', points=3, allowed=None, expires=None):
+        path = self.home / 'cortex/cortex-kb-company/plans' / f'{ident}.toml'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        expiry = expires or (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        path.write_text(f'id = "{ident}"\nexpires = "{expiry}"\n[points]\nclaude = {points}\ncodex = {points}\n[allowed]\n' +
+                        '\n'.join(f'{repo} = {json.dumps(tasks)}' for repo, tasks in (allowed or {'proj': ['*']}).items()) + '\n')
+        return path
+
+    @contextlib.contextmanager
+    def budget_environment(self):
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE, 'CORTEX', self.home / 'cortex'), \
+                mock.patch.dict(os.environ, dict(self.env, TASK_PLAN='chain'), clear=True), \
+                mock.patch.object(TASK_MODULE.task_usage, 'readings', return_value={}):
+            yield TASK_MODULE
+
+    def test_plan_budget_duplicate_crash_and_exact_short_batch_chain(self):
+        self.budget_fixture(points=3)
+        with self.budget_environment() as api:
+            fields = dict(repo='proj', task='docs', kind='lane', vendor='codex', commit='head-1')
+            first = api.budget_run(**fields)  # crash before launch: only a pending row survives
+            self.assertEqual(self.run_rows(), [])
+            self.assertEqual(api.budget_run(**fields)['id'], first['id'])
+            pending = self.home / '.local/state/task/pending-runs'
+            self.assertEqual(len(list(pending.glob('*.json'))), 1)
+            api.task_usage.run_log(self.home, first, 'finished')
+            retry = api.budget_run(**fields)
+            self.assertNotEqual(retry['id'], first['id'])
+            api.task_usage.run_log(self.home, retry, 'finished')
+            for number in (2, 3):
+                run = api.budget_run(**dict(fields, commit=f'head-{number}'))
+                api.task_usage.run_log(self.home, run, 'finished')
+            self.assertEqual(len(self.run_rows()), 4)
+            with self.assertRaisesRegex(api.Stop, 'codex points exhausted'):
+                api.budget_run(**dict(fields, commit='head-4'))
+            retry = api.budget_run(**fields)
+            api.task_usage.run_log(self.home, retry, 'finished')
+            self.assertEqual(len({r['id'] for r in self.run_rows()}), 5, 'every invocation keeps its own outcome')
+            before = {p: p.read_bytes() for p in (self.home / '.local/state/task').rglob('*') if p.is_file()}
+            self.assertIn('codex used 3 left 0', api.plan_budget('chain'))
+            self.raw_task('plan-budget', 'chain')
+            self.raw_task('usage', '--weekly-line')
+            self.raw_task('status', 'proj')
+            self.assertEqual(before, {p: p.read_bytes() for p in (self.home / '.local/state/task').rglob('*') if p.is_file()})
+            self.assertEqual(len(self.run_rows()), 5, 'reporting never adds draws or refills')
+
+    def test_plan_budget_pending_vendor_kind_scope_and_expiry(self):
+        plan = self.budget_fixture(points=1, allowed={'proj': ['T-5']})
+        with self.budget_environment() as api:
+            fields = dict(repo='proj', task='T-5', kind='lane', vendor='codex')
+            pending = api.budget_run(**fields)
+            self.assertEqual(api.budget_run(**fields)['id'], pending['id'])
+            with self.assertRaisesRegex(api.Stop, 'points exhausted'):
+                api.budget_run(**dict(fields, kind='review'))
+            other = api.budget_run(**dict(fields, kind='review', vendor='claude'))
+            self.assertNotEqual(other['id'], pending['id'])
+            for outside in ({'task': 'T-6'}, {'repo': 'elsewhere'}):
+                with self.assertRaisesRegex(api.Stop, 'outside allowed'):
+                    api.budget_run(**dict(fields, **outside))
+            plan.write_text(plan.read_text().replace('expires = "', 'expires = "2000-01-01T00:00:00Z" # '))
+            with self.assertRaisesRegex(api.Stop, 'expired'):
+                api.budget_run(**fields)
+
+    def test_plan_budget_breaker_classes_are_consecutive_latched_and_clearable(self):
+        self.budget_fixture(points=20)
+        with self.budget_environment() as api:
+            def end(kind, outcome, reason):
+                row = api.budget_run(repo='proj', task='docs', kind=kind, vendor='codex', commit=str(len(self.run_rows())))
+                api.task_usage.run_log(self.home, row, outcome, reason=reason)
+            end('lane', 'failed', 'same text')
+            end('lane', 'interrupted', 'same text')
+            self.assertIn('disabled []', api.plan_budget('chain'))
+            end('review', 'failed', 'unrelated kind')
+            end('lane', 'interrupted', 'different text')
+            with self.assertRaisesRegex(api.Stop, 'lane disabled'):
+                end('lane', 'finished', '')
+            self.assertIn("disabled ['lane']", self.raw_task('plan-budget', 'chain'))
+            before = len(self.run_rows())
+            self.raw_task('plan-budget', 'chain', '--clear', 'lane')
+            self.assertEqual(len(self.run_rows()), before + 1)
+            self.assertEqual(self.run_rows()[-1]['outcome'], 'cleared')
+            self.assertIn('disabled []', self.raw_task('plan-budget', 'chain'))
+            end('lane', 'failed', 'one')
+            end('lane', 'finished', 'success resets consecutive failures')
+            end('lane', 'failed', 'two')
+            self.assertIn('disabled []', api.plan_budget('chain'))
+            end('lane', 'failed', 'three')
+            self.assertIn("disabled ['lane']", api.plan_budget('chain'))
+
+    def test_plan_budget_read_only_missing_malformed_and_status(self):
+        state = self.home / '.local/state/task'
+        before = {p: p.read_bytes() for p in state.rglob('*') if p.is_file()}
+        self.budget_fixture(points=0)
+        self.assertIn('codex used 0 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual(before, {p: p.read_bytes() for p in state.rglob('*') if p.is_file()})
+        self.assertIn('Missing or malformed plan', self.raw_task('plan-budget', 'absent', code=1))
+        path = self.budget_fixture('broken')
+        valid = path.read_text()
+        for bad in ('id = [', valid.replace('id = "broken"', 'id = "wrong"'),
+                    valid.replace('codex = 3', 'codex = -1'), valid.replace('codex = 3', 'codex = true'),
+                    valid.replace('[allowed]', 'allowed = "bad"\n[invalid]'),
+                    valid.replace('+00:00', '+01:00')):
+            with self.subTest(bad=bad):
+                path.write_text(bad)
+                self.assertIn('Missing or malformed plan', self.raw_task('plan-budget', 'broken', code=1))
+                self.assertIn('plan broken: malformed', self.raw_task('status', 'proj'))
+        self.budget_fixture('expired', expires='2000-01-01T00:00:00Z')
+        self.assertNotIn('plan expired:', self.raw_task('status', 'proj'))
+        self.assertIn('plan chain:', self.raw_task('status', 'proj'))
+
+    def test_plan_budget_cli_start_lane_and_review_share_the_log(self):
+        self.budget_fixture(points=2)
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        wt = self.repo / '.worktrees/t5'
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', '--plan', 'chain')
+        self.wait_for_lane(wt)
+        self.assertEqual([(r['kind'], r['vendor']) for r in self.run_rows()], [('start', 'codex'), ('lane', 'codex')])
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        self.raw_task('lane', 'proj', '5', '--plan', 'chain')
+        self.wait_for_lane(wt)
+        self.assertEqual(len(self.run_rows()), 4, 'completed start and same-commit lane keep separate free attempts')
+        self.commit_in(wt, 'b.txt')
+        self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
+        self.raw_task('check', 'proj', '5')
+        self.stub_reviewers()
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual((self.run_rows()[-1]['kind'], self.run_rows()[-1]['vendor']), ('review', 'claude'))
+        self.assertIn('codex used 2 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('claude used 1 left 1', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_refused_start_draws_nothing_and_never_trips_breaker(self):
+        self.budget_fixture(points=1)
+        task_file = self.kb / 'backlog/tasks/t-5 - Add-the-b-file.md'
+        original = task_file.read_text()
+        justfile = self.repo / 'justfile'
+        intent = self.kb / 'INTENT.md'
+        cases = [
+            (justfile, None, 'No justfile'),
+            (task_file, original.replace('- [ ]', 'criterion'), 'no acceptance criteria'),
+            (task_file, original.replace('Verify:', 'Command:'), 'no `Verify:'),
+            (task_file, original.replace('`true`', '`missing-plan-test-command`'), 'not installed'),
+            (intent, intent.read_text() + '\nChanged plan\n', 'changed since sign-off'),
+        ]
+        for path, content, message in cases:
+            with self.subTest(message=message):
+                saved = path.read_text()
+                if content is None:
+                    path.unlink()
+                else:
+                    path.write_text(content)
+                try:
+                    for _ in range(2):
+                        output = self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain', code=1)
+                        self.assertIn(message, output)
+                        self.assertEqual(self.run_rows(), [])
+                        self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+                        self.assertFalse((self.repo / '.worktrees/t5').exists())
+                finally:
+                    path.write_text(saved)
+        self.assertIn('disabled []', self.raw_task('plan-budget', 'chain'))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        self.assertEqual([(r['kind'], r['outcome']) for r in self.run_rows()], [('start', 'finished')])
+
+    def test_plan_budget_failed_start_reuses_task_key(self):
+        self.budget_fixture(points=1)
+        probe = self.home / 'failed-start.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import runpy
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            with mock.patch.dict(api['start'].__globals__, prepare_environment=mock.Mock(side_effect=RuntimeError('after creation'))):
+                api['main'](['start', 'proj', '5', '--builder', 'codex', '--plan', 'chain'])
+        '''))
+        result = subprocess.run([sys.executable, str(probe)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('after creation', result.stderr)
+        rows = self.run_rows()
+        self.assertEqual([r['outcome'] for r in rows], ['failed'])
+        record = json.loads((self.state() / 'task.json').read_text())
+        self.assertEqual(record['plan'], 'chain')
+        self.assertEqual(record['revision'], TASK_MODULE.record_revision(record))
+        self.assertIn('Conflicting plan', self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'other', code=1))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex')
+        self.assertEqual([r['outcome'] for r in self.run_rows()], ['failed', 'finished'])
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
+        self.stub_models()
+        wt = self.repo / '.worktrees/t5'
+        (wt / '.work/prompt.md').write_text('task')
+        self.assertIn('points exhausted', self.raw_task('lane', 'proj', '5', code=1))
+        self.assertFalse((wt / '.work/model-call.json').exists())
+
+    def test_plan_budget_refused_start_allows_corrected_plan_before_binding(self):
+        self.budget_fixture('valid', points=10)
+        self.budget_fixture('outside', allowed={'proj': ['other']})
+        self.budget_fixture('expired', expires='2000-01-01T00:00:00Z')
+        self.budget_fixture('exhausted', points=0)
+        self.budget_fixture('malformed').write_text('id = [')
+        for ident, message in (('missing', 'Missing or malformed'), ('malformed', 'Missing or malformed'),
+                               ('outside', 'outside allowed'), ('expired', 'expired'),
+                               ('exhausted', 'points exhausted')):
+            with self.subTest(plan=ident):
+                name = 'refused-' + ident
+                rows = self.run_rows()
+                self.assertIn(message, self.raw_task('start', 'proj', name, '--builder', 'codex',
+                                                    '--plan', ident, code=1))
+                self.assertFalse((self.state(name) / 'task.json').exists(), 'no refused binding')
+                self.assertFalse((self.repo / '.worktrees' / name).exists())
+                self.assertEqual(self.run_rows(), rows)
+                self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+                self.raw_task('start', 'proj', name, '--builder', 'codex', '--plan', 'valid')
+                record = json.loads((self.state(name) / 'task.json').read_text())
+                self.assertEqual(record['plan'], 'valid')
+                self.assertEqual(record['revision'], TASK_MODULE.record_revision(record))
+                self.assertEqual(self.run_rows()[-1]['plan'], 'valid')
+
+    def test_plan_budget_failed_worktree_creation_keeps_binding_for_retry(self):
+        self.budget_fixture(points=1)
+        probe = self.home / 'failed-worktree.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import runpy
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            original = api['git']
+            def git(repo, *args):
+                if args[:2] == ('worktree', 'add'): raise RuntimeError('worktree creation failed')
+                return original(repo, *args)
+            with mock.patch.dict(api['start'].__globals__, git=git):
+                api['main'](['start', 'proj', '5', '--builder', 'codex', '--plan', 'chain'])
+        '''))
+        result = subprocess.run([sys.executable, str(probe)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('worktree creation failed', result.stderr)
+        self.assertFalse((self.repo / '.worktrees/t5').exists())
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
+        self.assertEqual([r['outcome'] for r in self.run_rows()], ['failed'])
+        self.assertIn('Conflicting plan', self.raw_task('start', 'proj', '5', '--builder', 'codex', code=1,
+                                                     env=dict(self.env, TASK_PLAN='other')))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex')
+        self.assertEqual([(r['plan'], r['outcome']) for r in self.run_rows()],
+                         [('chain', 'failed'), ('chain', 'finished')])
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_no_plan_start_refuses_missing_branch_without_refresh(self):
+        self.started()
+        record_path = self.state() / 'task.json'
+        original = record_path.read_text()
+        damaged = json.loads(original)
+        damaged.pop('branch')
+        record_path.write_text(json.dumps(damaged))
+        before = record_path.read_bytes()
+        output = self.raw_task('start', 'proj', '5', '--builder', 'codex', code=1)
+        self.assertIn('damaged; ask the PM to refresh', output)
+        self.assertEqual(record_path.read_bytes(), before)
+        self.assertEqual(self.run_rows(), [])
+        # Also pin the late record check, after initial plan binding validation.
+        record_path.write_text(original)
+        probe = self.home / 'damage-start-record.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import json, runpy
+            from pathlib import Path
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            prepare = api['prepare_environment']
+            def damage(*args):
+                prepare(*args)
+                path = Path({str(record_path)!r})
+                record = json.loads(path.read_text())
+                record.pop('branch')
+                path.write_text(json.dumps(record))
+            with mock.patch.dict(api['start'].__globals__, prepare_environment=damage):
+                raise SystemExit(api['main'](['start', 'proj', '5', '--builder', 'codex']))
+        '''))
+        result = subprocess.run([sys.executable, str(probe)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('damaged; ask the PM to refresh', result.stderr)
+        self.assertEqual(record_path.read_bytes(), before)
+        self.assertEqual(self.run_rows(), [])
+
+    def test_plan_budget_review_unstarted_task_stops_before_opening_lock(self):
+        self.assertFalse(self.state().exists())
+        output = self.raw_task('review', 'proj', '5', '--run', code=1)
+        self.assertIn('No pinned task record', output)
+        self.assertNotIn('Traceback', output)
+        self.assertFalse((self.state() / 'review.lock').exists())
+        self.assertEqual(self.run_rows(), [])
+
+    def test_plan_budget_refresh_repairs_damaged_record_and_preserves_binding(self):
+        self.started()
+        record_path = self.state() / 'task.json'
+        self.budget_fixture(points=1)
+        for planned in (False, True):
+            with self.subTest(planned=planned):
+                if planned:
+                    self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain', '--refresh')
+                record = json.loads(record_path.read_text())
+                record['revision'] = 'damaged'
+                record_path.write_text(json.dumps(record))
+                self.assertIn('damaged', self.raw_task('start', 'proj', '5', '--builder', 'codex', code=1))
+                if planned:
+                    before = record_path.read_bytes()
+                    self.assertIn('Conflicting plan', self.raw_task('start', 'proj', '5', '--builder', 'codex',
+                                                                 '--refresh', '--plan', 'other', code=1))
+                    self.assertEqual(record_path.read_bytes(), before)
+                self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+                repaired = json.loads(record_path.read_text())
+                self.assertEqual(repaired['revision'], TASK_MODULE.record_revision(repaired))
+                self.assertEqual(repaired.get('plan'), 'chain' if planned else None)
+                self.assertEqual(len(self.run_rows()), 2 if planned else 0)
+        self.assertTrue(all(r['plan'] == 'chain' for r in self.run_rows()))
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_lane_and_review_keys_follow_commits(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=2)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        heads = []
+        for number in range(2):
+            if number:
+                self.commit_in(wt, 'b.txt')
+            heads.append(self.git(wt, 'rev-parse', 'HEAD'))
+            for repeat in range(2):
+                extra = ('--extra-round', 'fourth launch for commit-key fixture') if number == repeat == 1 else ()
+                self.raw_task('lane', 'proj', '5', '--plan', 'chain', *extra)
+                self.wait_for_lane(wt)
+            self.assertEqual(len(self.run_rows()), 2 * (number + 1))
+        self.assertEqual([r['commit'] for r in self.run_rows()], [h for h in heads for _ in range(2)])
+        self.stub_reviewers()
+        review_heads = []
+        for number in range(2):
+            if number:
+                self.commit_in(wt, 'c.txt')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            review_heads.append(head)
+            self.raw_task('check', 'proj', '5')
+            reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+            for _ in range(2):
+                self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
+                              env=dict(self.env, REVIEW_STUB_REPLY=reply))
+            rows = [r for r in self.run_rows() if r['kind'] == 'review']
+            self.assertEqual(len(rows), 2 * (number + 1))
+        self.assertEqual([r['commit'] for r in rows], [h for h in review_heads for _ in range(2)])
+        self.assertIn('codex used 2 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('claude used 2 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_launches_respect_risk_round_limits_and_log_effort(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_models()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('round-limit fixture\n')
+        for builder in ('codex', 'claude'):
+            for risk, maximum in (('low', 2), ('normal', 3), ('high', 3)):
+                with self.subTest(builder=builder, risk=risk):
+                    self.raw_task('risk', 'proj', '5', risk, '--reason', 'planned round fixture')
+                    (self.state() / 'rounds.json').unlink(missing_ok=True)
+                    (work / 'lane.json').unlink(missing_ok=True)
+                    for number in range(1, maximum + 1):
+                        self.raw_task('lane', 'proj', '5', '--builder', builder, '--plan', 'chain', '--effort', 'medium', '--no-pace')
+                        run = self.wait_for_lane(wt)['usage_run']
+                        self.assertEqual((run['plan'], run['effort'], run['round']), ('chain', 'medium', number))
+                    (work / 'model-call.json').unlink()
+                    before = {p.name: p.read_bytes() for p in work.glob('final*.md')}
+                    rows = self.run_rows()
+                    pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+                    self.assertEqual(pending, [])
+                    refused = self.raw_task('lane', 'proj', '5', '--builder', builder, '--plan', 'chain', '--no-pace', code=1)
+                    self.assertIn(f'risk {risk}: maximum {maximum}', refused)
+                    self.assertEqual(self.run_rows(), rows)
+                    self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+                    self.assertFalse((work / 'model-call.json').exists())
+                    self.assertEqual({p.name: p.read_bytes() for p in work.glob('final*.md')}, before)
+                    self.raw_task('lane', 'proj', '5', '--builder', builder, '--plan', 'chain', '--no-pace', '--extra-round', 'bounded planned fix')
+                    self.assertEqual(self.wait_for_lane(wt)['usage_run']['round'], maximum + 1)
+                    self.assertIn(f'{builder} used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 22)
+        self.assertEqual(len({(r['vendor'], r['commit']) for r in rows}), 2, 'rounds do not change draw keys')
+
+    def test_plan_budget_reviewer_fallback_shares_reviewed_commit_draw(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
+                      env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                               REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
+                               REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply, REVIEW_STUB_EXIT='0'))
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
+        self.assertEqual(json.loads((self.state() / 'review.json').read_text())['reviewer'], 'codex')
+        rows = self.run_rows()
+        self.assertEqual([(r['kind'], r['commit'], r['vendor'], r['outcome']) for r in rows],
+                         [('review', head, 'claude', 'failed'), ('review', head, 'codex', 'finished')])
+        self.assertNotEqual(rows[0]['id'], rows[1]['id'])
+        self.assertEqual(rows[1]['replaces'], rows[0]['id'])
+        self.assertIn('claude used 0 left 1', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_same_commit_failures_are_separate_attempts_and_trip_breaker(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        for _ in range(2):
+            self.raw_task('lane', 'proj', '5', '--plan', 'chain',
+                          env=dict(self.env, LANE_STUB_EXIT='1'))
+            self.assertEqual(self.wait_for_lane(wt)['exit_code'], 1)
+        rows = self.run_rows()
+        self.assertEqual([r['outcome'] for r in rows], ['failed', 'failed'])
+        self.assertEqual(len({r['id'] for r in rows}), 2)
+        self.assertEqual(len({r['commit'] for r in rows}), 1)
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('lane disabled', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
+        self.assertEqual(self.run_rows(), rows)
+        self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+
+    def test_plan_budget_cancelled_attempts_keep_outcomes_and_trip_breaker(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        release = self.home / 'release-cancelled-model'
+        self.addCleanup(release.touch)
+        for _ in range(2):
+            (wt / '.work/model-call.json').unlink(missing_ok=True)
+            self.raw_task('lane', 'proj', '5', '--plan', 'chain', env=dict(self.env, LANE_STUB_RELEASE=str(release)))
+            self.wait_for_lane(wt, finished=False)
+            run = json.loads((wt / '.work/lane.json').read_text())['usage_run']
+            reservation = self.home / '.local/state/task/pending-runs' / (run['id'] + '.json')
+            self.assertTrue(json.loads(reservation.read_text())['invoked'])
+            self.raw_task('cancel', 'proj', '5')
+            self.wait_project_lock_free()
+        rows = self.run_rows()
+        self.assertEqual([r['outcome'] for r in rows], ['interrupted', 'interrupted'])
+        self.assertEqual(len({r['id'] for r in rows}), 2)
+        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('lane disabled', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
+        self.assertEqual(self.run_rows(), rows)
+
+    def test_plan_budget_vendor_change_requires_and_charges_executing_vendor(self):
+        wt, _ = self.started()
+        plan = self.budget_fixture(points=1)
+        plan.write_text(plan.read_text().replace('codex = 1', 'codex = 0'))
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', '--builder', 'claude', '--plan', 'chain')
+        self.wait_for_lane(wt)
+        self.assertIn('codex points exhausted', self.raw_task('lane', 'proj', '5', '--builder', 'codex', '--plan', 'chain', code=1))
+        self.assertEqual(len(self.run_rows()), 1)
+        self.budget_fixture(points=1)
+        for _ in range(2):
+            self.raw_task('lane', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+            self.wait_for_lane(wt)
+        self.assertEqual([r['vendor'] for r in self.run_rows()], ['claude', 'codex', 'codex'])
+        self.assertIn('claude used 1 left 0; codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_fallback_refused_for_zero_points_keeps_primary_charge(self):
+        wt, _ = self.started()
+        plan = self.budget_fixture(points=1)
+        plan.write_text(plan.read_text().replace('codex = 1', 'codex = 0'))
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        self.assertIn('codex points exhausted', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1,
+                      env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit", REVIEW_STUB_FIRST_EXIT='2')))
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual([(r['vendor'], r['outcome']) for r in self.run_rows()], [('claude', 'failed')])
+        self.assertIn('claude used 1 left 0; codex used 0 left 0', self.raw_task('plan-budget', 'chain'))
+
+    def test_plan_budget_start_binding_inherits_and_rejects_cli_and_environment_conflicts(self):
+        self.budget_fixture(points=10)
+        output = self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
+        wt = self.repo / '.worktrees/t5'
+        self.assertIn('task lane proj T-5`', output)
+        record = json.loads((self.state() / 'task.json').read_text())
+        self.assertEqual(record['plan'], 'chain')
+        self.assertEqual(record['revision'], TASK_MODULE.record_revision(record))
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5')  # another shell, with no TASK_PLAN
+        self.wait_for_lane(wt)
+        self.raw_task('check', 'proj', '5')
+        self.stub_reviewers()
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        runner = self.runner_fixture()
+        runner.write_text('1. 5: builder codex, model gpt-6-luna\n')
+        self.raw_task('runner-start', 'proj', str(runner))
+        self.wait_project_lock_free()
+        self.assertIn('--setenv=TASK_PLAN=chain', json.loads((self.home / 'service-args').read_text()))
+        self.assertEqual([r['plan'] for r in self.run_rows()], ['chain'] * 3)
+        rows = self.run_rows()
+        commands = [('start', 'proj', '5', '--builder', 'codex'), ('lane', 'proj', '5'),
+                    ('review', 'proj', '5', '--run'), ('runner-start', 'proj', str(runner))]
+        for command in commands:
+            for extra, env in ((('--plan', 'other'), self.env), ((), dict(self.env, TASK_PLAN='other')),
+                               (('--plan', 'chain'), dict(self.env, TASK_PLAN='other'))):
+                with self.subTest(command=command, extra=extra):
+                    self.assertIn('Conflicting plan', self.raw_task(*command, *extra, env=env, code=1))
+                    self.assertEqual(self.run_rows(), rows)
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+        self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
+
+    def test_plan_budget_fallback_refused_at_spawn_preserves_primary_charge(self):
+        wt, _ = self.started()
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        probe = self.home / 'refused-fallback.py'
+        for rule in ('expired', 'outside allowed', 'review disabled'):
+            with self.subTest(rule=rule):
+                plan = self.budget_fixture(points=10)
+                log = self.home / '.local/state/task/runs.jsonl'
+                log.unlink(missing_ok=True)
+                for pending in log.parent.glob('pending-runs/*.json'): pending.unlink()
+                for name in ('reviewer-count', 'reviewer-call.json'):
+                    (wt / '.work' / name).unlink(missing_ok=True)
+                mutation = {
+                    'expired': 'plan.write_text(plan.read_text().replace(\'expires = "\', \'expires = "2000-01-01T00:00:00Z" # \'))',
+                    'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
+                    'review disabled': "\n".join([
+                        "for number in range(2):",
+                        "    row = api['task_usage'].run_log(api['HOME'], plan='chain', repo='proj', task='seed-' + str(number), kind='review', vendor='codex', commit=str(number))",
+                        "    api['task_usage'].run_log(api['HOME'], row, 'failed')",
+                    ]),
+                }[rule]
+                probe.write_text(textwrap.dedent(f'''\
+                    import runpy, sys
+                    from pathlib import Path
+                    from unittest import mock
+                    api = runpy.run_path({str(TOOL)!r})
+                    original = api['atomic_json']
+                    plan = Path({str(plan)!r})
+                    changed = False
+                    def delayed(path, data):
+                        global changed
+                        original(path, data)
+                        if path.name == 'review-run.json' and data.get('usage_run', {{}}).get('vendor') == 'codex' and not changed:
+                            changed = True
+                ''') + textwrap.indent(mutation, '        ') + '\n' +
+                    "with mock.patch.dict(api['review'].__globals__, atomic_json=delayed):\n" +
+                    "    sys.exit(api['main'](['review', 'proj', '5', '--run', '--plan', 'chain']))\n")
+                result = subprocess.run([sys.executable, str(probe)], cwd=self.home,
+                                        env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                                                 REVIEW_STUB_FIRST_EXIT='2'), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(rule, result.stderr)
+                self.assertEqual((wt / '.work/reviewer-count').read_text(), '1', 'fallback never ran')
+                rows = self.run_rows()
+                self.assertEqual((rows[0]['vendor'], rows[0]['outcome']), ('claude', 'failed'))
+                reservations = list(log.parent.glob('pending-runs/*.json'))
+                self.assertEqual(len(reservations), 1)
+                fallback = json.loads(reservations[0].read_text())
+                self.assertEqual(fallback['replaces'], rows[0]['id'])
+                self.assertFalse(fallback.get('invoked', False))
+                self.assertIn('claude used 1 left 9', self.raw_task('plan-budget', 'chain'))
+                codex_used = 3 if rule == 'review disabled' else 1  # two concurrent seed keys
+                self.assertIn(f'codex used {codex_used} left {10 - codex_used}', self.raw_task('plan-budget', 'chain'))
+                if rule != 'review disabled':
+                    self.budget_fixture(points=10)  # restore expiry/scope in this fixture
+                self.raw_task('plan-budget', 'chain', '--clear', 'review')
+                (wt / '.work/reviewer-count').unlink()
+                head = self.git(wt, 'rev-parse', 'HEAD')
+                reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+                self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
+                              env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                                       REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
+                attempts = [r for r in self.run_rows() if r.get('task') == 'T-5']
+                self.assertEqual([(r['vendor'], r['outcome']) for r in attempts],
+                                 [('claude', 'failed'), ('claude', 'failed'), ('codex', 'finished')])
+                self.assertEqual(attempts[-1]['id'], fallback['id'], 'reuse the refused reservation')
+                self.assertNotEqual(attempts[0]['id'], attempts[1]['id'])
+                self.assertEqual(set(attempts[-1]['superseded']), {r['id'] for r in attempts[:-1]})
+                self.assertIn('claude used 0 left 10', self.raw_task('plan-budget', 'chain'))
+                self.assertIn(f'codex used {codex_used} left {10 - codex_used}', self.raw_task('plan-budget', 'chain'))
+                self.assertEqual(list(log.parent.glob('pending-runs/*.json')), [])
+
+    def test_plan_budget_lane_rechecks_expiry_scope_and_breaker_at_model_spawn(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        worker = self.home / 'delayed-worker.py'
+        launcher = self.home / 'delayed-launch.py'
+        launcher.write_text(textwrap.dedent(f'''\
+            import runpy, subprocess, sys
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            original = subprocess.Popen
+            def spawn(argv, *args, **kwargs):
+                if '--_worker' in argv: argv = [sys.executable, {str(worker)!r}, *argv[2:]]
+                return original(argv, *args, **kwargs)
+            with mock.patch.object(subprocess, 'Popen', side_effect=spawn):
+                sys.exit(api['main'](['lane', 'proj', '5', '--plan', 'chain', '--no-pace', '--no-boost']))
+        '''))
+        for rule in ('expired', 'outside allowed', 'lane disabled'):
+            with self.subTest(rule=rule):
+                plan = self.budget_fixture(points=10)
+                log = self.home / '.local/state/task/runs.jsonl'
+                log.unlink(missing_ok=True)
+                for pending in log.parent.glob('pending-runs/*.json'): pending.unlink()
+                mutation = {
+                    'expired': 'plan.write_text(plan.read_text().replace(\'expires = "\', \'expires = "2000-01-01T00:00:00Z" # \'))',
+                    'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
+                    'lane disabled': "\n".join([
+                        "for number in range(2):",
+                        "    run = api['budget_run'](repo='proj', task='seed-' + str(number), kind='lane', vendor='codex')",
+                        "    api['task_usage'].run_log(api['HOME'], run, 'failed')",
+                    ]),
+                }[rule]
+                worker.write_text(textwrap.dedent(f'''\
+                    import runpy, sys
+                    from pathlib import Path
+                    from unittest import mock
+                    api = runpy.run_path({str(TOOL)!r})
+                    original = api['lane_environment']
+                    plan = Path({str(plan)!r})
+                    def delayed(*args):
+                        environment = original(*args)
+                ''') + textwrap.indent(mutation, '    ') + '\n    return environment\n' +
+                    "with mock.patch.dict(api['lane'].__globals__, lane_environment=delayed):\n    sys.exit(api['main'](sys.argv[1:]))\n")
+                result = subprocess.run([sys.executable, str(launcher)], env=self.env, cwd=self.home, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                run = self.wait_for_lane(wt)
+                self.wait_project_lock_free()
+                self.assertIn(rule, (wt / '.work/lane.log').read_text())
+                self.assertFalse((wt / '.work/model-call.json').exists())
+                self.assertFalse(run['usage_run'].get('invoked', False))
+                self.assertEqual(len(self.run_rows()), 2 if rule == 'lane disabled' else 0)
+                pending = list(log.parent.glob('pending-runs/*.json'))
+                self.assertEqual(len(pending), 1, 'refusal preserves the existing reservation without a new attempt')
+                self.assertFalse(json.loads(pending[0].read_text()).get('invoked', False))
+
+    def test_plan_budget_review_rechecks_reservation_before_spawn(self):
+        wt, _ = self.started()
+        plan = self.budget_fixture(points=1)
+        self.stub_reviewers()
+        prompt = self.state() / 'review-prompt.md'
+        prompt.write_text('review')
+        reply = self.state() / 'review-response.md'
+        with self.budget_environment() as api:
+            original = api.atomic_json
+            def delayed(path, data):
+                original(path, data)
+                if path.name == 'review-run.json':
+                    plan.write_text(plan.read_text().replace('expires = "', 'expires = "2000-01-01T00:00:00Z" # '))
+            with mock.patch.object(api, 'atomic_json', side_effect=delayed):
+                with self.assertRaisesRegex(api.Stop, 'expired'):
+                    api.run_reviewer('claude -p --model haiku', wt, prompt, reply)
+        self.assertFalse((wt / '.work/reviewer-call.json').exists())
+        self.assertEqual(self.run_rows(), [])
+        pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+        self.assertEqual(len(pending), 1)
+        self.assertFalse(json.loads(pending[0].read_text()).get('invoked', False))
+
+    def test_plan_budget_concurrent_reviews_cannot_share_files_or_reservation(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        first = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run', '--plan', 'chain'],
+                                 env=dict(self.env, REVIEW_STUB_REPLY=reply, REVIEW_STUB_DELAY='1'),
+                                 cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.wait_runner_file(wt / '.work/reviewer-call.json')
+            before = {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()}
+            self.assertIn('Review already running', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1))
+            self.assertEqual(before, {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()})
+            output, errors = first.communicate(timeout=10)
+            self.assertEqual(first.returncode, 0, output + errors)
+        finally:
+            if first.poll() is None: first.kill(); first.communicate()
+        self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
+        self.assertEqual(len(self.run_rows()), 1)
+
+    def test_plan_budget_review_child_keeps_execution_lock_after_parent_is_killed(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=10)
+        self.stub_reviewers()
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                for name in ('reviewer-count', 'reviewer-call.json'):
+                    (wt / '.work' / name).unlink(missing_ok=True)
+                env = dict(self.env, REVIEW_STUB_REPLY=reply, REVIEW_STUB_DELAY='30')
+                if fallback:
+                    env.update(REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                               REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_FIRST_DELAY='0')
+                parent = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run', '--plan', 'chain'],
+                                          env=env, cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                child = None
+                try:
+                    counter = wt / '.work/reviewer-count'
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        if counter.exists() and counter.read_text() == ('2' if fallback else '1'): break
+                        if parent.poll() is not None:
+                            output, errors = parent.communicate()
+                            self.fail(output + errors)
+                        time.sleep(.02)
+                    else:
+                        self.fail('reviewer did not start')
+                    child = json.loads((wt / '.work/reviewer-call.json').read_text())['pid']
+                    parent.kill()
+                    parent.communicate(timeout=10)
+                    os.kill(child, 0)
+                    before = {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()}
+                    self.assertIn('Review already running', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1))
+                    self.assertEqual(before, {p.name: p.read_bytes() for p in self.state().glob('review*') if p.is_file()})
+                    self.assertEqual(counter.read_text(), '2' if fallback else '1')
+                finally:
+                    if parent.poll() is None: parent.kill(); parent.communicate()
+                    if child is None and (wt / '.work/reviewer-call.json').exists():
+                        child = json.loads((wt / '.work/reviewer-call.json').read_text())['pid']
+                    if child is not None:
+                        try: os.kill(child, signal.SIGKILL)
+                        except ProcessLookupError: pass
+                    self.wait_project_lock_free()
+                with (self.state() / 'review.lock').open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_plan_budget_file_points_and_lifetime_bounds(self):
+        now = datetime.now(timezone.utc)
+        class Clock(datetime):
+            @staticmethod
+            def now(tz): return now
+        path = self.budget_fixture(points=200, expires=(now + timedelta(days=31)).isoformat())
+        valid = path.read_text()
+        state = self.home / '.local/state/task'
+        before = {p: p.read_bytes() for p in state.rglob('*') if p.is_file()}
+        with self.budget_environment() as api, mock.patch.object(api, 'datetime', Clock):
+            self.assertIn('codex used 0 left 200', api.plan_budget('chain'))
+            path.write_text(valid + '#' * (16384 - len(valid.encode())))
+            self.assertIn('left 200', api.plan_budget('chain'))
+            for invalid, message in (
+                (path.read_text() + '#', '16 KiB'),
+                (valid.replace('codex = 200', 'codex = 201'), 'between 0 and 200'),
+                (valid.replace((now + timedelta(days=31)).isoformat(), (now + timedelta(days=31, seconds=1)).isoformat()), '31 days'),
+                (f'created = "{(now - timedelta(seconds=1)).isoformat()}"\n' + valid, '31 days'),
+                ('created = "bad"\n' + valid, '31 days'),
+                (f'created = "{(now + timedelta(seconds=1)).isoformat()}"\n' + valid, 'future'),
+                ('created = "9999-01-01T00:00:00Z"\n' + valid.replace((now + timedelta(days=31)).isoformat(),
+                                                                               '9999-01-20T00:00:00Z'), 'future'),
+            ):
+                with self.subTest(message=message):
+                    path.write_text(invalid)
+                    with self.assertRaisesRegex(api.Stop, message): api.plan_budget('chain')
+                    with self.assertRaisesRegex(api.Stop, message):
+                        api.budget_run(repo='proj', task='docs', kind='lane', vendor='codex')
+            path.write_text(f'created = "{now.isoformat()}"\n' + valid)
+            self.assertIn('left 200', api.plan_budget('chain'))
+        self.assertEqual(before, {p: p.read_bytes() for p in state.rglob('*') if p.is_file()})
+
+    def test_plan_budget_manual_review_prompt_and_record_never_carry_plan(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=0)
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'manual-review.md'
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n')
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'haiku', '--plan', 'chain')
+        self.raw_task('review', 'proj', '5', '--plan', 'chain')
+        pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+        self.assertEqual(len(pending), 1)
+        self.assertIsNone(json.loads(pending[0].read_text())['plan'])
+        # Even old stored routing metadata cannot smuggle a plan into a manual record.
+        route_path = self.state() / 'review-routing.json'
+        route = json.loads(route_path.read_text())
+        route['usage_run']['plan'] = 'chain'
+        route_path.write_text(json.dumps(route))
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--plan', 'chain')
+        self.assertTrue(all(r['plan'] is None for r in self.run_rows()))
+        self.assertIn('claude used 0 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual(list(pending[0].parent.glob('*.json')), [])
+
+    def test_plan_budget_no_plan_start_and_lane_match_fixed_traces(self):
+        # Fixed main traces keep this regression check effective after merge.
+        wt, _ = self.started()
+        self.stub_models()
+        probe = self.home / 'no-plan-probe.py'
+        probe.write_text(textwrap.dedent(f'''\
+            import json, os, runpy, subprocess, sys
+            from pathlib import Path
+            from types import SimpleNamespace
+            from unittest import mock
+            sys.path.insert(0, {str(TOOL.parent)!r})
+            api = runpy.run_path(sys.argv[1])
+            namespace = api['main'].__globals__
+            events = []
+            def traced(name, original):
+                def call(*args, **kwargs):
+                    events.append(name)
+                    if name == 'guards' and events.count(name) == 2 and sys.argv[2] == 'guard':
+                        raise api['Stop']('resolved model refused')
+                    return original(*args, **kwargs)
+                return call
+            original_popen = subprocess.Popen
+            def spawn(argv, *args, **kwargs):
+                if '--_worker' in argv:
+                    events.append('spawn')
+                    if sys.argv[2] == 'crash': raise RuntimeError('spawn refused')
+                    return SimpleNamespace(pid=os.getpid())
+                return original_popen(argv, *args, **kwargs)
+            replacements = {{name: traced(name, namespace[name]) for name in
+                            ('guards', 'tier_guard', 'archive_lane_final', 'check_plan',
+                             'seed_worktree', 'prepare_environment', 'refresh_context')}}
+            replacements.update(plan_budget=mock.Mock(side_effect=AssertionError('no plan')),
+                                budget_run=mock.Mock(side_effect=AssertionError('no plan')))
+            try:
+                with mock.patch.dict(namespace, replacements), \\
+                        mock.patch.object(subprocess, 'Popen', side_effect=spawn), \\
+                        mock.patch.object(api['task_usage'], 'record_override', traced('override', api['task_usage'].record_override)), \\
+                        mock.patch.object(api['task_usage'], 'run_log', traced('run_log', api['task_usage'].run_log)):
+                    raise SystemExit(api['main'](sys.argv[3:]))
+            finally:
+                Path({str(self.home / 'events.json')!r}).write_text(json.dumps(events))
+        '''))
+        traces = {}
+        for source, tool in (('build', TOOL),):
+            for mode in ('start', 'success', 'crash', 'guard'):
+                if mode == 'start':
+                    command = ['start', 'proj', f'no-plan-{source}', '--builder', 'codex']
+                else:
+                    (wt / '.work/prompt.md').write_text('task')
+                    (wt / '.work/final.md').write_text('Previous final\n')
+                    (wt / '.work/report.md').write_text('Previous report\nBLOCKED: previous stop\n')
+                    (wt / '.work/lane.json').unlink(missing_ok=True)
+                    command = ['lane', 'proj', '5', '--tier', 'hard', '--model', 'gpt-6.1-sol',
+                               '--override', 'Jacopo 2026-10-23: parity probe', '--no-pace', '--no-boost']
+                result = subprocess.run([sys.executable, str(probe), str(tool), mode, *command],
+                                        env=self.env, cwd=self.home, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1 if mode in {'crash', 'guard'} else 0, result.stdout + result.stderr)
+                traces[source, mode] = json.loads((self.home / 'events.json').read_text())
+                pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+                self.assertEqual(len(pending), int(mode == 'success'))
+                for row in pending:
+                    self.assertIsNone(json.loads(row.read_text())['plan'])
+                    row.unlink()
+                if mode != 'start':
+                    # Each probe must start from the same pinned tier.
+                    record = json.loads((self.state() / 'task.json').read_text())
+                    record['tier'] = 'routine'
+                    record['revision'] = TASK_MODULE.record_revision(record)
+                    (self.state() / 'task.json').write_text(json.dumps(record))
+        expected = {
+            'start': ['check_plan', 'seed_worktree', 'prepare_environment', 'refresh_context'],
+            'success': ['refresh_context', 'guards', 'tier_guard', 'override', 'guards', 'archive_lane_final', 'spawn', 'run_log'],
+            'crash': ['refresh_context', 'guards', 'tier_guard', 'override', 'guards', 'archive_lane_final', 'spawn'],
+            'guard': ['refresh_context', 'guards', 'tier_guard', 'override', 'guards'],
+        }
+        for mode, expected_trace in expected.items():
+            self.assertEqual(traces['build', mode], expected_trace, mode)
+        success = traces['build', 'success']
+        self.assertLess(success.index('override'), success.index('archive_lane_final'))
+        self.assertLess(success.index('archive_lane_final'), success.index('spawn'))
+        self.assertLess(success.index('spawn'), success.index('run_log'))
+        self.assertNotIn('run_log', traces['build', 'start'])
+
+    def test_plan_budget_refused_lane_preserves_override_and_final_records(self):
+        wt, _ = self.started()
+        self.stub_models()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('task')
+        (work / 'final.md').write_text('Previous final\n')
+        (work / 'report.md').write_text('Previous report\nBLOCKED: previous stop\n')
+        before = {p.name: p.read_bytes() for p in work.glob('*.md')}
+        for reason in ('points exhausted', 'expired', 'outside allowed', 'lane disabled'):
+            with self.subTest(reason=reason):
+                self.budget_fixture(points=0 if reason == 'points exhausted' else 5,
+                                    allowed={'proj': ['other']} if reason == 'outside allowed' else None,
+                                    expires='2000-01-01T00:00:00Z' if reason == 'expired' else None)
+                if reason == 'lane disabled':
+                    with self.budget_environment() as api:
+                        for number in range(2):
+                            run = api.budget_run(repo='proj', task='T-5', kind='lane', vendor='codex', commit=str(number))
+                            api.task_usage.run_log(self.home, run, 'failed')
+                rows = self.run_rows()
+                output = self.raw_task('lane', 'proj', '5', '--plan', 'chain', '--tier', 'design',
+                                       '--model', 'gpt-6-astra', '--override', 'Jacopo 2026-10-22: design pass', code=1)
+                self.assertIn(reason, output)
+                self.assertEqual(self.overrides(), [])
+                self.assertEqual({p.name: p.read_bytes() for p in work.glob('final*.md')},
+                                 {'final.md': before['final.md']})
+                self.assertEqual((work / 'report.md').read_bytes(), before['report.md'])
+                self.assertEqual(self.run_rows(), rows)
+                self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+                self.assertFalse((work / 'lane.json').exists())
+
+    def test_plan_budget_commit_key_ignores_round_environment(self):
+        self.budget_fixture(points=1)
+        with self.budget_environment() as api, mock.patch.dict(os.environ, TASK_PLAN_ROUND='1'):
+            fields = dict(repo='proj', task='docs', kind='lane', vendor='codex', commit='first')
+            run = api.budget_run(**fields)
+            api.task_usage.run_log(self.home, run, 'finished')
+            retry = api.budget_run(**fields)
+            self.assertNotEqual(retry['id'], run['id'])
+            api.task_usage.run_log(self.home, retry, 'finished')
+            with self.assertRaisesRegex(api.Stop, 'points exhausted'):
+                api.budget_run(**dict(fields, commit='second'))
+            self.assertEqual(len(self.run_rows()), 2)
+
+    def test_plan_budget_runner_launch_and_inheritance(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.budget_fixture(points=1, allowed={'proj': ['docs', 'T-5']})
+        runner = self.runner_fixture()
+        self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain')
+        self.wait_project_lock_free()
+        args = json.loads((self.home / 'service-args').read_text())
+        self.assertIn('--setenv=TASK_PLAN=chain', args)
+        self.assertEqual(self.run_rows(), [])
+        self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+        self.assertIn('codex used 0 left 1', self.raw_task('plan-budget', 'chain'))
+        # The deterministic runner passes the plan to its actual model lane.
+        (self.home / 'bin/task-batch').write_text(f'#!{sys.executable}\n' +
+            'import subprocess, sys\n' +
+            f'subprocess.run([sys.executable, {str(TOOL)!r}, "lane", "proj", "5", "--no-pace", "--no-boost"], check=True)\n')
+        self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain')
+        self.wait_project_lock_free()
+        self.wait_for_lane(wt)
+        rows = self.run_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]['kind'], rows[0]['vendor'], rows[0]['outcome'], rows[0]['plan']),
+                         ('lane', 'codex', 'finished', 'chain'))
+        self.assertIn('points exhausted', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
+        runner.write_text('1. unapproved: builder codex, model gpt-6-luna\n')
+        self.assertIn('outside allowed', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
+
+    def test_plan_budget_runner_checks_expiry_and_disabled_kind_without_drawing(self):
+        runner = self.runner_fixture()
+        self.budget_fixture(expires='2000-01-01T00:00:00Z')
+        self.assertIn('expired', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
+        self.budget_fixture(points=5)
+        with self.budget_environment() as api:
+            for number in range(2):
+                run = api.budget_run(repo='proj', task=f'old-batch-{number}', kind='runner-start', vendor='codex')
+                api.task_usage.run_log(self.home, run, 'failed')
+        rows = self.run_rows()
+        self.assertIn('runner-start disabled', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
+        self.assertEqual(self.run_rows(), rows)
+        self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
+        self.assertFalse((self.home / 'service-args').exists())
+
+    def test_plan_budget_atomic_pending_reservations_across_repositories(self):
+        self.budget_fixture(points=1, allowed={'proj': ['*'], 'other': ['*']})
+        with self.budget_environment() as api:
+            results, errors = [], []
+            def draw(repo):
+                try:
+                    results.append(api.budget_run(repo=repo, task='docs', kind='lane', vendor='codex'))
+                except api.Stop as error:
+                    errors.append(str(error))
+            threads = [threading.Thread(target=draw, args=(repo,)) for repo in ('proj', 'other')]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join()
+            self.assertEqual(len(results), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertIn('points exhausted', errors[0])
+            self.assertIn('codex used 1 left 0', api.plan_budget('chain'))
+
+    def test_plan_budget_real_lane_crash_before_spawn_reuses_reservation(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.budget_fixture(points=1)
+        crash = self.home / 'crash-before-spawn.py'
+        crash.write_text(textwrap.dedent(f'''\
+            import runpy, subprocess
+            from unittest import mock
+            api = runpy.run_path({str(TOOL)!r})
+            original_popen = subprocess.Popen
+            def crash_worker(argv, *positional, **keywords):
+                if '--_worker' in argv: raise RuntimeError('crash before launch')
+                return original_popen(argv, *positional, **keywords)
+            with mock.patch.object(subprocess, 'Popen', side_effect=crash_worker):
+                api['main'](['lane', {str(self.repo)!r}, '5', '--plan', 'chain', '--no-pace', '--no-boost'])
+        '''))
+        # Let process exit release the launcher's lock, as a real crash would.
+        result = subprocess.run([sys.executable, str(crash)], env=self.env, cwd=self.home,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('RuntimeError: crash before launch', result.stderr)
+        self.assertIn('free', self.raw_task('lock', 'proj'))
+        self.assertEqual(self.run_rows(), [])
+        pending = list((self.home / '.local/state/task/pending-runs').glob('*.json'))
+        self.assertEqual(len(pending), 1)
+        reserved = json.loads(pending[0].read_text())
+        self.raw_task('lane', 'proj', '5', '--plan', 'chain')
+        self.wait_for_lane(wt)
+        self.assertEqual([r['id'] for r in self.run_rows()], [reserved['id']])
+        self.assertEqual(list(pending[0].parent.glob('*.json')), [])
+
     def test_run_log_lane_review_merge_and_retry(self):
+        self.budget_fixture('plan-42', points=10)
         wt, _ = self.started()
         self.stub_models()
         (wt / '.work/prompt.md').write_text('task')
@@ -1146,6 +2137,7 @@ class TaskTool(unittest.TestCase):
         self.raw_task('lane', 'proj', '5', env=dict(self.env, LANE_STUB_RELEASE=str(self.home / 'release')))
         self.wait_for_lane(wt, finished=False)
         lane = json.loads((wt / '.work/lane.json').read_text())
+        self.assertIsNone(lane['usage_run']['plan'])
         os.killpg(lane['pid'], signal.SIGKILL)
         self.assertEqual(self.run_rows(), [])
         pending = self.home / '.local/state/task/pending-runs' / (lane['usage_run']['id'] + '.json')
@@ -1588,61 +2580,6 @@ class TaskTool(unittest.TestCase):
                          'quality (since 2026-09-01): first-review pass 2/5 (40%), '
                          'reviews per merged task n/a')
 
-    def test_gate_drill_signals_clean_children_worktrees_and_reservations(self):
-        just = self.home / 'bin/just'
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            for phase in ('group', 'solo'):
-                with self.subTest(signal=sig, phase=phase):
-                    marker = self.home / 'sleeping-gate.json'
-                    marker.unlink(missing_ok=True)
-                    just.write_text(f'#!{sys.executable}\n' + textwrap.dedent(f'''\
-                        import json, os, pathlib, signal, subprocess, time
-                        if not pathlib.Path.cwd().name.endswith('-{phase}'):
-                            raise SystemExit(0)
-                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-                        child = subprocess.Popen(['sleep', '60'])
-                        pathlib.Path({str(marker)!r}).write_text(json.dumps(
-                            [os.getpid(), child.pid, os.environ['TMPDIR']]))
-                        time.sleep(60)
-                        '''))
-                    just.chmod(0o755)
-                    process = subprocess.Popen([sys.executable, str(TOOL), 'gate-drill', 'proj'],
-                                               env=self.env, cwd=self.home, stdout=subprocess.PIPE,
-                                               stderr=subprocess.STDOUT, text=True)
-                    pids = []
-                    try:
-                        deadline = time.monotonic() + 10
-                        while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
-                            time.sleep(0.02)
-                        self.assertTrue(marker.exists(), 'sleeping gate never started')
-                        leader, child, temporary = json.loads(marker.read_text())
-                        pids = [leader, child]
-                        process.send_signal(sig)
-                        output, _ = process.communicate(timeout=10)
-                        self.assertNotEqual(process.returncode, 0, output)
-                        self.assertIn('Drill interrupted', output)
-                        for pid in pids:
-                            status = Path(f'/proc/{pid}/stat')
-                            self.assertTrue(not status.exists() or status.read_text().split()[2] == 'Z',
-                                            f'gate process {pid} survived')
-                        self.assertFalse(Path(temporary).exists())
-                        self.assertEqual(list((self.repo / '.worktrees').glob('.*drill-*')), [])
-                        self.assertNotIn('.drill-', self.git(self.repo, 'worktree', 'list'))
-                        locks = list(self.gate_dir.glob('*.lock'))
-                        self.assertTrue(locks, 'gate did not reserve a port index')
-                        for lock in locks:
-                            with lock.open('r') as stream:
-                                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    finally:
-                        if process.poll() is None:
-                            process.kill()
-                        process.communicate(timeout=5)
-                        for pid in pids:
-                            try:
-                                os.kill(pid, signal.SIGKILL)
-                            except ProcessLookupError:
-                                pass
-
     def test_status_bad_config_does_not_hide_other_repos(self):
         good = self.home / 'dev_workspace/z-good'
         good.mkdir()
@@ -1673,115 +2610,6 @@ class TaskTool(unittest.TestCase):
                 (self.repo / '.task.toml').write_text(f'[env]\n{name} = "never-print-this"\n')
                 with self.assertRaisesRegex(TASK_MODULE.Stop, 'reserved'):
                     TASK_MODULE.configured_environment(self.repo)
-
-    def test_gate_drill_seeds_and_per_repo_failures(self):
-        self.commit_in(self.repo, '.task.toml', 'drill_seeds = ["pinned"]\n[env]\nPRODUCT_DIR = "{repo}/data"\n')
-        self.git(self.repo, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
-        work = self.repo / '.work'
-        work.mkdir(exist_ok=True)
-        (work / 'pinned').mkdir()
-        (work / 'pinned/source').write_text('source bytes')
-        (work / 'extra').write_text('extra bytes')
-        (work / 'another').write_text('another bytes')
-        just = self.home / 'bin/just'
-        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
-            import os, pathlib, sys
-            if sys.argv[1:] != ['check']:
-                sys.exit(1)
-            assert pathlib.Path('.work/pinned/source').read_text() == 'source bytes'
-            assert pathlib.Path('.work/extra').read_text() == 'extra bytes'
-            assert pathlib.Path('.work/another').read_text() == 'another bytes'
-            assert os.environ['PRODUCT_DIR'] == str(pathlib.Path(os.environ['HOME']) / 'dev_workspace/proj/data')
-            print('OK')
-            '''))
-        just.chmod(0o755)
-        self.raw_task('gate-drill', 'proj', '--seed', 'proj:extra', '--seed', 'proj:another')
-        evidence = self.home / '.local/state/task/gate-drill'
-        rows = json.loads(next(evidence.glob('*/results.json')).read_text())
-        self.assertEqual(rows[0]['verdict'], 'ok')
-        # Evidence identity must not depend on filesystem timestamp ordering.
-        initial_result = next(evidence.glob('*/results.json'))
-        future = time.time() + 3600
-        os.utime(initial_result, (future, future))
-        bad = self.home / 'dev_workspace/bad'
-        bad.mkdir()
-        self.git(bad, 'init', '-q', '-b', 'main')
-        for config, reason in [('drill_seeds = ["absent"]', 'missing seed absent'),
-                               ('drill_seeds = ["../escape"]', 'Invalid seed name'),
-                               ('drill_seeds = "pinned"', 'list of seed names'),
-                               ('drill_seeds = [2]', 'list of seed names'),
-                               (b'\xff', 'Cannot read'),
-                               (None, 'Cannot read')]:
-            with self.subTest(config=config):
-                if config is None:
-                    (bad / '.task.toml').unlink()
-                    (bad / '.task.toml').mkdir()
-                    (bad / '.task.toml/entry').write_text('directory instead of config')
-                    self.git(bad, 'add', '-A', '.task.toml')
-                    self.git(bad, 'commit', '-qm', 'Unreadable config')
-                elif isinstance(config, bytes):
-                    (bad / '.task.toml').write_bytes(config)
-                    self.git(bad, 'add', '.task.toml')
-                    self.git(bad, 'commit', '-qm', 'Non-UTF-8 config')
-                else:
-                    self.commit_in(bad, '.task.toml', config + '\n')
-                output = self.raw_task('gate-drill', 'bad', 'proj', '--seed', 'proj:extra',
-                                       '--seed', 'proj:another', code=1)
-                self.assertIn(reason, output)
-                self.assertRegex(output, r'proj \| passed .* \| passed .* \| ok')
-                self.assertEqual(len(self.git(bad, 'worktree', 'list').splitlines()), 1)
-                archive = Path(next(line.removeprefix('Drill evidence: ') for line in output.splitlines()
-                                    if line.startswith('Drill evidence: ')))
-                rows = json.loads((archive / 'results.json').read_text())
-                self.assertEqual([row['repo'] for row in rows], ['bad', 'proj'])
-                self.assertEqual(rows[0]['concurrent']['result'], 'failed')
-                self.assertEqual(rows[0]['solo']['result'], 'failed')
-                if isinstance(config, bytes) or config is None:
-                    for phase in ('concurrent', 'solo'):
-                        self.assertIn('.task.toml', rows[0][phase]['error'])
-                self.assertEqual(rows[1]['verdict'], 'ok')
-        output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:missing', code=1)
-        self.assertIn('missing seed missing', output)
-        (work / 'escape').symlink_to(self.home)
-        output = self.raw_task('gate-drill', 'proj', '--seed', 'proj:escape', code=1)
-        self.assertIn('Seed symlink escapes .work', output)
-        self.assertEqual(len(self.git(self.repo, 'worktree', 'list').splitlines()), 1)
-
-    def test_gate_drill_seed_read_errors_do_not_hide_other_repos(self):
-        bad = self.home / 'dev_workspace/bad'
-        bad.mkdir()
-        self.git(bad, 'init', '-q', '-b', 'main')
-        self.commit_in(bad, '.task.toml', 'drill_seeds = ["pinned"]\n')
-        (bad / '.work').mkdir()
-        seed = bad / '.work/pinned'
-        seed.write_text('seed contents')
-        copy = shutil.copy2
-        for error in (OSError('seed read failed'), ValueError('seed read failed'),
-                      UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid')):
-            with self.subTest(error=type(error).__name__):
-                def copy_seed(source, destination, *args, **kwargs):
-                    if Path(source) == seed:
-                        raise error
-                    return copy(source, destination, *args, **kwargs)
-
-                output = io.StringIO()
-                with mock.patch.dict(os.environ, self.env), \
-                        mock.patch.object(TASK_MODULE, 'HOME', self.home), \
-                        mock.patch.object(TASK_MODULE, 'WORKSPACE', self.repo.parent), \
-                        mock.patch.object(shutil, 'copy2', side_effect=copy_seed), \
-                        contextlib.redirect_stdout(output):
-                    self.assertEqual(TASK_MODULE.gate_drill(mock.Mock(repos=['bad', 'proj'], seed=[])), 1)
-                self.assertRegex(output.getvalue(), r'proj \| passed .* \| passed .* \| ok')
-                archive = Path(next(line.removeprefix('Drill evidence: ') for line in output.getvalue().splitlines()
-                                    if line.startswith('Drill evidence: ')))
-                rows = json.loads((archive / 'results.json').read_text())
-                self.assertEqual([row['repo'] for row in rows], ['bad', 'proj'])
-                for phase in ('concurrent', 'solo'):
-                    self.assertEqual(rows[0][phase]['result'], 'failed')
-                    self.assertIn('error', rows[0][phase])
-                self.assertEqual(rows[1]['verdict'], 'ok')
-                for repo in (bad, self.repo):
-                    self.assertEqual(len(self.git(repo, 'worktree', 'list').splitlines()), 1)
 
     def test_configured_gate_environment(self):
         config = '[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n'
@@ -1864,10 +2692,9 @@ class TaskTool(unittest.TestCase):
         script.write_text('#!/bin/sh\ncase "$PH_PRODUCT_DIR" in\n'
                           '*/fake) rm -f FAIL;;\n*) touch FAIL;;\nesac\n')
         script.chmod(0o755)
-        for name in ('check.json', 'gate-check.json', 'drill-check.json'):
+        for name in ('check.json', 'gate-check.json'):
             with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, 'HOME', self.home):
-                self.assertFalse(TASK_MODULE.run_check(wt, '', state=self.state(), evidence_name=name,
-                                                      pre_commit_all_files=name == 'drill-check.json'))
+                self.assertFalse(TASK_MODULE.run_check(wt, '', state=self.state(), evidence_name=name))
             evidence = json.loads((self.state() / name).read_text())
             self.assertEqual(evidence['result'], 'failed')
             self.assertEqual([row['result'] for row in evidence['variants']], ['failed', 'passed'])
@@ -2065,6 +2892,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(realign.read_text(), 'Local review\n')
 
     def test_boost_state_expiry_off_and_authority(self):
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
         future = '2099-01-01T00:00:00+00:00'
         self.assertIn('boost: off', self.task('boost'))
         self.assertIn('future ISO', self.task('boost', '--codex-until', '2000-01-01T00:00:00+00:00', code=1))
@@ -2086,6 +2914,8 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(path.read_bytes(), before)
 
     def test_boost_builder_models_opt_out_and_astra(self):
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 20\n')
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
         self.stub_models()
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('task\n')
@@ -2112,6 +2942,114 @@ class TaskTool(unittest.TestCase):
             self.task('lane', 'proj', '5', '--builder', builder, '--tier', 'hard', '--no-boost', '--override', 'Jacopo 2026-10-21: tier')
             no_boost_hard = 'gpt-6.1-sol' if builder == 'codex' else explicit
             self.assertEqual(self.wait_for_lane(wt)['model'], no_boost_hard)
+
+    def test_boost_pauses_per_vendor_and_resumes_without_rewriting_state(self):
+        from task_routing import active, route, lane_limits, UNBOOSTED
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00',
+                  '--codex-until', '2099-01-01T00:00:00+00:00')
+        path = self.home / '.local/state/task/boost.json'
+        original = path.read_bytes()
+        for vendor in ('claude', 'codex'):
+            other = 'codex' if vendor == 'claude' else 'claude'
+            for five, age, allowed in ((49.9, 0, True), (50, 0, False), (62, 0, False),
+                                       (10, 46, False), (10, 0, True)):
+                with self.subTest(vendor=vendor, five=five, age=age):
+                    self.readings(**{vendor: (40, 84)}, five=five, age=timedelta(minutes=age))
+                    if age:
+                        TASK_MODULE.task_usage.claim(self.home, vendor, 'lane', 2 ** 22 + 7)
+                    self.assertEqual(vendor in active(self.home), allowed)
+                    self.assertEqual(lane_limits(self.home, 3)[vendor], 3 if allowed else 1)
+                    self.assertIn(other, active(self.home))
+                    if not allowed:
+                        for tier in ('routine', 'hard', 'design'):
+                            expected = ('sonnet' if vendor == 'claude' else 'gpt-6-luna') if tier == 'routine' else UNBOOSTED[vendor]
+                            self.assertEqual(route(self.home, vendor, tier), expected)
+                        self.assertIn(f'boost paused: {vendor}', self.task('status', 'proj'))
+            if vendor == 'claude':
+                state = self.home / '.local/state/task/usage/claude.json'
+                data = json.loads(state.read_text())
+                data.pop('five_hour')
+                state.write_text(json.dumps(data))
+            else:
+                # A window seen recently but missing from the newest event still fails closed.
+                rollout = next((self.home / '.codex/sessions').rglob('rollout-*.jsonl'))
+                prior = rollout.read_text()
+                self.readings(codex=(40, 84))
+                rollout.write_text(prior + rollout.read_text())
+            self.assertNotIn(vendor, active(self.home))
+            self.assertIn(f'boost paused: {vendor} no current 5-hour reading', self.task('boost'))
+            self.readings(**{vendor: (40, 84)}, five=10)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_deeper_review_requires_boost_and_hard_tier_or_explicit_final(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise high review routing')
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00',
+                  '--codex-until', '2099-01-01T00:00:00+00:00')
+        self.assertIn('--final requires --run', self.task('review', 'proj', '5', '--final', code=1))
+        for builder, vendor, normal, deeper in (('codex', 'claude', 'haiku', 'opus'),
+                                                ('claude', 'codex', 'gpt-6-luna', 'gpt-6.1-sol')):
+            for tier, final, five, age, expected in (
+                    ('routine', False, 10, 0, normal), ('design', False, 10, 0, normal),
+                    ('hard', False, 10, 0, deeper), ('routine', True, 10, 0, deeper),
+                    ('hard', False, 50, 0, normal), ('routine', True, 62, 0, normal),
+                    ('hard', True, 10, 46, normal),
+                    *([('hard', False, None, 0, deeper), ('routine', True, None, 0, deeper)] if vendor == 'codex' else [])):
+                with self.subTest(builder=builder, tier=tier, final=final, five=five, age=age):
+                    self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier,
+                              '--override', 'Jacopo 2026-10-23: test tiers')
+                    self.raw_task('check', 'proj', '5')
+                    self.readings(**{vendor: (40, 84)}, five=five, age=timedelta(minutes=age))
+                    if age:
+                        TASK_MODULE.task_usage.claim(self.home, vendor, 'lane', 2 ** 22 + 7)
+                    head = self.git(wt, 'rev-parse', 'HEAD')
+                    reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+                    self.raw_task('review', 'proj', '5', '--run', '--no-pace', *(['--final'] if final else []),
+                                  env=dict(self.env, REVIEW_STUB_REPLY=reply))
+                    metadata = json.loads((self.state() / 'review.json').read_text())
+                    self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, expected))
+
+    def test_codex_boost_without_a_five_hour_window_routes_and_starts_automatically(self):
+        from task_routing import active, route, lane_limits
+        self.readings(codex=(40, 30))
+        self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00')
+        self.assertIn('codex', active(self.home))
+        self.assertEqual(route(self.home, 'codex', 'design'), 'gpt-6-astra')
+        self.assertEqual(lane_limits(self.home, 3)['codex'], 3)
+        self.assertNotIn('boost paused: codex', self.task('usage'))
+        self.task('boost', 'off')
+        wt, out = self.pace_lane(builder='codex', recorded=('--tier', 'design'))
+        self.assertIn('pace: codex under-used near its reset; boost on until', out)
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'gpt-6-astra')
+
+    def test_command_reads_usage_once_for_boost_routing_and_refreshes_next_command(self):
+        usage = TASK_MODULE.task_usage
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00',
+                  '--codex-until', '2099-01-01T00:00:00+00:00')
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(usage, 'read_claude', wraps=usage.read_claude) as claude, \
+                mock.patch.object(usage, 'read_codex', wraps=usage.read_codex) as codex:
+            for five in (10, 62):
+                self.readings(claude=(40, 84), codex=(40, 84), five=five)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(TASK_MODULE.main(['status', str(self.repo)]), 0)
+                self.assertEqual('boost paused: claude' in output.getvalue(), five == 62)
+                self.assertEqual('boost paused: codex' in output.getvalue(), five == 62)
+            self.assertEqual((claude.call_count, codex.call_count), (2, 2))
+
+    def test_above_threshold_does_not_start_automatic_boost_and_usage_explains(self):
+        self.readings(claude=(40, 30), five=62)
+        wt, out = self.pace_lane('--tier', 'hard', recorded=('--tier', 'hard'))
+        self.assertIn('boost paused: claude 5-hour 62 % ≥ 50 %', out)
+        self.assertEqual(self.wait_for_lane(wt)['model'], 'opus')
+        self.assertFalse((self.home / '.local/state/task/boost.json').exists())
+        self.readings(claude=(40, 30), five=62)
+        self.assertIn('boost paused: claude 5-hour 62 % ≥ 50 %', self.task('usage'))
 
     def lane_refused(self, *options, env=None):
         out = self.raw_task('lane', 'proj', '5', *options, code=1, env=env)
@@ -2297,6 +3235,7 @@ class TaskTool(unittest.TestCase):
             self.assertIn('Jacopo 2026-10-21: design look', out)
 
     def test_reviews_never_pick_astra_or_fable(self):
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
         from task_routing import TOP_ONLY
         self.stub_reviewers()
         wt, _ = self.started()
@@ -2327,6 +3266,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['tier'], 'design')
 
     def test_tier_defaults_and_override_policy(self):
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
         from task_routing import route, lane_limits
         for vendor, default in [('codex', 'gpt-6-luna'), ('claude', 'sonnet')]:
             for tier in ('routine', 'hard', 'design'):
@@ -2344,6 +3284,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(lane_limits(self.home, 3), {'codex': 1, 'claude': 2})
 
     def test_boost_reviewer_models_and_recorded_identity(self):
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
         self.stub_reviewers()
         wt, _ = self.started()
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
@@ -2430,6 +3371,101 @@ class TaskTool(unittest.TestCase):
                     else:
                         meta = json.loads((self.state() / 'review.json').read_text())
                         self.assertEqual((meta['reviewer'], meta['model']), (vendor, model))
+
+    def assert_knowledge_paths(self, name=None):
+        default = self.kb
+        if name is not None:
+            self.kb = default.with_name(name)
+            default.rename(self.kb)
+            # A decoy proves callers use the key even when the default exists.
+            default.mkdir()
+            (default / 'INTENT.md').write_text('Wrong knowledge repository\n')
+            self.commit_in(self.repo, '.task.toml', f'knowledge = "{name}"\n')
+        plan = self.kb / 'INTENT.md'
+        self.assertIn('plan: ok', self.raw_task('plan', 'proj'))
+        plan.write_text('---\ncurrent: m-1\nrealign_every: 1\n---\nNamed goal\n')
+        self.assertIn('plan not signed', self.task('start', 'proj', '5', code=1))
+        self.assertIn('plan: ok', self.raw_task('plan', 'proj', '--sign'))
+        self.assertIn('signed_hash:', plan.read_text())
+        wt, _ = self.started()
+        record = json.loads((self.state() / 'task.json').read_text())
+        self.assertEqual(record['title'], 'Add the b file')
+        self.assertEqual(record['milestone'], 'm-1')
+        self.assertEqual(len(list((wt / '.work/context/backlog/tasks').glob('t-5 *'))), 1)
+        self.assertIn('Named goal', (wt / '.work/context/INTENT.md').read_text())
+        plan.write_text(plan.read_text() + 'Changed\n')
+        self.assertIn('changed since sign-off', self.task('start', 'proj', '5', '--refresh', code=1))
+        self.raw_task('note', 'proj', '5', 'improve', 'Named improvement')
+        self.assertIn('Named improvement', (self.kb / 'improvements.md').read_text())
+        status = self.raw_task('status', 'proj')
+        self.assertIn('changed since sign-off', status)
+        self.assertIn('open improvements: 1', status)
+        runner = self.home / 'runner.md'
+        runner.write_text('1. 5: builder codex, model gpt-6-luna\n2. direct: builder codex, model gpt-6-luna\n')
+        self.assertIn('stop at direct', self.raw_task('runner-check', 'proj', str(runner)))
+        stub = self.home / 'bin/codex'
+        stub.write_text('#!/usr/bin/env python3\nimport pathlib,sys\n'
+                        'pathlib.Path("prompt-copy").write_text(sys.stdin.read())\n'
+                        'print("partial reply")\nsys.exit(1)\n')
+        stub.chmod(0o755)
+        output = self.raw_task('realign', 'proj', code=1)
+        reply = Path(output.strip().split('Reply: ', 1)[1])
+        state_name = name if name is not None else 'proj'
+        self.assertEqual(reply.parent, self.home / '.local/state/task' / state_name / 'realign')
+        self.assertEqual(reply.read_text(), 'partial reply\n')
+        self.assertIn('Named goal', (self.kb / 'prompt-copy').read_text())
+        self.assertFalse((self.kb / 'history/realign').exists())
+        stub.write_text(stub.read_text().replace('sys.exit(1)', 'sys.exit(0)'))
+        self.raw_task('realign', 'proj')
+        self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
+        if name is not None:
+            self.assertEqual(list(default.iterdir()), [default / 'INTENT.md'])
+
+    def test_knowledge_default_paths(self):
+        self.assert_knowledge_paths()
+
+    def test_knowledge_named_paths(self):
+        self.assert_knowledge_paths('cortex-core')
+
+    def test_knowledge_prefixed_key_keeps_state_name(self):
+        self.assert_knowledge_paths('cortex-kb-custom')
+
+    def test_knowledge_rejects_paths_and_symlinks(self):
+        config = self.repo / '.task.toml'
+        for value in ('../outside', '..', '.', '/tmp/outside', str(self.kb),
+                      'nested/repo', '', 1, [], True):
+            with self.subTest(value=value):
+                config.write_text('knowledge = ' + json.dumps(value) + '\n')
+                for command in (('plan', 'proj'), ('plan', 'proj', '--sign'),
+                                ('start', 'proj', '5', '--builder', 'codex'), ('realign', 'proj')):
+                    self.assertIn('knowledge must be a single repository name under ~/cortex',
+                                  self.raw_task(*command, code=1))
+        (self.home / 'outside').mkdir()
+        for target in (self.kb, self.home / 'outside', self.home / 'missing'):
+            with self.subTest(target=target):
+                link = self.kb.with_name('linked')
+                link.symlink_to(target, target_is_directory=True)
+                config.write_text('knowledge = "linked"\n')
+                self.assertIn('symlinked target', self.raw_task('plan', 'proj', code=1))
+                link.unlink()
+        config.unlink()
+        self.kb.rename(self.home / 'original-kb')
+        self.kb.symlink_to(self.home / 'original-kb', target_is_directory=True)
+        self.assertIn('symlinked target', self.raw_task('plan', 'proj', code=1))
+
+    def test_knowledge_missing_repo_keeps_plan_exemption(self):
+        for name in (None, 'missing'):
+            with self.subTest(name=name):
+                if name is None:
+                    self.kb.rename(self.home / 'unused-kb')
+                else:
+                    (self.repo / '.task.toml').write_text(f'knowledge = "{name}"\n')
+                with mock.patch.object(TASK_MODULE, 'CORTEX', self.home / 'cortex'):
+                    task = TASK_MODULE.Task(self.repo, '5')
+                    TASK_MODULE.check_plan(task)
+                self.assertIn('No Backlog.md task', self.task('start', 'proj', '5', code=1))
+                self.task('start', 'proj', 'direct-' + (name or 'default'))
+                self.assertNotIn('plan: stop:', self.raw_task('status', 'proj'))
 
     def test_plan_refusals_exceptions_and_resume(self):
         plan = self.kb / 'INTENT.md'
@@ -3106,7 +4142,7 @@ sys.exit(7)
         out = self.raw_task('merge', 'proj', '5', '--override', 'approved emergency')
         waived = json.loads((self.state() / 'exception.json').read_text())['waived']
         self.assertEqual({item['step'] for item in waived}, {
-            'recorded PASS review for lane head with every criterion pass by the other vendor',
+            'risk normal: recorded PASS review for lane head with every criterion pass by the other vendor',
             'filled .work/report.md'})
         for item in waived:
             self.assertIn(item['step'] + ' waived: approved emergency', out)
@@ -3770,137 +4806,6 @@ store.write_text(json.dumps(prs))
         self.assertEqual((root / 'unrelated/keep').read_text(), 'data')
         self.assertTrue((root / 'gate-link').is_symlink())
 
-    def test_gate_drill_real_concurrency_isolation_and_cleanup(self):
-        repos = []
-        for name in ('clean', 'clash', 'always'):
-            repo = self.home / 'dev_workspace' / name
-            repo.mkdir()
-            self.git(repo, 'init', '-q', '-b', 'main')
-            (repo / 'justfile').write_text('check:\n    true\n')
-            (repo / 'kind').write_text(name)
-            (repo / '.task.toml').write_text('drill_seeds = ["pinned"]\n[env]\nPRODUCT_DIR = "{repo}/data"\nWORK_DIR = "{worktree}/output"\n')
-            (repo / '.pre-commit-config.yaml').write_text('repos: []\n')
-            self.git(repo, 'add', '.')
-            self.git(repo, 'commit', '-qm', 'stub gate')
-            (repo / '.work').mkdir()
-            (repo / '.work/pinned').write_text(name)
-            (repo / '.work/extra').write_text(name)
-            repos.append(repo)
-        # The drill runs the full default gate: pre-commit over all files follows `just check`.
-        # The `always` repo passes `just check` and fails only in pre-commit, so a skipped
-        # pre-commit stage would wrongly report it as ok.
-        pre_commit = self.home / 'bin/pre-commit'
-        pre_commit.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
-            import json, os, pathlib, sys
-            assert not any(key in os.environ for key in ('PYTHONPATH', 'VIRTUAL_ENV', 'FOO', 'TASK_GATE_FAKE'))
-            home = pathlib.Path(os.environ['HOME'])
-            kind = pathlib.Path('kind').read_text()
-            with (home / (kind + '-pre-commit')).open('a') as out:
-                out.write(json.dumps([sys.argv[1:], os.environ['TMPDIR'], int(os.environ['TASK_GATE_SLOT'])]) + '\\n')
-            sys.exit(1 if kind == 'always' else 0)
-            '''))
-        pre_commit.chmod(0o755)
-        just = self.home / 'bin/just'
-        just.write_text(f'#!{sys.executable}\n' + textwrap.dedent('''\
-            import json, os, pathlib, re, sys, time
-            assert not any(key in os.environ for key in ('PYTHONPATH', 'VIRTUAL_ENV', 'FOO', 'TASK_GATE_FAKE'))
-            if sys.argv[1:] != ['check']:
-                sys.exit(1)
-            home = pathlib.Path(os.environ['HOME'])
-            kind = pathlib.Path('kind').read_text()
-            name = pathlib.Path.cwd().name
-            assert re.fullmatch(r'\\.drill-[0-9a-f]{6}-\\d+-(group|solo)', name), name
-            assert len(name) < 24, name
-            assert not re.search(r'sk-[A-Za-z0-9_-]{20,}|\\d{10,}', name), name
-            temporary = pathlib.Path(os.environ['TMPDIR'])
-            assert pathlib.Path('.work/pinned').read_text() == kind
-            assert pathlib.Path('.work/extra').read_text() == kind
-            assert os.environ['PRODUCT_DIR'] == str(home / 'dev_workspace' / kind / 'data')
-            assert os.environ['WORK_DIR'] == str(pathlib.Path.cwd() / 'output')
-            slot = int(os.environ['TASK_GATE_SLOT'])
-            port = int(os.environ['TASK_GATE_PORT_BASE'])
-            # Record first so a failed assertion below still leaves evidence for the test.
-            with (home / (kind + '-env')).open('a') as out:
-                out.write(json.dumps([str(temporary), slot, port]) + '\\n')
-            assert temporary.is_dir(), temporary
-            assert not temporary.resolve().is_relative_to(pathlib.Path.cwd().resolve()), temporary
-            assert not temporary.resolve().is_relative_to((home / 'dev_workspace').resolve()), temporary
-            assert temporary.stat().st_mode & 0o777 == 0o700, temporary
-            assert temporary.parent.stat().st_mode & 0o777 == 0o700, temporary.parent
-            assert [entry.name for entry in temporary.iterdir()] == ['holder.pid'], temporary
-            os.kill(int((temporary / 'holder.pid').read_text()), 0)
-            (temporary / 'leftover').write_text(kind)
-            assert port == 20000 + 200 * slot, (slot, port)
-            if kind == 'clean':
-                (home / 'active').touch()
-                deadline = time.monotonic() + 8
-                while not (home / 'clashed').exists() and time.monotonic() < deadline:
-                    time.sleep(.01)
-                assert (home / 'clashed').exists(), 'gates did not run concurrently'
-                (home / 'active').unlink()
-            elif kind == 'clash' and (home / 'active').exists():
-                (home / 'clashed').touch()
-                sys.exit(1)
-            elif kind == 'clash' and not (home / 'clashed').exists():
-                deadline = time.monotonic() + 8
-                while not (home / 'active').exists() and time.monotonic() < deadline:
-                    time.sleep(.01)
-                (home / 'clashed').touch()
-                sys.exit(1)
-            '''))
-        just.chmod(0o755)
-        out = self.raw_task('gate-drill', 'clean', 'clash', 'always',
-                            '--seed', 'clean:extra', '--seed', 'clash:extra', '--seed', 'always:extra', code=1,
-                            env=dict(self.env, TMPDIR=str(self.repo), PYTHONPATH='/odd-python',
-                                     VIRTUAL_ENV='/odd-venv', FOO='caller', TASK_GATE_FAKE='caller'))
-        self.assertIn('clash', out)
-        self.assertIn('clean: solo: PASS, together: PASS, verdict: ok', out)
-        self.assertIn('clash: solo: PASS, together: FAIL, verdict: clash', out)
-        self.assertIn('always: solo: FAIL, together: FAIL, verdict: failing-alone (pre-existing failure, not a concurrency clash)', out)
-        evidence = list((self.home / '.local/state/task/gate-drill').glob('*/results.json'))
-        self.assertEqual(len(evidence), 1)
-        rows = json.loads(evidence[0].read_text())
-        logs = '\n'.join(log.read_text() for log in evidence[0].parent.glob('*/drill-check.log'))
-        self.assertEqual([row['verdict'] for row in rows], ['ok', 'clash', 'failing-alone'], out + logs + repr(rows))
-        self.assertTrue(all(row['concurrent']['duration'] > 0 for row in rows))
-        concurrent_slots = []
-        temporary_paths = []
-        for name in ('clean', 'clash', 'always'):
-            records = [json.loads(line) for line in (self.home / (name + '-env')).read_text().splitlines()]
-            self.assertEqual(len(records), 2)
-            concurrent_slots.append(records[0][1])
-            for temporary, slot, port in records:
-                temporary_paths.append(temporary)
-                for repo in repos:
-                    self.assertFalse(Path(temporary).resolve().is_relative_to(repo.resolve()))
-                # Drill runs take no slot, so their port range starts above the 3 default slots.
-                self.assertGreaterEqual(slot, 3)
-                self.assertEqual(port, 20000 + 200 * slot)
-                self.assertFalse(Path(temporary).exists())
-            # pre-commit ran over all files after every passing `just check` (for `clash`
-            # only the solo run), in the same isolated environment as that run.
-            pre_commit_log = self.home / (name + '-pre-commit')
-            pre_commit_records = [json.loads(line) for line in pre_commit_log.read_text().splitlines()]
-            self.assertEqual([(temporary, slot) for _, temporary, slot in pre_commit_records],
-                             [(temporary, slot) for temporary, slot, _ in
-                              (records[1:] if name == 'clash' else records)], logs)
-            self.assertEqual({tuple(arguments) for arguments, _, _ in pre_commit_records},
-                             {('run', '--all-files')}, logs)
-        self.assertEqual(sorted(concurrent_slots), [3, 4, 5])
-        self.assertEqual(len(set(temporary_paths)), len(temporary_paths))
-        self.assertIn('$ pre-commit run --all-files', logs)
-        self.assertNotIn('--from-ref', logs)
-        always_steps = [json.loads(path.read_text())['steps']
-                        for path in sorted(evidence[0].parent.glob('2-*/drill-check.json'))]
-        self.assertEqual([[(step['command'], step['exit']) for step in steps] for steps in always_steps],
-                         [[(['just', 'check'], 0), (['pre-commit', 'run', '--all-files'], 1)]] * 2, always_steps)
-        self.assertEqual([path for path in self.gate_dir.iterdir() if path.suffix != '.lock'], [])
-        with mock.patch.dict(os.environ, TASK_GATE_DIR=str(self.gate_dir)):
-            self.assertEqual(TASK_MODULE.gate_holders(), [])
-        for repo in repos:
-            self.assertEqual(list((repo / '.worktrees').iterdir()), [])
-            self.assertEqual(len(self.git(repo, 'worktree', 'list').splitlines()), 1)
-
     def test_gate_slots_resources_exclusivity_and_status(self):
         config = self.home / '.config/task/gate.toml'
         config.parent.mkdir(parents=True, exist_ok=True)
@@ -4278,6 +5183,408 @@ store.write_text(json.dumps(prs))
         self.assertTrue(wt.is_dir(), out)
         return wt, out
 
+    def risk_policy_fixture(self, text):
+        path = self.home / 'cortex/cortex-kb-company/policy/usage-pacing.toml'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_risk_defaults_legacy_records_changes_and_high_reason(self):
+        self.assertIn('--risk-reason', self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'high', code=1))
+        wt, _ = self.started()
+        record_path = self.state() / 'task.json'
+        record = json.loads(record_path.read_text())
+        self.assertEqual(record['risk'], 'normal')
+        record.pop('risk'); record.pop('risk_reason')
+        record['revision'] = TASK_MODULE.record_revision(record)
+        record_path.write_text(json.dumps(record))
+        self.assertIn('tier=routine risk=normal', self.raw_task('status', 'proj'))
+        self.assertIn('one-line reason', self.raw_task('risk', 'proj', '5', 'high', code=1))
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'rails change')
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+        record = json.loads(record_path.read_text())
+        self.assertEqual((record['risk'], record['risk_reason']), ('high', 'rails change'))
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'low')
+        self.assertIn('risk=low', self.raw_task('status', 'proj'))
+        ledger = [json.loads(line) for line in (self.home / '.local/state/task/usage/overrides.jsonl').read_text().splitlines()]
+        self.assertEqual([(r['model'], r['tier']) for r in ledger], [(None, 'routine')] * 2)
+        self.assertEqual([(r['kind'], r['old_risk'], r['risk'], r['override']) for r in ledger],
+                         [('risk_change', 'normal', 'high', 'rails change'),
+                          ('risk_change', 'high', 'low', 'PM risk choice')])
+        self.assertIn('risk normal to high on routine', self.raw_task('status', 'proj'))
+        self.assertIn('nonempty line', self.raw_task('risk', 'proj', '5', 'high', '--reason', 'two\nlines', code=1))
+
+    def test_risk_low_runs_trusted_check_and_merges_without_review_or_report(self):
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'low')
+        wt = self.repo / '.worktrees/t5'
+        self.commit_in(wt, 'b.txt')
+        for flags in (('--run',), (), ('--record', 'missing.md')):
+            out = self.raw_task('review', 'proj', '5', *flags, code=1)
+            self.assertIn('risk low: trusted check only', out)
+        self.assertIn('risk low', self.raw_task('redteam', 'proj', '5', '--brief', 'missing.md', code=1))
+        (wt / '.work/report.md').unlink()
+        self.assertIn('Risk: low', self.raw_task('check', 'proj', '5'))
+        self.assertFalse((self.state() / 'review.json').exists())
+        self.raw_task('merge', 'proj', '5', '--keep')
+        self.assertEqual(self.git(self.repo, 'show', 'origin/main:b.txt'), 'x')
+
+    def test_risk_normal_keeps_cheap_review_in_boost_and_final_for_both_builders(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.readings(claude=(40, 84), codex=(40, 84), five=10)
+        self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00', '--codex-until', '2099-01-01T00:00:00+00:00')
+        for builder, vendor, model in (('codex', 'claude', 'haiku'), ('claude', 'codex', 'gpt-6-luna')):
+            self.raw_task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', 'hard', '--override', 'Jacopo 2026-10-23: routing fixture')
+            self.raw_task('check', 'proj', '5')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+            self.raw_task('review', 'proj', '5', '--run', '--final', '--no-pace', env=dict(self.env, REVIEW_STUB_REPLY=reply))
+            review = json.loads((self.state() / 'review.json').read_text())
+            self.assertEqual((review['reviewer'], review['model']), (vendor, model))
+        self.assertIn('risk normal', self.raw_task('redteam', 'proj', '5', '--brief', 'missing', code=1))
+
+    def test_risk_normal_manual_deeper_review_refused_even_with_stored_route(self):
+        wt, _ = self.started()
+        self.raw_task('review', 'proj', '5')
+        for model in ('opus', 'claude-opus-5-5', 'fable', 'claude-fable-5-1', 'gpt-6.1-sol'):
+            self.assertIn('risk normal', self.raw_task('review', 'proj', '5', '--record', 'missing', '--reviewer', 'claude', model, code=1))
+
+    def test_risk_policy_selects_reviewers_and_invalid_policy_fails_closed(self):
+        self.started()
+        self.risk_policy_fixture('[review.normal]\ncodex = "sonnet"\n')
+        self.assertIn('--model sonnet', self.raw_task('review', 'proj', '5'))
+        self.risk_policy_fixture('[review.normal]\ncodex = "opus"\n')
+        self.assertIn('risk normal', self.raw_task('review', 'proj', '5', code=1))
+        self.risk_policy_fixture('[review.normal]\nunknown = 1\n')
+        self.assertIn('invalid review.normal', self.raw_task('check', 'proj', '5', code=1))
+
+    def test_risk_status_invalid_review_reports_problem_and_uses_defaults(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        for text in ('[review.normal]\nunknown = 1\n',
+                     '[review]\nhigh_paths = { proj = ["b.txt"] }\n[review.low]\nmax_rounds = 0\n'):
+            with self.subTest(policy=text):
+                self.risk_policy_fixture(text)
+                out = self.raw_task('status', 'proj')
+                self.assertIn('invalid review.', out)
+                self.assertIn('built-in defaults used', out)
+                self.assertIn('risk=normal', out)
+                self.assertIn('branch=t5', out)
+                self.assertNotIn('Traceback', out)
+                self.assertIn('invalid review.', self.raw_task('review', 'proj', '5', code=1))
+
+    def test_risk_forced_high_global_and_company_repo_paths_refuse_lowering(self):
+        wt, _ = self.started()
+        target = wt / 'rails/guard.py'
+        target.parent.mkdir()
+        self.commit_in(wt, 'rails/guard.py')
+        self.risk_policy_fixture('[review]\nhigh_paths = { proj = ["rails/**"] }\n')
+        self.assertIn('risk=high', self.raw_task('status', 'proj'))
+        self.assertIn('Risk: high (forced by rails/guard.py)', self.raw_task('check', 'proj', '5'))
+        for value in ('low', 'normal'):
+            self.assertIn('rails/guard.py', self.raw_task('risk', 'proj', '5', value, code=1))
+            self.assertIn('rails/guard.py', self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', value, code=1))
+        self.assertIn('risk high: merge requires red-team', self.raw_task('merge', 'proj', '5', '--override', 'cannot skip red-team', code=1))
+        self.risk_policy_fixture('')
+        (wt / 'policy').mkdir()
+        self.commit_in(wt, 'policy/access.toml')
+        self.assertIn('forced by policy/access.toml', self.raw_task('check', 'proj', '5'))
+
+    def test_risk_bootstrap_defaults_cover_rails_but_not_task_itself(self):
+        wt, _ = self.started()
+        fake_task = SimpleNamespace(repo=Path('bootstrap'))
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), mock.patch.object(TASK_MODULE, 'default_branch', return_value='main'), \
+                mock.patch.object(TASK_MODULE, 'has_origin', return_value=False):
+            for path in ('home/dot_local/bin/executable_task', 'system/agent-policy/pre_tool_use.py',
+                         'home/dot_local/share/bootstrap/agent-policy/remove_pre_tool_use.py',
+                         'home/dot_local/share/bootstrap/agent-policy/remove_context_reminder.py',
+                         'system/claude-managed-guardrails.json', 'home/dot_codex/rules/default.rules',
+                         'system/codex-requirements.toml', 'home/dot_claude/settings.json',
+                         'home/dot_local/bin/executable_task-hold', 'HOLD.founder', 'profiles/sandbox.json',
+                         'home/dot_gitconfig.tmpl', '.gitleaks.toml'):
+                target = wt / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                self.commit_in(wt, path)
+                risk, _, forced = TASK_MODULE.risk_context(fake_task, wt, {})
+                self.assertEqual(risk, 'normal' if path.endswith('executable_task') else 'high')
+                if risk == 'high': self.assertTrue(forced)
+                self.git(self.repo, 'update-ref', 'refs/heads/main', self.git(wt, 'rev-parse', 'HEAD'))
+
+    def test_risk_rules_paths_are_high_but_skill_support_files_are_normal(self):
+        wt, _ = self.started()
+        fake = SimpleNamespace(repo=Path('proj'))
+        high = ('skills/company/SKILL.md', 'skills/company/references/nested/rules.md',
+                'AGENTS.md', 'CLAUDE.md', 'home/dot_codex/AGENTS.md', 'home/dot_claude/CLAUDE.md',
+                'INTENT.md', 'decisions/d-1.md', 'backlog/decisions/d-1.md', 'policy/usage.toml')
+        normal = ('skills/company/evals/case.json', 'skills/company/scripts/run.py',
+                  'skills/company/assets/logo.svg')
+        with mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE, 'default_branch', return_value='main'), \
+                mock.patch.object(TASK_MODULE, 'has_origin', return_value=False):
+            for name in (*high, *normal):
+                with self.subTest(path=name):
+                    (wt / name).parent.mkdir(parents=True, exist_ok=True)
+                    self.commit_in(wt, name)
+                    risk, _, forced = TASK_MODULE.risk_context(fake, wt, {})
+                    self.assertEqual((risk, forced), ('high', name) if name in high else ('normal', ''))
+                    self.git(self.repo, 'update-ref', 'refs/heads/main', self.git(wt, 'rev-parse', 'HEAD'))
+
+    def test_risk_redteam_both_vendors_wrapper_and_default_models(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'wrapper fixture')
+        wrapper = self.home / 'cortex/cortex-core/skills/company/references/red-team-brief.md'
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text('# Ambition bar fixture\nJudge against today\'s best practice.\n')
+        brief = self.home / 'brief.md'
+        brief.write_text('Attack the task.\n')
+        for vendor in ('claude', 'codex'):
+            binary = self.home / 'bin' / vendor
+            binary.write_text('#!/usr/bin/env python3\nimport json, os, pathlib, sys\n'
+                              'pathlib.Path(".work/redteam-call.json").write_text(json.dumps(dict(args=sys.argv[1:], brief=sys.stdin.read())))\n'
+                              'if "-o" in sys.argv: pathlib.Path(sys.argv[sys.argv.index("-o")+1]).write_text("Reviewed risks\\n")\n'
+                              'else: print("Reviewed risks")\n')
+            binary.chmod(0o755)
+        for builder, vendor, model in (('codex', 'claude', 'sonnet'), ('claude', 'codex', 'gpt-6.1-sol')):
+            self.raw_task('start', 'proj', '5', '--builder', builder, '--refresh')
+            self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+            meta = json.loads((self.state() / 'redteam.json').read_text())
+            call = json.loads((wt / '.work/redteam-call.json').read_text())
+            self.assertEqual((meta['vendor'], meta['model'], meta['ambition_wrapper']), (vendor, model, True))
+            self.assertEqual(call['brief'], wrapper.read_text() + '\n\n' + brief.read_text())
+            self.assertIn(model, call['args'])
+            if vendor == 'codex':
+                self.assertEqual(call['args'][:3], ['exec', '--sandbox', 'read-only'])
+            else:
+                self.assertIn('dontAsk', call['args'])
+        wrapper.unlink()
+        self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+        self.assertFalse(json.loads((self.state() / 'redteam.json').read_text())['ambition_wrapper'])
+
+    def test_risk_close_low_without_review_after_worktree_removal(self):
+        self.raw_task('start', 'proj', '5', '--builder', 'codex', '--risk', 'low')
+        wt = self.repo / '.worktrees/t5'
+        self.commit_in(wt, 'b.txt')
+        self.raw_task('merge', 'proj', '5')
+        self.assertFalse(wt.exists())
+        self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine')
+        text = next((self.kb / 'backlog/tasks').glob('t-5*')).read_text()
+        self.assertIn('status: Done', text)
+        self.assertIn('[x] #1', text)
+        self.assertIn('[x] #2', text)
+        self.assertNotIn('## Review evidence', text)
+
+    def test_risk_close_high_forced_paths_stale_missing_empty_redteam_and_normal_review(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.assertIn('recorded review', self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine', code=1))
+        self.prepare_merge_evidence('5')
+        review_path = self.state() / 'review.json'
+        review = json.loads(review_path.read_text())
+        review['model'] = 'opus'
+        review_path.write_text(json.dumps(review))
+        self.assertIn('cheap review', self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine', code=1))
+        (wt / 'skills/company').mkdir(parents=True)
+        self.commit_in(wt, 'skills/company/SKILL.md')
+        self.prepare_merge_evidence('5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        self.git(self.repo, 'worktree', 'remove', '--force', str(wt))
+        output = self.state() / 'redteam-output.md'
+        for commit, content in ((None, None), ('old-head', 'Risks'), (head, '')):
+            if commit:
+                output.write_text(content)
+                (self.state() / 'redteam.json').write_text(json.dumps(dict(commit=commit, output=str(output))))
+            self.assertIn('risk high: close requires red-team', self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine', code=1))
+        output.write_text('Risks reviewed')
+        self.raw_task('close', 'proj', '5', '-m', 'done', '--retro', 'routine')
+
+    def test_risk_high_redteam_command_head_staleness_and_waiver(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
+        self.prepare_merge_evidence('5')
+        brief = self.home / 'redteam-brief.md'
+        brief.write_text('Attack the safety assumptions.\n')
+        binary = self.home / 'bin/claude'
+        binary.write_text('#!/usr/bin/env python3\nimport json, os, pathlib, sys\n'
+                          'pathlib.Path(".work/redteam-call.json").write_text(json.dumps(dict(args=sys.argv[1:], '
+                          'brief=sys.stdin.read(), locks=os.environ.get("GIT_OPTIONAL_LOCKS"))))\n'
+                          'print("Risks reviewed.")\n')
+        binary.chmod(0o755)
+        self.risk_policy_fixture('[review.high]\nred_team_model_claude = "haiku"\n')
+        self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        meta = json.loads((self.state() / 'redteam.json').read_text())
+        call = json.loads((wt / '.work/redteam-call.json').read_text())
+        self.assertEqual(call, dict(args=['-p', '--permission-mode', 'dontAsk', '--model', 'haiku', '--effort', 'high',
+                         '--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(git --no-optional-locks:*)'],
+                         brief=brief.read_text(), locks='0'))
+        self.assertEqual(meta['commit'], head)
+        self.assertEqual((meta['vendor'], meta['model'], meta['ambition_wrapper']), ('claude', 'haiku', False))
+        self.assertIn(f"redteam={meta['output']} matches", self.raw_task('status', 'proj'))
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        self.assertIn('stale', self.raw_task('status', 'proj'))
+        self.assertIn('risk high: merge requires red-team', self.raw_task('merge', 'proj', '5', code=1))
+        self.raw_task('merge', 'proj', '5', '--keep', '--no-redteam', 'PM accepts bounded change')
+        ledger = (self.home / '.local/state/task/usage/overrides.jsonl').read_text()
+        self.assertIn('PM accepts bounded change', ledger)
+
+    def test_risk_high_redteam_current_output_allows_merge_and_failed_run_preserves_evidence(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'guard')
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        output = self.state() / 'redteam.md'
+        output.write_text('Reviewed risks\n')
+        (self.state() / 'redteam.json').write_text(json.dumps(dict(commit=self.git(wt, 'rev-parse', 'HEAD'), output=str(output))))
+        brief = self.home / 'brief.md'
+        brief.write_text('Check the guard.\n')
+        binary = self.home / 'bin/claude'
+        binary.write_text('#!/bin/sh\nexit 1\n')
+        binary.chmod(0o755)
+        self.assertIn('red-team failed', self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1))
+        self.assertEqual(json.loads((self.state() / 'redteam.json').read_text())['output'], str(output))
+        self.assertEqual(output.read_text(), 'Reviewed risks\n')
+        binary.write_text('#!/bin/sh\necho "Reviewed risks"\n')
+        self.raw_task('redteam', 'proj', '5', '--brief', str(brief))
+        self.raw_task('merge', 'proj', '5', '--keep')
+
+    def test_risk_redteam_invalid_brief_and_unavailable_claude_preserve_old_evidence(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        output = self.state() / f'redteam-{head}.md'
+        output.write_text('Existing reviewed risks\n')
+        meta = self.state() / 'redteam.json'
+        meta.write_text(json.dumps(dict(commit=head, output=str(output))))
+        before = meta.read_bytes(), output.read_bytes()
+        brief = self.home / 'brief.md'
+        unreadable = self.home / 'unreadable.md'
+        unreadable.write_text('valid content')
+        make_read_only(self, unreadable, 0)
+        binary = self.home / 'bin/claude'
+        binary.write_text('#!/bin/sh\ntouch "$HOME/redteam-launched"\nexit 1\n')
+        binary.chmod(0o755)
+        for value in (None, self.home, unreadable, b'', b' \n', b'\xff'):
+            with self.subTest(brief=value):
+                if isinstance(value, bytes):
+                    brief.write_bytes(value)
+                target = value if isinstance(value, Path) else brief
+                out = self.raw_task('redteam', 'proj', '5', '--brief', str(target), code=1)
+                self.assertIn('task redteam: risk high:', out)
+                self.assertNotIn('Traceback', out)
+                self.assertFalse((self.home / 'redteam-launched').exists())
+                self.assertEqual((meta.read_bytes(), output.read_bytes()), before)
+        brief.write_text('Attack this boundary.\n')
+        # An explicit PATH with only Git makes the missing-Claude fixture independent
+        # of any real vendor CLI installed on the machine.
+        git_only = self.home / 'git-only'
+        git_only.mkdir()
+        (git_only / 'git').symlink_to(shutil.which('git'))
+        out = self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1,
+                            env=dict(self.env, PATH=str(git_only)))
+        self.assertIn('claude is not available on PATH', out)
+        self.assertNotIn('Traceback', out)
+        self.assertEqual((meta.read_bytes(), output.read_bytes()), before)
+        binary.write_text('#!/missing-fixture-interpreter\n')
+        out = self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1)
+        self.assertIn('red-team failed', out)
+        self.assertNotIn('Traceback', out)
+        self.assertEqual((meta.read_bytes(), output.read_bytes()), before)
+
+    def test_risk_no_redteam_waiver_is_not_ledgered_when_remaining_gate_fails(self):
+        wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
+        self.commit_in(wt, 'b.txt')
+        ledger = self.home / '.local/state/task/usage/overrides.jsonl'
+        before = ledger.read_bytes()
+        out = self.raw_task('merge', 'proj', '5', '--no-redteam', 'bounded waiver', code=1)
+        self.assertIn('Merge refused', out)
+        self.assertEqual(ledger.read_bytes(), before)
+        self.prepare_merge_evidence('5')
+        self.commit_in(self.repo, 'FAIL')
+        self.git(self.repo, 'push', '-q', 'origin', 'main')
+        out = self.raw_task('merge', 'proj', '5', '--no-redteam', 'bounded waiver', code=1)
+        self.assertIn('Gate check failed', out)
+        self.assertEqual(ledger.read_bytes(), before)
+        self.git(self.repo, 'rm', 'FAIL')
+        self.git(self.repo, 'commit', '-qm', 'repair fixture gate')
+        self.git(self.repo, 'push', '-q', 'origin', 'main')
+        self.raw_task('merge', 'proj', '5', '--keep', '--no-redteam', 'bounded waiver')
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        waived = [row for row in rows if row.get('kind') == 'no_redteam']
+        self.assertEqual(len(waived), 1)
+        self.assertEqual((waived[0]['override'], waived[0]['commit']), ('bounded waiver', self.git(wt, 'rev-parse', 'HEAD')))
+
+    def test_risk_extra_round_under_limit_is_refused_without_launch_or_grant(self):
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('build fixture\n')
+        for used, extra in ((0, 0), (3, 2)):
+            with self.subTest(used=used, extra=extra):
+                rounds = self.state() / 'rounds.json'
+                rounds.write_text(json.dumps(dict(used=used, extra=extra)))
+                before = rounds.read_bytes()
+                out = self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'premature grant', code=1)
+                self.assertIn('only when the round limit is reached', out)
+                self.assertEqual(rounds.read_bytes(), before)
+                self.assertFalse((wt / '.work/model-call.json').exists())
+                self.assertNotIn('premature grant', self.raw_task('status', 'proj'))
+
+    def test_risk_round_limits_per_tier_and_extra_allowance_persists_across_refresh(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('build fixture\n')
+        for risk, maximum in (('low', 2), ('normal', 3), ('high', 3)):
+            with self.subTest(risk=risk):
+                self.raw_task('risk', 'proj', '5', risk, '--reason', 'round fixture')
+                (self.state() / 'rounds.json').unlink(missing_ok=True)
+                (wt / '.work/lane.json').unlink(missing_ok=True)
+                for _ in range(maximum):
+                    self.raw_task('lane', 'proj', '5', '--no-pace')
+                    self.wait_for_lane(wt)
+                refused = self.raw_task('lane', 'proj', '5', '--no-pace', code=1)
+                self.assertIn(f'risk {risk}: maximum {maximum}', refused)
+                self.assertIn('nonempty reason', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', ' ', code=1))
+                self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'small contained fix')
+                self.wait_for_lane(wt)
+                self.raw_task('start', 'proj', '5', '--builder', 'codex', '--refresh')
+                self.assertIn(f'maximum {maximum + 1}', self.raw_task('lane', 'proj', '5', '--no-pace', code=1))
+                before = (self.state() / 'rounds.json').read_bytes()
+                refused = self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'second grant', code=1)
+                self.assertIn('extra rounds exhausted (1/1 granted)', refused)
+                self.assertEqual((self.state() / 'rounds.json').read_bytes(), before)
+        self.assertEqual((self.home / '.local/state/task/usage/overrides.jsonl').read_text().count('small contained fix'), 3)
+
+    def test_risk_policy_round_limits_and_lane_effort_are_forwarded_and_logged(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 6\nextra_rounds = 0\n')
+        (wt / '.work/prompt.md').write_text('effort fixture\n')
+        for builder in ('codex', 'claude'):
+            for effort in ('low', 'medium', 'high'):
+                self.raw_task('lane', 'proj', '5', '--builder', builder, '--effort', effort, '--no-pace')
+                run = self.wait_for_lane(wt)
+                call = json.loads((wt / '.work/model-call.json').read_text())['args']
+                self.assertIn(f'model_reasoning_effort={effort}' if builder == 'codex' else effort, call)
+                self.assertEqual(run['usage_run']['effort'], effort)
+        self.assertIn('risk normal: maximum 6', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'no allowance', code=1))
+
+    def test_risk_extra_round_policy_two_grants_capped_across_tier_changes(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 1\nextra_rounds = 2\n')
+        (wt / '.work/prompt.md').write_text('round fixture\n')
+        self.raw_task('lane', 'proj', '5', '--no-pace')
+        self.wait_for_lane(wt)
+        for count in (1, 2):
+            self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'one more')
+            self.wait_for_lane(wt)
+            self.assertEqual(json.loads((self.state() / 'rounds.json').read_text())['extra'], count)
+        self.assertIn('(2/2 granted)', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'excess', code=1))
+        self.raw_task('risk', 'proj', '5', 'low')
+        self.raw_task('lane', 'proj', '5', '--no-pace')
+        self.wait_for_lane(wt)
+        self.assertIn('(2/1 granted)', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'excess', code=1))
+
     def state(self, name="t5"):
         return self.home / ".local/state/task/proj" / name
 
@@ -4500,41 +5807,6 @@ store.write_text(json.dumps(prs))
         self.assertTrue(file.exists())
         self.assertTrue(any('kept' in line and 'cannot archive' in line for line in report))
 
-    def test_archive_task_prune_uses_shared_big_evidence_rule(self):
-        snapshot = self.work_archives() / 'snapshot'
-        snapshot.mkdir(parents=True)
-        (snapshot / 'manifest.json').write_text('{}')
-        big = snapshot / 'check.log'
-        subprocess.run(['truncate', '-s', '51M', str(big)], check=True)
-        (snapshot / 'report.md').write_text('keep')
-        outside = self.home / 'outside-manifest'
-        outside.write_text('untouched')
-        (snapshot / 'manifest.json.tmp').symlink_to(outside)
-        for name, record in [('array', []), ('bad-pruned', {'pruned': {}})]:
-            bad = self.work_archives() / name
-            bad.mkdir()
-            (bad / 'manifest.json').write_text(json.dumps(record))
-            (bad / 'copy.db').write_bytes(b'db')
-        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
-        self.assertIn(str(big), out)
-        self.assertTrue(big.exists())
-        out = self.raw_task('repair', '--prune-archive', 'proj')
-        self.assertFalse(big.exists())
-        self.assertEqual((snapshot / 'report.md').read_text(), 'keep')
-        self.assertEqual(outside.read_text(), 'untouched')
-        row, = json.loads((snapshot / 'manifest.json').read_text())['pruned']
-        self.assertEqual(row['path'], 'check.log')
-        self.assertEqual(row['size'], 51 * 1024 ** 2)
-        digest = hashlib.sha256()
-        for _ in range(51):
-            digest.update(bytes(1024 ** 2))
-        self.assertEqual(row['sha256'], digest.hexdigest())
-        self.assertEqual(row['reason'], 'file over 50 MB')
-        self.assertIsNotNone(__import__('datetime').datetime.fromisoformat(row['date']))
-        for name in ('array', 'bad-pruned'):
-            self.assertTrue((self.work_archives() / name / 'copy.db').exists())
-            self.assertIn('cannot prune ' + str(self.work_archives() / name), out)
-
     def test_archive_dry_runs_do_not_hash_and_tidy_skips_pending(self):
         root = self.home / '.local/state/task/archive'
         snapshot = self.work_archives() / 'snapshot'
@@ -4549,7 +5821,6 @@ store.write_text(json.dumps(prs))
         with mock.patch.object(TASK_MODULE.hashlib, 'sha256', side_effect=AssertionError('dry-run hash')), \
                 mock.patch.object(TASK_MODULE, 'HOME', self.home):
             TASK_MODULE.prune_evidence_archive(root, False, report)
-            TASK_MODULE.prune_archive(self.repo, dry_run=True)
         self.assertTrue(any('database' in line and 'copy.db' in line for line in report))
         TASK_MODULE.prune_evidence_archive(root, True, [])
         self.assertEqual((pending / 'copy.db').read_bytes(), b'db')
@@ -4571,41 +5842,9 @@ store.write_text(json.dumps(prs))
         with mock.patch.object(Path, 'unlink', fail_database):
             report = []
             TASK_MODULE.prune_evidence_archive(root, True, report)
-            with mock.patch.object(TASK_MODULE, 'HOME', self.home):
-                with contextlib.redirect_stdout(io.StringIO()) as output:
-                    TASK_MODULE.prune_archive(self.repo)
-                self.assertIn('fixture unlink denied', output.getvalue())
         self.assertEqual(json.loads(manifest.read_text()), {})
         self.assertTrue(database.exists())
         self.assertTrue(any('fixture unlink denied' in line for line in report))
-
-    def test_archive_repair_records_first_removal_when_second_fails(self):
-        snapshot = self.work_archives() / 'snapshot'
-        snapshot.mkdir(parents=True)
-        manifest = snapshot / 'manifest.json'
-        manifest.write_text('{}')
-        (snapshot / 'copy.db').write_bytes(b'db')
-        subprocess.run(['truncate', '-s', '51M', str(snapshot / 'check.log')], check=True)
-        unlink, attempted = Path.unlink, []
-        def fail_second(path, *args, **kwargs):
-            if path.parent == snapshot and path.name in ('copy.db', 'check.log'):
-                attempted.append(path)
-                if len(attempted) == 2:
-                    row, = json.loads(manifest.read_text())['pruned']
-                    self.assertEqual(row['path'], attempted[0].name)
-                    raise PermissionError('second removal denied')
-            return unlink(path, *args, **kwargs)
-        with mock.patch.object(Path, 'unlink', fail_second), \
-                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
-                contextlib.redirect_stdout(io.StringIO()) as output:
-            TASK_MODULE.prune_archive(self.repo)
-        self.assertEqual(len(attempted), 2)
-        self.assertFalse(attempted[0].exists())
-        self.assertTrue(attempted[1].exists())
-        row, = json.loads(manifest.read_text())['pruned']
-        self.assertEqual(row['path'], attempted[0].name)
-        self.assertEqual(set(row), {'path', 'size', 'sha256', 'reason', 'date'})
-        self.assertIn('second removal denied', output.getvalue())
 
     def test_atomic_json_failure_removes_temporary_file(self):
         directory = self.home / 'atomic-json'
@@ -4833,90 +6072,7 @@ store.write_text(json.dumps(prs))
         self.assertIn('Gate cleanup warning:', warning.getvalue())
         self.assertTrue((gate / 'locked/file').exists())
 
-    def test_prune_archive_dry_run_and_preserves_evidence(self):
-        root = self.work_archives()
-        saved = root / 't5-finished'
-        (saved / '.work/fakehome').mkdir(parents=True)
-        (saved / '.work/fakehome/state').write_bytes(b'x' * 100)
-        (saved / '.work/fakehome/gateway.log').write_text('keep nested log')
-        (saved / '.work/large').mkdir()
-        with (saved / '.work/large/data').open('wb') as stream:
-            stream.truncate(201 * 1024 ** 2)
-        (saved / '.work/large/merge.json').write_text('{}')
-        (saved / '.work/report.md').write_text('report')
-        (saved / '.work/gateway.log').write_text('log')
-        (saved / 'manifest.json').write_text('{}')
-        locked = saved / '.work/large/locked'
-        locked.mkdir()
-        (locked / 'evidence.txt').write_text('keep inaccessible evidence')
-        make_read_only(self, locked, 0)
-        pending = root / '.pending-old'
-        pending.mkdir()
-        (pending / 'partial').write_text('partial')
-        # A live numeric PID alone is not a live kernel gate holder.
-        stale = root / f'.task-gate-t5-{os.getpid()}-copy'
-        stale.mkdir()
-        (stale / 'cache').write_text('cache')
-        orphan = root / 'other/.pending-unfinished'
-        orphan.mkdir(parents=True)
-        for copy in (pending, stale, orphan):
-            (copy / '.work/records').mkdir(parents=True)
-            (copy / '.work/check.log').write_text('check evidence')
-            (copy / '.work/report.md').write_text('report evidence')
-            (copy / '.work/records/run.jsonl').write_text('{}\n')
-            if copy != orphan:
-                (copy / 'manifest.json').write_text('{}')
-        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
-        self.assertIn('Would free', out)
-        self.assertTrue(pending.exists())
-        self.assertTrue(stale.exists())
-        self.assertTrue(orphan.exists())
-        self.assertIn('Would finish', out)
-        self.assertTrue((saved / '.work/fakehome').exists())
-        self.assertIn('Skipped ' + str(locked), out)
-        self.assertEqual((saved / 'manifest.json').read_text(), '{}')
-        out = self.raw_task('repair', '--prune-archive', 'proj')
-        self.assertIn('Freed', out)
-        self.assertFalse(pending.exists())
-        self.assertFalse(stale.exists())
-        self.assertFalse(orphan.exists())
-        recovered = orphan.with_name('other-unfinished')
-        manifest = json.loads((recovered / 'manifest.json').read_text())
-        self.assertEqual(manifest['note'], 'finished by repair')
-        self.assertIn('.work/report.md', [entry['path'] for entry in manifest['contents']])
-        duplicate = recovered.parent / '.pending-later'
-        duplicate.mkdir()
-        (duplicate / 'partial').write_text('duplicate')
-        self.raw_task('repair', '--prune-archive', 'proj')
-        self.assertFalse(duplicate.exists())
-        for name in ('.work/check.log', '.work/report.md', '.work/records/run.jsonl', 'manifest.json'):
-            self.assertTrue((recovered / name).is_file())
-        self.assertFalse((saved / '.work/fakehome/state').exists())
-        self.assertFalse((saved / '.work/fakehome').exists())
-        self.assertFalse((saved / '.work/large/data').exists())
-        self.assertEqual((saved / '.work/large/merge.json').read_text(), '{}')
-        self.assertTrue(locked.exists())
-        record = json.loads((saved / 'manifest.json').read_text())
-        self.assertIn('.work/large/locked', [entry['path'] for entry in record['skipped']])
-        locked.chmod(0o700)
-        self.assertEqual((locked / 'evidence.txt').read_text(), 'keep inaccessible evidence')
-        for name in ('.work/report.md', '.work/gateway.log', 'manifest.json'):
-            self.assertTrue((saved / name).is_file())
-
-    def test_prune_archive_retains_gate_with_kernel_holder(self):
-        gate = self.work_archives() / '.task-gate-t5-99999999-copy'
-        (gate / '.work/records').mkdir(parents=True)
-        (gate / '.work/check.log').write_text('check')
-        (gate / '.work/report.md').write_text('report')
-        (gate / '.work/records/run.jsonl').write_text('{}\n')
-        with (self.gate_dir / 'agent-task-gate.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            self.raw_task('repair', '--prune-archive', 'proj')
-            self.assertTrue((gate / '.work/check.log').exists())
-        self.raw_task('repair', '--prune-archive', 'proj')
-        self.assertFalse(gate.exists())
-
-    def test_archive_and_prune_named_virtualenv_and_runtime(self):
+    def test_archive_named_virtualenv_and_runtime(self):
         wt, _ = self.started()
         venv = wt / '.work/t8venv'
         (venv / 'lib').mkdir(parents=True)
@@ -4951,79 +6107,8 @@ store.write_text(json.dumps(prs))
         for name in ('report.md', 'check.log', 'merge.json'):
             self.assertEqual((archived / name).read_text(), 'keep')
 
-        root = self.work_archives()
-        finished = root / 'old-finished'
-        pending = root / 'other/.pending-runtime'
-        for container in (finished, pending):
-            work = container / '.work'
-            (work / 't8venv/lib').mkdir(parents=True)
-            (work / 't8venv/pyvenv.cfg').write_text('home = /usr/bin\n')
-            (work / 't8venv/lib/package.py').write_text('runtime')
-            (work / 't8venv/lib/README.md').write_text('package readme')
-            (work / 't8venv/lib/direct_url.json').write_text('{}')
-            (work / 'node_modules').mkdir()
-            (work / 'node_modules/.package-lock.json').write_text('{}')
-            (work / 'node_modules/package.json').write_text('{}')
-            (work / '.pytest_cache').mkdir()
-            (work / '.pytest_cache/README.md').write_text('cache')
-            (work / 'reports').mkdir()
-            with (work / 'reports/large.log').open('wb') as stream:
-                stream.truncate(201 * 1024 ** 2)
-            for name in ('report.md', 'check.log', 'merge.json'):
-                (work / name).write_text('keep')
-                (work / 'reports' / name).write_text('keep report')
-            (work / 'runtime').mkdir()
-            with (work / 'runtime/data').open('wb') as stream:
-                stream.truncate(201 * 1024 ** 2)
-            for name in ('report.md', 'prompt.md', 'request.md', 'check.json',
-                         'review.json', 'merge.json', 'small.log', 'manifest.json', 'run.jsonl'):
-                (work / 'runtime' / name).write_text('evidence')
-            (work / 'records').mkdir()
-            (work / 'records/run.jsonl').write_text('{}\n')
-            with (work / 'records/data').open('wb') as stream:
-                stream.truncate(201 * 1024 ** 2)
-            (work / 't8venv/request.md').write_text('keep nested evidence')
-        (finished / 'manifest.json').write_text('{"head": "original"}')
-        before = {path: (path.stat().st_size,
-                         path.read_bytes() if path.stat().st_size < 1024 else None)
-                  for path in root.rglob('*') if path.is_file()}
-        out = self.raw_task('repair', '--prune-archive', '--dry-run', 'proj')
-        self.assertIn(str(pending / '.work/t8venv'), out)
-        self.assertIn(str(finished / '.work/runtime'), out)
-        for path, (size, content) in before.items():
-            self.assertEqual(path.stat().st_size, size)
-            if content is not None:
-                self.assertEqual(path.read_bytes(), content)
-        self.raw_task('repair', '--prune-archive', 'proj')
-        recovered = pending.with_name('other-runtime')
-        for container in (finished, recovered):
-            self.assertFalse((container / '.work/t8venv/lib').exists())
-            self.assertFalse((container / '.work/t8venv/pyvenv.cfg').exists())
-            self.assertFalse((container / '.work/runtime/data').exists())
-            for name in ('t8venv', 'node_modules', '.pytest_cache'):
-                self.assertFalse((container / '.work' / name).exists())
-            for name in ('report.md', 'prompt.md', 'request.md', 'check.json',
-                         'review.json', 'merge.json', 'small.log', 'manifest.json', 'run.jsonl'):
-                self.assertEqual((container / '.work/runtime' / name).read_text(), 'evidence')
-            self.assertEqual((container / '.work/records/run.jsonl').read_text(), '{}\n')
-            self.assertFalse((container / '.work/records/data').exists())
-            for name in ('report.md', 'check.log', 'merge.json'):
-                self.assertEqual((container / '.work' / name).read_text(), 'keep')
-                self.assertEqual((container / '.work/reports' / name).read_text(), 'keep report')
-            record = json.loads((container / 'manifest.json').read_text())
-            self.assertTrue(any(line['path'] == '.work/runtime/data'
-                                for line in record['pruned']))
-            self.assertTrue(any(line['path'] == '.work/t8venv'
-                                for line in record['pruned']))
-        self.assertEqual(json.loads((finished / 'manifest.json').read_text())['head'], 'original')
-        manifest = (finished / 'manifest.json').read_bytes()
-        self.raw_task('repair', '--prune-archive', 'proj')
-        self.assertEqual((finished / 'manifest.json').read_bytes(), manifest)
-
-    def test_oversized_directory_keeps_broad_evidence_in_archive_and_repair(self):
+    def test_oversized_directory_keeps_broad_evidence_in_archive(self):
         wt, _ = self.started()
-        finished = self.work_archives() / 'old-finished'
-        pending = self.work_archives() / 'other/.pending-broad'
         names = ['report.json', 'report.txt', 'run.json', 'exception.json',
                  'task.json', 'gate-check.json', 'arbitrary.json']
         names += ['notes' + suffix for suffix in
@@ -5031,7 +6116,7 @@ store.write_text(json.dumps(prs))
         names += [word + '.dat' for word in
                   ('report', 'prompt', 'request', 'check', 'review', 'merge',
                    'manifest', 'run', 'task', 'exception', 'gate')]
-        for container in (wt, finished, pending):
+        for container in (wt,):
             directory = container / '.work/big'
             directory.mkdir(parents=True)
             for name in names:
@@ -5040,13 +6125,10 @@ store.write_text(json.dumps(prs))
                 with (directory / name).open('wb') as stream:
                     stream.truncate(megabytes * 1024 ** 2)
             (directory / 'empty').mkdir()
-        (finished / 'manifest.json').write_text('{}')
         with mock.patch.object(TASK_MODULE, 'HOME', self.home):
             TASK_MODULE.preserve_work(self.repo, 't5', wt)
-        archived = next(path.parent.parent for path in self.work_archives().glob('*/.work/big')
-                        if path.parent.parent != finished)
-        self.raw_task('repair', '--prune-archive', 'proj')
-        for container in (archived, finished, pending.with_name('other-broad')):
+        archived = next(path.parent.parent for path in self.work_archives().glob('*/.work/big'))
+        for container in (archived,):
             directory = container / '.work/big'
             for name in names:
                 self.assertEqual((directory / name).read_text(), 'evidence')
@@ -5616,23 +6698,6 @@ store.write_text(json.dumps(prs))
                         self.fail('shared resource was not locked')
                 self.assertEqual(caught.exception.code, 3)
 
-    def test_drill_cleanup_old_and_new_names_preserves_live_and_unrelated(self):
-        parent = self.repo / '.worktrees'
-        parent.mkdir(exist_ok=True)
-        stale = ['.task-drill-1792000000000000000-99999999-0-concurrent',
-                 '.drill-abcdef-0-group', '.drill-abcdef-0-solo']
-        kept = [f'.task-drill-1792000000000000000-{os.getpid()}-0-solo',
-                '.drill-fedcba-0-group', '.drill-unrelated']
-        for name in stale + kept:
-            path = parent / name
-            self.git(self.repo, 'worktree', 'add', '-q', '--detach', str(path), 'HEAD')
-            if name == '.drill-fedcba-0-group':
-                (path / '.work').mkdir(exist_ok=True)
-                (path / '.work/drill.pid').write_text(str(os.getpid()))
-        with mock.patch.dict(os.environ, self.env):
-            TASK_MODULE.prune_drill_worktrees(self.repo)
-        self.assertEqual(sorted(path.name for path in parent.iterdir()), sorted(kept))
-
     def test_bare_just_check_does_not_expand_unset_proxy_bypass_vars(self):
         justfile = (ROOT / "justfile").read_text()
         self.assertIn("check:\n", justfile, "inspect the repository's real justfile")
@@ -5815,6 +6880,7 @@ store.write_text(json.dumps(prs))
         before = {str(path.relative_to(self.home)): path.read_bytes()
                   for path in self.home.rglob("*") if path.is_file()}
         commands = (("start", "proj", "5", "--builder", "codex", "--refresh"),
+                    ("risk", "proj", "5", "low"), ("redteam", "proj", "5", "--brief", "missing.md"),
                     ("review", "proj", "5"),
                     ("review", "proj", "5", "--run"),
                     ("review", "proj", "5", "--record", "missing-review.md"),
@@ -6140,19 +7206,25 @@ store.write_text(json.dumps(prs))
         self.assertIn("claude-final", log)
         self.assertIn("lane: finished (exit 3)", self.raw_task("status", "proj"))
 
-    def readings(self, claude=None, codex=None):
+    def readings(self, claude=None, codex=None, five=None, age=timedelta()):
         """Fixture usage readings in the temporary HOME: (weekly used %, hours until the weekly reset)."""
         now = datetime.now(timezone.utc)
         if claude:
             event = {"rate_limit_info": {"unifiedWindows": {"seven_day": {
                 "utilization": claude[0] / 100, "resetsAt": int(now.timestamp() + claude[1] * 3600)}}}}
-            TASK_MODULE.task_usage.record_claude(self.home, event, now)
+            if five is not None:
+                event["rate_limit_info"]["unifiedWindows"]["five_hour"] = {
+                    "utilization": five / 100, "resetsAt": int(now.timestamp() + 5 * 3600)}
+            TASK_MODULE.task_usage.record_claude(self.home, event, now - age)
         if codex:
             limits = {"primary": {"used_percent": codex[0], "window_minutes": 10080,
                                   "resets_at": int(now.timestamp() + codex[1] * 3600)}}
+            if five is not None:
+                limits["secondary"] = {"used_percent": five, "window_minutes": 300,
+                                       "resets_at": int(now.timestamp() + 5 * 3600)}
             path = self.home / ".codex/sessions/2026/10/20/rollout-fixture.jsonl"
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"timestamp": now.isoformat(), "payload": {"rate_limits": limits}}) + "\n")
+            path.write_text(json.dumps({"timestamp": (now - age).isoformat(), "payload": {"rate_limits": limits}}) + "\n")
 
     def pace_lane(self, *options, code=0, builder="claude", recorded=()):
         self.stub_models()
@@ -6260,7 +7332,7 @@ store.write_text(json.dumps(prs))
         self.assertIn("Jacopo: codex is at 100 %; use your spare reset", out)
 
     def test_pace_lane_under_used_near_reset_switches_the_boost_on_until_the_reset(self):
-        self.readings(claude=(40, 30))
+        self.readings(claude=(40, 30), five=10)
         # Fable follows the recorded tier, so the task is started as hard.
         wt, out = self.pace_lane("--tier", "hard", recorded=("--tier", "hard"))
         self.assertRegex(out, r"pace: claude under-used near its reset; boost on until ")
@@ -6269,18 +7341,21 @@ store.write_text(json.dumps(prs))
         self.assertIn(f"boost on for claude until {until}", self.pace_log())
         self.assertIn(f"boost: claude until {until}", self.raw_task("status", "proj"))
 
-    def test_pace_review_holds_exhausted_reviewer_and_goes_deeper_when_under_used(self):
+    def test_pace_review_holds_exhausted_reviewer_and_final_goes_deeper_when_under_used(self):
         self.stub_reviewers()
         wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise high review pacing')
         head = self.git(wt, "rev-parse", "HEAD")
         self.raw_task("check", "proj", "5")
         self.readings(claude=(80, 84))
         out = self.raw_task("review", "proj", "5", "--run", code=4)
         self.assertIn("held back by usage pacing: claude automated share used up", out)
         self.assertFalse((wt / ".work/reviewer-call.json").exists())
-        self.readings(claude=(40, 30))
+        self.readings(claude=(40, 30), five=10)
         reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```\n"
         self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "haiku")
+        self.raw_task("review", "proj", "5", "--run", "--final", env=dict(self.env, REVIEW_STUB_REPLY=reply))
         call = json.loads((wt / ".work/reviewer-call.json").read_text())
         self.assertEqual(call["args"][call["args"].index("--model") + 1], "opus")
         self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "opus")
@@ -6320,7 +7395,7 @@ store.write_text(json.dumps(prs))
             publish(path, run)
 
         args = SimpleNamespace(repo=str(self.repo), id="5", builder="claude", tier=None,
-                               model="opus", no_boost=True, _worker=True, timeout=None, override="")
+                               model="opus", no_boost=True, _worker=True, timeout=None, override="", effort="high")
         with mock.patch.dict(os.environ, self.env), \
                 mock.patch.object(TASK_MODULE, "HOME", self.home), \
                 mock.patch.object(TASK_MODULE, "atomic_json", side_effect=observe):
@@ -6460,6 +7535,7 @@ store.write_text(json.dumps(prs))
         self.assertFalse((wt / ".work/model-call.json").exists())
 
     def test_lane_full_model_ids_and_builder_override_review_route(self):
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 10\n')
         import json
         self.stub_models()
         wt, _ = self.started()
@@ -8759,6 +9835,22 @@ class WatcherTests(unittest.TestCase):
         self.assertIn('P2:claude', self.scan())
         path.write_text('{}')
         self.assertNotIn('P2:claude', self.scan())
+
+    def test_invalid_review_warns_uses_defaults_and_keeps_watching_other_sources(self):
+        self.readings.stop()
+        self.write('cortex/cortex-kb-company/policy/usage-pacing.toml',
+                   '[reserve]\nclaude = 0\n[review.normal]\nunknown = 1\n')
+        future = self.now.timestamp() + 5 * 86400
+        self.write('.local/state/task/usage/claude.json', json.dumps({'seven_day': {
+            'at': self.now.isoformat(), 'utilization': .80, 'resetsAt': future}}))
+        self.write('.config/task/live-units', 'broken.timer\n')
+        with mock.patch.object(self.watch, 'command', return_value=self.unit_properties(LoadState='not-found')), \
+                contextlib.redirect_stderr(io.StringIO()) as warnings:
+            found = self.scan()
+        self.assertIn('invalid review.normal', warnings.getvalue())
+        self.assertIn('built-in defaults used', warnings.getvalue())
+        self.assertIn('P2:claude', found)  # 80 % exceeds the default 75 %, not the invalid file's 100 %.
+        self.assertIn('P4:broken.timer', found)
 
     def test_p4_only_registered_units_and_errors_do_not_clear(self):
         self.write('.config/task/live-units', '  # comment\n\n product.service \nproduct.timer\n')

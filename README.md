@@ -524,8 +524,9 @@ text is refused. Each use is appended to
 these models, override or not.
 `--no-boost` disables boosted tier
 routing, while Codex hard remains gpt-6.1-sol.
-The launch notice explains the decision. Reviews keep their usual cheap models
-and usage-limit handling regardless of boost.
+The launch notice explains the decision. For high-risk tasks in boost, hard-tier reviews and rounds explicitly
+marked with `task review <repo> <id> --run --final` use Claude opus or Codex gpt-6.1-sol.
+Other reviews keep their usual cheap models; no round is inferred to be final.
 Usage limits retry once on the other reviewer vendor and record its actual
 identity. If that fallback uses the builder's vendor, the batch stops for an
 independent review; the merge gate still requires the other vendor.
@@ -541,6 +542,66 @@ limit and the slots in `~/.config/task/gate.toml` (default 3).
 Dependencies wait for their predecessor to merge; parked predecessors skip
 their dependants. Expiry reduces new dispatches without interrupting live work.
 `task status` shows the effective vendor limits and gate slots.
+
+#### Risk and checks
+
+Risk (`low`, `normal`, `high`) is separate from the builder-routing `tier` above.
+`task start <repo> <id> --builder codex --risk high --risk-reason "rails change"`
+sets it; omitted risk defaults to normal, including older records. High needs a
+one-line reason. Change it later with `task risk <repo> <id> low` or
+`task risk <repo> <id> high --reason "safety boundary"`; changes enter the override ledger.
+Refresh preserves risk. `task status` shows both risk and builder tier.
+
+| Risk | Required checks | Default build/fix rounds | Total extra rounds per task |
+| --- | --- | --- | --- |
+| low | Trusted check; review commands refused; merge needs no review or report | 2 | 1 |
+| normal | Trusted check and one cheap other-vendor review | 3 | 1 |
+| high | Trusted check, other-vendor review and red-team at the reviewed commit | 3 | 1 |
+
+Low risk also refuses `review --record`; its merge skips report and criteria checks,
+and close ticks the pinned criteria without review evidence. The batch runner skips
+low-tier review and runs a red-team after a high-tier review, before merge.
+
+Normal reviews stay cheap even in boost or with `review --run --final`. Manual
+Opus, Fable and other deeper reviews are refused outside high risk. High keeps the
+existing boost routing: hard builder tier or explicit `--final` selects the deeper
+reviewer while that vendor is boosted. Default cheap reviewers are Haiku for
+Codex-built work and gpt-6-luna for Claude-built work.
+
+At check, review and merge, changed paths in `main...HEAD` matching `review.high_paths`
+force high risk; attempting to lower it names the matching path and refuses.
+Patterns apply to the whole repository-relative path, with `*` matching any part;
+the `"*"` repository entry applies everywhere. Defaults cover every repo's `policy/**`,
+skill rules and references, agent instructions, `INTENT.md` and decision records,
+and bootstrap's agent-policy hook/rule tables, managed settings, Codex sandbox/rules,
+hold script/markers, boundary checks, Git credential settings and gitleaks config.
+The task executable itself is excluded. The complete paths are in the example policy.
+
+`task redteam <repo> <id> --brief FILE` runs the other vendor at high effort,
+using Sonnet for a Codex builder and gpt-6.1-sol for a Claude builder by default.
+It prepends `~/cortex/cortex-core/skills/company/references/red-team-brief.md` when
+present, records that fact, vendor, model and output for the commit, and appears in status.
+It refuses low and normal risk. High-risk merge requires that output at the reviewed
+head, or `task merge ... --no-redteam "reason"` (ledgered after a successful merge
+that passes the remaining gate); ordinary `--override`
+does not waive this rule. High-tier close requires current review and red-team evidence.
+
+`task lane ... --extra-round "small contained fix"` grants one extra round when the
+limit is reached; it refuses the flag below the limit. Total grants are capped at
+the policy's `extra_rounds` per task. Round counts persist across `start --refresh`,
+as do the ledgered extra grants.
+`task lane ... --effort low|medium|high` forwards effort to either vendor and records
+it; default is high.
+
+The company usage-pacing TOML also accepts `[review]`: `high_paths` maps repository
+names (or `"*"`) to pattern lists. `[review.low]` accepts positive-integer `max_rounds`
+and nonnegative-integer `extra_rounds`; `[review.normal]` and `[review.high]` also
+accept `codex` and `claude` reviewer model names, keyed by builder vendor.
+`[review.high]` additionally accepts `red_team_model` for Codex (default `gpt-6.1-sol`)
+and `red_team_model_claude` for Claude (default `sonnet`).
+Missing keys use built-in defaults; per-repository high-path lists replace their
+defaults. Unknown keys and malformed values are refused. Risk enforcement fails
+closed on invalid policy, while usage pacing reports its existing defaults fallback.
 
 #### Usage pacing
 
@@ -568,7 +629,15 @@ so `task runner-start` too) apply the verdict:
 | `on`, `under`, unknown | unchanged (unknown prints a warning) |
 | `ahead` | routine lanes use the vendor's cheaper model (Claude haiku, Codex gpt-6-luna) even when `--model` names another one (only `--no-pace`, logged, keeps it); no new batch starts; only the first `priority` repository with an unmerged task gets new lanes (others exit 4, held back) |
 | `exhausted-automated-share` | no new lanes or reviews on that vendor (running ones finish); a routine lane moves to the other vendor unless that is also ahead or exhausted; otherwise it is held. With a spare reset held, a line asks Jacopo to use it |
-| `under-used-near-reset` | spend before the reset: `task boost` for that vendor is switched on until its reset (stronger models by tier and extra capacity for already queued work, logged), and `task review --run` uses the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+| `under-used-near-reset` | spend before the reset: when the 5-hour reading permits boost, `task boost` for that vendor is switched on until its weekly reset (stronger models by tier and extra capacity for already queued work, logged). High-risk hard-tier reviews and explicit `--final` rounds use the stronger reviewer (Claude opus, Codex gpt-6.1-sol). Allowance is never spent on new build tasks; the `research_backlog` names pre-approved research the PM may use next |
+
+Manual and automatic boosts pause per vendor at or above `boost_five_hour_max` (default 50 %).
+A missing 5-hour reading, or one older than 45 minutes while the vendor's lanes ran since it,
+also pauses boost for a vendor with a 5-hour window. A vendor without one (Codex today) keeps
+its weekly rules. Normal routing and capacity apply to paused boosts, and no new automatic
+boost starts. `task usage` and `task status` explain a saved boost's pause. Its expiry stays saved,
+so a fresh reading below the threshold resumes it automatically until that expiry. `--no-pace`
+does not bypass this boost limit.
 
 The 5-hour window is a second pace input per vendor with the same reserves (it ignores spare resets,
 which only refill the weekly window). The reserve shrinks with the time left in the window: reserve ×
@@ -610,14 +679,14 @@ a review without that prompt leaves its start and before reading null.
 A PM logs its run with `task note <repo> - pm-run start`, followed by
 `task note <repo> - pm-run end [finished|failed|interrupted] [reason]`. Set `TASK_VENDOR`, `TASK_MODEL`,
 `TASK_EFFORT`, `TASK_TIER` and `TASK_PLAN` at start to record its identity. Repeating start while pending
-or repeating end is safe. Lane and review commands explicitly use high effort.
+or repeating end is safe. Lanes default to high effort, configurable with `--effort`; reviews use high.
 
 The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
 `~/cortex/cortex-kb-company/policy/usage-pacing.toml`; `task` only reads it and the company PM writes it.
 A missing file or key means the built-in defaults; an invalid file is reported and the defaults apply.
 [`docs/usage-pacing.example.toml`](docs/usage-pacing.example.toml) shows every key at its default:
 `[reserve]` (claude 25, codex 10), `[spare_resets]` (claude 0, codex 1), `priority`, `ahead_margin` (10),
-`under_use_percent` (60), `under_use_hours` (36) and `research_backlog`.
+`under_use_percent` (60), `under_use_hours` (36), `boost_five_hour_max` (50, percent 0–100) and `research_backlog`.
 
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
@@ -631,6 +700,8 @@ Trust comes from sandbox capability: `task` probes write access to
 and unsandboxed runner can write it and produce trusted evidence. Sandboxed
 Codex and Claude Code builders cannot: their checks remain advisory, and commands
 that mutate PM state refuse with “run this from the PM shell or a batch runner”.
+Always launch builders via `task lane`. Sessions that cannot write
+`~/.local/state/task` are advisory lanes.
 The hook permits PM task command routes; its other rules remain in force.
 `task lane` and plain `task review` are PM/runner-only too: lane dispatch starts
 a builder, and review preparation writes private routing and prompt records.
@@ -701,14 +772,13 @@ PH_PRODUCT_DIR = "{worktree}/.work/fake"
 
 When variants are declared, these are the runs; add an empty variant to include
 the base configuration. With no variants, the gate runs once as before.
-Checks, merge gates and gate drills all run the matrix. Advisory lane checks
+Checks and merge gates run the matrix. Advisory lane checks
 also accept `task check --variant fake`; trusted checks always run every variant.
 The combined check log labels each run, and JSON evidence and history include
 per-variant results. `task status` lists variant names.
 
 Advisory lane checks write `.work/check.log`. Trusted checks write `check.log`
-in the task's state directory; merge gates write `gate-check.log` there and
-drills write `drill-check.log` in their evidence directory. They leave the lane
+in the task's state directory; merge gates write `gate-check.log` there. They leave the lane
 log untouched. Check JSON and history record the log path and summary; status
 and review prompts identify the corresponding trusted or advisory log.
 Merge and published-merge repair preserve the trusted `check.log` in state
@@ -885,6 +955,127 @@ behind when a call hung. Long-lived processes go through `start_process` and
   the real server twice in a throwaway home. After an install, `python3 ci/shell-connector-probe.py`
   speaks MCP to the real `~/.local/bin/agentdev-shell-mcp`, lists its tools and runs `echo ok` as
   `agent`; the fresh-distro CI run (`ci/distro.sh`) does the same.
+
+### Backlog.md MCP for the Claude app
+
+The Company Control Room page calls [Backlog.md](https://github.com/MrLesk/Backlog.md)'s own MCP
+server through the Claude app on Windows (as `host:<server>`). The Claude app reports no MCP
+roots, so there is one server entry per knowledge repository, each pinned to its repository
+with `backlog mcp start --cwd`. Started through
+`wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-backlog-mcp <repo>`, it runs
+inside AgentDev as `agent` over stdio, like qmd and the shell connector.
+
+- **Pin:** `backlog.md` 1.53.0 and `backlog.md-linux-x64` 1.53.0 in the npm lock, installed by
+  `chezmoi apply` like the other npm tools. The launcher execs the platform binary directly (the
+  npm `cli.js` wrapper does not pass SIGTERM on). 1.53.0 has no telemetry and no update check.
+- **Never in agent sessions.** Agents use the `backlog` CLI. `ci/backlog-mcp-test.py` fails if a
+  tracked agent-session config references the launcher, and `checks/agent-drift.py` reports
+  `backlog-mcp-in-agent-session` for a live registration of the launcher or of `backlog mcp` in
+  `~/.claude.json`, `~/.claude/settings.json` or `~/.codex/config.toml`.
+- **Launcher allowlist:** `~/.local/bin/agentdev-backlog-mcp` serves only the repositories named
+  in it: `cortex-kb-company`, `cortex-kb-product-harness`, `cortex-kb-household-signal-harness`,
+  `cortex-kb-madplanner-v2`, `cortex-kb-consultancy-website`, `cortex-kb-home-energy-lab`, and the
+  dormant `cortex-kb-hermes`, `cortex-kb-historical-ingestion`, `cortex-kb-linkedin-ops` and
+  `cortex-kb-orw`. Never `cortex-kb-typo3-dkm`, `cortex-kb-customer-harness` or
+  `cortex-kb-photo-organizer` (standing privacy rule). Any other name, a path or `..` exits 2
+  before the server starts. Backlog.md resolves its project by walking up from `--cwd` to the
+  first directory with a Backlog config, and a root `backlog.config.yml` can move the backlog
+  folder, so the launcher also refuses a repository whose path contains a symlink (including
+  `$HOME`), whose `backlog/` or `backlog/config.yml` is a symlink or missing, or that has a
+  `backlog.config.yml`. On every launch it walks the entire `backlog/` tree and refuses any
+  file or directory symlink that resolves outside the repository (also broken links and
+  unreadable files). These are startup checks per connection; restart after filesystem or
+  config changes. It starts the server in the repository with a clean environment
+  (`HOME`, `PATH`, `LANG` only: `DEBUG` would print to stdout and break MCP), opens no network
+  port and writes nothing to stdout before the exec.
+- **Callbacks and git:** before starting, the launcher rejects project `onStatusChange` or
+  `on_status_change` commands and task-frontmatter callbacks throughout `backlog/`, including
+  drafts, completed and archived tasks. It rejects `auto_commit: true` and requires
+  `remote_operations: false` explicitly, because remote operations default to on. It also requires
+  `check_active_branches: false`: recent local branches are outside the startup scan, and 1.53.0
+  can evaluate JavaScript task frontmatter while reading those branches. It reads
+  `backlog/config.yml` using the scalar rules in the pinned
+  [1.53.0 config parser](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/src/file-system/operations.ts)
+  and decodes task YAML with the already locked `yaml` package; non-YAML frontmatter engines
+  and unreadable metadata fail closed. `onStatusChange` is the only command callback in this
+  version's [configuration reference](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/ADVANCED-CONFIG.md).
+  The [config resolver](https://github.com/MrLesk/Backlog.md/blob/v1.53.0/src/utils/backlog-directory.ts)
+  selects `backlog.config.yml`, or `backlog/config.yml` / `config.yaml`, or `.backlog/config.yml`
+  / `config.yaml`; it has no user-level Backlog config layer. This launcher requires its own
+  `backlog/config.yml` and rejects the root override, so no parent or alternate config is used.
+- **What the page may call:** the page's capability manifest grants read-only access only:
+  `task_view`, `task_list`, `task_search` and `document_view`. Write tools stay out of the page
+  manifest unless Jacopo later approves a server-side guard. Backlog.md 1.53.0 has no tool filter,
+  so that manifest, enforced by the Claude app, is the allowlist for the page. Its enforcement
+  is proven only by the live probe
+  through the page/platform, including refused calls outside the manifest; the stdio probe
+  below checks server availability and cannot prove that platform boundary.
+  It covers the page only: any other Claude app chat
+  with these servers connected sees every Backlog.md tool, including `task_archive`,
+  `milestone_archive` and `milestone_remove` (archive and delete), `document_create`, and the
+  Definition of Done config upsert. Recovery is the git history in each knowledge repository;
+  Backlog.md writes files without committing (`autoCommit` off), so an edit is recoverable only
+  once the PM has committed the state before it.
+- **Claude app entries** (Windows-side config, pasted by Jacopo after the install; nothing in
+  this repository touches Windows files). `chezmoi apply` writes the same block to
+  `~/.local/share/bootstrap/claude-app-mcp.json`; merge its entries into `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "backlog-company": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-company"]
+    },
+    "backlog-product-harness": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-product-harness"]
+    },
+    "backlog-household-signal-harness": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-household-signal-harness"]
+    },
+    "backlog-madplanner-v2": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-madplanner-v2"]
+    },
+    "backlog-consultancy-website": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-consultancy-website"]
+    },
+    "backlog-home-energy-lab": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-home-energy-lab"]
+    },
+    "backlog-hermes": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-hermes"]
+    },
+    "backlog-historical-ingestion": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-historical-ingestion"]
+    },
+    "backlog-linkedin-ops": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-linkedin-ops"]
+    },
+    "backlog-orw": {
+      "command": "wsl.exe",
+      "args": ["-d", "AgentDev", "-u", "agent", "--", "/home/agent/.local/bin/agentdev-backlog-mcp", "cortex-kb-orw"]
+    }
+  }
+}
+```
+
+- **Tests and probe:** `python3 ci/backlog-mcp-test.py` (run by `ci/lint.sh`) starts a stub
+  server through the launcher for each allowed name and checks the refusals (private and
+  unknown names, paths, `..`, repository-path and nested escaping symlinks, callbacks in config
+  and task metadata, unsafe git settings, a missing or parent Backlog config), runs the pinned
+  server over stdio through the launcher against a temporary Backlog project (tools listed,
+  `task_list` leaves the project unchanged), checks that this block and `claude-app-mcp.json`
+  match the launcher's allowlist, and checks the agent-session configs. After an install,
+  `python3 ci/backlog-mcp-probe.py` speaks MCP to the real `~/.local/bin/agentdev-backlog-mcp`
+  for `cortex-kb-company`, lists its tools and runs `task_list` read-only.
 
 ### Browser tests in a project gate
 

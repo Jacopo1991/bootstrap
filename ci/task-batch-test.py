@@ -79,6 +79,7 @@ if cmd == 'start':
         state.mkdir(parents=True)
         save(state / 'task.json', dict(base_sha=git(wt, 'rev-parse', 'HEAD'), branch=name,
              builder=options[options.index('--builder') + 1], revision='revision', criteria=[],
+             risk=entry.get('risk', 'normal'),
              tier=options[options.index('--tier') + 1] if '--tier' in options else 'routine'))
     if '--seed' in options:
         import shutil
@@ -127,6 +128,11 @@ elif cmd == 'lane':
         if entry.get('report'):
             (work / 'report.md').write_text('## What changed\nMerged main\n\n## How I verified\nTests\n')
     elif not entry.get('unfinished'):
+        if entry.get('high_path'):
+            target = wt / entry['high_path']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('Changed rules')
+            git(wt, 'add', entry['high_path'])
         (wt / 'result').write_text(str(index))
         git(wt, 'add', 'result')
         git(wt, 'commit', '--allow-empty', '-m', entry.get('subject', 'Implement task'))
@@ -161,6 +167,11 @@ elif cmd == 'review':
     print(entry.get('output', 'Verdict: FAIL (stdout is not authoritative)'))
 elif cmd == 'merge':
     save(state / 'merge.json', dict(head=git(wt, 'rev-parse', 'HEAD')))
+elif cmd == 'redteam':
+    assert '--brief' in options
+    brief = pathlib.Path(options[options.index('--brief') + 1])
+    assert 'Request: implement one' in brief.read_text()
+    save(state / 'redteam.json', dict(commit=git(wt, 'rev-parse', 'HEAD')))
 print(entry.get('output', 'OK'))
 '''
 
@@ -201,6 +212,7 @@ class BatchTest(unittest.TestCase):
         self.assertIn('[one] OK', result.stdout)
 
     def test_stop_and_interrupt_report_before_inflight_worker_finishes(self):
+        self.boost_readings()
         for interruption in (False, True):
             with self.subTest(interruption=interruption):
                 config = self.home / '.config/task'
@@ -262,10 +274,7 @@ class BatchTest(unittest.TestCase):
         state = self.home / '.local/state/task'
         state.mkdir(parents=True)
         boost = state / 'boost.json'
-        now = datetime.now(timezone.utc)  # claude has a 5-hour window, so boost needs a fresh reading below the warning band
-        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
-            'five_hour': {'utilization': 0.2, 'resetsAt': int(now.timestamp() + 7200)},
-            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        self.boost_readings()
         for vendor in ('codex', 'claude'):
             for boosted, slots, expected in ((False, 3, 1), (True, 3, 3), (True, 2, 2), (True, 1, 1)):
                 with self.subTest(vendor=vendor, boosted=boosted, slots=slots):
@@ -308,7 +317,7 @@ class BatchTest(unittest.TestCase):
         boost.write_text(json.dumps({'claude': '2099-01-01T00:00:00+00:00'}))
         now = datetime.now(timezone.utc)
         runner = batch_module.Batch(self.repo, self.source)
-        for five, expected in ((0.5, 3), (0.65, 1), (0.8, 0)):  # claude reserve 25: warning from 60 %, exhausted from 75 %
+        for five, expected in ((0.49, 3), (0.5, 1), (0.65, 1), (0.8, 0)):  # boost pauses from 50 %, exhausted from 75 %
             with self.subTest(five=five):
                 task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
                     'five_hour': {'utilization': five, 'resetsAt': int(now.timestamp() + 5 * 3600)},
@@ -337,7 +346,19 @@ class BatchTest(unittest.TestCase):
             return 'merged'
         with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(batch_module.Batch, 'task', execute):
             runner.schedule(tasks)
-        self.assertEqual(state['maximum'], 1)  # boosted for three, held to one by the warning band
+        self.assertEqual(state['maximum'], 1)  # boost paused and warning band limits this vendor to one
+
+    def boost_readings(self):
+        """Both vendors need fresh 5-hour room before a fixture boost can add capacity or models."""
+        now = datetime.now(timezone.utc)
+        task_usage.record_claude(self.home, {'rate_limit_info': {'unifiedWindows': {
+            'five_hour': {'utilization': 0.2, 'resetsAt': int(now.timestamp() + 7200)},
+            'seven_day': {'utilization': 0.3, 'resetsAt': int(now.timestamp() + 84 * 3600)}}}}, now)
+        path = self.home / '.codex/sessions/rollout-boost-fixture.jsonl'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'timestamp': now.isoformat(), 'payload': {'rate_limits': {
+            'primary': {'used_percent': 20, 'window_minutes': 300, 'resets_at': int(now.timestamp() + 7200)},
+            'secondary': {'used_percent': 30, 'window_minutes': 10080, 'resets_at': int(now.timestamp() + 84 * 3600)}}}}) + '\n')
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='task-batch-test-')
@@ -406,6 +427,25 @@ class BatchTest(unittest.TestCase):
         self.assertNotIn('<id>', prompt['prompt'])
         self.assertIn('60.0', prompt['args'])
         self.assertFalse(self.source.with_suffix('.done').exists())
+
+    def test_low_skips_review_and_high_runs_redteam_after_review(self):
+        source = self.source.read_text()
+        for risk in ('low', 'high'):
+            with self.subTest(risk=risk):
+                self.scenario({'start': [{'risk': risk}]})
+                self.source.write_text(source.replace('one:', risk + ':'))
+                self.assertIn(risk + ': merged', self.run_batch())
+                commands = [c[0] for c in self.calls() if len(c) > 2 and c[2] == risk]
+                self.assertEqual(commands, ['start', 'lane', 'wait', 'check'] +
+                                 ([] if risk == 'low' else ['review', 'redteam']) + ['merge'])
+
+    def test_forced_high_path_and_redteam_failure_stop_before_merge(self):
+        self.scenario({'start': [{'risk': 'low'}], 'lane': [{'high_path': 'skills/company/SKILL.md'}],
+                       'redteam': [{'code': 1, 'output': 'red-team failed'}]})
+        self.assertIn('red-team failed', self.run_batch(1))
+        self.assertEqual(len(self.calls('review')), 1)
+        self.assertEqual(len(self.calls('redteam')), 1)
+        self.assertFalse(self.calls('merge'))
 
     def test_resume_committed_work_skips_start_and_lane(self):
         for command in (['start', '--builder', 'codex'],
@@ -584,6 +624,7 @@ class BatchTest(unittest.TestCase):
     def test_tier_only_fix_rounds_preserve_routing(self):
         state = self.home / '.local/state/task'
         state.mkdir(parents=True)
+        self.boost_readings()
         for vendor in ('claude', 'codex'):
             for boosted in (False, True):
                 for tier in ('routine', 'hard', 'design'):
