@@ -1,3 +1,6 @@
 # Managed by chezmoi for the dedicated agent user.
 export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib"
 export DISABLE_AUTOUPDATER=1
+# uv's maintained constraint mechanism for pip, tools and uvx (including builds).
+export UV_CONSTRAINT=/usr/local/lib/agent-policy/constraints.txt
+export UV_BUILD_CONSTRAINT=/usr/local/lib/agent-policy/constraints.txt
