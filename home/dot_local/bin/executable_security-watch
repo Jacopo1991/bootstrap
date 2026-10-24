@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Daily OSV scan. Extraction, traversal and exemptions belong to osv-scanner."""
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import sys
+import tomllib
 
 # Paths are relative to HOME. GPU is optional; the other installed roots are required.
 ROOTS = ((".local/share/bootstrap/npm", False),
@@ -17,6 +18,8 @@ ROOTS = ((".local/share/bootstrap/npm", False),
          ("dev_workspace", False))
 EXCLUDES = ("customer-harness", "CustomerHarness", "typo3-dkm-plugin", "typo3-dkm",
             "Typo3", "DKM", "photo-organizer", "secrets", "project-data", ".git")
+SENTINELS = {ROOTS[0][0]: "@openai/codex", ROOTS[1][0]: "pre-commit",
+             ROOTS[2][0]: "inspect-ai"}
 
 
 def run(args, timeout):
@@ -34,7 +37,35 @@ def summary(report, dated):
              f"Report: {dated}", ""]
     lines += [f"- `{r['root']}`: {r['status']}" for r in report["roots"]]
     lines += ["- Error: " + e.replace("\n", " ") for e in report["errors"]]
+    lines += [f"- Exemption `{e['id']}` until {e['ignoreUntil']} "
+              f"({'effective' if e['effective'] else 'expired'}): {e['reason']}"
+              for e in report.get("exemptions", [])]
     return "\n".join(lines) + "\n"
+
+
+def approved_config(home, state, report):
+    source = home / ROOTS[0][0] / "osv-scanner.toml"
+    if source.is_symlink():
+        raise RuntimeError("approved config is symlinked")
+    content = source.read_text() if source.exists() else ""
+    data = tomllib.loads(content)
+    if set(data) - {"IgnoredVulns"} or not isinstance(data.get("IgnoredVulns", []), list):
+        raise ValueError("only [[IgnoredVulns]] is allowed")
+    exemptions = []
+    today = datetime.now(timezone.utc).date()
+    for entry in data.get("IgnoredVulns", []):
+        if (set(entry) != {"id", "reason", "ignoreUntil"}
+                or any(not isinstance(entry.get(k), str) or not entry[k].strip()
+                       for k in ("id", "reason"))):
+            raise ValueError("every exemption needs id, reason and ignoreUntil")
+        expiry = entry["ignoreUntil"]
+        if type(expiry) is not date or expiry > today + timedelta(days=90):
+            raise ValueError("ignoreUntil must be a TOML date no more than 90 days out")
+        exemptions.append(dict(entry, ignoreUntil=expiry.isoformat(), effective=expiry >= today))
+    report["exemptions"] = exemptions
+    config = state / "scan-config.toml"
+    write(config, content)  # One validated snapshot for every root, including an empty file.
+    return config
 
 
 def main():
@@ -45,9 +76,25 @@ def main():
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     report = {"run": now, "status": "incomplete", "roots": [], "errors": []}
     result = 1
+    completed = False
     dated = state / (now.replace(":", "-") + ".json")
-    write(dated, json.dumps(report, indent=2) + "\n")
+
+    def persist():
+        body = json.dumps(report, indent=2) + "\n"
+        write(dated, body)
+        write(state / "latest.json", body)
+        write(dated.with_suffix(".md"), summary(report, dated))
+
+    previous = {}
     try:
+        previous = json.loads((state / "latest.json").read_text())
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as error:
+        report["errors"].append("previous report unreadable: " + str(error))
+    persist()
+    try:
+        config = approved_config(home, state, report)
         refresh = run(["systemctl", "--user", "start", "osv-db-refresh.service"], 1800)
         if refresh.returncode:
             report["errors"].append("osv-db-refresh.service failed: " + refresh.stderr)
@@ -56,7 +103,7 @@ def main():
             raise RuntimeError("osv-scanner 2.6.0 is required")
         for relative, optional in ROOTS:
             root = home / relative
-            entry = {"root": relative}
+            entry = {"root": relative, "status": "incomplete"}
             report["roots"].append(entry)
             if optional and not root.exists():
                 entry["status"] = "not installed"
@@ -67,30 +114,38 @@ def main():
                 args = ["osv-scanner", "scan", "source", "--offline",
                         "--offline-vulnerabilities", "--no-resolve", "--no-ignore", "-r",
                         "--experimental-plugins=python/wheelegg,javascript/packagejson",
-                        "--format=json", "--all-packages"]
+                        "--format=json", "--all-packages", "--config", str(config)]
                 for excluded in EXCLUDES:
                     args += ["--experimental-exclude", "r:(?i)/" + re.escape(excluded) + "(/|$)"]
-                config = root / "osv-scanner.toml"
-                if config.is_symlink():
-                    raise RuntimeError("root config is symlinked")
-                if config.is_file():
-                    args += ["--config", str(config)]
-                if relative == "dev_workspace":
-                    args += ["--allow-no-lockfiles"]
                 scan = run(args + [str(root)], 120)
                 entry.update(exit=scan.returncode, diagnostics=scan.stderr)
                 data = json.loads(scan.stdout)
                 if scan.returncode not in (0, 1) or not isinstance(data.get("results"), list):
                     raise RuntimeError("scanner failed or returned invalid results")
+                packages = [p["package"] for source in data["results"] for p in source["packages"]]
+                entry.update(results=data, package_count=len(packages))
+                if not packages:
+                    raise RuntimeError("empty package results")
+                if re.search(r"(?im)\b(?:error|fatal)\b", scan.stderr):
+                    raise RuntimeError("scanner diagnostics contain errors")
+                if relative in SENTINELS and not any(p["name"] == SENTINELS[relative] for p in packages):
+                    raise RuntimeError("missing sentinel package: " + SENTINELS[relative])
+                baseline = next((r.get("package_count", 0) for r in previous.get("roots", [])
+                                 if r["root"] == relative), 0)
+                if len(packages) < baseline / 2:
+                    raise RuntimeError(f"sharp package count drop: {baseline} to {len(packages)}")
                 entry.update(status="findings" if scan.returncode else "clean", results=data)
-            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
                 entry.update(status="error", error=str(error))
                 report["errors"].append(relative + ": " + str(error))
         result = int(bool(report["errors"]) or any(r["status"] == "findings" for r in report["roots"]))
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        completed = True
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
         report["errors"].append(str(error))
+        completed = True
     finally:
-        report["status"] = "failed" if result else "clean"
+        report["status"] = ("failed" if result else "clean") if completed else "incomplete"
+        persist()  # Reports must survive even a failed/undecodable STATUS update.
         section = summary(report, dated)
         try:
             status = home / "cortex/cortex-core/STATUS.md"
@@ -98,19 +153,17 @@ def main():
             pattern = r"(?ms)^## Security\n.*?(?=^## |\Z)"
             text = re.sub(pattern, lambda match: section + "\n", text) if re.search(pattern, text) else text.rstrip() + "\n\n" + section
             write(status, text)
-        except OSError as error:
+        except (OSError, UnicodeError) as error:
             result = 1
-            report["status"] = "failed"
+            if completed:
+                report["status"] = "failed"
             report["errors"].append("cortex-core security update failed: " + str(error))
-        body = json.dumps(report, indent=2) + "\n"
-        write(dated, body)
-        write(state / "latest.json", body)
-        write(dated.with_suffix(".md"), summary(report, dated))
+            persist()
     return result
 
 
 def terminated(signum, frame):
-    raise RuntimeError("scan terminated")
+    raise SystemExit("scan terminated")
 
 
 if __name__ == "__main__":

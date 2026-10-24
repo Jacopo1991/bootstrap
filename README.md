@@ -1354,14 +1354,22 @@ The scanner is pinned to osv-scanner 2.6.0. Scans use `--offline`,
 plugins. Gitignored environments are included. Scanner path exclusions omit
 customer-harness/CustomerHarness, typo3-dkm/typo3-dkm-plugin/Typo3/DKM,
 photo-organizer, secrets, project-data and .git directories (case insensitive).
-Directory symlinks are not traversed by the scanner. Missing required roots and scan errors fail the run;
-an absent optional GPU environment is explicitly reported.
+Directory and file symlinks are not read by the scanner (covered by fixture canaries).
+Missing required roots and scan errors fail the run; an absent optional GPU
+environment is explicitly reported. Every scanned root must return packages.
+The npm tree must include `@openai/codex`, pre-commit must include `pre-commit`,
+and Inspect must include `inspect-ai`. Error/fatal diagnostics and a package count
+below half of that root's count in the previous `latest.json` fail the run.
 
 Exemptions use native `osv-scanner.toml` `[[IgnoredVulns]]` entries with an advisory
-`id`, `ignoreUntil` and `reason`, as in the bootstrap npm config. A config at a
-listed root is passed explicitly so installed metadata also receives exemptions.
-Project lockfiles otherwise use the scanner's normal config discovery. Root configs
-must be regular files. Expired exemptions expose the finding again.
+`id`, `ignoreUntil` and `reason`. The only approved source is
+`~/.local/share/bootstrap/npm/osv-scanner.toml`; a missing file means no exemptions.
+The wrapper validates it with `tomllib`: non-empty ID and reason, a TOML date no
+more than 90 days ahead, and no other tables or fields. A symlink is refused.
+Every root receives one explicit `--config` pointing to the validated snapshot
+(or an empty file), so configs planted in projects or dependencies have no effect.
+JSON, Markdown and STATUS list the exemptions with reasons, expiry and whether
+they are effective. Expired exemptions expose the finding again.
 
 Dated JSON reports under `~/.local/state/security/` contain scanner findings and
 diagnostics per root; `latest.json` points to the latest result by content. A dated
@@ -1372,8 +1380,10 @@ refresh/scan errors or a failed status update. Provision `SECURITY_WATCH_URL` in
 existing owner-managed pings file to receive these signals. No report body is sent.
 
 Refresh has a 30-minute budget and each of five roots has two minutes, within the
-45-minute unit timeout. An incomplete JSON record is written before work begins.
-Reports use a private umask. This wrapper does not install or repair packages.
+45-minute unit timeout. An incomplete record replaces `latest.json` and the dated
+reports before work begins. SIGTERM stops scanning and leaves an incomplete result
+and failure ping. Reports are written before STATUS, and survive STATUS decode or
+write errors. Reports use a private umask. This wrapper does not install or repair packages.
 `ci/security-watch-test.py` and `ci/osv-db-test.py` use synthetic packages and local
 advisory zip fixtures, temporary HOME/state and stubbed refresh/ping commands; they
 never refresh a real feed or scan an installed environment.
