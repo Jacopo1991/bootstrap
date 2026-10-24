@@ -279,10 +279,12 @@ with tempfile.TemporaryDirectory() as temp:
         for command in ("npm help config", "command -v task just uv npm", "type --all task"):
             assert judge(command) is None, (command, judge(command))
         for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun"):
-            for action in ("help", "help install", "--help", "-h", "--version", "-v"):
+            for action in ("--help", "-h", "--version", "-v"):
                 command = f"{runner} {action}"
                 assert judge(command) is None, (command, judge(command))
-            for action in ("help --prefix other", "help install --global", "--help exec evil"):
+            for action in ("help", "help --prefix other", "help install --global",
+                           "help --prefix", "help install exec", "help ../x", "help a=b",
+                           "--help exec evil"):
                 assert judge(f"{runner} {action}"), (runner, action)
         for command in ("xargs npm install", "setsid npm install", "nohup npm install",
                         "env -S 'npm install'", "sh -c 'npm install'",
@@ -292,6 +294,44 @@ with tempfile.TemporaryDirectory() as temp:
     # Help must not need a package manifest or inspect executable lifecycle hooks.
     with patch.object(policy, "program_text", side_effect=AssertionError("help read a recipe")):
         assert judge("npm help config") is None
+    # Round 3: Yarn/Bun help can be a script shorthand, even with a topic.
+    fixture("package.json", '{"scripts":{"help":"sudo true","check":"node build.js"}}\n')
+    for runner in ("pnpm", "yarn", "yarnpkg", "bun"):
+        for action in ("help", "help config"):
+            assert judge(f"{runner} {action}"), (runner, action)
+    assert judge("npm help config") is None  # Does not execute the help script.
+    fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+    # npm help accepts exactly one literal topic and no config flags on either side.
+    for command in ("npm --userconfig=other help config", "npm --userconfig other help config",
+                    "npm help config --userconfig=other", "npm help config --viewer=browser",
+                    "npm --viewer=browser help config", "npm help --browser=./viewer"):
+        assert judge(command), command
+    for name in ("npm_config_viewer", "NPM_CONFIG_BROWSER", "npm_config_userconfig"):
+        for command in (f"{name}=fixture npm help config", f"env {name}=fixture npm help config"):
+            assert judge(command), command
+        with patch.dict(os.environ, {name: "fixture"}):
+            assert judge("npm help config"), name
+        for location in ("event", "tool_input"):
+            for key in ("env", "environment"):
+                payload = {"tool_name": "Bash", "cwd": temp,
+                           "tool_input": {"command": "npm help config"}}
+                target = payload if location == "event" else payload["tool_input"]
+                target[key] = {name: "fixture"}
+                assert policy.evaluate(payload, (root,)), (name, location, key)
+    # Help needs no manifest, including below a changed ancestor .npmrc.
+    (root / "help-only").mkdir()
+    help_event = {"tool_name": "Bash", "cwd": str(root / "help-only"),
+                  "tool_input": {"command": "npm help config"}}
+    assert policy.evaluate(help_event, (root,)) is None
+    for config_directory in (root, root / "help-only"):
+        config = config_directory / ".npmrc"
+        config.write_text("viewer=browser\nbrowser=./viewer\n")
+        assert policy.evaluate(help_event, (root,)), config
+        config.unlink()
+    (root / ".npmrc").symlink_to("missing-npmrc")
+    assert judge("npm help config")
+    (root / ".npmrc").unlink()
+    assert judge("npm help config") is None
     for command in ("just check", "make check", "npm run check", "pnpm run check"):
         assert judge(command), command  # Unchanged is not an execution exemption.
     assert judge("task check") is None

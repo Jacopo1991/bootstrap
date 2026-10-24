@@ -45,16 +45,15 @@ WRAPPER_OPTIONS = {  # (switches, options taking a value)
 }
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=.*$")
 # Variables that change what runs or where Git looks: never settable from a command.
-UNSAFE_ENV_PREFIXES = ("GIT_", "GH_", "LD_", "DYLD_", "BASH_", "PYTHON", "PERL", "RUBY")
+UNSAFE_ENV_PREFIXES = ("GIT_", "GH_", "LD_", "DYLD_", "BASH_", "PYTHON", "PERL", "RUBY",
+                       "npm_config_", "NPM_CONFIG_")
 UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "VISUAL",
                     "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND", "SHELLOPTS", "ZDOTDIR",
                     "FPATH", "fpath", "path", "cdpath", "EXECIGNORE", "POSIXLY_CORRECT",
                     "NODE_OPTIONS", "NODE_PATH", "SSH_ASKPASS", "GITHUB_TOKEN",
                     "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "MAKEFLAGS", "MFLAGS", "MAKEFILES",
                     "JUSTFILE", "JUST_SHELL", "JUST_SHELL_ARG", "JUST_WORKING_DIRECTORY",
-                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND",
-                    "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
-                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
+                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND"}
 # A Docker socket carries the agent user's full power (bind-mount any readable path, write
 # anywhere the agent can), so lane sessions, which carry TASK_WORKTREE, may not run a container
 # CLI or choose a daemon. Only unsandboxed agent processes use agent's rootless Docker.
@@ -1327,6 +1326,14 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
         return None
     if tool != "Bash":
         return None
+    # npm config can select executables (for example the help viewer/browser).
+    environments = [os.environ]
+    for source in (event, data):
+        environments.extend(source[key] for key in ("env", "environment")
+                            if isinstance(source.get(key), dict))
+    if any(name.startswith(("npm_config_", "NPM_CONFIG_"))
+           for environment in environments for name in environment):
+        return Denial("command.unsafe_environment", "npm configuration environment overrides are blocked.")
     command = data.get("command")
     if not isinstance(command, str) or not command.strip():
         return Denial("input.invalid", "Shell command is unrecognized; blocked by policy.")
@@ -1926,12 +1933,24 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
     package_runner = runner in {"npm", "pnpm", "yarn", "bun"}
     script_name = None
     if package_runner:
-        # Help/version are inspections, including for runners with script shorthand.
-        # Keep the grammar literal so options cannot select another execution mode.
-        if (args in (["--help"], ["-h"], ["--version"], ["-v"])
-                or args and args[0] == "help" and len(args) <= 2
-                and all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", arg)
-                        for arg in args[1:])):
+        # Literal flags are inspections; positional help is npm-only because
+        # other runners may resolve it as a script or binary shorthand.
+        if args in (["--help"], ["-h"], ["--version"], ["-v"]):
+            return None
+        if (runner == "npm" and len(args) == 2 and args[0] == "help"
+                and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args[1])):
+            # No manifest is needed, but a changed .npmrc may select a viewer.
+            try:
+                directory = Path(cwd).resolve()
+                while True:
+                    config = directory / ".npmrc"
+                    if config.is_symlink() or config.exists() and recipe_changed(config, root):
+                        return "Changed runner configuration cannot be judged reliably."
+                    if directory == root or root not in directory.parents:
+                        break
+                    directory = directory.parent
+            except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+                return "Runner configuration cannot be read safely."
             return None
         if args and args[0] in {"exec", "dlx", "x", "create"}:
             return "Fetch-and-run package commands are blocked."
