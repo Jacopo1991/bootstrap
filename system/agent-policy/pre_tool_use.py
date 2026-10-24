@@ -52,9 +52,7 @@ UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "V
                     "NODE_OPTIONS", "NODE_PATH", "SSH_ASKPASS", "GITHUB_TOKEN",
                     "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "MAKEFLAGS", "MFLAGS", "MAKEFILES",
                     "JUSTFILE", "JUST_SHELL", "JUST_SHELL_ARG", "JUST_WORKING_DIRECTORY",
-                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND",
-                    "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
-                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
+                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND"}
 # A Docker socket carries the agent user's full power (bind-mount any readable path, write
 # anywhere the agent can), so lane sessions, which carry TASK_WORKTREE, may not run a container
 # CLI or choose a daemon. Only unsandboxed agent processes use agent's rootless Docker.
@@ -1951,7 +1949,10 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
             return None
         if (runner == "npm" and args[:1] == ["help"] and (len(args) == 1 or
                 len(args) == 2 and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args[1]))):
-            # No manifest is needed, but a changed .npmrc may select a viewer.
+            # Inspect only ancestor .npmrc files within the repository: a changed
+            # one may select a viewer. User/global npmrc are not inspected here.
+            # Managed Claude Read denies ~/.npmrc (not a Codex read restriction);
+            # sandbox write roots exclude home npmrc and the global config.
             try:
                 directory = Path(cwd).resolve()
                 while True:
@@ -2318,9 +2319,10 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     unwrapped = unwrap_command(tokens)
     if isinstance(unwrapped, str):
         return unwrapped
-    npm_config_override |= any(
+    inline_npm_config = any(
         ENV_ASSIGNMENT.fullmatch(token) and token.split("=", 1)[0].lower().startswith("npm_config_")
         for token in tokens[:len(tokens) - len(unwrapped)])
+    npm_config_override |= inline_npm_config
     tokens = unwrapped
     if not tokens:
         return None
@@ -2328,6 +2330,10 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     external = external_binary(tokens[0], cwd, root)
     if external is not None:
         executable = external.name.lower()
+    # npm configuration is command-specific, regardless of key or spelling.
+    # Evaluated wrappers have been stripped, including their env assignments.
+    if inline_npm_config and executable in {"npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"}:
+        return Denial("command.unsafe_environment", "Inline npm configuration on package commands is blocked.")
     if executable in {"printf", "echo"} and not print_allowlist(tokens):
         return "Shell print syntax cannot be judged safely."
     if re.match(r"(?:\d*[<>]|&[<>])", tokens[0]) or (

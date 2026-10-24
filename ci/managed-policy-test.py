@@ -17,6 +17,7 @@ import re
 import subprocess
 import tempfile
 import tomllib
+import types
 from unittest.mock import patch
 
 from policy_test_env import isolate_policy_environment
@@ -273,6 +274,80 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
     fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
     fixture_git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     fixture_git("checkout", "-qb", "lane")
+    # Round 6: measure the compatibility claim against the actual pinned main
+    # hook, never a second implementation of its rules. Commands are inert data.
+    main_source = subprocess.run(
+        ["git", "-C", str(ROOT), "show", "69870f4:system/agent-policy/pre_tool_use.py"],
+        capture_output=True, text=True, check=True).stdout
+    main_policy = types.ModuleType("t39_main_policy")
+    main_policy.__file__ = str(ROOT / "system/agent-policy/pre_tool_use.py")
+    exec(compile(main_source, main_policy.__file__, "exec"), main_policy.__dict__)
+    fixture("package.json", '{"scripts":{"check":"echo safe"}}\n')
+    with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
+        def compare(command):
+            event = {"tool_name": "Bash", "cwd": temp, "tool_input": {"command": command}}
+            return (main_policy.evaluate(event, (root,)), policy.evaluate(event, (root,)))
+
+        names = [case("npm_config_" + name)
+                 for name in ("userconfig", "globalconfig", "script_shell", "prefix",
+                              "min_release_age", "viewer", "browser", "loglevel")
+                 for case in (str.lower, str.upper, str.title)]
+        regressions = []
+        main_refusals = 0
+        for name in names:
+            for command in ("npm run check", "npm install x", "npx x", "npm help config"):
+                text = f"{name}=fixture {command}"
+                before, after = compare(text)
+                main_refusals += bool(before)
+                if before and not after:
+                    regressions.append(text)
+                assert after, ("inline package config must be refused", text)
+            # Cover every known manager, with and without evaluated wrappers.
+            for runner in ("npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"):
+                for prefix in ("", "env ", "timeout 3 env "):
+                    text = f"{prefix}{name}=fixture {runner} --version"
+                    reason = judge(text)
+                    assert reason and reason.rule_id == "command.unsafe_environment", (text, reason)
+        assert not regressions, regressions
+        print(f"T-39 inline table: {len(names) * 4} inputs, {main_refusals} main refusals preserved")
+        viewer = "NPM_CONFIG_VIEWER=browser NPM_CONFIG_BROWSER=./x.sh"
+        for command in ("yarn help", "yarn help x", f"{viewer} npm help config"):
+            before, after = compare(command)
+            assert before and after, (command, before, after)
+        with patch.dict(os.environ, {"NPM_CONFIG_VIEWER": "browser", "NPM_CONFIG_BROWSER": "./x.sh"}):
+            before, after = compare("npm help config")
+            assert before and after, (before, after)
+
+        newly_allowed = set()
+        inspections = ["npm help", "npm help config", "command -v task just uv npm",
+                       "command -v task >/dev/null", "command -v task >/dev/null 2>&1"]
+        inspections += [f"{runner} {flag}" for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun")
+                        for flag in ("--help", "-h", "--version", "-v")]
+        inspections += [f"{name}=fixture {command}" for name in names
+                        for command in ("git status", "task check")]
+        for command in inspections:
+            before, after = compare(command)
+            assert after is None, (command, after)
+            if before:
+                newly_allowed.add(command)
+        expected = {"npm help", "npm help config", "command -v task just uv npm",
+                    "command -v task >/dev/null", "command -v task >/dev/null 2>&1"}
+        expected |= {f"{runner} {flag}" for runner in ("npm", "pnpm") for flag in ("-h", "-v")}
+        expected |= {f"{runner} {flag}" for runner in ("yarn", "yarnpkg", "bun")
+                     for flag in ("--help", "-h", "--version", "-v")}
+        expected |= {f"{name}=fixture {command}"
+                     for name in ("npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
+                                  "npm_config_prefix", "NPM_CONFIG_PREFIX")
+                     for command in ("git status", "task check")}
+        assert newly_allowed == expected, ("unexpected main compatibility delta", newly_allowed ^ expected)
+        print("T-39 newly allowed against 69870f4:", *sorted(newly_allowed), sep="\n  ")
+        # Verify the configuration-boundary comment using policy/config data;
+        # never open the user's npmrc or a machine configuration file.
+        assert "Read(~/.npmrc)" in managed["permissions"]["deny"]
+        for path in ("/nonexistent/.npmrc", "/etc/npmrc", "/usr/local/etc/npmrc"):
+            event = {"tool_name": "Write", "cwd": temp, "tool_input": {"file_path": path}}
+            assert policy.evaluate(event, (root,)).rule_id == "filesystem.write_boundary", path
+    fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
     # T-39: npm help config is quoted exactly in the t37 fixtures. The wrapper
     # command is absent; reconstruct the executable-location inspection described
     # there as a plain lookup of the task, gate and installer tools.
