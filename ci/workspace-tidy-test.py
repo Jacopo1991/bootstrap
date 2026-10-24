@@ -15,6 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from hold_fixture import install_checker
+from unit_fixture import install_units
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "home/dot_local/bin/executable_workspace-tidy"
@@ -48,6 +49,7 @@ def tidy_environment(home):
     bin_dir = home / 'bin'
     bin_dir.mkdir(exist_ok=True)
     install_checker(home)
+    install_units(home)
     task = bin_dir / 'task'
     task.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
     task.chmod(0o755)

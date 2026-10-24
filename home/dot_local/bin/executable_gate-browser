@@ -4,6 +4,7 @@ import argparse
 import glob
 import json
 import os
+import runpy
 from pathlib import Path
 import signal
 import subprocess
@@ -40,12 +41,25 @@ def main():
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--port-offset", type=int, default=0)
     parser.add_argument("specs", nargs="+", help="quoted spec globs, relative to project root")
+    parser.add_argument('--_unit', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not args._unit:
+        tool = Path.home() / '.local/bin/task'
+        helper = runpy.run_path(str(tool), run_name='browser_launch')
+        environment = helper['trusted_check_environment'](Path.cwd(), os.environ['TASK_GATE_RUN_ID'],
+            {key: os.environ[key] for key in ('TMPDIR', 'TASK_GATE_SLOT', 'TASK_GATE_PORT_BASE')})
+        process = helper['launch_unit']('browser', Path.cwd(), 'gate',
+            [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], '--_unit'],
+            cwd=Path.cwd(), env=environment)
+        code = process.wait()
+        record = Path(tempfile.mkdtemp(prefix='gate-browser-', dir=os.environ['TMPDIR'])) / 'unit.json'
+        helper['atomic_json'](record, dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code))
+        print(f'gate-browser: {"skipped: hold" if process.skipped else code}; unit: {process.unit}; record: {record}')
+        return 1 if process.skipped else code
     server = runner = None
     out = None
     status = 1
     try:
-        admit()
         base = int(os.environ["TASK_GATE_PORT_BASE"])
         if not (0 <= args.port_offset < 200 and 1024 <= base <= 65336):
             raise ValueError("invalid gate port base or offset (0..199)")
@@ -91,7 +105,6 @@ def main():
             "  });\n"
             "});\n" + "\n".join(f"require({json.dumps(p)});" for p in specs) + "\n")
         with (out / "server.log").open("w") as log:
-            admit()
             server = subprocess.Popen(["bash", "-c", args.server], env=env,
                                       stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -113,7 +126,6 @@ def main():
                 if time.monotonic() >= deadline:
                     raise ValueError("server readiness timed out")
                 time.sleep(0.1)
-            admit()
             runner = subprocess.Popen([str(playwright), "test", "--config",
                                        str(out / "playwright.config.cjs")],
                                       env=env, start_new_session=True)
@@ -131,7 +143,6 @@ def interrupted(signum, frame):
     raise KeyboardInterrupt
 
 
-def admit(): subprocess.run([str(Path.home() / '.local/bin/task'), 'hold', '--check'], check=True)
 
 
 if __name__ == "__main__":

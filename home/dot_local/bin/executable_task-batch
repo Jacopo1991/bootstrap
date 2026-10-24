@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import runpy
 import shlex
 import subprocess
 import sys
@@ -126,8 +127,6 @@ def git(repo, *args):
     return result.stdout.strip()
 
 
-def admit():
-    if subprocess.run([str(Path.home() / '.local/bin/task'), 'hold', '--check']).returncode: raise Stop('refused: hold')
 
 
 def blocking(text):
@@ -148,7 +147,6 @@ def default_branch(path):
 
 
 def run_git(path, *args):
-    if args[:1] not in [('rev-parse',), ('status',), ('log',), ('diff',), ('rev-list',), ('merge-base',), ('merge-tree',)]: admit()
     return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True)
 
 
@@ -210,7 +208,6 @@ class Batch:
                 if self.stopping.is_set():
                     raise Stop("batch is stopping")
                 self.output("+ " + shlex.join(argv))
-                admit()
                 child = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, pass_fds=task_lock.descriptors())
             with child:
                 while True:
@@ -579,13 +576,24 @@ def main():
     parser.add_argument("repo")
     parser.add_argument("runner_file", type=Path)
     parser.add_argument("--no-pace", action="store_true", help="start without the usage-pacing check (logged)")
+    parser.add_argument('--_unit', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    try: admit()
-    except (Stop, OSError) as error: print(f'task-batch: {error}', file=sys.stderr); return 1
     repo = Path(args.repo).expanduser()
     if not repo.is_absolute():
         repo = Path.home() / "dev_workspace" / repo
     batch = Batch(repo.resolve(), args.runner_file.resolve(), no_pace=args.no_pace)
+    if not args._unit:
+        tool = Path.home() / '.local/bin/task'
+        helper = runpy.run_path(str(tool), run_name='batch_launch')
+        environment = helper['agent_environment']()
+        command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], '--_unit']
+        process = helper['launch_unit']('runner', batch.repo, batch.source.stem, command,
+                                        cwd=batch.repo, env=environment)
+        code = process.wait()
+        helper['atomic_json'](batch.source.with_suffix('.unit.json'),
+                              dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code))
+        if process.skipped: batch.append('batch: stopped: skipped: hold')
+        return 1 if process.skipped else code
     try:
         batch.repo = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
         batch.done = batch.repo / ".work" / batch.source.with_suffix(".done").name

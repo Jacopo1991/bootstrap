@@ -31,6 +31,7 @@ from unittest import mock
 from pathlib import Path
 
 from policy_test_env import isolate_policy_environment
+from unit_fixture import install_units
 
 # Keep only explicit test selection and trusted-gate socket-test semantics.
 isolate_policy_environment("TASK_TEST_TOOL", "TASK_GATE_RUN_ID")
@@ -46,7 +47,8 @@ HOLD_FIXTURE = Path(audit_state.name) / 'etc/agent-hold'
 HOLD_FIXTURE.parent.mkdir()
 def hold_fixture_source(source):
     assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
-    return source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
+    source = source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
+    return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'}")
 fixture_bin = Path(audit_state.name) / 'bin'
 fixture_bin.mkdir()
 for sibling in TOOL.parent.iterdir():
@@ -231,38 +233,116 @@ sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else c
 
 
 class TaskTool(unittest.TestCase):
-    def test_hold_work_commands_refuse_both_markers_before_any_launch(self):
-        commands = [
-            ('start', 'proj', 'docs', '--builder', 'codex'),
-            ('start', 'proj', 'docs', '--builder', 'codex', '--refresh'),
-            ('lane', 'proj', '5'),
-            ('review', 'proj', '5', '--run'), ('merge', 'proj', '5'),
-            ('merge', 'proj', '5', '--detach'), ('runner-start', 'proj', 'runner-b1.md'),
-            ('check', 'proj', '5'), ('check', 'proj', '5', '--detach'),
-            ('check',), ('check', '--detach'), ('repair', 'proj'),
-            ('realign', 'proj'), ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
-            ('plan', 'proj', '--sign'),
-        ]
-        self.assertEqual(TASK_MODULE.HOLD_WORK_COMMANDS,
-                         {'start', 'lane', 'check', 'merge', 'runner-start', 'realign', 'close', 'repair'})
-        runner = self.runner_fixture('setsid')
-        agent = self.home / '.local/state/task/hold'
-        for marker in (HOLD_FIXTURE, agent):
+    def test_units_hold_all_launch_kinds_and_merge_entry(self):
+        self.stub_models()
+        self.stub_reviewers()
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('Build the task.')
+        runner = self.runner_fixture()
+        for marker in (HOLD_FIXTURE, self.home / '.local/state/task/hold'):
             with self.subTest(marker=marker):
-                marker.write_text('human reason; not JSON and no parsed mode')
+                marker.write_text('unit admission hold')
                 try:
-                    for command in commands:
-                        output = self.raw_task(*command, code=1, env=dict(self.env,
-                            TASK_HOLD_SHARED=str(self.home / 'absent'), AGENT_HOLD_STATE=str(self.home / 'absent')))
-                        self.assertIn(str(marker), output, command)
-                        self.assertIn('human reason', output, command)
-                        self.assertIn('Release:', output, command)
-                    self.assertFalse((self.home / 'service-args').exists())
+                    for command, record in (
+                            (('lane', 'proj', '5'), work / 'lane.json'),
+                            (('review', 'proj', '5', '--run', '--no-check', 'hold fixture'), self.state() / 'review-run.json'),
+                            (('check', 'proj', '5'), self.state() / 'check.json'),
+                            (('runner-start', 'proj', str(runner)), runner.with_suffix('.json'))):
+                        self.assertIn('skipped: hold', self.raw_task(*command, code=1))
+                        data = json.loads(record.read_text())
+                        self.assertEqual(data.get('state', data.get('result')), 'skipped: hold')
+                        self.assertTrue(data.get('unit') or data['steps'][0]['unit'])
+                    before = (self.home / 'unit-calls.jsonl').read_text()
+                    output = self.raw_task('merge', 'proj', '5', code=1)
+                    self.assertIn('unit admission hold', output)
+                    self.assertEqual((self.home / 'unit-calls.jsonl').read_text(), before)
+                    for kind, arguments in (
+                            ('executable_task-batch', ['proj', str(runner)]),
+                            ('executable_workspace-tidy', ['--apply']),
+                            ('executable_gate-browser', ['--server', 'touch forbidden-server', 'missing.spec.cjs'])):
+                        result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin' / kind), *arguments],
+                            cwd=wt, env=dict(self.env, TASK_GATE_RUN_ID='hold-test', TASK_GATE_PORT_BASE='22000',
+                                             TASK_GATE_SLOT='0', TMPDIR=str(work)), capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn('skipped: hold', result.stdout + result.stderr)
+                    self.assertFalse((work / 'model-call.json').exists())
+                    self.assertFalse((work / 'reviewer-call.json').exists())
                     self.assertFalse((runner.parent / 'runner-call').exists())
-                    self.assertFalse((self.repo / '.worktrees').exists())
-                    self.assertFalse((self.state('docs') / 'task.json').exists())
                 finally:
                     marker.unlink()
+
+    def test_units_unheld_run_and_pulling_hold_does_not_stop_running_unit(self):
+        wt, _ = self.started()
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            for kind in ('lane', 'review', 'gate', 'runner', 'browser', 'tidy'):
+                target = self.home / kind
+                process = TASK_MODULE.launch_unit(kind, self.repo, 'proof', ['touch', str(target)],
+                                                  cwd=self.repo, env=TASK_MODULE.agent_environment())
+                self.assertEqual(process.wait(timeout=10), 0)
+                self.assertTrue(target.exists())
+            process = TASK_MODULE.launch_unit('lane', self.repo, 'drain', ['sleep', '30'],
+                                              cwd=self.repo, env=TASK_MODULE.agent_environment())
+            try:
+                self.raw_task('hold', 'pull', 'drain the running unit')
+                self.assertIsNone(process.poll())
+                self.assertFalse((self.home / 'stopped').exists())
+                (wt / '.work/lane.json').write_text(json.dumps(dict(state='running', pid=process.pid,
+                    unit=process.unit, process_start=TASK_MODULE.task_usage.process_start(process.pid))))
+                self.raw_task('cancel', 'proj', '5')
+                self.assertEqual((self.home / 'stopped').read_text(), process.unit)
+            finally:
+                if process.poll() is None: process.stop()
+                else: process.wait()
+                self.raw_task('hold', 'release')
+
+    def test_unit_missing_systemd_fails_closed_without_process_fallback(self):
+        with mock.patch.object(TASK_MODULE.subprocess, 'Popen', side_effect=FileNotFoundError('systemd-run')) as launch:
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'systemd-run --user unavailable; launch failed closed'):
+                TASK_MODULE.launch_unit('lane', self.repo, 'missing', ['touch', str(self.home / 'forbidden')],
+                                        cwd=self.repo, env={})
+            self.assertEqual(launch.call_count, 1)
+        self.assertFalse((self.home / 'forbidden').exists())
+
+    def test_merge_has_exactly_one_entry_hold_check(self):
+        import ast
+        tree = ast.parse(TOOL.read_text())
+        merge = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'merge')
+        checks = [node for node in ast.walk(merge) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == 'hold']
+        self.assertEqual(len(checks), 1)
+        self.assertIs(merge.body[0].value, checks[0])
+
+    def test_unit_launch_proof_codex_and_claude_sandbox_commands(self):
+        self.stub_models()
+        wt, _ = self.started()
+        work = wt / '.work'
+        prompt = work / 'proof-prompt'
+        prompt.write_text('sandbox launch proof')
+        for vendor, command in (
+                ('codex', ['codex', 'exec', '--sandbox', 'workspace-write', '--model', 'gpt-6.1-sol',
+                           '--output-last-message', str(work / 'proof-final'), '-']),
+                ('claude', ['claude', '-p', '--permission-mode', 'acceptEdits',
+                            '--allowedTools', 'Bash Read Write Edit Glob Grep'])):
+            with self.subTest(vendor=vendor), mock.patch.dict(os.environ, self.env, clear=True):
+                environment = TASK_MODULE.lane_environment(TASK_MODULE.Task(self.repo, '5'), vendor)
+                with prompt.open() as source, (work / 'proof.log').open('w') as output:
+                    process = TASK_MODULE.launch_unit('lane', self.repo, 't5', command,
+                        cwd=wt, env=environment, stdin=source, stdout=output, stderr=output)
+                    self.assertEqual(process.wait(timeout=10), 0)
+                call = json.loads((work / 'model-call.json').read_text())
+                self.assertEqual(call['args'], command[1:])
+                self.assertEqual(call['cwd'], str(wt))
+                self.assertEqual(call['prompt'], 'sandbox launch proof')
+                self.assertEqual(call['tmpdir'], environment['TMPDIR'])
+                recorded = json.loads((self.home / 'unit-calls.jsonl').read_text().splitlines()[-1])
+                self.assertEqual(recorded['env'], environment)
+                self.assertIn('--user', recorded['args'])
+                self.assertIn(f'ExecCondition={self.home}/.local/bin/task hold --check', recorded['args'])
+                self.assertRegex(process.unit, r'^task-lane-proj-t5-[a-f0-9]+$')
+                self.assertGreater(process.pid, 0)
+                TASK_MODULE.cleanup_lane_temporary(environment['TMPDIR'] if vendor == 'claude' else None)
+
 
     def test_hold_read_only_commands_and_release_preserves_jacopo(self):
         self.started()
@@ -411,324 +491,22 @@ class TaskTool(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, 'exactly one'):
                 hold_fixture_source(source)
 
-    def test_hold_direct_helpers_refuse_before_side_effects(self):
-        helpers = [
-            ('executable_task-batch', ['proj', 'missing-runner.md']),
-            ('executable_workspace-tidy', ['--apply']),
-            ('executable_gate-browser', ['--server', 'touch launched', '*.spec.cjs']),
-        ]
-        shadow = self.home / 'bin/task'
-        shadow.unlink()
-        shadow.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
-        shadow.chmod(0o755)
-        marker = self.home / '.local/state/task/hold'
-        for path in (HOLD_FIXTURE, marker):
-            path.write_text('direct helper hold')
-            try:
-                for name, args in helpers:
-                    with self.subTest(marker=path, helper=name):
-                        result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin' / name), *args],
-                            cwd=self.home, env=dict(self.env, TASK_GATE_RUN_ID='hold-test'),
-                            capture_output=True, text=True, timeout=10)
-                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                        self.assertIn('direct helper hold', result.stdout + result.stderr)
-                        self.assertFalse((self.home / 'launched').exists())
-                        self.assertFalse((self.home / '.local/state/workspace-tidy').exists())
-                        self.assertFalse((self.repo / '.work').exists())
-                        self.assertFalse((self.home / 'hostile-checker-used').exists())
-                # Report-only tidy and the lane browser skip launch nothing.
-                result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin/executable_workspace-tidy')],
-                    env=self.env, capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                shutil.rmtree(self.home / '.local/state/workspace-tidy')
-            finally:
-                path.unlink()
 
-    def test_hold_helpers_refuse_when_absolute_checker_is_missing(self):
-        (self.home / '.local/bin/task').unlink()
-        shadow = self.home / 'bin/task'
-        shadow.unlink()
-        shadow.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
-        shadow.chmod(0o755)
-        helpers = [('executable_task-batch', ['proj', 'missing.md']),
-                   ('executable_workspace-tidy', ['--apply']),
-                   ('executable_gate-browser', ['--server', 'touch launched', '*.spec.cjs'])]
-        for helper, args in helpers:
-            result = subprocess.run([sys.executable, str(ROOT / 'home/dot_local/bin' / helper), *args],
-                cwd=self.home, env=dict(self.env, TASK_GATE_RUN_ID='fixture'),
-                capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn(str(self.home / '.local/bin/task'), result.stderr)
-        self.assertFalse((self.home / 'hostile-checker-used').exists())
-        self.assertFalse((self.home / 'launched').exists())
-        self.assertFalse((self.home / '.local/state/workspace-tidy').exists())
 
-    def test_hold_pulled_during_gate_slot_wait_prevents_launch(self):
-        wt, _ = self.started()
-        script = self.home / 'during-check.sh'
-        script.write_text(f'#!/bin/sh\ntouch "{self.home}/gate-launched"\n')
-        script.chmod(0o755)
-        (wt / '.task.toml').write_text('exclusive_gate = true\n')
-        self.git(wt, 'add', '.task.toml')
-        self.git(wt, 'commit', '-qm', 'exclusive gate')
-        lock = self.gate_dir / 'agent-task-gate.lock'
-        transcript = self.home / 'waiting-check.log'
-        with lock.open('a') as held, transcript.open('w') as output:
-            fcntl.flock(held, fcntl.LOCK_EX)
-            process = subprocess.Popen([sys.executable, str(TOOL), 'check', 'proj', '5'],
-                cwd=self.home, env=self.env, stdout=output, stderr=subprocess.STDOUT)
-            try:
-                deadline = time.monotonic() + 10
-                while 'Waiting for exclusive task gate' not in transcript.read_text():
-                    self.assertIsNone(process.poll(), transcript.read_text())
-                    self.assertLess(time.monotonic(), deadline, transcript.read_text())
-                    time.sleep(.02)
-                self.raw_task('hold', 'pull', 'hold during slot wait')
-                fcntl.flock(held, fcntl.LOCK_UN)
-                self.assertEqual(process.wait(timeout=10), 1)
-            finally:
-                if process.poll() is None: process.kill(); process.wait()
-        self.assertIn('hold during slot wait', transcript.read_text())
-        self.assertFalse((self.home / 'gate-launched').exists())
-        self.assertFalse((self.state() / 'check.json').exists())
 
-    def test_hold_pulled_while_lane_worker_waits_on_lane_lock(self):
-        self.stub_models()
-        wt, _ = self.started()
-        work = wt / '.work'
-        (work / 'prompt.md').write_text('Do the task.\n')
-        ready = self.home / 'waiting-lane-lock'
-        script = self.home / 'lane-worker.py'
-        script.write_text(textwrap.dedent(f'''\
-            import fcntl, json, os, pathlib, runpy
-            module = runpy.run_path({str(TOOL)!r})
-            work = pathlib.Path({str(work)!r})
-            (work / 'lane.json').write_text(json.dumps(dict(pid=os.getpid(), state='running')))
-            original = fcntl.flock
-            def flock(stream, flags):
-                if getattr(stream, 'name', '') == str(work / 'lane.lock'):
-                    pathlib.Path({str(ready)!r}).touch()
-                return original(stream, flags)
-            fcntl.flock = flock
-            raise SystemExit(module['main'](['lane', 'proj', '5', '--_worker', '--no-boost']))
-            '''))
-        transcript = self.home / 'waiting-lane.log'
-        with (work / 'lane.lock').open('a') as lock, transcript.open('w') as output:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            process = subprocess.Popen([sys.executable, str(script)], cwd=wt, env=self.env,
-                                       stdout=output, stderr=subprocess.STDOUT)
-            try:
-                self.wait_runner_file(ready)
-                self.assertIsNone(process.poll())
-                self.raw_task('hold', 'pull', 'hold during lane lock wait')
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                self.assertEqual(process.wait(timeout=10), 1, transcript.read_text())
-            finally:
-                if process.poll() is None: process.kill(); process.wait()
-        self.assertIn('refused: hold', transcript.read_text())
-        self.assertFalse((work / 'model-call.json').exists())
-        self.assertEqual(json.loads((work / 'lane.json').read_text())['state'], 'refused: hold')
 
-    def test_hold_round7_run_record_does_not_bypass_command_entry(self):
-        commands = [('start', 'proj', 'docs', '--builder', 'codex'),
-                    ('lane', 'proj', '5'), ('runner-start', 'proj', 'runner.md'),
-                    ('realign', 'proj'), ('close', 'proj', '5', '-m', 'done', '--retro', 'retro'),
-                    ('repair', 'proj'), ('plan', 'proj', '--sign'),
-                    ('review', 'proj', '5', '--run')]
-        self.assertEqual({c[0] for c in commands} - {'plan', 'review'},
-                         TASK_MODULE.HOLD_WORK_COMMANDS - {'check', 'merge'})
-        self.raw_task('hold', 'pull', 'entry hold with ambient run record')
-        for command in commands:
-            with self.subTest(command=command):
-                output = self.raw_task(*command, code=1,
-                    env=dict(self.env, TASK_RUN_RECORD=str(self.home / 'ambient-run.json')))
-                self.assertIn('entry hold with ambient run record', output)
-                self.assertIn('refused: hold', output)
-        self.assertFalse((self.home / 'ambient-run.json').exists())
 
-    def test_hold_round7_reviewer_plan_reservation_is_removed_without_charge(self):
-        wt, _ = self.started()
-        self.budget_fixture(points=1)
-        prompt, reply = wt / '.work/review-prompt.md', wt / '.work/review-response.md'
-        prompt.write_text('Review the task.\n')
-        before = self.run_rows()
-        self.raw_task('hold', 'pull', 'hold at planned reviewer launch')
-        with self.budget_environment() as api, mock.patch.object(api.subprocess, 'Popen') as launch:
-            for _ in range(2):
-                with self.assertRaisesRegex(api.HoldRefused, 'refused: hold'):
-                    api.run_reviewer('codex exec -m gpt-6-luna', wt, prompt, reply)
-                self.assertEqual(self.run_rows(), before)
-                self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
-                self.assertIn('codex used 0 left 1', api.plan_budget('chain'))
-                self.assertIn('disabled []', api.plan_budget('chain'))
-            launch.assert_not_called()
-        self.assertEqual(json.loads(reply.with_name('review-run.json').read_text())['state'], 'refused: hold')
 
-    def assert_hold_during_child_startup(self, kind, plan=False):
-        self.stub_models()
-        wt, _ = self.started()
-        work = wt / '.work'
-        (work / 'prompt.md').write_text('Do the task.\n')
-        rounds = self.state() / 'rounds.json'
-        rounds.write_text(json.dumps(dict(used=1, extra=0, previous='preserve')))
-        rounds_before = json.loads(rounds.read_text())
-        before = self.run_rows()
-        if plan: self.budget_fixture(points=1)
-        ready, resume = self.home / 'child-ready', self.home / 'child-resume'
-        # Pause the actual launched child before main(), after the launcher has admitted it.
-        # Source already contains the asserted /etc fixture seam; modules stay read-only links.
-        tools = self.home / 'startup-tools'
-        tools.mkdir()
-        for sibling in TOOL.parent.iterdir():
-            if sibling != TOOL:
-                (tools / sibling.name).symlink_to(sibling)
-        tool = tools / TOOL.name
-        startup = textwrap.dedent(f'''\
-            if __name__ == '__main__' and ('--_worker' in sys.argv or os.environ.get('TASK_RUN_RECORD')):
-                Path({str(ready)!r}).touch()
-                deadline = time.monotonic() + 15
-                while not Path({str(resume)!r}).exists():
-                    if time.monotonic() >= deadline: raise RuntimeError('startup handshake timed out')
-                    time.sleep(.01)
 
-            ''')
-        source = TOOL.read_text()
-        entry = 'if __name__ == "__main__":'
-        self.assertEqual(source.count(entry), 1)
-        tool.write_text(source.replace(entry, startup + entry))
-        command = (['lane', 'proj', '5', '--no-boost'] if kind == 'lane'
-                   else [kind, 'proj', '5', '--detach'])
-        launched = subprocess.run([sys.executable, str(tool), *command], env=dict(self.env, TASK_PLAN='chain') if plan else self.env,
-                                  cwd=wt, capture_output=True, text=True, timeout=10)
-        self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
-        record = work / 'lane.json' if kind == 'lane' else self.state() / 'run.json'
-        try:
-            self.wait_runner_file(ready)
-            self.assertEqual(json.loads(record.read_text())['state'], 'running')
-            self.raw_task('hold', 'pull', 'hold during child startup')
-        finally:
-            resume.touch()
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            run = json.loads(record.read_text())
-            if run['state'] != 'running' and not (self.state() / 'run.lock').exists():
-                break
-            time.sleep(.02)
-        self.assertEqual(run['state'], 'refused: hold')
-        self.assertTrue(run['ended_at'])
-        self.assertFalse((self.state() / 'run.lock').exists())
-        self.assertFalse((work / 'model-call.json').exists())
-        self.assertFalse((self.state() / 'check.json').exists())
-        self.assertIn('refused: hold', self.raw_task('wait', 'proj', '5'))
-        log = self.home / '.local/state/task/runs.jsonl'
-        rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-        self.assertFalse(any(row.get('outcome') == 'interrupted' for row in rows), rows)
-        if kind == 'lane':
-            self.assertEqual(json.loads(rounds.read_text()), rounds_before)
-        if plan:
-            self.assertEqual(rows, before)
-            self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
-            self.assertIn('codex used 0 left 1', self.raw_task('plan-budget', 'chain'))
-        elif kind == 'lane':
-            outcomes = [row for row in rows if row.get('outcome') and row.get('kind') == 'lane']
-            self.assertEqual(len(outcomes), 1, rows)
-            self.assertEqual(outcomes[0]['outcome'], 'failed')
-            self.assertEqual(outcomes[0]['reason'], 'refused: hold')
 
-    def test_hold_round6_lane_worker_startup_finalizes_refusal(self):
-        self.assert_hold_during_child_startup('lane')
 
-    def test_hold_round6_detached_check_startup_finalizes_refusal(self):
-        self.assert_hold_during_child_startup('check')
 
-    def test_hold_round7_planned_worker_startup_restores_round_and_reservation(self):
-        self.assert_hold_during_child_startup('lane', plan=True)
 
-    def test_hold_round7_detached_merge_startup_finalizes_refusal(self):
-        self.assert_hold_during_child_startup('merge')
-
-    def test_hold_round5_worker_stop_records_distinguish_hold(self):
-        self.stub_models()
-        wt, _ = self.started()
-        work = wt / '.work'
-        (work / 'prompt.md').write_text('Do the task.\n')
-        record = work / 'lane.json'
-        config = wt / '.task.toml'
-        args = SimpleNamespace(repo=str(self.repo), id='5', builder='codex', tier=None,
-                               model='gpt-6.1-sol', no_boost=True, _worker=True, effort='high',
-                               timeout=None, override='')
-        claude_root = self.home / 'claude-root'
-        claude_root.mkdir(mode=0o700)
-        bad_tmp = self.home / 'bad-tmp'
-        bad_tmp.mkdir()
-        # Run the real root validators against an isolated /tmp stand-in.
-        for prefix in ('claude', 'task-gate'):
-            (bad_tmp / f'{prefix}-{os.getuid()}').mkdir(mode=0o777)
-            (bad_tmp / f'{prefix}-{os.getuid()}').chmod(0o777)
-        advisory_root = bad_tmp / 'advisory'
-        advisory_root.mkdir(mode=0o777)
-        advisory_root.chmod(0o777)
-        popen = subprocess.Popen
-        def invalid_root(function):
-            def validate():
-                with mock.patch.object(TASK_MODULE, 'Path',
-                        side_effect=lambda value: bad_tmp if value == '/tmp' else Path(value)):
-                    return function()
-            return validate
-        cases = [
-            ('env table', 'env = 1\n', 'codex', None, None),
-            ('reserved env', '[env]\nTMPDIR = "bad"\n', 'codex', None, None),
-            ('credential env', '[env]\nAPI_TOKEN = "fixture"\n', 'codex', None, None),
-            ('invalid env name', '[env]\n"bad-name" = "x"\n', 'codex', None, None),
-            ('invalid env value', '[env]\nNORMAL = 1\n', 'codex', None, None),
-            ('NUL env value', '[env]\nNORMAL = "\\u0000"\n', 'codex', None, None),
-            ('unreadable config', '[env\n', 'codex', None, None),
-            ('escaped lane tmp', '', 'codex', None, None),
-            ('advisory root', '', 'codex', 'lane_temporary_root', lambda: advisory_root),
-            ('claude root', '', 'claude', 'claude_temporary_root',
-             invalid_root(TASK_MODULE.claude_temporary_root)),
-            ('gate root', '', 'claude', 'gate_temporary_root',
-             invalid_root(TASK_MODULE.gate_temporary_root)),
-            ('generic Stop', '', 'codex', 'admit',
-             TASK_MODULE.Stop('refused: hold is only text, not a HoldRefused')),
-            ('hold', '', 'codex', None, None),
-        ]
-        for label, contents, builder, target, failure in cases:
-            with self.subTest(reason=label), contextlib.ExitStack() as stack:
-                config.write_text(contents)
-                record.write_text(json.dumps(dict(pid=os.getpid(), state='running')))
-                args.builder = builder
-                args.model = 'opus' if builder == 'claude' else 'gpt-6.1-sol'
-                stack.enter_context(mock.patch.dict(os.environ, self.env, clear=True))
-                stack.enter_context(mock.patch.object(TASK_MODULE, 'claude_temporary_root', return_value=claude_root))
-                launch = mock.Mock(side_effect=AssertionError('builder launched'))
-                def start(command, *positional, **keywords):
-                    if command[0] in {'codex', 'claude'}:
-                        return launch(command, *positional, **keywords)
-                    return popen(command, *positional, **keywords)
-                stack.enter_context(mock.patch.object(TASK_MODULE.subprocess, 'Popen', side_effect=start))
-                if target:
-                    stack.enter_context(mock.patch.object(TASK_MODULE, target, side_effect=failure))
-                if label == 'escaped lane tmp':
-                    temporary = work / 'tmp'
-                    if temporary.exists(): shutil.rmtree(temporary)
-                    temporary.symlink_to(self.home)
-                    stack.callback(temporary.unlink)
-                if label == 'hold':
-                    marker = self.home / '.local/state/task/hold'
-                    marker.write_text('worker admission')
-                    stack.callback(marker.unlink)
-                with self.assertRaises(TASK_MODULE.Stop):
-                    TASK_MODULE.lane(args)
-                launch.assert_not_called()
-                run = json.loads(record.read_text())
-                self.assertEqual(run['state'], 'refused: hold' if label == 'hold' else 'finished')
-                self.assertEqual(run['exit_code'], 1)
 
     def test_hold_round5_cancel_prunes_after_failed_worktree_removal(self):
         self.started()
         run_path = self.state() / 'run.json'
-        run_path.write_text(json.dumps(dict(state='running', pgid=99999999)))
+        run_path.write_text(json.dumps(dict(state='running', pid=99999999, pgid=99999999)))
         gate = self.repo / '.worktrees/.task-gate-t5-99999999'
         gate.mkdir()
         self.raw_task('hold', 'pull', 'cancel must remain available')
@@ -742,128 +520,18 @@ class TaskTool(unittest.TestCase):
             return transport(command, **kwargs)
         # The first sweep sees a live gate; the post-cancel sweep cleans it up.
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(TASK_MODULE, 'pid_alive', side_effect=[True, False]), \
+                mock.patch.object(TASK_MODULE, 'pid_alive', side_effect=[True, False, False]), \
                 mock.patch.object(TASK_MODULE, 'task_lock_status', return_value='running'), \
-                mock.patch.object(TASK_MODULE, 'signal_task_run'), \
-                mock.patch.object(TASK_MODULE, 'task_run_pids', return_value=[]), \
                 mock.patch.object(TASK_MODULE.os, 'killpg', side_effect=ProcessLookupError), \
                 mock.patch.object(TASK_MODULE.subprocess, 'run', side_effect=fail_removal):
             self.assertEqual(TASK_MODULE.main(['cancel', str(self.repo), '5']), 0)
-        self.assertEqual(json.loads(run_path.read_text())['state'], 'cancelled')
+        self.assertEqual(json.loads(run_path.read_text())['state'], 'interrupted')
         self.assertFalse(gate.exists())
         self.assertEqual(len(pruned), 1)
 
-    def test_hold_round5_launcher_records_refusal_after_lane_lock_wait(self):
-        self.stub_models()
-        wt, _ = self.started()
-        work = wt / '.work'
-        (work / 'prompt.md').write_text('Do the task.\n')
-        (work / 'lane.json').write_text(json.dumps(dict(state='finished')))
-        ready = self.home / 'waiting-launcher-lock'
-        script = self.home / 'lane-launcher.py'
-        script.write_text(textwrap.dedent(f'''\
-            import fcntl, pathlib, runpy
-            module = runpy.run_path({str(TOOL)!r})
-            original = fcntl.flock
-            def flock(stream, flags):
-                if getattr(stream, 'name', '') == {str(work / 'lane.lock')!r}:
-                    pathlib.Path({str(ready)!r}).touch()
-                return original(stream, flags)
-            fcntl.flock = flock
-            raise SystemExit(module['main'](['lane', 'proj', '5', '--no-boost']))
-            '''))
-        transcript = self.home / 'waiting-launcher.log'
-        with (work / 'lane.lock').open('a') as lock, transcript.open('w') as output:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            process = subprocess.Popen([sys.executable, str(script)], cwd=wt, env=self.env,
-                                       stdout=output, stderr=subprocess.STDOUT)
-            try:
-                self.wait_runner_file(ready)
-                self.assertIsNone(process.poll())
-                self.raw_task('hold', 'pull', 'hold during launcher lock wait')
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                self.assertEqual(process.wait(timeout=10), 1, transcript.read_text())
-            finally:
-                if process.poll() is None: process.kill(); process.wait()
-        self.assertIn('refused: hold', transcript.read_text())
-        self.assertFalse((work / 'model-call.json').exists())
-        run = json.loads((work / 'lane.json').read_text())
-        self.assertEqual(run['state'], 'refused: hold')
-        self.assertTrue(run['ended_at'])
-        self.assertNotIn('pid', run)
 
-    def test_hold_during_last_merge_gate_step_prevents_all_publication(self):
-        last = self.home / 'last-gate-step.sh'
-        last.write_text(f'#!/bin/sh\n"{self.home}/.local/bin/task" hold pull "last merge gate step" --holder gate\n')
-        task_file = next((self.kb / 'backlog/tasks').iterdir())
-        task_file.write_text(task_file.read_text().replace('Verify: `true`', f'Verify: `bash {last}`'))
-        wt, _ = self.started()
-        self.commit_in(wt, 'b.txt')
-        self.prepare_merge_evidence('5')
-        before = self.git(self.repo, 'rev-parse', 'main')
-        real_git = shutil.which('git')
-        wrapper = self.home / 'bin/git'
-        wrapper.write_text(f'#!/bin/sh\nfor arg do\ncase "$arg" in push|commit-tree) '
-                           f'echo "$arg" >> "{self.home}/publication";; esac\ndone\nexec "{real_git}" "$@"\n')
-        wrapper.chmod(0o755)
-        gh = self.home / 'bin/gh'
-        gh.write_text('#!/bin/sh\ncase "$1 $2" in "pr create"|"pr merge") '
-                      'touch "$HOME/publication";; esac\nexit 0\n')
-        for backend in ('remote', 'github', 'local'):
-            with self.subTest(backend=backend):
-                if backend == 'github':
-                    origin = self.home / 'github-origin.git'
-                    self.git(self.home, 'clone', '-q', '--bare', str(self.origin), str(origin))
-                    self.git(self.repo, 'remote', 'set-url', 'origin', str(origin))
-                elif backend == 'local':
-                    self.git(self.repo, 'remote', 'remove', 'origin')
-                output = self.raw_task('merge', 'proj', '5', code=1)
-                self.assertIn('last merge gate step', output)
-                self.assertIn('PASS', output)
-                self.assertFalse((self.home / 'publication').exists())
-                self.assertEqual(self.git(self.repo, 'rev-parse', 'main'), before)
-                self.assertFalse((self.state() / 'merge.json').exists())
-                gate = json.loads((self.state() / 'gate-check.json').read_text())
-                self.assertEqual(gate['steps'][-1]['command'], ['bash', '-c', f'bash {last}'])
-                self.assertTrue(all(step['exit'] == 0 for step in gate['steps']))
-                if backend != 'local': self.assertEqual(self.git(origin if backend == 'github' else self.origin, 'rev-parse', 'main'), before)
-                (self.home / '.local/state/task/hold').unlink()
 
-    def test_hold_before_reviewer_retry_and_usage_fallback_prevents_second_launch(self):
-        self.stub_reviewers()
-        wt, _ = self.started()
-        self.raw_task('check', 'proj', '5')
-        marker = self.home / '.local/state/task/hold'
-        for options in ({}, {'REVIEW_STUB_FIRST_EXIT': '2', 'REVIEW_STUB_REPLY': "You've hit your weekly limit",
-                             'REVIEW_STUB_STDERR': "ERROR: You've hit your usage limit."}):
-            with self.subTest(options=options):
-                (wt / '.work/reviewer-count').unlink(missing_ok=True)
-                output = self.raw_task('review', 'proj', '5', '--run', code=1,
-                    env=dict(self.env, REVIEW_STUB_HOLD='1', **options))
-                self.assertIn('hold before reviewer retry', output)
-                self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
-                self.assertFalse((self.state() / 'review.json').exists())
-                run = json.loads((self.state() / 'review-run.json').read_text())
-                self.assertEqual(run['state'], 'refused: hold')
-                runs = self.home / '.local/state/task/runs.jsonl'
-                self.assertFalse(any(row.get('kind') == 'review' and row['outcome'] == 'interrupted'
-                                     for row in map(json.loads, runs.read_text().splitlines())))
-                if options: self.assertIn('retrying once', output)
-                marker.unlink()
 
-    def test_hold_at_first_reviewer_action_records_refusal_without_a_run(self):
-        wt, _ = self.started()
-        prompt, reply = wt / '.work/review-prompt.md', wt / '.work/review-response.md'
-        prompt.write_text('Review the task.\n')
-        marker = self.home / '.local/state/task/hold'
-        marker.write_text('hold at reviewer admission')
-        with mock.patch.object(TASK_MODULE.subprocess, 'Popen') as launch, \
-                mock.patch.object(TASK_MODULE.task_usage, 'run_log') as usage:
-            with self.assertRaisesRegex(TASK_MODULE.Stop, 'refused: hold'):
-                TASK_MODULE.run_reviewer('codex exec -m gpt-6-luna', wt, prompt, reply)
-            launch.assert_not_called()
-            usage.assert_not_called()
-        self.assertEqual(json.loads((wt / '.work/review-run.json').read_text())['state'], 'refused: hold')
 
     def test_hold_between_gate_steps_prevents_second_launch(self):
         task_file = next((self.kb / 'backlog/tasks').iterdir())
@@ -874,39 +542,11 @@ class TaskTool(unittest.TestCase):
         script.write_text(f'#!/bin/sh\n"{TOOL}" hold pull "between gate steps" --holder gate-test\n')
         script.chmod(0o755)
         output = self.raw_task('check', 'proj', '5', code=1)
-        self.assertIn('between gate steps', output)
+        self.assertIn('skipped: hold', output)
         log = (self.state() / 'check.log').read_text()
         self.assertIn('Ran 3 tests', log)
         self.assertFalse((self.home / 'second-gate-launch').exists())
 
-    def test_hold_runner_skipped_closes_record_and_blocks_setsid_fallback(self):
-        for backend, collected in (('systemd', False), ('systemd', True), ('setsid', False)):
-            with self.subTest(backend=backend, collected=collected):
-                runner = self.runner_fixture(backend)
-                if collected: (self.home / 'service-collected').touch()
-                (self.home / 'pull-before-service').touch()
-                output = self.raw_task('runner-start', 'proj', str(runner), code=1)
-                self.assertNotIn('process lock', output)
-                self.assertFalse((runner.parent / 'runner-call').exists())
-                if backend == 'systemd':
-                    self.assertIn('skipped: hold', output)
-                    data = json.loads(runner.with_suffix('.json').read_text())
-                    self.assertEqual(data['result'], 'skipped: hold')
-                    datetime.fromisoformat(data['finished_at'])
-                    self.assertIn('batch: stopped: skipped: hold', runner.with_suffix('.done').read_text())
-                    self.assertIn('skipped: hold', self.raw_task('status', 'proj'))
-                else:
-                    self.assertIn('service admission hold', output)
-                (self.home / '.local/state/task/hold').unlink()
-                (self.home / 'service-skipped').unlink(missing_ok=True)
-                (self.home / 'service-collected').unlink(missing_ok=True)
-                runner.with_suffix('.json').unlink(missing_ok=True)
-                if collected:
-                    (self.home / 'pull-before-service').unlink()
-                    self.assertNotIn('skipped: hold', self.raw_task('runner-start', 'proj', str(runner)))
-                    self.wait_project_lock_free()
-                    self.assertTrue((runner.parent / 'runner-call').exists())
-                    (runner.parent / 'runner-call').unlink()
 
 
     def test_project_lock_contention_commands_and_read_only_status(self):
@@ -3899,7 +3539,7 @@ class TaskTool(unittest.TestCase):
     def test_plan_without_knowledge_repo_is_exempt(self):
         from types import SimpleNamespace
         TASK_MODULE.check_plan(SimpleNamespace(kb=self.home / 'absent', number=5))
-    def runner_fixture(self, backend='systemd'):
+    def runner_fixture(self):
         installed_task = self.home / '.local/bin/task'
         installed_task.parent.mkdir(parents=True, exist_ok=True)
         if not installed_task.exists(): installed_task.symlink_to(TOOL)
@@ -3907,45 +3547,8 @@ class TaskTool(unittest.TestCase):
         work.mkdir(exist_ok=True)
         runner = work / 'runner-b1.md'
         runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
+        install_units(self.home)
         scripts = {
-            'systemctl': """#!/usr/bin/env python3
-import os, pathlib, sys
-home = pathlib.Path(os.environ['HOME'])
-if 'stop' in sys.argv:
-    (home / 'stopped').write_text(sys.argv[-1])
-else:
-    print('ActiveState=' + ('active' if (home / 'active').exists() else 'inactive'))
-    print('ExecMainStartTimestamp=test-start')
-    print('MainPID=' + os.environ.get('FAKE_MAINPID', str(os.getppid())))
-    if not (home / 'service-collected').exists():
-        print('Result=' + ('exec-condition' if (home / 'service-skipped').exists() else 'success'))
-""",
-            'systemd-run': """#!/usr/bin/env python3
-import json, os, pathlib, shlex, subprocess, sys
-home = pathlib.Path(os.environ['HOME'])
-(home / 'service-args').write_text(json.dumps(sys.argv[1:]))
-if (home / 'pull-before-service').exists():
-    (home / '.local/state/task/hold').write_text('service admission hold')
-code = int(os.environ.get('SERVICE_EXIT', '0'))
-if not code:
-    condition = next(arg for arg in sys.argv if arg.startswith('ExecCondition='))
-    log = next(arg.split('append:', 1)[1] for arg in sys.argv if arg.startswith('--property=StandardError='))
-    with open(log, 'a') as output:
-        denied = subprocess.run(shlex.split(condition.split('=', 1)[1]), stdout=output, stderr=output).returncode
-    if denied:
-        (home / 'service-skipped').touch()
-        sys.exit(0)
-    env = dict(os.environ)
-    for arg in sys.argv:
-        if arg.startswith('--setenv='):
-            key, value = arg[len('--setenv='):].split('=', 1)
-            env[key] = value
-    subprocess.Popen(sys.argv[sys.argv.index(sys.executable):], env=env,
-                     cwd=sys.argv[sys.argv.index('--working-directory') + 1],
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
-sys.exit(code)
-""",
             'task-batch': """#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 work = pathlib.Path.cwd() / '.work'
@@ -3964,8 +3567,6 @@ sys.exit(7)
             path = self.home / 'bin' / name
             path.write_text(body)
             path.chmod(0o755)
-        if backend == 'setsid':
-            self.env['SERVICE_EXIT'] = '1'
         return runner
 
     def wait_runner_file(self, path):
@@ -3979,35 +3580,32 @@ sys.exit(7)
         runner = self.runner_fixture()
         runner.write_text('invalid\n')
         self.raw_task('runner-start', 'proj', str(runner), code=1)
-        self.assertFalse((self.home / 'service-args').exists())
+        self.assertFalse((self.home / 'unit-calls.jsonl').exists())
         runner.write_text('1. docs: builder codex, model gpt-6-luna\n')
-        out = self.raw_task('runner-start', 'proj', str(runner))
-        self.assertIn('task-runner-proj-b1', out)
-        args = json.loads((self.home / 'service-args').read_text())
-        self.assertEqual(args[:7], ['--user', '--unit', 'task-runner-proj-b1', '--collect',
-                                   '--working-directory', str(self.repo), '--property=StandardInput=null'])
-        self.assertIn(f'--property=StandardOutput=append:{runner.with_suffix(".log")}', args)
-        self.assertIn('--property=KillMode=process', args)
-        condition = f'ExecCondition={self.home}/.local/bin/task hold --check'
-        self.assertEqual(args.count(condition), 1)
-        self.assertEqual(args[args.index(condition) - 1], '-p')
-        self.assertFalse(any('ConditionPathExists' in arg for arg in args))
-        self.assertIn('--setenv=TASK_HOLDER=test-seat', args)
-        command = args[args.index(sys.executable):]
-        self.wait_project_lock_free()
-        call = json.loads((runner.parent / 'runner-call').read_text())
-        self.assertEqual(call['args'], [str(self.repo), str(runner)])
-        self.assertEqual(call['prompt'], '')
-        self.assertIn('code 7', runner.with_suffix('.done').read_text())
-        (self.home / 'active').touch()
-        self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
-        status = self.raw_task('status', 'proj')
-        self.assertIn('task-runner-proj-b1: active started=test-start', status)
-        self.assertIn('last=batch: stopped: runner exited', status)
-        self.raw_task('cancel', 'proj', 'runner-b1')
-        self.assertEqual((self.home / 'stopped').read_text(), 'task-runner-proj-b1')
-        (self.home / 'active').unlink()
-        self.assertIn('task-runner-proj-b1: inactive', self.raw_task('status', 'proj'))
+        hold = runner.parent / 'hold'
+        hold.touch()
+        try:
+            out = self.raw_task('runner-start', 'proj', str(runner))
+            data = json.loads(runner.with_suffix('.json').read_text())
+            unit = data['unit']
+            self.assertRegex(unit, r'^task-runner-proj-b1-[a-f0-9]+$')
+            self.assertIn(unit, out)
+            args = json.loads((self.home / 'unit-calls.jsonl').read_text().splitlines()[-1])['args']
+            for option in ('--user', '--wait', '--pipe', '--service-type=exec', '--setenv=TASK_HOLDER=test-seat'):
+                self.assertIn(option, args)
+            self.assertEqual(args[args.index('--working-directory') + 1], str(self.repo))
+            self.assertEqual(args.count(f'ExecCondition={self.home}/.local/bin/task hold --check'), 1)
+            call = json.loads(self.wait_runner_file(runner.parent / 'runner-call'))
+            self.assertEqual(call['args'], [str(self.repo), str(runner)])
+            self.assertEqual(call['prompt'], '')
+            self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
+            self.assertIn(unit + ': active', self.raw_task('status', 'proj'))
+            self.raw_task('cancel', 'proj', 'runner-b1')
+            self.assertEqual((self.home / 'stopped').read_text(), unit)
+            self.assertIn(unit + ': inactive', self.raw_task('status', 'proj'))
+        finally:
+            hold.unlink()
+            self.wait_project_lock_free()
         for final in ('batch: finished', 'batch: stopped: deliberate'):
             for own_final in ('', final):
                 with self.subTest(stale=final, own_final=own_final):
@@ -4015,16 +3613,11 @@ sys.exit(7)
                     stale = done.read_text() + final + '\n'
                     done.write_text(stale)
                     self.raw_task('runner-start', 'proj', str(runner), env=dict(self.env, RUNNER_FINAL=own_final))
-                    args = json.loads((self.home / 'service-args').read_text())
-                    command = args[args.index(sys.executable):]
                     self.wait_project_lock_free()
                     current = done.read_text()[len(stale):]
                     self.assertTrue(done.read_text().startswith(stale))
-                    if own_final:
-                        self.assertEqual(current, own_final + '\n')
-                    else:
-                        self.assertEqual(current, 'batch: stopped: runner exited (code 7) '
-                                         f'without a final line; see {runner.with_suffix(".log")}\n')
+                    self.assertEqual(current, own_final + '\n' if own_final else
+                        'batch: stopped: runner exited (code 7) without a final line; see ' + str(runner.with_suffix('.log')) + '\n')
                     self.assertIn('last=' + current.strip(), self.raw_task('status', 'proj'))
 
     def test_runner_passes_lock_holder_to_children(self):
@@ -4033,7 +3626,7 @@ sys.exit(7)
         self.stub_models()
         self.commit_in(wt, 'b.txt')
         self.prepare_merge_evidence('5')
-        runner = self.runner_fixture('setsid')
+        runner = self.runner_fixture()
         batch = self.home / 'bin/task-batch'
         batch.write_text(textwrap.dedent(f'''\
             #!/usr/bin/env python3
@@ -4097,7 +3690,7 @@ sys.exit(7)
         self.prepare_merge_evidence('5')
         report = (wt / '.work/report.md').read_text()
         (wt / '.work/report.md').unlink()  # The real batch must run a lane first.
-        runner = self.runner_fixture('setsid')
+        runner = self.runner_fixture()
         runner.write_text('1. T-5: builder codex, model gpt-6-luna\nTime box: 0.5 min\n')
         for name, target in [('task', TOOL), ('task-batch', TOOL.with_name('executable_task-batch'))]:
             binary = self.home / 'bin' / name
@@ -4139,8 +3732,8 @@ sys.exit(7)
         self.assertIn('unrecognized arguments: --llm', out)
         self.assertFalse((self.home / 'service-args').exists())
 
-    def test_runner_fallback_survives_callers_group_and_cancel(self):
-        runner = self.runner_fixture('setsid')
+    def test_runner_unit_survives_callers_group_and_cancel(self):
+        runner = self.runner_fixture()
         hold = runner.parent / 'hold'
         hold.touch()
         # The launcher stays in the caller's session until that entire group is killed.
@@ -4157,18 +3750,19 @@ sys.exit(7)
             caller.wait()
             os.kill(call['pid'], 0)
             self.assertIn('already active', self.raw_task('runner-start', 'proj', str(runner), code=1))
-            self.assertIn('task-runner-proj-b1: active', self.raw_task('status', 'proj'))
+            unit = json.loads(runner.with_suffix('.json').read_text())['unit']
+            self.assertIn(unit + ': active', self.raw_task('status', 'proj'))
             self.raw_task('cancel', 'proj', 'runner-b1')
-            self.assertIn('without a final line', self.wait_runner_file(runner.with_suffix('.done')))
+            self.assertIn('batch: stopped:', self.wait_runner_file(runner.with_suffix('.done')))
         finally:
             hold.unlink(missing_ok=True)
             if caller.poll() is None:
                 os.killpg(caller.pid, signal.SIGKILL)
                 caller.wait()
 
-    def test_runner_fallback_exit_guard_and_logs(self):
-        runner = self.runner_fixture('setsid')
-        self.assertIn('falling back to setsid', self.raw_task('runner-start', 'proj', str(runner)))
+    def test_runner_unit_exit_guard_and_logs(self):
+        runner = self.runner_fixture()
+        self.assertIn('task-runner-proj-b1-', self.raw_task('runner-start', 'proj', str(runner)))
         self.assertIn('code 7', self.wait_runner_file(runner.with_suffix('.done')))
         log = runner.with_suffix('.log').read_text()
         self.assertIn('runner stdout', log)
@@ -4213,29 +3807,17 @@ sys.exit(7)
             {'step': 'check:just check', 'reason': 'approved timeout'}])
         self.assertIn('check:just check waived: approved timeout', out)
 
-    def test_reliability_cancel_lane_already_stopped(self):
-        import json
-        from types import SimpleNamespace
+    def test_reliability_cancel_unit_stop_failure_preserves_running_record(self):
         wt, _ = self.started()
         lane = wt / '.work/lane.json'
-        for error in (ProcessLookupError, PermissionError):
-            with self.subTest(error=error):
-                lane.write_text(json.dumps({'state': 'running', 'pid': 99999999}))
-                output = io.StringIO()
-                with mock.patch.object(TASK_MODULE, 'resolve_repo', return_value=self.repo), \
-                        mock.patch.object(TASK_MODULE, 'prune_stale_gate_worktrees'), \
-                        mock.patch.object(TASK_MODULE, 'Task', return_value=SimpleNamespace(path=wt)), \
-                        mock.patch.object(TASK_MODULE, 'pid_alive', return_value=True), \
-                        mock.patch.object(TASK_MODULE.os, 'killpg', side_effect=error), \
-                        contextlib.redirect_stdout(output):
-                    self.assertEqual(TASK_MODULE.cancel(SimpleNamespace(repo='proj', id='5')), 0)
-                message = 'could not stop (permission denied)' if error is PermissionError else 'already stopped'
-                self.assertIn(message, output.getvalue())
-                if error is PermissionError:
-                    self.assertNotIn('already stopped', output.getvalue())
-                record = json.loads(lane.read_text())
-                self.assertEqual(record['state'], 'interrupted')
-                self.assertTrue(record['ended_at'])
+        lane.write_text(json.dumps(dict(state='running', pid=os.getpid(), unit='task-lane-proj-t5-test')))
+        with mock.patch.object(TASK_MODULE, 'resolve_repo', return_value=self.repo), \
+                mock.patch.object(TASK_MODULE, 'prune_stale_gate_worktrees'), \
+                mock.patch.object(TASK_MODULE, 'Task', return_value=SimpleNamespace(path=wt)), \
+                mock.patch.object(TASK_MODULE.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'systemctl')):
+            with self.assertRaisesRegex(TASK_MODULE.Stop, 'Cannot stop .* kept the running record'):
+                TASK_MODULE.cancel(SimpleNamespace(repo='proj', id='5'))
+        self.assertEqual(json.loads(lane.read_text())['state'], 'running')
 
     def test_reliability_repair_dead_lane_status_read_only(self):
         import json
@@ -5210,6 +4792,7 @@ store.write_text(json.dumps(prs))
         self.addCleanup(close_project_locks)
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
+        install_units(self.home)
         (bin_dir / 'task').symlink_to(TOOL)
         installed = self.home / '.local/bin/task'
         installed.parent.mkdir(parents=True)
@@ -7198,13 +6781,13 @@ store.write_text(json.dumps(prs))
         inner = outer / "lane-abcdef12"
         inner.mkdir(mode=0o700)
         lane = wt / ".work/lane.json"
-        lane.write_text(json.dumps(dict(state="running", pid=123456, temporary=str(inner))))
+        lane.write_text(json.dumps(dict(state="running", pid=123456, unit="task-lane-proj-t5-test", temporary=str(inner))))
         shutil.rmtree(outer)
         with mock.patch.dict(os.environ, self.env), \
                 mock.patch.object(TASK_MODULE, "HOME", self.home), \
                 mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
                 mock.patch.object(TASK_MODULE, "pid_alive", return_value=True), \
-                mock.patch.object(TASK_MODULE.os, "killpg"):
+                mock.patch.object(TASK_MODULE.subprocess, "run"):
             TASK_MODULE.cancel(SimpleNamespace(repo=str(self.repo), id="5"))
         self.assertEqual(json.loads(lane.read_text())["state"], "cancelled")
 
@@ -7649,7 +7232,7 @@ store.write_text(json.dumps(prs))
         claim = self.home / f'.local/state/task/usage/running/claude/{os.getpid()}.json'
         for result in (0, 3, KeyboardInterrupt(), subprocess.TimeoutExpired('claude', 1), OSError('refused')):
             with self.subTest(result=result):
-                process = mock.Mock(pid=os.getpid())
+                process = mock.Mock(pid=os.getpid(), unit='task-review-proj-t5-test', skipped=False)
                 def wait(**kwargs):
                     self.assertTrue(claim.exists())
                     if isinstance(result, BaseException):
@@ -7668,7 +7251,7 @@ store.write_text(json.dumps(prs))
                     KeyboardInterrupt if isinstance(result, KeyboardInterrupt) else TASK_MODULE.Stop)
                 with mock.patch.dict(os.environ, self.env, clear=True), \
                         mock.patch.object(TASK_MODULE, 'HOME', self.home), \
-                        mock.patch.object(TASK_MODULE.subprocess, 'Popen', **spawn), \
+                        mock.patch.object(TASK_MODULE, 'launch_unit', **spawn), \
                         mock.patch.object(TASK_MODULE, 'main_repo', return_value=self.repo), \
                         mock.patch.object(TASK_MODULE.os, 'killpg'), expected:
                     TASK_MODULE.run_reviewer('claude -p --model haiku', wt, prompt, reply)

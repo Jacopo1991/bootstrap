@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 from hold_fixture import install_checker
+from unit_fixture import install_units
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "home/dot_local/bin/executable_gate-browser"
@@ -24,13 +25,14 @@ base = int(os.environ["TASK_GATE_PORT_BASE"])
 admission = tempfile.TemporaryDirectory(prefix='browser-admission-')
 fixture_home = Path(admission.name)
 install_checker(fixture_home)
+install_units(fixture_home)
 real_home = Path.home()
 for relative in ('.local/bin/playwright', '.local/share/bootstrap/npm', '.cache/ms-playwright'):
     link = fixture_home / relative
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(real_home / relative, target_is_directory=(real_home / relative).is_dir())
 hostile = fixture_home / 'bin/task'
-hostile.parent.mkdir()
+hostile.parent.mkdir(exist_ok=True)
 hostile.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
 hostile.chmod(0o755)
 for offset, fail in [(10, False), (11, True)]:

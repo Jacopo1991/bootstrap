@@ -32,7 +32,6 @@ from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits,
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 JACOPO_HOLD = Path("/etc/agent-hold")
-HOLD_WORK_COMMANDS = {"start", "lane", "check", "merge", "runner-start", "realign", "close", "repair"}
 WORKSPACE = HOME / "dev_workspace"
 CORTEX = HOME / "cortex"
 GATE_SLOT = ContextVar("gate_slot", default=None)
@@ -86,9 +85,8 @@ def archive_exclusion(item, info, size=None, errors=None, *, hash_files=True):
     return None
 
 
-def prune_evidence_archive(root, apply, report, *, snapshots=None, admit=None):
+def prune_evidence_archive(root, apply, report, *, snapshots=None):
     """Prune archive snapshots, including legacy ones without manifests; never traverse links."""
-    admit = admit or globals()['admit']
     if any(item.is_symlink() for item in (root, *root.parents)) or not root.is_dir():
         return
     entries, _, _ = archive_inventory(root)
@@ -143,10 +141,8 @@ def prune_evidence_archive(root, apply, report, *, snapshots=None, admit=None):
                 if apply:
                     try:
                         if stat.S_ISDIR(meta.st_mode):
-                            admit()
                             shutil.rmtree(item)
                         else:
-                            admit()
                             item.unlink()
                     except OSError as error:
                         report.append(f"archive: cannot remove {item}: {error}")
@@ -157,7 +153,6 @@ def prune_evidence_archive(root, apply, report, *, snapshots=None, admit=None):
                 for item, meta in reversed(contents):
                     if stat.S_ISDIR(meta.st_mode) and item != manifest.parent:
                         try:
-                            admit()
                             item.rmdir()
                         except OSError:
                             pass
@@ -243,8 +238,6 @@ GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FIL
 class Stop(Exception):
     """A clear, expected reason to stop; printed without a traceback."""
 
-class HoldRefused(Stop): """Admission refused by a hold."""
-
 
 class UsageLimit(Stop):
     """A reviewer CLI ended with a terminal usage-limit diagnostic."""
@@ -289,12 +282,6 @@ def frontmatter_title(text):
 
 
 def run_git(cwd, *args, **kwargs):
-    # Only queries and cancellation of disposable gates may run during a hold.
-    query = args == ('worktree', 'prune') or args[:1] in [('rev-parse',), ('merge-base',), ('rev-list',), ('log',), ('show',), ('diff',), ('status',), ('ls-files',), ('for-each-ref',), ('show-ref',), ('ls-remote',)]
-    query |= args[:2] in [('remote', 'get-url'), ('worktree', 'list'), ('branch', '--show-current'), ('merge', '--abort')]
-    query |= args[:1] == ('symbolic-ref',) and len([a for a in args[1:] if not a.startswith('-')]) == 1 and all(a in {'--quiet', '--short'} for a in args[1:] if a.startswith('-'))
-    query |= len(args) == 4 and args[:3] == ('worktree', 'remove', '--force') and Path(args[3]).parent == Path(cwd) / '.worktrees' and bool(re.fullmatch(r'\.(?:drill-[0-9a-f]{6}-\d+-(?:group|solo)|task-gate-[\w-]+-\d+)', Path(args[3]).name))
-    if not query: admit()
     return subprocess.run(["git", "-c", "core.quotePath=false", "-C", str(cwd), *args],
                           capture_output=True, text=True, **kwargs)
 
@@ -937,7 +924,7 @@ def task_event(task: Task, name: str):
     atomic_json(path, events)
 
 
-def set_child_group(state: Path, pgid: int | None):
+def set_child_group(state: Path, pgid: int | None, unit=None):
     lock = state / "run.lock"
     try:
         data = json.loads(lock.read_text())
@@ -945,8 +932,10 @@ def set_child_group(state: Path, pgid: int | None):
         return
     if pgid is None:
         data.pop("child_pgid", None)
+        data.pop("child_unit", None)
     else:
         data["child_pgid"] = pgid
+        if unit: data['child_unit'] = unit
     atomic_json(lock, data)
 
 
@@ -958,7 +947,9 @@ def handle_interruption(signum, _frame):
         try:
             lock_data = json.loads(lock.read_text())
             child_pgid = int(lock_data.get("child_pgid", 0))
-            if child_pgid:
+            if lock_data.get('child_unit'):
+                subprocess.run(['systemctl', '--user', 'stop', lock_data['child_unit']], check=True)
+            elif child_pgid:
                 os.killpg(child_pgid, signal.SIGTERM)
                 time.sleep(0.1)
                 try:
@@ -1055,11 +1046,15 @@ def redteam(args):
                                  "-o", str(temporary), "-"] if vendor == "codex" else
                    [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
                     "--allowedTools", "Read", "Grep", "Glob", "Bash(git --no-optional-locks:*)"])
-        with temporary.open("w") as output_stream:
-            admit(); result = subprocess.run(command, cwd=path, input=brief, text=True, encoding="utf-8",
-                                    stdout=output_stream if vendor == "claude" else None,
-                                    env={**agent_environment(), "GIT_OPTIONAL_LOCKS": "0"})
-        if result.returncode or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
+        with tempfile.TemporaryFile() as source, temporary.open('w') as output_stream:
+            source.write(brief.encode()); source.seek(0)
+            process = launch_unit('review', task.repo, task.name, command, cwd=path,
+                                  env={**agent_environment(), 'GIT_OPTIONAL_LOCKS': '0'}, stdin=source,
+                                  stdout=output_stream if vendor == 'claude' else None)
+            code = process.wait()
+        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code))
+        if process.skipped: raise Stop('skipped: hold')
+        if code or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
             raise Stop("risk high: red-team failed or head changed; no output recorded")
         temporary.replace(output)
         atomic_json(state / "redteam.json", dict(commit=head, output=str(output), time=utc_now(),
@@ -1556,38 +1551,6 @@ def pid_alive(pid):
 
 
 
-def task_run_pids(run_id):
-    """Find this user's processes carrying a check/gate run marker, including new sessions."""
-    if not run_id:
-        return []
-    markers = {f"{name}={run_id}".encode() for name in ("TASK_RUN_ID", "TASK_GATE_RUN_ID")}
-    found = []
-    try:
-        processes = Path("/proc").iterdir()
-        for entry in processes:
-            if not entry.name.isdecimal():
-                continue
-            try:
-                if entry.stat().st_uid != os.getuid():
-                    continue
-                if markers.intersection(entry.joinpath("environ").read_bytes().split(b"\0")):
-                    found.append(int(entry.name))
-            except (OSError, PermissionError, ValueError):
-                continue
-    except OSError:
-        return []
-    return found
-
-
-def signal_task_run(run_id, signum):
-    for pid in task_run_pids(run_id):
-        if pid != os.getpid():
-            try:
-                os.kill(pid, signum)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-
-
 def task_lock_status(task: Task, repair=False):
     lock = task_state(task) / "run.lock"
     if not lock.exists():
@@ -1649,17 +1612,19 @@ def detached(args, task, path):
     log = (work / "run.log").open("ab")
     archive = run_path
     run_id = secrets.token_hex(16)
-    env = dict(os.environ, TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive),
+    env = dict(agent_environment(), TASK_RUN_RECORD=str(run_path), TASK_RUN_ARCHIVE=str(archive),
                TASK_RUN_ID=run_id)
     try:
-        admit()
-        child = subprocess.Popen(command, cwd=path, env=env, stdin=subprocess.DEVNULL,
-                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-                             close_fds=True)
-    except HoldRefused:
+        child = launch_unit(args.command, task.repo, task.name, command, cwd=path, env=env,
+                            stdout=log, stderr=log)
+    except Stop:
         lock.unlink(missing_ok=True)
-        atomic_json(run_path, dict(command=args.command, state='refused: hold', ended_at=utc_now())); raise
-    atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid,
+        raise
+    if child.skipped:
+        child.wait(); lock.unlink(missing_ok=True)
+        atomic_json(run_path, dict(command=args.command, unit=child.unit, state='skipped: hold', ended_at=utc_now()))
+        print('skipped: hold'); return 1
+    atomic_json(run_path, {"command": args.command, "pid": child.pid, "pgid": child.pid, "unit": child.unit,
                            "task_run_id": run_id,
                            "state": "running", "started_at": started, "ended_at": "",
                            "completed": []})
@@ -1715,8 +1680,14 @@ def stripped_agent_variable(name):
 def agent_environment():
     # The hook refuses Git control-plane overrides inherited by a nested CLI.
     # Never carry a runner's detached gate ownership into an agent.
+    allowed = {'HOME', 'PATH', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR',
+               'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+               'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'SECRETSPEC_REASON', 'TASK_HOLDER', 'TASK_PLAN',
+               'TASK_NO_PACE', 'TASK_GATE_DIR', 'TASK_LANE_TEMP_ROOT', 'TASK_REVIEW_TIMEOUT',
+               'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
+               'GIT_OPTIONAL_LOCKS', 'UV_CONSTRAINT', 'NPM_CONFIG_MIN_RELEASE_AGE'}
     return {name: value for name, value in os.environ.items()
-            if not stripped_agent_variable(name)}
+            if name in allowed or name.startswith('LC_')}
 
 
 def claude_temporary_root():
@@ -1776,6 +1747,11 @@ def stop_child_group(process):
     except ProcessLookupError:
         pass
     process.wait()
+
+
+def lane_alive(run):
+    return (pid_alive(run.get('pid')) and
+            (not run.get('process_start') or run['process_start'] == task_usage.process_start(run['pid'])))
 
 
 def finalize_lane_record(path, run, state, **fields):
@@ -1992,7 +1968,7 @@ def lane(args):
                 previous = json.loads(lane_record.read_text())
             except (OSError, json.JSONDecodeError):
                 previous = {}
-            if previous.get("state") == "running" and pid_alive(previous.get("pid")):
+            if previous.get("state") == "running" and lane_alive(previous):
                 raise Stop(f"Lane already running (pid {previous['pid']}); see {work / 'lane.log'}.")
             risk, limits, _ = risk_context(task, path, record)
             rounds = read_json_object(task_state(task) / "rounds.json")
@@ -2027,20 +2003,22 @@ def lane(args):
                 worker.extend(["--timeout", str(args.timeout)])
             try:
                 with (work / "lane.log").open("wb") as log:
-                    admit()
-                    child = subprocess.Popen(worker, cwd=path, env=agent_environment(),
-                                             pass_fds=task_lock.descriptors(),
-                                             stdin=subprocess.DEVNULL, stdout=log,
-                                             stderr=subprocess.STDOUT, start_new_session=True,
-                                             close_fds=True)
-            except HoldRefused:
-                atomic_json(lane_record, dict(state='refused: hold', ended_at=utc_now()))
+                    child = launch_unit('lane', task.repo, task.name, worker, cwd=path,
+                                        env=agent_environment(), stdout=log, stderr=log)
+            except Stop:
+                atomic_json(lane_record, dict(state='launch_failed', ended_at=utc_now()))
                 raise
+            if child.skipped:
+                child.wait()
+                if os.environ.get('TASK_PLAN'): (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
+                atomic_json(lane_record, dict(unit=child.unit, state='skipped: hold', ended_at=utc_now()))
+                print('skipped: hold'); return 1
             atomic_json(task_state(task) / "rounds.json", dict(used=used + 1, extra=extra))
             if extra != rounds.get("extra", 0):
                 task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
             task_usage.claim(HOME, builder, "lane", child.pid)
-            atomic_json(lane_record, {"state": "running", "pid": child.pid,
+            atomic_json(lane_record, {"state": "running", "pid": child.pid, "unit": child.unit,
+                                      "process_start": task_usage.process_start(child.pid),
                                       "usage_run": usage_run if os.environ.get("TASK_PLAN") else task_usage.run_log(HOME, repo=task.repo.name, task=task.id, kind="lane", vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1),
                                       "builder": builder, "model": model, "cli_model": cli_model,
                                       "started_at": utc_now(), "ended_at": ""})
@@ -2080,7 +2058,6 @@ def lane(args):
                 # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
                 stream = task_usage.ClaudeStream(HOME) if raw else None
                 if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], run["usage_run"], reserve=run["usage_run"])
-                admit()
                 child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
                                          pass_fds=task_lock.descriptors(),
                                          stdout=subprocess.PIPE if output else None, start_new_session=True)
@@ -2126,8 +2103,6 @@ def lane(args):
     except (SystemExit, KeyboardInterrupt):
         interrupted = True
         raise
-    except HoldRefused:
-        result = "refused: hold"; raise
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
@@ -2256,7 +2231,6 @@ def prepare_environment(repo: Path, path: Path):
                       "--no-deps", "-e", str(path)]]
             for number, step in enumerate(steps):
                 try:
-                    admit()
                     result = subprocess.run(step, cwd=path, capture_output=True, text=True)
                 except FileNotFoundError:
                     print("warning: uv is not installed; the worktree has no .venv.")
@@ -2300,7 +2274,7 @@ def advisory_check_lock(path: Path):
 
 def check_step_environment(run_id):
     """Keep local mock traffic off the sandbox proxy without changing proxy settings."""
-    child_env = dict(os.environ, TASK_RUN_ID=run_id)
+    child_env = dict(agent_environment(), TASK_RUN_ID=run_id)
     bypass = ("localhost", "127.0.0.1", "::1")
     for name in ("NO_PROXY", "no_proxy"):
         existing = child_env.get(name, "")
@@ -2330,7 +2304,6 @@ def advisory_pre_commit_environment(path: Path, child_env):
             shutil.copyfile(real_index, private_index)
         else:
             private_env = dict(child_env, GIT_INDEX_FILE=str(private_index))
-            admit()
             result = run_git(path, "read-tree", "HEAD", env=private_env)
             if result.returncode:
                 raise Stop(f"Could not seed advisory pre-commit index: {(result.stderr or result.stdout).strip()}")
@@ -2513,8 +2486,6 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
-    def admit(): subprocess.run([str(pathlib.Path.home() / '.local/bin/task'), 'hold', '--check'], check=True)
-    admit()
     child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL, pass_fds=task_lock.descriptors())
     code = child.wait()
 finally:
@@ -2532,20 +2503,62 @@ sys.exit(code if code >= 0 else 128 - code)
 '''
 
 
-def runner_unit(repo, batch):
-    if not re.fullmatch(r'[A-Za-z0-9_-]+', repo.name + batch):
-        raise Stop('Runner repo and batch names must contain only letters, digits, _ or -.')
-    return f'task-runner-{repo.name}-{batch}'
-
-
 def runner_service(unit):
     try:
-        result = subprocess.run(['systemctl', '--user', 'show', unit,
-                                 '--property=ActiveState,ExecMainStartTimestamp,MainPID,Result'],
+        result = subprocess.run(['systemctl', '--user', 'show',
+                                 '--property=ActiveState,ExecMainStartTimestamp,MainPID,Result', '--', unit],
                                 capture_output=True, text=True)
         return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
     except OSError:
         return {}
+
+
+class UnitProcess:
+    """Wait on systemd-run, but identify and stop the service's actual process."""
+    def __init__(self, process, unit):
+        self.process, self.unit, self.pid, self.skipped = process, unit, 0, False
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            code = process.poll()
+            service = runner_service(unit)
+            self.skipped = service.get('Result') == 'exec-condition'
+            self.pid = int(service.get('MainPID') or 0)
+            if self.pid or self.skipped: return
+            if code is not None and service.get('Result') == 'success': return
+            if code is not None:
+                raise Stop('systemd-run --user unavailable or unit failed to start; inspect the launch log.')
+            time.sleep(.02)
+        self.stop()
+        raise Stop('systemd-run --user did not report MainPID; launch failed closed.')
+
+    def wait(self, timeout=None):
+        code = self.process.wait(timeout=timeout)
+        self.skipped = self.skipped or runner_service(self.unit).get('Result') == 'exec-condition'
+        return 77 if self.skipped else code
+
+    def poll(self):
+        return None if self.process.poll() is None else self.wait()
+
+    def stop(self):
+        subprocess.run(['systemctl', '--user', 'stop', self.unit], check=True)
+        self.process.wait()
+
+
+def launch_unit(kind, repo, ident, command, *, cwd, env, stdin=subprocess.DEVNULL,
+                stdout=None, stderr=None):
+    """All work starts behind the installed hold checker; no session fallback."""
+    safe = lambda value: re.sub(r'[^A-Za-z0-9_-]', '-', str(value))[:60]
+    unit = f'task-{safe(kind)}-{safe(Path(repo).name)}-{safe(ident)}-{secrets.token_hex(4)}'
+    launch = ['systemd-run', '--user', '--unit', unit, '--wait', '--pipe', '--service-type=exec',
+              '--working-directory', str(cwd), '-p',
+              f'ExecCondition={shlex.quote(str(HOME / ".local/bin/task"))} hold --check',
+              *[f'--setenv={key}={value}' for key, value in sorted(env.items())], '--', *command]
+    try:
+        process = subprocess.Popen(launch, cwd=cwd, stdin=stdin, stdout=stdout, stderr=stderr,
+                                   start_new_session=True)
+    except OSError as error:
+        raise Stop(f'systemd-run --user unavailable; launch failed closed: {error}') from error
+    return UnitProcess(process, unit)
 
 
 def runner_start(args):
@@ -2558,17 +2571,13 @@ def runner_start(args):
         return 1
     for ident in args.plan_tasks: bind_plan(Task(repo, ident), args)
     batch = match[1]
-    unit = runner_unit(repo, batch)
     work = repo / '.work'
     work.mkdir(exist_ok=True)
     record = work / f'runner-{batch}.json'
-    service = runner_service(unit)
-    if service.get('ActiveState') in {'active', 'activating', 'deactivating', 'reloading'}:
-        raise Stop(f'{unit} is already active.')
-    if record.exists():
-        previous = json.loads(record.read_text())
-        if previous.get('backend') == 'setsid' and pid_alive(previous.get('pid')):
-            raise Stop(f'{unit} is already active (setsid).')
+    previous = read_json_object(record)
+    service = runner_service(previous['unit']) if previous.get('unit') else {}
+    if service.get('ActiveState') == 'activating' or service.get('ActiveState') == 'active' and task_usage.process_start(service.get('MainPID')):
+        raise Stop(f"{previous['unit']} is already active.")
     executable = shutil.which('task-batch')
     if not executable:
         raise Stop('task-batch is unavailable.')
@@ -2578,46 +2587,26 @@ def runner_start(args):
     wrapper = work / f'runner-{batch}-watch.py'
     wrapper.write_text(RUNNER_WRAPPER)
     log = work / f'runner-{batch}.log'
-    log_offset = log.stat().st_size if log.exists() else 0
     done = work / f'runner-{batch}.done'
     done_offset = done.stat().st_size if done.exists() else 0
     ready = work / f'runner-{batch}.ready'; ready.unlink(missing_ok=True)
     command = [sys.executable, str(wrapper), str(source), str(done),
                str(log), executable, str(done_offset), str(repo), str(Path(__file__).resolve().parent), str(ready)]
-    launch = ['systemd-run', '--user', '--unit', unit, '--collect',
-              '--working-directory', str(repo), '--property=StandardInput=null',
-              '-p', f'ExecCondition={shlex.quote(str(HOME / ".local/bin/task"))} hold --check',
-              '--property=KillMode=process',
-              f'--property=StandardOutput=append:{log}', f'--property=StandardError=append:{log}',
-              '--setenv=PATH=' + os.environ.get('PATH', ''),
-              '--setenv=TASK_HOLDER=' + holder,
-              *(['--setenv=TASK_PLAN=' + os.environ['TASK_PLAN']] if os.environ.get('TASK_PLAN') else []),
-              *(['--setenv=TASK_NO_PACE=1'] if args.no_pace else []), *command]
-    try:
-        admit()
-        result = subprocess.run(launch, capture_output=True, text=True)
-    except FileNotFoundError:
-        result = None
-    data = dict(unit=unit, started_at=utc_now(), backend='systemd', done_offset=done_offset)
-    if result is None or result.returncode:
-        # A failed launch can race another caller; never duplicate an active service.
-        if runner_service(unit).get('ActiveState') in {'active', 'activating'}:
-            raise Stop(f'{unit} is already active.')
-        with log.open('a') as output:
-            admit()
-            process = subprocess.Popen(command, cwd=repo, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                       pass_fds=task_lock.descriptors(),
-                                       start_new_session=True, env={**os.environ, "TASK_HOLDER": holder, **({"TASK_NO_PACE": "1"} if args.no_pace else {})})
-        data.update(backend='setsid', pid=process.pid)
-        print('systemd-run --user unavailable; falling back to setsid (new session).')
+    environment = agent_environment()
+    if args.no_pace: environment['TASK_NO_PACE'] = '1'
+    with log.open('a') as output:
+        process = launch_unit('runner', repo, batch, command, cwd=repo, env=environment,
+                              stdout=output, stderr=output)
+    unit = process.unit
+    data = dict(unit=unit, pid=process.pid, started_at=utc_now(), backend='systemd', done_offset=done_offset)
     atomic_json(record, data)
+    if process.skipped:
+        process.wait()
+        atomic_json(record, dict(data, result='skipped: hold', finished_at=utc_now()))
+        with done.open('a') as output: output.write('batch: stopped: skipped: hold\n')
+        print(f'{unit}: skipped: hold'); return 1
     deadline = time.monotonic() + 10
-    while not ready.exists() and time.monotonic() < deadline:
-        if data['backend'] == 'systemd' and (runner_service(unit).get('Result') == 'exec-condition' or
-                log.exists() and b'task hold:' in log.read_bytes()[log_offset:]):
-            atomic_json(record, dict(data, result='skipped: hold', finished_at=utc_now()))
-            with done.open('a') as output: output.write('batch: stopped: skipped: hold\n')
-            print(f'{unit}: skipped: hold'); return 1
+    while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
         time.sleep(.02)
     if not ready.exists(): raise Stop('Runner did not acquire its process lock; inspect its log before retrying.')
     print(f'{unit}: log={log}')
@@ -2738,7 +2727,7 @@ def start_locked(args, repo):
             task_lock.work(HOME, repo, base)
             create, source = ["--no-track", "-b", branch, str(task.path), base], f"{branch} from {label} {base[:7]}"
         args.usage_run = budget_run(repo=repo.name, task=task.id, kind="start", vendor=args.builder) if os.environ.get("TASK_PLAN") else None
-        admit(); git(repo, "worktree", "add", "-q", *create)
+        git(repo, "worktree", "add", "-q", *create)
         print(f"Created {task.path} on {source}.")
     seed_worktree(repo, task.path, args.seed)
     prepare_environment(repo, task.path)
@@ -2933,7 +2922,7 @@ def run_check_matrix(path, base, record, state, evidence_name, display_log,
     log.write_text("\n".join(logs))
     passed = all(row["result"] == "passed" for row in results)
     evidence = {key: value for key, value in results[0].items() if key not in {"name", "steps", "result"}}
-    evidence.update(result="passed" if passed else "failed", variants=results,
+    evidence.update(result="skipped: hold" if any(row['result'] == 'skipped: hold' for row in results) else "passed" if passed else "failed", variants=results,
                     steps=[step for row in results for step in row["steps"]])
     save_check_evidence(destination, evidence_name, evidence, log)
     if not advisory and evidence_name == "check.json":
@@ -2985,21 +2974,14 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
-                admit()
-                process = subprocess.Popen(step, cwd=path, env=child_env, stdout=out,
-                                           pass_fds=task_lock.descriptors(),
-                                           stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                           start_new_session=True)
+                process = launch_unit('gate', main_repo(path), path.name, step, cwd=path,
+                                      env=child_env, stdout=out, stderr=out)
                 if state:
-                    set_child_group(state, process.pid)
+                    set_child_group(state, process.pid, process.unit)
                 try:
                     code = process.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
+                    process.stop()
                     if state:
                         set_child_group(state, None)
                     out.write(f"\nTIMEOUT configured={configured}s effective={timeout}s "
@@ -3035,14 +3017,21 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
             if state:
                 set_child_group(state, None)
             out.write(f"exit {code}\n")
-            results.append({"command": step, "exit": code, "duration": round(time.monotonic()-started, 3),
+            results.append({"command": step, "unit": process.unit,
+                            "result": 'skipped: hold' if process.skipped else 'finished',
+                            "exit": code, "duration": round(time.monotonic()-started, 3),
                             **timeout_details})
             if code:
+                if process.skipped:
+                    out.write('skipped: hold\n')
+                    if ACTIVE_FOREGROUND_TASK:
+                        run_path = run_record_path(ACTIVE_FOREGROUND_TASK)
+                        atomic_json(run_path, read_json_object(run_path) | dict(state='skipped: hold', ended_at=utc_now()))
                 passed = False
                 break
     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
                 "record_revision": record.get("revision") if record else "",
-                "result": "passed" if passed else "failed", "steps": results,
+                "result": "skipped: hold" if process.skipped else "passed" if passed else "failed", "steps": results,
                 "time": utc_now(), "trusted": state is not None, "advisory": state is None}
     if evidence_sink is not None:
         evidence_sink.append(evidence)
@@ -3057,7 +3046,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
     summary = [line for line in lines if SUMMARY.match(line.strip())][-4:]
     for line in summary if passed else lines[-20:]:
         print("  " + line)
-    print(("PASS" if passed else "FAIL") + f" (log: {display_log or log})")
+    print(("SKIP: hold" if process.skipped else "PASS" if passed else "FAIL") + f" (log: {display_log or log})")
     return passed
 
 
@@ -3158,14 +3147,12 @@ def update_local_default(repo, default, commit, *, allow_plan_changes=False):
         if f"branch refs/heads/{default}" in lines:
             holder = path
     if holder is None:
-        admit()
         result = run_git(repo, "update-ref", f"refs/heads/{default}", commit, old or "")
         return f"local {default} updated" if result.returncode == 0 else \
             f"local {default} not updated: {result.stderr.strip()}"
     dirty = knowledge_checkout_dirty(holder) if allow_plan_changes else git(holder, "status", "--porcelain")
     if dirty:
         return f"local {default} not updated in {holder}: it has uncommitted changes"
-    admit()
     result = run_git(holder, "merge", "-q", "--ff-only", commit)
     if result.returncode:
         return f"local {default} not updated in {holder}: {result.stderr.strip()}"
@@ -3198,7 +3185,6 @@ def sync_dependencies_after_merge(repo: Path, old_head: str, new_head: str, upda
         return
     if recipe and recipe.returncode == 0:
         try:
-            admit()
             result = subprocess.run(["just", "sync"], cwd=repo, capture_output=True,
                                     text=True, timeout=timeout_for(repo))
         except (FileNotFoundError, subprocess.TimeoutExpired) as error:
@@ -3222,7 +3208,6 @@ def on_github(repo):
 
 def gh(repo, *args, timeout=120):
     try:
-        if args[:2] not in [('pr', 'list'), ('pr', 'view')]: admit()
         result = subprocess.run(["gh", *args], cwd=repo, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
         raise Stop("gh is not installed.")
@@ -3400,10 +3385,12 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
-            admit()
-            process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply,
-                                       pass_fds=task_lock.descriptors() + ((lock_fd,) if lock_fd is not None else ()),
-                                       stderr=errors, start_new_session=True)
+            process = launch_unit('review', main_repo(path), path.name, argv, cwd=path, env=env,
+                                  stdin=prompt, stdout=reply, stderr=errors)
+            run.update(unit=process.unit, pid=process.pid, process_start=task_usage.process_start(process.pid))
+            if process.skipped:
+                process.wait(); run.update(state='skipped: hold')
+                raise Stop('skipped: hold')
             run["state"] = "running"
             if not usage_run: usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
             task_usage.claim(HOME, run["builder"], "review", process.pid)
@@ -3411,27 +3398,24 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
                 code = process.wait(timeout=timeout)
                 run.update(state="finished", exit_code=code)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                process.stop()
                 run.update(state="timed_out")
                 raise Stop(f"Reviewer timed out after {timeout}s; no review recorded. Reply: {reply_file}")
-    except HoldRefused:
-        run.update(state='refused: hold'); raise
     except OSError as error:
         run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
     finally:
         if process is not None and process.poll() is None:
-            stop_child_group(process)
+            process.stop()
         task_usage.release(HOME, run["builder"], process.pid if process else None)
         if raw != reply_file and raw.is_file():
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
         atomic_json(run_file, run)
-        if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")): task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
+        if usage_run and run['state'] == 'skipped: hold':
+            task_usage.run_log(HOME, usage_run, 'skipped: hold')
+            (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
+        elif usage_run and (not usage_run.get("plan") or usage_run.get("invoked")): task_usage.run_log(HOME, usage_run, "interrupted" if run["state"] in {"running", "timed_out"} else "finished" if run.get("exit_code") == 0 else "failed", reason=cli_limit(run, task_usage._text(reply_file if run["builder"] == "claude" else stderr_file)) or run["state"], exit_code=run.get("exit_code"))
         if stderr_file.is_file():
             print(stderr_file.read_text(), end="", file=sys.stderr)
     if code:
@@ -3828,7 +3812,6 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
     exclude(repo, ".worktrees/")
     git(repo, "worktree", "add", "-q", "--detach", str(gate), base)
     try:
-        admit()
         result = run_git(gate, "merge", "--no-edit", "--no-ff", lane_head)
         if result.returncode:
             conflicts = git(gate, "diff", "--name-only", "--diff-filter=U").splitlines()
@@ -3856,6 +3839,7 @@ def gate_merge_result(task: Task, repo: Path, lane_head: str, base: str, record)
 
 
 def merge(args):
+    hold(argparse.Namespace(check=True))
     repo = resolve_repo(args.repo)
     prune_stale_gate_worktrees(repo)
     task = Task(repo, args.id)
@@ -3958,11 +3942,9 @@ def merge(args):
                 continue
             if on_github(repo):
                 task_lock.verify(HOME, repo)
-                admit()
                 git(repo, "push", "-q", "origin", f"{lane_head}:refs/heads/{branch}")
                 pr = open_pr(repo, branch)
                 if not pr:
-                    admit()
                     gh(repo, "pr", "create", "--head", branch, "--base", default,
                        "--title", f"{task.id}{title}" if task.title else task.id,
                        "--body", (path / ".work/report.md").read_text())
@@ -3976,7 +3958,6 @@ def merge(args):
                     print(f"{label} moved before PR merge; re-gating against the new tip.")
                     continue
                 task_lock.verify(HOME, repo)
-                admit()
                 gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", lane_head)
                 completed_step(task, "published")
                 try:
@@ -4000,12 +3981,10 @@ def merge(args):
                 print(f"Merged PR #{pr} ({pr_merge_commit[:7]}) from reviewed head {lane_head[:7]}.")
             else:
                 task_lock.verify(HOME, repo)
-                admit()
                 commit = git(repo, "commit-tree", tree, "-p", base, "-p", lane_head,
                              "-m", f"Merge {task.id}{title}\n\nBranch {branch}, checked with `task merge`.")
                 if has_origin(repo):
                     task_lock.verify(HOME, repo)
-                    admit()
                     pushed = run_git(repo, "push", "-q", "origin", f"{commit}:refs/heads/{default}")
                     if pushed.returncode:
                         fetch(repo)
@@ -4102,7 +4081,6 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
     command = ["backlog", "task", "edit", task.id, "-s", status, "--final-summary", summary]
     for number in criteria:
         command += ["--check-ac", number]
-    admit()
     result = subprocess.run(command, cwd=kb, capture_output=True, text=True)
     if result.returncode:
         raise Stop(f"backlog failed: {(result.stderr or result.stdout).strip()}")
@@ -4149,11 +4127,9 @@ def apply_close_update(kb, task, before, archive, criteria, status, summary):
     paths = sorted({str(p.relative_to(kb)) for p in (before, after) if p})
     if noticed:
         paths.append("improvements.md")
-    admit()
     git(kb, "add", "-A", "--", *paths)
     if ok(kb, "diff", "--cached", "--quiet", "--", *paths):
         return False
-    admit()
     git(kb, "commit", "-q", "-m", f"Close {task.id}: {task.title}", "--", *paths)
     return True
 
@@ -4294,7 +4270,6 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         head = sha(path, "HEAD")
 
     kept = f" Close worktree kept at {path} for the resume."
-    admit()
     pushed = run_git(path, "push", "-q", "-u", "origin", branch)
     if pushed.returncode:
         raise Stop(f"Close branch {branch} at {head[:7]} remains locally at {path}; push failed: {pushed.stderr.strip()}. Rerun `task close` to resume.")
@@ -4306,7 +4281,6 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
     existing = close_pr(repo, branch)
     if not existing:
         try:
-            admit()
             gh(repo, "pr", "create", "--head", branch, "--base", default,
                "--title", f"Close {task.id}: {task.title}", "--body", summary)
         except Stop as error:
@@ -4318,7 +4292,6 @@ def close_with_pr(task, before, archive, args, criteria, status, summary):
         print(f"Opened close PR #{existing['number']}.")
     pr = str(existing["number"])
     try:
-        admit()
         gh(repo, "pr", "merge", pr, "--merge", "--match-head-commit", head)
     except Stop as error:
         raise Stop(f"Close PR #{pr} for branch {branch} at {head[:7]} remains open; merge failed: {error}. Rerun `task close` to resume.{kept}")
@@ -4636,9 +4609,8 @@ def status(args):
         for record in sorted((repo / '.work').glob('runner-*.json')):
             data = json.loads(record.read_text())
             unit = data['unit']
-            service = runner_service(unit) if data['backend'] == 'systemd' else {}
-            active = (service.get('ActiveState') == 'active' if data['backend'] == 'systemd'
-                      else pid_alive(data.get('pid')))
+            service = runner_service(unit)
+            active = service.get('ActiveState') == 'active' and bool(task_usage.process_start(service.get('MainPID')))
             done = record.with_suffix('.done')
             content = done.read_bytes() if done.exists() else b''
             lines = content[data.get('done_offset', 0):].decode().splitlines()
@@ -4731,7 +4703,7 @@ def status(args):
                 lane_run = {}
             if lane_run:
                 lane_state = lane_run.get("state", "unknown")
-                if lane_state == "running" and not pid_alive(lane_run.get("pid")):
+                if lane_state == "running" and not lane_alive(lane_run):
                     lane_state = "interrupted"
                 result = f" (exit {lane_run['exit_code']})" if "exit_code" in lane_run else ""
                 limit = lane_limit(lane_run, path / ".work")
@@ -4834,99 +4806,36 @@ def cancel(args):
     repo = resolve_repo(args.repo)
     if args.id.startswith('runner-'):
         record = repo / '.work' / f'{args.id}.json'
-        if record.exists():
-            data = json.loads(record.read_text())
-            if data['backend'] == 'systemd':
-                subprocess.run(['systemctl', '--user', 'stop', data['unit']], check=True)
-            elif pid_alive(data.get('pid')):
-                os.killpg(data['pid'], signal.SIGTERM)
-            print(f"Cancelled {data['unit']}")
-            return 0
+        data = read_json_object(record)
+        if data.get('unit'):
+            subprocess.run(['systemctl', '--user', 'stop', data['unit']], check=True)
+            print(f"Cancelled {data['unit']}"); return 0
     prune_stale_gate_worktrees(repo)
     task = Task(repo, args.id)
-    lane_path = task.path / ".work/lane.json"
-    try:
-        lane_run = json.loads(lane_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        lane_run = {}
-    if lane_run.get("state") == "running" and pid_alive(lane_run.get("pid")):
-        try:
-            if lane_run.get("child_pgid"):
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(int(lane_run["child_pgid"]), signal.SIGKILL)
-            os.killpg(int(lane_run["pid"]), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError) as error:
-            finalize_lane_record(lane_path, lane_run, "interrupted")
-            reason = "could not stop (permission denied)" if isinstance(error, PermissionError) else "already stopped"
-            print(f"Lane process group {lane_run['pid']} {reason}; kept {task.path}.")
-            return 0
-        finalize_lane_record(lane_path, lane_run, "cancelled")
-        print(f"Cancelled lane process group {lane_run['pid']}; kept {task.path}.")
-        return 0
-    run_path = task_state(task) / "run.json"
-    try: run = json.loads(run_path.read_text())
-    except (OSError, json.JSONDecodeError): raise Stop("No detached run to cancel.")
-    lock = run_path.parent / "run.lock"
+    lane_path = task.path / '.work/lane.json'
+    lane_run = read_json_object(lane_path)
+    if lane_run.get('state') == 'running' and lane_alive(lane_run):
+        if not lane_run.get('unit'): raise Stop('Lane has no unit; ask the PM to inspect the legacy run.')
+        try: subprocess.run(['systemctl', '--user', 'stop', lane_run['unit']], check=True)
+        except subprocess.CalledProcessError as error: raise Stop(f"Cannot stop {lane_run['unit']}; kept the running record.") from error
+        finalize_lane_record(lane_path, lane_run, 'cancelled')
+        print(f"Cancelled lane unit {lane_run['unit']}; kept {task.path}."); return 0
+    run_path = task_state(task) / 'run.json'
+    run = read_json_object(run_path)
+    lock = run_path.with_name('run.lock')
+    if not run: raise Stop('No detached run to cancel.')
     lock_state = task_lock_status(task)
-    if run.get("state") in {"running", "foreground"} and not lock_state:
-        pid = run.get("pid") or run.get("pgid")
-        if not pid_alive(pid):
-            run["state"] = "interrupted"
-            run["ended_at"] = run.get("ended_at") or utc_now()
-            atomic_json(run_path, run)
-    if run.get("state") == "interrupted" or lock_state == "interrupted":
-        lock.unlink(missing_ok=True)
-        run["state"] = "interrupted"
-        run["ended_at"] = run.get("ended_at") or utc_now()
-        atomic_json(run_path, run)
-        prune_stale_gate_worktrees(repo)
-        print("Cleared interrupted run lock.")
-        return 0
-    if run.get("state") not in {"running", "foreground"} or lock_state != "running":
-        raise Stop(f"Run is {run.get('state', 'unknown')}; nothing is running to cancel.")
-    child_pgid = 0
-    try:
-        lock_record = json.loads(lock.read_text())
-        child_pgid = int(lock_record.get("child_pgid", 0))
-        if child_pgid:
-            os.killpg(child_pgid, signal.SIGTERM)
-        if run.get("state") == "running":
-            os.killpg(int(run["pgid"]), signal.SIGTERM)
-        else:
-            os.kill(int(run["pid"]), signal.SIGTERM)
-    except (ProcessLookupError, OSError, KeyError, ValueError): pass
-    run_id = run.get("task_run_id")
-    signal_task_run(run_id, signal.SIGTERM)
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline:
-        live_group = False
-        try:
-            if run.get("state") == "running":
-                os.killpg(int(run["pgid"]), 0)
-                live_group = True
-            elif pid_alive(run.get("pid")):
-                live_group = True
-        except (ProcessLookupError, OSError, KeyError, ValueError):
-            pass
-        if not live_group and not task_run_pids(run_id):
-            break
-        time.sleep(0.05)
-    else:
-        try:
-            if child_pgid:
-                os.killpg(child_pgid, signal.SIGKILL)
-            if run.get("state") == "running":
-                os.killpg(int(run["pgid"]), signal.SIGKILL)
-            else:
-                os.kill(int(run["pid"]), signal.SIGKILL)
-        except (ProcessLookupError, OSError, KeyError, ValueError): pass
-    signal_task_run(run_id, signal.SIGKILL)
-    run["state"] = "cancelled"
-    run["ended_at"] = utc_now()
-    atomic_json(run_path, run)
-    (run_path.parent / "run.lock").unlink(missing_ok=True)
-    prune_stale_gate_worktrees(repo)
-    print("Cancelled task run.")
+    if run.get('state') == 'interrupted' or lock_state == 'interrupted' or not pid_alive(run.get('pid')):
+        run.update(state='interrupted', ended_at=utc_now()); atomic_json(run_path, run)
+        lock.unlink(missing_ok=True); prune_stale_gate_worktrees(repo)
+        print('Cleared interrupted run lock.'); return 0
+    child_unit = read_json_object(lock).get('child_unit')
+    units = list(filter(None, (child_unit, run.get('unit'))))
+    if not units: raise Stop('Run has no unit; ask the PM to inspect the legacy run.')
+    for unit in units: subprocess.run(['systemctl', '--user', 'stop', unit], check=True)
+    run.update(state='cancelled', ended_at=utc_now()); atomic_json(run_path, run)
+    lock.unlink(missing_ok=True); prune_stale_gate_worktrees(repo)
+    print('Cancelled task run.')
     return 0
 
 
@@ -4948,7 +4857,7 @@ def repair_published(task, base):
             lane = json.loads((task.path / '.work/lane.json').read_text())
         except (OSError, ValueError):
             lane = {}
-        if lane.get('state') == 'running' and pid_alive(lane.get('pid')):
+        if lane.get('state') == 'running' and lane_alive(lane):
             return
     if not head:
         for filename, key in (('merge.json', 'head'), ('check.json', 'sha')):
@@ -5020,7 +4929,7 @@ def repair(args):
                 lane_run = json.loads(lane_path.read_text())
             except (OSError, ValueError):
                 lane_run = {}
-            if lane_run.get("state") == "running" and not pid_alive(lane_run.get("pid")):
+            if lane_run.get("state") == "running" and not lane_alive(lane_run):
                 finalize_lane_record(lane_path, lane_run, "interrupted")
                 print(f"Repaired interrupted lane: {repo.name}/{task.id}")
             lock = task_state(task) / "run.lock"
@@ -5075,17 +4984,11 @@ def hold_status():
     return '\n'.join(held)
 
 
-def admit():
-    if held := hold_status():
-        if ACTIVE_FOREGROUND_TASK:
-            path = run_record_path(ACTIVE_FOREGROUND_TASK)
-            atomic_json(path, read_json_object(path) | dict(state='refused: hold', ended_at=utc_now()))
-        raise HoldRefused('refused: hold\n' + held)
-
-
 def hold(args):
     path = HOME / '.local/state/task/hold'
-    if args.check: admit(); return 0
+    if args.check:
+        if held := hold_status(): raise Stop('refused: hold\n' + held)
+        return 0
     if args.action:
         holder = (args.holder or os.environ.get('TASK_HOLDER', '')).strip()
         if not holder: raise Stop('Set TASK_HOLDER or pass --holder <name>')
@@ -5207,9 +5110,6 @@ def main(argv=None):
     sub.add_argument("--rule")
     sub.add_argument("--repo")
     args = parser.parse_args(argv)
-    if args.command in HOLD_WORK_COMMANDS or args.command == 'review' and args.run or args.command == 'plan' and args.sign:
-        try: admit() if not (getattr(args, '_worker', False) or os.environ.get('TASK_RUN_RECORD')) else None
-        except Stop as error: print(f'task {args.command}: {error}', file=sys.stderr); return 1
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
     global GATE_LOCK_WAIT

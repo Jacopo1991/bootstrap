@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from unittest import mock
 from policy_test_env import isolate_policy_environment
 from hold_fixture import install_checker
+from unit_fixture import install_units
 
 isolate_policy_environment()
 
@@ -376,7 +377,7 @@ class BatchTest(unittest.TestCase):
         (self.repo / '.gitignore').write_text('.work/\n.worktrees/\n')
         self.git('add', '.gitignore')
         self.git('commit', '-m', 'Initial')
-        (self.home / 'bin').mkdir()
+        install_units(self.home)
         stub = self.home / 'bin/task'
         stub.write_text(STUB)
         stub.chmod(0o755)
