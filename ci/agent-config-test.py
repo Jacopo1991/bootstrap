@@ -91,6 +91,9 @@ for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"
 tools_template = (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert 'mkdir -p "$HOME/.cache/uv" "$HOME/.cache/pre-commit" "$HOME/.cache/pip" "$HOME/.npm"' in tools_template
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
+# T-48: the Antigravity sign-in folder is unreadable to Claude; Codex has no native deny here, so its
+# guard is the policy hook on Bash and apply_patch (checked above), tested in ci/managed-policy-test.py.
+assert "Read(~/.gemini/**)" in claude["permissions"]["deny"]
 assert "Bash(git merge *)" not in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
 assert not any("*" in d for d in claude["sandbox"]["network"]["allowedDomains"])

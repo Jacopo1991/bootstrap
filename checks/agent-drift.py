@@ -17,7 +17,7 @@ import time
 import tomllib
 
 EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
-                     "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just",
+                     "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "agy",
                      "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
                      "verify-enable", "gate-browser", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch",
                      "task-watch", "job-ping", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
@@ -30,12 +30,14 @@ VERSION_COMMANDS = {
     "ccusage": ["ccusage", "--version"],
     "lychee": ["lychee", "--version"],
     "osv-scanner": ["osv-scanner", "--version"],
+    "agy": ["agy", "--version"],
 }
 # Release binaries pinned only by URL: the version is the URL's tag.
 URL_VERSIONS = {
     "gitleaks": ("GITLEAKS_URL", "/download/v"),
     "lychee": ("LYCHEE_URL", "/download/lychee-v"),
     "osv-scanner": ("OSV_SCANNER_URL", "/download/v"),
+    "agy": ("AGY_URL", "/download/"),
 }
 
 
@@ -209,12 +211,13 @@ def installed_uv_tools(directory: Path) -> list[str]:
                   if entry.is_dir() and not entry.name.startswith("."))
 
 
-def scan(root: Path, home: Path) -> list[str]:
+def scan(root: Path, home: Path, run=run_quiet) -> list[str]:
+    """`run` is the command runner (run_quiet); tests inject a fake one."""
     findings: set[str] = set()
-    rc, _ = run_quiet(["chezmoi", "verify"], home=home)
+    rc, _ = run(["chezmoi", "verify"], home=home)
     if rc:
         findings.add("chezmoi-verify-failed")
-    rc, diff = run_quiet(["chezmoi", "diff"], home=home)
+    rc, diff = run(["chezmoi", "diff"], home=home)
     if rc or diff.strip():
         findings.add("chezmoi-diff-nonempty")
 
@@ -235,7 +238,7 @@ def scan(root: Path, home: Path) -> list[str]:
         resolved = shutil.which(name, path=approved_runtime_path(home))
         if not resolved or Path(resolved).parent.resolve() != (home / ".local" / "bin").resolve():
             findings.add("cli-path-drift:" + name)
-        rc, actual = run_quiet(args, home=home)
+        rc, actual = run(args, home=home)
         if rc or not version_matches(expected, actual):
             findings.add("cli-version-drift:" + name)
 
@@ -254,7 +257,7 @@ def scan(root: Path, home: Path) -> list[str]:
     except (OSError, KeyError, tomllib.TOMLDecodeError):
         findings.add("mise-lock-unavailable")
 
-    npm_rc, npm_output = run_quiet(["npm", "list", "-g", "--depth=0", "--json"], home=home)
+    npm_rc, npm_output = run(["npm", "list", "-g", "--depth=0", "--json"], home=home)
     try:
         npm_extras = unexpected_global_npm_packages(npm_output)
     except (json.JSONDecodeError, ValueError):
@@ -264,7 +267,7 @@ def scan(root: Path, home: Path) -> list[str]:
             findings.add("npm-global-inventory-unavailable")
         findings.update("npm-global-outside-bootstrap:" + name for name in npm_extras)
 
-    uv_dir_rc, uv_dir_output = run_quiet(["uv", "tool", "dir"], home=home)
+    uv_dir_rc, uv_dir_output = run(["uv", "tool", "dir"], home=home)
     if uv_dir_rc or not uv_dir_output.strip():
         findings.add("uv-tool-inventory-unavailable")
     else:

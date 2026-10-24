@@ -70,9 +70,10 @@ assert set(managed["permissions"]) == {"deny"}
 for path in keys(managed):  # "permissions" only as the container of the deny list
     assert path == ("permissions",) or path[-1] not in RESTRICTING, path
 deny = managed["permissions"]["deny"]
-assert len(deny) == 88 and len(set(deny)) == 88, len(deny)
+assert len(deny) == 89 and len(set(deny)) == 89, len(deny)
 for rule in ("Bash(gh pr merge *)", "Bash(wsl.exe *)", "Read(~/.ssh/**)", "Read(~/.claude.json)",
-             "Edit(//etc/**)", "Bash(git push --force*)", "Bash(/usr/bin/gh api * --method=DELETE*)"):
+             "Read(~/.gemini/**)", "Edit(//etc/**)", "Bash(git push --force*)",
+             "Bash(/usr/bin/gh api * --method=DELETE*)"):
     assert rule in deny, rule
 # One source of truth: the user file keeps preferences only.
 assert "deny" not in user["permissions"] and "hooks" not in user, "guardrails left in user settings"
@@ -1316,4 +1317,66 @@ assert (ROOT / "home/dot_codex/remove_hooks.json").read_bytes() == b""
 stale = ROOT / "home/dot_local/share/bootstrap/agent-policy"
 assert sorted(p.name for p in stale.iterdir()) == ["remove_context_reminder.py", "remove_pre_tool_use.py"]
 assert all(p.read_bytes() == b"" for p in stale.iterdir())
+
+# --- T-48: Antigravity CLI (agy) and its Google sign-in folder ----------------------------------
+# agy is refused in lane sessions only; --dangerously-skip-permissions is refused in every session;
+# no tool reaches ~/.gemini in either. Claude's Read() rule and the sandbox read-deny come from the
+# same entry. Codex has no native deny in this repository, so its guard is this hook (Bash, apply_patch).
+assert "Read(~/.gemini/**)" in managed["permissions"]["deny"]
+assert policy.SKIP_PERMISSIONS_FLAG == "--dangerously-skip-permissions"
+with tempfile.TemporaryDirectory() as temp_home, tempfile.TemporaryDirectory() as temp_work:
+    home_dir = Path(temp_home).resolve()
+    work = Path(temp_work).resolve()
+    gemini = home_dir / ".gemini" / "antigravity-cli"
+    gemini.mkdir(parents=True)
+    (gemini / "credentials.enc").write_text("fixture\n")
+    (home_dir / ".gemini-notes").write_text("fixture\n")
+    (work / "link").symlink_to(home_dir / ".gemini")
+
+    def rule_of(event):
+        reason = policy.evaluate(event, (work,))
+        return getattr(reason, "rule_id", None), reason
+
+    def bash(command):
+        return {"tool_name": "Bash", "cwd": str(work), "tool_input": {"command": command}}
+
+    for lane in (True, False):
+        with patch.dict(os.environ, {"HOME": str(home_dir)}):
+            if lane:
+                os.environ["TASK_WORKTREE"] = str(work)
+            else:
+                os.environ.pop("TASK_WORKTREE", None)
+            # The lane refusal names the task, by name and by absolute path, through wrappers too.
+            for command in ("agy -p 'say hi'", "antigravity --version", f"{home_dir}/.local/bin/agy -p x",
+                            "env agy --help", "timeout 5 agy -p x", "true; agy -p x"):
+                rule, reason = rule_of(bash(command))
+                if lane:
+                    assert rule == "agy.lane_boundary" and "T-48" in reason, (command, rule, reason)
+                else:
+                    assert rule != "agy.lane_boundary", (command, reason)
+            if not lane:
+                assert rule_of(bash("agy --version"))[1] is None
+            # The skip-permissions flag is refused for any executable, in every session.
+            for command in ("agy -p x --dangerously-skip-permissions", "claude --dangerously-skip-permissions -p x",
+                            "agy --dangerously-skip-permissions=1 -p x"):
+                assert rule_of(bash(command))[0] == "agent.skip_permissions", (lane, command)
+            # Any access to ~/.gemini is refused, reads included: literal, $HOME, tilde, glob, symlink.
+            for command in (f"cat {gemini}/credentials.enc", f"ls {home_dir}/.gemini", "ls ~/.gem*",
+                            "head $HOME/.gemini/antigravity-cli/credentials.enc",
+                            f"cp {gemini}/credentials.enc copy.txt", "grep -r fixture link",
+                            "cat link/antigravity-cli/credentials.enc", f"touch {home_dir}/.gemini/out.txt"):
+                assert rule_of(bash(command))[0] == "credential.protected_path", (lane, command)
+            for event in (
+                {"tool_name": "Write", "cwd": str(work), "tool_input": {"file_path": f"{gemini}/settings.json"}},
+                {"tool_name": "Edit", "cwd": str(work), "tool_input": {"file_path": "~/.gemini/settings.json"}},
+                {"tool_name": "apply_patch", "cwd": str(work), "tool_input": {
+                    "patch": f"*** Begin Patch\n*** Update File: {gemini}/credentials.enc\n*** End Patch\n"}},
+            ):
+                assert rule_of(event)[0] == "credential.protected_path", (lane, event["tool_name"])
+            # Negative controls: a similarly named folder, the home folder and ordinary work stay allowed.
+            for command in (f"cat {home_dir}/.gemini-notes", f"ls {home_dir}", "cat README.md"):
+                assert rule_of(bash(command))[0] != "credential.protected_path", (lane, command)
+            assert rule_of({"tool_name": "Write", "cwd": str(work), "tool_input": {
+                "file_path": str(work / "notes.md")}})[0] != "credential.protected_path", lane
 print("PASS: guardrails only in root-owned managed config; hooks run root-owned scripts; no mode limits")
+print("PASS: agy refused in lane sessions with T-48 reason; skip-permissions refused everywhere; ~/.gemini unreachable by tools")

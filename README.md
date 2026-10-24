@@ -1204,6 +1204,30 @@ PyPI and about six for npm (its database is about 200 MB).
   it also checks that the exception passes the lock until it expires, that an expired
   copy blocks it and that the lock without the exception is blocked.
 
+### Antigravity CLI (agy)
+
+`agy` (Antigravity CLI 1.4.0) is a third vendor for research, read-only audits and plan
+red-teams. Bootstrap installs the release tarball pinned in `pins.env` (`AGY_URL`,
+`AGY_SHA256`): the SHA-256 is checked before extraction, the binary is kept under
+`~/.local/share/bootstrap/agy/<version>/` and `~/.local/bin/agy` links to it. The vendor's
+install script is never run. The drift report reads back `agy --version`.
+
+- **Who runs it:** the PM, from an unsandboxed shell (`agy -p "<prompt>"`, `--add-dir <path>`).
+  The policy hook refuses `agy` and `antigravity` in every lane session (T-48). It refuses
+  `--dangerously-skip-permissions` in every session.
+- **Data:** public material only until Google's data terms are checked. The CLI's README says
+  Google collects and uses "Interactions data" by default, with an opt-out in settings. No
+  `settings.json` key for that opt-out, or for Remote Control, is documented in the release
+  notes we pinned, so bootstrap writes no settings file. The opt-outs are Jacopo's account
+  action in the CLI (`/config`: `Enable Telemetry` off; Remote Control off).
+- **Credentials:** the Google sign-in lives in `~/.gemini/` (credentials under
+  `~/.gemini/antigravity-cli/`). Claude's `Read(~/.gemini/**)` deny in the managed guardrails
+  also feeds the sandbox read-deny. The policy hook refuses any Bash, Write, Edit or
+  `apply_patch` access to `~/.gemini` in both vendors; Codex has no native read-deny in this
+  repository, so the hook is its guard. The hook matches command tokens, so a recursive search
+  from the home folder (for example `grep -r ... ~`) is not caught by it.
+- **Login and probe:** the one-time login and the probe are in [docs/agy-probe.md](docs/agy-probe.md).
+
 ## Skills, prompt reminders and the minutes watchdog
 
 - **Skills:** the skills in `Jacopo1991/cortex-core` are distributed with `gh skill`.
