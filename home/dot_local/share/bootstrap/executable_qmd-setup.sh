@@ -48,6 +48,9 @@ systemctl --user list-timers qmd-index.timer --no-pager
 systemctl --user enable --now osv-db-refresh.timer
 systemctl --user is-active --quiet osv-db-refresh.timer
 systemctl --user list-timers osv-db-refresh.timer --no-pager
+systemctl --user enable --now security-watch.timer
+systemctl --user is-active --quiet security-watch.timer
+systemctl --user list-timers security-watch.timer --no-pager
 
 step 'shared qmd MCP server'
 # One HTTP server keeps the models loaded once; Claude Code sessions and the

@@ -1200,8 +1200,8 @@ PyPI and about six for npm (its database is about 200 MB).
   checks the config and hook in both new repositories. `ci/osv-db-test.py` checks the
   npm exception (one ID, a reason, the expiry date, still matching the lock), the units
   and their enablement, and that `osv-db-refresh` reports failures, keeps old data and
-  stamps only a full success. With osv-scanner and the offline npm database installed,
-  it also checks that the exception passes the lock until it expires, that an expired
+  stamps only a full success. With osv-scanner installed, a synthetic offline npm
+  database checks that the exception passes the lock until it expires, that an expired
   copy blocks it and that the lock without the exception is blocked.
 
 ## Skills, prompt reminders and the minutes watchdog
@@ -1298,6 +1298,7 @@ file; a job whose key is missing skips its ping silently.
 | `qmd-index` | `qmd-index.timer` (AgentDev) | every 15 minutes | `QMD_INDEX_URL` |
 | `task-watch` | `task-watch.timer` (PM enables after review) | every 15 minutes | `TASK_WATCH_URL` |
 | `osv-db-refresh` | `osv-db-refresh.timer` (AgentDev) | weekly | `OSV_DB_REFRESH_URL` |
+| `security-watch` | `security-watch.timer` (AgentDev) | daily | `SECURITY_WATCH_URL` |
 | `gh-skill-update` | `gh-skill-update.timer` (AgentDev) | daily | `GH_SKILL_UPDATE_URL` |
 | `windows-skills-update` | `MachineBootstrap-Skills-Update` task | daily 09:15 | `WINDOWS_SKILLS_UPDATE_URL` |
 | `windows-minutes-watchdog` | `MachineBootstrap-Minutes-Watchdog` task | daily 09:45 | `WINDOWS_MINUTES_WATCHDOG_URL` |
@@ -1306,7 +1307,7 @@ file; a job whose key is missing skips its ping silently.
 - **Files** (one `KEY=https://hc-ping.com/<uuid>` per line, nothing else needed): in AgentDev
   `~/project-data/healthchecks/pings.env` (runtime data, never Git; `chmod 600`); on Windows
   `%LOCALAPPDATA%\machine-bootstrap\pings.env` (keep it readable by your account only). AgentDev
-  needs the first three keys, Windows the last three. A ping URL is a secret: it is read at run
+  needs the AgentDev keys, Windows the last three. A ping URL is a secret: it is read at run
   time, handed to curl on stdin and never printed, logged, put in a command line or in Backrest's
   `config.json`. `JOB_PINGS_FILE` overrides the AgentDev path (tests use it).
 - **Never in the way:** `job-ping` (installed to `~/.local/bin`; `windows\job-ping.ps1` on
@@ -1330,6 +1331,50 @@ file; a job whose key is missing skips its ping silently.
   inventory-mirror jobs, which were not part of this change.
 - **Tests:** `ci/job-ping-test.py` (which URL, silent skips, timeouts, no URL in a command line, dead
   network) runs in `ci/lint.sh`; the Windows twin is tested in `ci/founder-tasks-test.ps1`.
+
+## Daily installed-environment security scan
+
+`security-watch.timer` runs daily, catches up after downtime, and adds up to one hour
+of random delay. Installation enables it alongside the existing weekly OSV refresh
+timer. Each scan first starts the existing `osv-db-refresh.service` and waits for it;
+refresh failure fails the run even when cached data can still be scanned.
+
+The fixed roots, relative to the agent HOME, are:
+
+- `.local/share/bootstrap/npm` (including installed `node_modules` and the lockfile);
+- `.local/share/bootstrap/pre-commit/venv` and `.local/share/bootstrap/inspect/venv`;
+- `.local/share/bootstrap/gpu-venv` when installed;
+- `dev_workspace`, recursively, including project venv metadata and lockfiles.
+
+The scanner is pinned to osv-scanner 2.6.0. Scans use `--offline`,
+`--offline-vulnerabilities`, `--no-resolve`, `--no-ignore` and the bundled
+`python/wheelegg` and `javascript/packagejson` plugins alongside default lockfile
+plugins. Gitignored environments are included. Scanner path exclusions omit
+customer-harness/CustomerHarness, typo3-dkm/typo3-dkm-plugin/Typo3/DKM, secrets,
+project-data and .git directories (case insensitive). Directory symlinks are not
+traversed by the scanner. Missing required roots and scan errors fail the run;
+an absent optional GPU environment is explicitly reported.
+
+Exemptions use native `osv-scanner.toml` `[[IgnoredVulns]]` entries with an advisory
+`id`, `ignoreUntil` and `reason`, as in the bootstrap npm config. A config at a
+listed root is passed explicitly so installed metadata also receives exemptions.
+Project lockfiles otherwise use the scanner's normal config discovery. Root configs
+must be regular files. Expired exemptions expose the finding again.
+
+Dated JSON reports under `~/.local/state/security/` contain scanner findings and
+diagnostics per root; `latest.json` points to the latest result by content. A dated
+Markdown summary and the `## Security` section of `~/cortex/cortex-core/STATUS.md`
+show the result. The job replaces only that section, preserving adjacent sections.
+It calls `job-ping security-watch 0` for a clean completed scan, or `1` for findings,
+refresh/scan errors or a failed status update. Provision `SECURITY_WATCH_URL` in the
+existing owner-managed pings file to receive these signals. No report body is sent.
+
+Refresh has a 30-minute budget and each of five roots has two minutes, within the
+45-minute unit timeout. An incomplete JSON record is written before work begins.
+Reports use a private umask. This wrapper does not install or repair packages.
+`ci/security-watch-test.py` and `ci/osv-db-test.py` use synthetic packages and local
+advisory zip fixtures, temporary HOME/state and stubbed refresh/ping commands; they
+never refresh a real feed or scan an installed environment.
 
 ## Backups (Backrest on Windows)
 

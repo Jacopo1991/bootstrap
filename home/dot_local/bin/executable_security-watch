@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Daily OSV scan. Extraction, traversal and exemptions belong to osv-scanner."""
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+
+# Paths are relative to HOME. GPU is optional; the other installed roots are required.
+ROOTS = ((".local/share/bootstrap/npm", False),
+         (".local/share/bootstrap/pre-commit/venv", False),
+         (".local/share/bootstrap/inspect/venv", False),
+         (".local/share/bootstrap/gpu-venv", True),
+         ("dev_workspace", False))
+EXCLUDES = ("customer-harness", "CustomerHarness", "typo3-dkm-plugin", "typo3-dkm",
+            "Typo3", "DKM", "secrets", "project-data", ".git")
+
+
+def run(args, timeout):
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def write(path, content):
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(content)
+    temporary.replace(path)
+
+
+def summary(report, dated):
+    lines = ["## Security", "", f"OSV scan {report['run']}: {report['status']}.",
+             f"Report: {dated}", ""]
+    lines += [f"- `{r['root']}`: {r['status']}" for r in report["roots"]]
+    lines += ["- Error: " + e.replace("\n", " ") for e in report["errors"]]
+    return "\n".join(lines) + "\n"
+
+
+def main():
+    os.umask(0o077)
+    home = Path.home()
+    state = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state")) / "security"
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    report = {"run": now, "status": "incomplete", "roots": [], "errors": []}
+    result = 1
+    dated = state / (now.replace(":", "-") + ".json")
+    write(dated, json.dumps(report, indent=2) + "\n")
+    try:
+        refresh = run(["systemctl", "--user", "start", "osv-db-refresh.service"], 1800)
+        if refresh.returncode:
+            report["errors"].append("osv-db-refresh.service failed: " + refresh.stderr)
+        version = run(["osv-scanner", "--version"], 30)
+        if version.returncode or "osv-scanner version: 2.6.0" not in version.stdout:
+            raise RuntimeError("osv-scanner 2.6.0 is required")
+        for relative, optional in ROOTS:
+            root = home / relative
+            entry = {"root": relative}
+            report["roots"].append(entry)
+            if optional and not root.exists():
+                entry["status"] = "not installed"
+                continue
+            try:
+                if not root.is_dir() or root.is_symlink():
+                    raise RuntimeError("required root missing or symlinked")
+                args = ["osv-scanner", "scan", "source", "--offline",
+                        "--offline-vulnerabilities", "--no-resolve", "--no-ignore", "-r",
+                        "--experimental-plugins=python/wheelegg,javascript/packagejson",
+                        "--format=json", "--all-packages"]
+                for excluded in EXCLUDES:
+                    args += ["--experimental-exclude", "r:(?i)/" + re.escape(excluded) + "(/|$)"]
+                config = root / "osv-scanner.toml"
+                if config.is_symlink():
+                    raise RuntimeError("root config is symlinked")
+                if config.is_file():
+                    args += ["--config", str(config)]
+                if relative == "dev_workspace":
+                    args += ["--allow-no-lockfiles"]
+                scan = run(args + [str(root)], 120)
+                entry.update(exit=scan.returncode, diagnostics=scan.stderr)
+                data = json.loads(scan.stdout)
+                if scan.returncode not in (0, 1) or not isinstance(data.get("results"), list):
+                    raise RuntimeError("scanner failed or returned invalid results")
+                entry.update(status="findings" if scan.returncode else "clean", results=data)
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+                entry.update(status="error", error=str(error))
+                report["errors"].append(relative + ": " + str(error))
+        result = int(bool(report["errors"]) or any(r["status"] == "findings" for r in report["roots"]))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        report["errors"].append(str(error))
+    finally:
+        report["status"] = "failed" if result else "clean"
+        section = summary(report, dated)
+        try:
+            status = home / "cortex/cortex-core/STATUS.md"
+            text = status.read_text()
+            pattern = r"(?ms)^## Security\n.*?(?=^## |\Z)"
+            text = re.sub(pattern, lambda match: section + "\n", text) if re.search(pattern, text) else text.rstrip() + "\n\n" + section
+            write(status, text)
+        except OSError as error:
+            result = 1
+            report["status"] = "failed"
+            report["errors"].append("cortex-core security update failed: " + str(error))
+        body = json.dumps(report, indent=2) + "\n"
+        write(dated, body)
+        write(state / "latest.json", body)
+        write(dated.with_suffix(".md"), summary(report, dated))
+    return result
+
+
+def terminated(signum, frame):
+    raise RuntimeError("scan terminated")
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, terminated)
+    outcome = 1
+    try:
+        outcome = main()
+    except (OSError, RuntimeError) as error:
+        print("security-watch: " + str(error), file=sys.stderr)
+    finally:
+        try:
+            run(["job-ping", "security-watch", str(outcome)], 10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass  # job-ping is best effort, as for the existing refresh job.
+    sys.exit(outcome)
