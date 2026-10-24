@@ -37,6 +37,8 @@ hostile.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
 hostile.chmod(0o755)
 for offset, fail in [(10, False), (11, True)]:
     env = dict(os.environ, HOME=str(fixture_home), PATH=f"{hostile.parent}:{os.environ['PATH']}")
+    env.update(XDG_RUNTIME_DIR=str(fixture_home / 'runtime'), DBUS_SESSION_BUS_ADDRESS='unix:path=' + str(fixture_home / 'runtime/bus'))
+    env.setdefault('TASK_GATE_SLOT', '0')
     if fail:
         env["GATE_BROWSER_FIXTURE_FAIL"] = "1"
     result = subprocess.run([

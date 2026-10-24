@@ -5,6 +5,8 @@ RUN = r'''#!/usr/bin/env python3
 import json, os, pathlib, shlex, subprocess, sys
 home = pathlib.Path.home()
 args = sys.argv[1:]
+if not all(os.environ.get(key) for key in ('XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS')):
+    sys.exit('No user systemd bus: missing XDG_RUNTIME_DIR or DBUS_SESSION_BUS_ADDRESS')
 unit = args[args.index('--unit') + 1]
 root = home / 'units'
 root.mkdir(exist_ok=True)
@@ -26,7 +28,8 @@ if os.environ.get('SERVICE_EXIT'):
 (root / unit).write_text(json.dumps(dict(MainPID=str(os.getpid()), ActiveState='active', Result='success')))
 os.chdir(args[args.index('--working-directory') + 1])
 command = args[args.index('--') + 1:]
-os.execvpe(command[0], command, env)
+try: os.execvpe(command[0], command, env)
+except OSError as error: sys.exit(str(error))
 '''
 
 CTL = r'''#!/usr/bin/env python3
@@ -35,6 +38,11 @@ home = pathlib.Path.home()
 unit = sys.argv[-1]
 try: data = json.loads((home / 'units' / unit).read_text())
 except FileNotFoundError: sys.exit(1)
+try:
+    status = pathlib.Path(f"/proc/{data['MainPID']}/stat").read_text().rsplit(')', 1)[1].split()[0]
+    if status == 'Z': raise FileNotFoundError()
+except FileNotFoundError:
+    data.update(MainPID='0', ActiveState='inactive')
 if 'stop' in sys.argv:
     (home / 'stopped').write_text(unit)
     def kill_tree(pid, signum):

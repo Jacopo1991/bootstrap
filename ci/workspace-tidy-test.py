@@ -54,6 +54,7 @@ def tidy_environment(home):
     task.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
     task.chmod(0o755)
     env = dict(os.environ, HOME=str(home), PATH=f"{bin_dir}:{os.environ['PATH']}",
+               XDG_RUNTIME_DIR=str(home / 'runtime'), DBUS_SESSION_BUS_ADDRESS='unix:path=' + str(home / 'runtime/bus'),
                GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
     env.pop('CODEX_HOME', None)
     return env

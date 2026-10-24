@@ -369,6 +369,7 @@ class BatchTest(unittest.TestCase):
         self.repo = self.home / 'dev_workspace/proj'
         self.repo.mkdir(parents=True)
         self.env = dict(HOME=str(self.home), PATH=os.environ['PATH'], TASK_HOLDER='batch-test',
+                        XDG_RUNTIME_DIR=str(self.home / 'runtime'), DBUS_SESSION_BUS_ADDRESS='unix:path=' + str(self.home / 'runtime/bus'),
                         TASK_TEST_ROUTING_DIR=str(ROOT / 'home/dot_local/bin'),
                         GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1',
                         GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid',

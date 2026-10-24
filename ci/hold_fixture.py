@@ -11,7 +11,7 @@ def install_checker(home):
     source_dir = ROOT / 'home/dot_local/bin'
     source = (source_dir / 'executable_task').read_text()
     source = source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'TASK_TEST_', 'GATE_BROWSER_FIXTURE_')) or name in {'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'}")
-    source = source.replace('"LANG", "TERM", "SHELL"}', '"LANG", "TERM", "SHELL", "GATE_BROWSER_FIXTURE_FAIL"}')
+    source = source.replace('"DBUS_SESSION_BUS_ADDRESS"}', '"DBUS_SESSION_BUS_ADDRESS", "GATE_BROWSER_FIXTURE_FAIL"}')
     assert source.count('Path("/etc/agent-hold")') == 1
     target.write_text(source.replace('Path("/etc/agent-hold")', f'Path({str(home / "etc-agent-hold")!r})'))
     target.chmod(0o755)

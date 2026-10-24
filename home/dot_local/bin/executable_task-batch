@@ -127,8 +127,6 @@ def git(repo, *args):
     return result.stdout.strip()
 
 
-
-
 def blocking(text):
     """Keep recorded blocking evidence, excluding commit hashes and optional notes."""
     section = re.search(r"(?ims)^\s*(?:#{1,6}\s*)?(?:\*\*)?Blocking(?:\*\*)?\s*:?\s*\n"

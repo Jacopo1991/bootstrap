@@ -48,7 +48,7 @@ HOLD_FIXTURE.parent.mkdir()
 def hold_fixture_source(source):
     assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
     source = source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
-    return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'}")
+    return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL'}")
 fixture_bin = Path(audit_state.name) / 'bin'
 fixture_bin.mkdir()
 for sibling in TOOL.parent.iterdir():
@@ -326,9 +326,17 @@ class TaskTool(unittest.TestCase):
                             '--allowedTools', 'Bash Read Write Edit Glob Grep'])):
             with self.subTest(vendor=vendor), mock.patch.dict(os.environ, self.env, clear=True):
                 environment = TASK_MODULE.lane_environment(TASK_MODULE.Task(self.repo, '5'), vendor)
+                release = work / 'proof-release'
+                release.unlink(missing_ok=True)
+                environment['LANE_STUB_RELEASE'] = str(release)
+                for key in ('XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'):
+                    os.environ.pop(key, None)  # The supplied launch environment owns the bus.
                 with prompt.open() as source, (work / 'proof.log').open('w') as output:
                     process = TASK_MODULE.launch_unit('lane', self.repo, 't5', command,
                         cwd=wt, env=environment, stdin=source, stdout=output, stderr=output)
+                    self.assertGreater(process.pid, 0)
+                    self.assertTrue(TASK_MODULE.task_usage.process_start(process.pid))
+                    release.touch()
                     self.assertEqual(process.wait(timeout=10), 0)
                 call = json.loads((work / 'model-call.json').read_text())
                 self.assertEqual(call['args'], command[1:])
@@ -337,11 +345,24 @@ class TaskTool(unittest.TestCase):
                 self.assertEqual(call['tmpdir'], environment['TMPDIR'])
                 recorded = json.loads((self.home / 'unit-calls.jsonl').read_text().splitlines()[-1])
                 self.assertEqual(recorded['env'], environment)
+                for key in ('XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'):
+                    self.assertEqual(environment[key], self.env[key])
+                    self.assertIn(f'--setenv={key}={self.env[key]}', recorded['args'])
                 self.assertIn('--user', recorded['args'])
                 self.assertIn(f'ExecCondition={self.home}/.local/bin/task hold --check', recorded['args'])
                 self.assertRegex(process.unit, r'^task-lane-proj-t5-[a-f0-9]+$')
                 self.assertGreater(process.pid, 0)
                 TASK_MODULE.cleanup_lane_temporary(environment['TMPDIR'] if vendor == 'claude' else None)
+        for missing in ('XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'):
+            environment = dict(self.env)
+            environment.pop(missing)
+            target = work / 'forbidden-without-bus'
+            with (work / 'missing-bus.log').open('w') as output, \
+                    self.assertRaisesRegex(TASK_MODULE.Stop, 'launch log'):
+                TASK_MODULE.launch_unit('lane', self.repo, 'no-bus', ['touch', str(target)],
+                    cwd=wt, env=environment, stdout=output, stderr=output)
+            self.assertFalse(target.exists())
+            self.assertIn('No user systemd bus', (work / 'missing-bus.log').read_text())
 
 
     def test_hold_read_only_commands_and_release_preserves_jacopo(self):
@@ -386,7 +407,11 @@ class TaskTool(unittest.TestCase):
         self.raw_task('hold', 'release')
         for content in ('', '{broken', '{"mode":"released"}'):
             marker.write_text(content)
-            self.assertIn(str(marker), self.raw_task('realign', 'proj', code=1))
+            self.assertIn(str(marker), self.raw_task('hold', '--check', code=1))
+            self.assertIn('skipped: hold', self.raw_task('realign', 'proj', code=1))
+            run = json.loads((self.home / '.local/state/task/cortex-kb-proj/realign/review-run.json').read_text())
+            self.assertEqual(run['state'], 'skipped: hold')
+            self.assertTrue(run['unit'])
         self.raw_task('hold', 'release')
         self.assertIn('no hold', self.raw_task('hold'))
 
@@ -520,7 +545,7 @@ class TaskTool(unittest.TestCase):
             return transport(command, **kwargs)
         # The first sweep sees a live gate; the post-cancel sweep cleans it up.
         with mock.patch.dict(os.environ, self.env, clear=True), \
-                mock.patch.object(TASK_MODULE, 'pid_alive', side_effect=[True, False, False]), \
+                mock.patch.object(TASK_MODULE, 'pid_alive', side_effect=[True, False, False, False]), \
                 mock.patch.object(TASK_MODULE, 'task_lock_status', return_value='running'), \
                 mock.patch.object(TASK_MODULE.os, 'killpg', side_effect=ProcessLookupError), \
                 mock.patch.object(TASK_MODULE.subprocess, 'run', side_effect=fail_removal):
@@ -1348,7 +1373,7 @@ class TaskTool(unittest.TestCase):
         runner.write_text('1. 5: builder codex, model gpt-6-luna\n')
         self.raw_task('runner-start', 'proj', str(runner))
         self.wait_project_lock_free()
-        self.assertIn('--setenv=TASK_PLAN=chain', json.loads((self.home / 'service-args').read_text()))
+        self.assertIn('--setenv=TASK_PLAN=chain', json.loads((self.home / 'unit-calls.jsonl').read_text().splitlines()[-1])['args'])
         self.assertEqual([r['plan'] for r in self.run_rows()], ['chain'] * 3)
         rows = self.run_rows()
         commands = [('start', 'proj', '5', '--builder', 'codex'), ('lane', 'proj', '5'),
@@ -1447,7 +1472,9 @@ class TaskTool(unittest.TestCase):
             api = runpy.run_path({str(TOOL)!r})
             original = subprocess.Popen
             def spawn(argv, *args, **kwargs):
-                if '--_worker' in argv: argv = [sys.executable, {str(worker)!r}, *argv[2:]]
+                if '--_worker' in argv:
+                    entry = argv.index('--') + 1
+                    argv = [*argv[:entry], sys.executable, {str(worker)!r}, *argv[entry + 2:]]
                 return original(argv, *args, **kwargs)
             with mock.patch.object(subprocess, 'Popen', side_effect=spawn):
                 sys.exit(api['main'](['lane', 'proj', '5', '--plan', 'chain', '--no-pace', '--no-boost']))
@@ -1583,6 +1610,8 @@ class TaskTool(unittest.TestCase):
                     self.wait_project_lock_free()
                 with (self.state() / 'review.lock').open('a') as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(list((self.home / '.local/state/task/usage/running').glob('*/*.json')), [])
+                self.raw_task('plan-budget', 'chain', '--clear', 'review')
 
     def test_plan_budget_file_points_and_lifetime_bounds(self):
         now = datetime.now(timezone.utc)
@@ -1663,7 +1692,7 @@ class TaskTool(unittest.TestCase):
                 if '--_worker' in argv:
                     events.append('spawn')
                     if sys.argv[2] == 'crash': raise RuntimeError('spawn refused')
-                    return SimpleNamespace(pid=os.getpid())
+                    return SimpleNamespace(pid=os.getpid(), unit='task-lane-proj-t5-trace', skipped=False)
                 return original_popen(argv, *args, **kwargs)
             replacements = {{name: traced(name, namespace[name]) for name in
                             ('guards', 'tier_guard', 'archive_lane_final', 'check_plan',
@@ -1672,7 +1701,7 @@ class TaskTool(unittest.TestCase):
                                 budget_run=mock.Mock(side_effect=AssertionError('no plan')))
             try:
                 with mock.patch.dict(namespace, replacements), \\
-                        mock.patch.object(subprocess, 'Popen', side_effect=spawn), \\
+                        mock.patch.dict(namespace, launch_unit=lambda kind, repo, ident, argv, **kwargs: spawn(argv)), \\
                         mock.patch.object(api['task_usage'], 'record_override', traced('override', api['task_usage'].record_override)), \\
                         mock.patch.object(api['task_usage'], 'run_log', traced('run_log', api['task_usage'].run_log)):
                     raise SystemExit(api['main'](sys.argv[3:]))
@@ -1771,7 +1800,7 @@ class TaskTool(unittest.TestCase):
         runner = self.runner_fixture()
         self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain')
         self.wait_project_lock_free()
-        args = json.loads((self.home / 'service-args').read_text())
+        args = json.loads((self.home / 'unit-calls.jsonl').read_text().splitlines()[-1])['args']
         self.assertIn('--setenv=TASK_PLAN=chain', args)
         self.assertEqual(self.run_rows(), [])
         self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
@@ -4051,7 +4080,7 @@ store.write_text(json.dumps(prs))
         self.assertTrue((wt / '.work/descendant.pid').exists())
         cancelled = json.loads((wt / '.work/lane.json').read_text())
         out = self.raw_task("cancel", "proj", "5")
-        self.assertIn("process group", out)
+        self.assertIn("Cancelled lane unit", out)
         self.assertEqual(json.loads((wt / ".work/lane.json").read_text())["state"], "cancelled")
         self.assertFalse((self.home / f'.local/state/task/usage/running/codex/{cancelled["pid"]}.json').exists())
         self.assert_group_stopped(cancelled['pid'])
@@ -4801,6 +4830,8 @@ store.write_text(json.dumps(prs))
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY, TASK_HOLDER='test-seat')
+        self.env.update(XDG_RUNTIME_DIR=str(self.home / 'runtime'),
+                        DBUS_SESSION_BUS_ADDRESS='unix:path=' + str(self.home / 'runtime/bus'))
         self.enterContext(mock.patch.dict(os.environ, TASK_HOLDER='test-seat'))
         self.contract_text = "# Fake lane contract\n"
         self.install_contract(".agents")
@@ -6783,11 +6814,16 @@ store.write_text(json.dumps(prs))
         lane = wt / ".work/lane.json"
         lane.write_text(json.dumps(dict(state="running", pid=123456, unit="task-lane-proj-t5-test", temporary=str(inner))))
         shutil.rmtree(outer)
+        transport = TASK_MODULE.subprocess.run
+        def stop_unit(command, **kwargs):
+            if command[:3] == ['systemctl', '--user', 'stop']:
+                return subprocess.CompletedProcess(command, 0)
+            return transport(command, **kwargs)
         with mock.patch.dict(os.environ, self.env), \
                 mock.patch.object(TASK_MODULE, "HOME", self.home), \
                 mock.patch.object(TASK_MODULE, "claude_temporary_root", return_value=root), \
                 mock.patch.object(TASK_MODULE, "pid_alive", return_value=True), \
-                mock.patch.object(TASK_MODULE.subprocess, "run"):
+                mock.patch.object(TASK_MODULE.subprocess, "run", side_effect=stop_unit):
             TASK_MODULE.cancel(SimpleNamespace(repo=str(self.repo), id="5"))
         self.assertEqual(json.loads(lane.read_text())["state"], "cancelled")
 
@@ -7173,13 +7209,15 @@ store.write_text(json.dumps(prs))
                         self.assertTrue((work / 'reviewer-child.pid').exists(),
                                         (self.home / 'review-process.log').read_text())
                         child = json.loads((work / 'reviewer-call.json').read_text())['pid']
-                        claim = self.home / f'.local/state/task/usage/running/claude/{child}.json'
+                        unit_pid = json.loads((self.state() / 'review-run.json').read_text())['pid']
+                        claim = self.home / f'.local/state/task/usage/running/claude/{unit_pid}.json'
                         self.assertTrue(claim.exists())
                         process.send_signal(sig)
                         process.wait(timeout=5)
                         self.assertNotEqual(process.returncode, 0)
                         self.assertFalse(claim.exists())
                         self.assert_group_stopped(child)
+                        self.assertEqual(json.loads((self.state() / 'review-run.json').read_text())['state'], 'interrupted')
                     finally:
                         if process.poll() is None:
                             process.kill()
@@ -7232,7 +7270,7 @@ store.write_text(json.dumps(prs))
         claim = self.home / f'.local/state/task/usage/running/claude/{os.getpid()}.json'
         for result in (0, 3, KeyboardInterrupt(), subprocess.TimeoutExpired('claude', 1), OSError('refused')):
             with self.subTest(result=result):
-                process = mock.Mock(pid=os.getpid(), unit='task-review-proj-t5-test', skipped=False)
+                process = mock.Mock(pid=os.getpid())
                 def wait(**kwargs):
                     self.assertTrue(claim.exists())
                     if isinstance(result, BaseException):
@@ -7247,14 +7285,15 @@ store.write_text(json.dumps(prs))
                         return -9
                     process.wait.side_effect = timed_wait
                 spawn = {'side_effect': result} if isinstance(result, OSError) else {'return_value': process}
-                expected = contextlib.nullcontext() if result == 0 else self.assertRaises(
+                expected = contextlib.nullcontext() if isinstance(result, int) else self.assertRaises(
                     KeyboardInterrupt if isinstance(result, KeyboardInterrupt) else TASK_MODULE.Stop)
                 with mock.patch.dict(os.environ, self.env, clear=True), \
                         mock.patch.object(TASK_MODULE, 'HOME', self.home), \
-                        mock.patch.object(TASK_MODULE, 'launch_unit', **spawn), \
+                        mock.patch.object(TASK_MODULE.subprocess, 'Popen', **spawn), \
                         mock.patch.object(TASK_MODULE, 'main_repo', return_value=self.repo), \
                         mock.patch.object(TASK_MODULE.os, 'killpg'), expected:
-                    TASK_MODULE.run_reviewer('claude -p --model haiku', wt, prompt, reply)
+                    code = TASK_MODULE.run_reviewer('claude -p --model haiku', wt, prompt, reply, unit='task-review-proj-t5-test')
+                    if isinstance(result, int): self.assertEqual(code, result)
                 self.assertFalse(claim.exists())
 
     def test_claude_lane_accepts_opus_and_records_selected_model(self):
@@ -7605,15 +7644,15 @@ store.write_text(json.dumps(prs))
         runner.write_text("1. docs: builder codex, model gpt-6-luna\ncp -v x y\n")
         self.assertIn("runner file OK (1 tasks)", self.raw_task("runner-check", "proj", str(runner)))
 
-    def test_agent_environment_removes_only_hook_blocked_git_and_runner_ownership(self):
+    def test_agent_environment_explicit_allowlist_removes_runner_ownership(self):
         blocked = {name: "blocked" for name in TASK_MODULE.GIT_OVERRIDE_ENV}
         blocked.update(GIT_CONFIG="blocked", GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="override",
                        GIT_CONFIG_VALUE_0="value", GIT_CONFIG_FUTURE="blocked", TASK_RUN_ID="runner",
                        TASK_GATE_RUN_ID="gate", TASK_WORKTREE="/stale/runner")
         kept = {"GIT_AUTHOR_NAME": "builder", "GIT_AUTHOR_EMAIL": "builder@example.invalid",
                 "GIT_COMMITTER_NAME": "builder", "GIT_COMMITTER_EMAIL": "builder@example.invalid",
-                "GIT_OPTIONAL_LOCKS": "0", "GIT_FUTURE_VARIABLE": "value",
-                "CODEX_THREAD_ID": "runner", "PATH": "tools"}
+                "GIT_OPTIONAL_LOCKS": "0", "PATH": "tools"}
+        blocked.update(GIT_FUTURE_VARIABLE='value', CODEX_THREAD_ID='runner')
         with mock.patch.dict(os.environ, dict(blocked, **kept), clear=True):
             self.assertEqual(TASK_MODULE.agent_environment(), kept)
 
@@ -7937,7 +7976,7 @@ store.write_text(json.dumps(prs))
         self.prepare_merge_evidence("5")
         isolated_bin = self.home / "isolated-bin"
         isolated_bin.mkdir()
-        for name in ("bash", "git", "python3"):
+        for name in ("bash", "git", "python3", "systemd-run", "systemctl"):
             executable = shutil.which(name, path=self.env["PATH"])
             self.assertIsNotNone(executable, f"{name} is needed by this test")
             os.symlink(executable, isolated_bin / name)
@@ -8014,7 +8053,11 @@ store.write_text(json.dumps(prs))
         if builder == "claude":
             self.assertEqual(call["git_optional_locks"], "0")
         self.assertEqual((self.state() / "review-response.md").read_text(), reply)
-        self.assertEqual(json.loads((self.state() / "review-run.json").read_text()),
+        run = json.loads((self.state() / "review-run.json").read_text())
+        self.assertRegex(run['unit'], r'^task-review-proj-t5-[a-f0-9]+$')
+        self.assertGreater(run['pid'], 0)
+        self.assertTrue(run['process_start'])
+        self.assertEqual({key: run[key] for key in ('builder', 'state', 'exit_code')},
                          dict(builder='claude' if builder == 'codex' else 'codex',
                               state='finished', exit_code=0))
         self.assertEqual((self.state() / "review.md").read_text(), reply)
@@ -8049,7 +8092,9 @@ store.write_text(json.dumps(prs))
                             env=dict(self.env, REVIEW_STUB_STDERR=diagnostic, REVIEW_STUB_EXIT='1'))
         self.assertIn(diagnostic, out)
         self.assertEqual((self.state() / 'review-stderr.log').read_text(), diagnostic)
-        self.assertEqual(json.loads((self.state() / 'review-run.json').read_text()),
+        run = json.loads((self.state() / 'review-run.json').read_text())
+        self.assertRegex(run['unit'], r'^task-review-proj-t5-[a-f0-9]+$')
+        self.assertEqual({key: run[key] for key in ('builder', 'state', 'exit_code')},
                          dict(builder='claude', state='finished', exit_code=1))
         self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text()),
                          dict(vendor='claude', model='haiku', fallback_from=['codex', 'gpt-6-luna']))
