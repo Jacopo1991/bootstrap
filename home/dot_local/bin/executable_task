@@ -1753,6 +1753,7 @@ def cleanup_lane_temporary(temporary):
 def finalize_lane_record(path, run, state, **fields):
     # A terminal record is the completion signal to waiters and batch runners.
     # Cleanup must precede publication, but a cleanup failure must not hide exit.
+    task_usage.release(HOME, run.get("builder"), run.get("pid"))
     try:
         cleanup_lane_temporary(run.get("temporary"))
     except (OSError, Stop) as error:
@@ -3338,6 +3339,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     atomic_json(run_file, run)
     # Claude runs stream JSON events to review-response.jsonl; the reply keeps the plain text.
     raw = reply_file.with_suffix(".jsonl") if argv[0] == "claude" else reply_file
+    process = None
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
@@ -3360,6 +3362,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         run.update(state="launch_failed")
         raise Stop(f"Cannot run reviewer: {error}; no review recorded.")
     finally:
+        task_usage.release(HOME, run["builder"], process.pid if process else None)
         if raw != reply_file and raw.is_file():
             stream = task_usage.ClaudeStream(HOME)
             reply_file.write_text(stream.feed(raw.read_bytes()) + stream.finish())
@@ -5095,7 +5098,11 @@ def main(argv=None):
         except Stop as stop:
             print(f"task {args.command}: {stop}", file=sys.stderr)
             return 1
+    handlers = {}
     try:
+        if args.command == "review" or args.command == "lane" and args._worker:
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                handlers[sig] = signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
         task_lock.before_work(args, HOME, resolve_repo)
         if args.command == "note":
             if args.kind != "setup-done":
@@ -5172,6 +5179,11 @@ def main(argv=None):
         finish_detached(1)
         print(f"task {args.command}: {stop}", file=sys.stderr)
         return 1
+    finally:
+        if args.command == "lane" and args._worker:
+            task_usage.release(HOME, args.builder, os.getpid())
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":
