@@ -203,6 +203,10 @@ if count == 1:
 print(reply, end='', flush=True)
 print(os.environ.get('REVIEW_STUB_STDERR', ''), end='', file=sys.stderr, flush=True)
 delay = os.environ.get('REVIEW_STUB_DELAY', '0')
+if os.environ.get('REVIEW_STUB_CHILD'):
+    import subprocess
+    child = subprocess.Popen(['sleep', '30'])
+    (work / 'reviewer-child.pid').write_text(str(child.pid))
 time.sleep(float(os.environ.get('REVIEW_STUB_FIRST_DELAY', delay) if count == 1 else delay))
 code = os.environ.get('REVIEW_STUB_EXIT', '0')
 sys.exit(int(os.environ.get('REVIEW_STUB_FIRST_EXIT', code) if count == 1 else code))
@@ -3741,6 +3745,7 @@ store.write_text(json.dumps(prs))
         self.assertIn('lane timed_out', self.raw_task('status', 'proj').split('Needs attention:')[1])
         self.assertTrue((wt / '.work/descendant.pid').exists())
         self.assert_group_stopped(run['pid'])
+        self.assert_group_stopped(run['child_pgid'])
         self.assertTrue(wt.exists())
         (wt / '.work/descendant.pid').unlink()
         self.raw_task("lane", "proj", "5", env=env)
@@ -3755,6 +3760,7 @@ store.write_text(json.dumps(prs))
         self.assertEqual(json.loads((wt / ".work/lane.json").read_text())["state"], "cancelled")
         self.assertFalse((self.home / f'.local/state/task/usage/running/codex/{cancelled["pid"]}.json').exists())
         self.assert_group_stopped(cancelled['pid'])
+        self.assert_group_stopped(cancelled['child_pgid'])
         self.raw_task("lane", "proj", "5")
         self.wait_for_lane(wt)
 
@@ -6807,6 +6813,75 @@ store.write_text(json.dumps(prs))
             self.assertEqual(TASK_MODULE.lane(args), 0)
         self.assertEqual(len(terminal), 1)
         self.assertEqual(json.loads(record.read_text())["state"], "finished")
+
+    def test_worker_signals_interrupt_release_claim_and_stop_builder_group(self):
+        self.stub_models()
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 4\n')
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('task')
+        env = dict(self.env, LANE_STUB_RELEASE=str(self.home / 'never-release'))
+        for vendor in ('codex', 'claude'):
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                with self.subTest(vendor=vendor, signal=sig):
+                    for name in ('model-call.json', 'descendant.pid'):
+                        (work / name).unlink(missing_ok=True)
+                    self.raw_task('lane', 'proj', '5', '--builder', vendor, env=env)
+                    self.wait_for_lane(wt, finished=False)
+                    deadline = time.monotonic() + 5
+                    while not (work / 'descendant.pid').exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue((work / 'descendant.pid').exists())
+                    run = json.loads((work / 'lane.json').read_text())
+                    child_group = run['child_pgid']
+                    claim = self.home / f'.local/state/task/usage/running/{vendor}/{run["pid"]}.json'
+                    self.assertTrue(claim.exists())
+                    # Signal only the worker; cleanup must stop its separately running builder.
+                    os.kill(run['pid'], sig)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        run = json.loads((work / 'lane.json').read_text())
+                        if run['state'] != 'running':
+                            break
+                        time.sleep(0.02)
+                    self.assertEqual((run['state'], run['exit_code']), ('interrupted', None))
+                    self.assertFalse(claim.exists())
+                    self.assert_group_stopped(child_group)
+                    self.assert_group_stopped(run['pid'])
+                    logs = [json.loads(line) for line in (self.home / '.local/state/task/runs.jsonl').read_text().splitlines()]
+                    self.assertEqual(logs[-1]['outcome'], 'interrupted')
+
+    def test_reviewer_signals_stop_live_group_before_releasing_claim(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.prepare_merge_evidence('5')
+        work = wt / '.work'
+        env = dict(self.env, REVIEW_STUB_DELAY='30', REVIEW_STUB_CHILD='1')
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(signal=sig):
+                (work / 'reviewer-child.pid').unlink(missing_ok=True)
+                with (self.home / 'review-process.log').open('w') as output:
+                    process = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run'],
+                                               cwd=self.home, env=env, stdout=output, stderr=output)
+                    try:
+                        deadline = time.monotonic() + 5
+                        while not (work / 'reviewer-child.pid').exists() and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        self.assertTrue((work / 'reviewer-child.pid').exists(),
+                                        (self.home / 'review-process.log').read_text())
+                        child = json.loads((work / 'reviewer-call.json').read_text())['pid']
+                        claim = self.home / f'.local/state/task/usage/running/claude/{child}.json'
+                        self.assertTrue(claim.exists())
+                        process.send_signal(sig)
+                        process.wait(timeout=5)
+                        self.assertNotEqual(process.returncode, 0)
+                        self.assertFalse(claim.exists())
+                        self.assert_group_stopped(child)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                            process.wait()
 
     def test_lane_finalization_cleanup_order_and_failure(self):
         record = self.home / "lane.json"
