@@ -241,7 +241,9 @@ policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
 # Script and recipe controls inspect inert fixture text; no denied command runs.
-with tempfile.TemporaryDirectory() as temp:
+with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+        "TMPDIR": tempfile.gettempdir(), "PYTHONDONTWRITEBYTECODE": "1"}, clear=True):
     root = Path(temp)
     def judge(command):
         return policy.evaluate({"tool_name": "Bash", "cwd": temp,
@@ -294,6 +296,10 @@ with tempfile.TemporaryDirectory() as temp:
                         f"env -S '{inner}'", f"sh -c '{inner}'", f"command {inner}"):
             assert judge(inner) is None, (inner, judge(inner))
             assert judge(wrapped), wrapped  # Hiding an allowed command stays refused.
+            if wrapped.startswith("sh -c"):
+                reason = judge(wrapped)
+                assert reason == "Inline shell and interpreter programs are blocked.", reason
+                assert reason.rule_id == "shell.interpreter", reason
         fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
         for command in ("command -v task -- npm install",
                         "command -v", "command -v --help"):
@@ -321,17 +327,33 @@ with tempfile.TemporaryDirectory() as temp:
         with patch.dict(os.environ, {name: "fixture"}):
             for command in ("git status", "task check"):
                 assert judge(command) is None, (name, command)
-            for command in ("npm help", "npm help config", "env npm help config"):
+            for command in ("npm help", "npm help config", "env npm help config", "npm --help", "npm -h"):
                 assert judge(command), (name, command)
         for location in ("event", "tool_input"):
             for key in ("env", "environment"):
-                for command in ("git status", "task check", "npm help", "npm help config"):
+                for command in ("git status", "task check", "npm help", "npm help config", "npm --help", "npm -h"):
                     payload = {"tool_name": "Bash", "cwd": temp,
                                "tool_input": {"command": command}}
                     target = payload if location == "event" else payload["tool_input"]
                     target[key] = {name: "fixture"}
                     result = policy.evaluate(payload, (root,))
-                    assert bool(result) == command.startswith("npm help"), (name, location, key, command, result)
+                    assert bool(result) == command.startswith("npm "), (name, location, key, command, result)
+    # Generic inline npm configuration must not widen denials on other commands.
+    for command in ("npm_config_loglevel=warn git status", "npm_config_loglevel=warn task check"):
+        assert judge(command) is None, (command, judge(command))
+    for name in ("npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL", "npm_config_prefix", "NPM_CONFIG_PREFIX"):
+        assert judge(f"{name}=evil npm run check").rule_id == "command.unsafe_environment", name
+    # Per-tool viewers can execute programs just like npm configuration can.
+    for name in ("PAGER", "MANPAGER", "BROWSER"):
+        for location in ("event", "tool_input"):
+            for key in ("env", "environment"):
+                for command in ("git status", "task check", "npm help", "npm help config", "npm --help", "npm -h"):
+                    payload = {"tool_name": "Bash", "cwd": temp,
+                               "tool_input": {"command": command}}
+                    target = payload if location == "event" else payload["tool_input"]
+                    target[key] = {name: "fixture"}
+                    result = policy.evaluate(payload, (root,))
+                    assert bool(result) == command.startswith("npm "), (name, location, key, command, result)
     # Per-tool config follows recursive script evaluation, too.
     fixture("help.sh", "#!/bin/sh\nnpm help config\n")
     payload = {"tool_name": "Bash", "cwd": temp, "env": {"Npm_Config_viewer": "fixture"},

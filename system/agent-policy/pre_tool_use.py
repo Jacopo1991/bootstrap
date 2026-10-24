@@ -45,15 +45,16 @@ WRAPPER_OPTIONS = {  # (switches, options taking a value)
 }
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=.*$")
 # Variables that change what runs or where Git looks: never settable from a command.
-UNSAFE_ENV_PREFIXES = ("GIT_", "GH_", "LD_", "DYLD_", "BASH_", "PYTHON", "PERL", "RUBY",
-                       "npm_config_", "NPM_CONFIG_")
+UNSAFE_ENV_PREFIXES = ("GIT_", "GH_", "LD_", "DYLD_", "BASH_", "PYTHON", "PERL", "RUBY")
 UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "VISUAL",
                     "CDPATH", "GLOBIGNORE", "PROMPT_COMMAND", "SHELLOPTS", "ZDOTDIR",
                     "FPATH", "fpath", "path", "cdpath", "EXECIGNORE", "POSIXLY_CORRECT",
                     "NODE_OPTIONS", "NODE_PATH", "SSH_ASKPASS", "GITHUB_TOKEN",
                     "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "MAKEFLAGS", "MFLAGS", "MAKEFILES",
                     "JUSTFILE", "JUST_SHELL", "JUST_SHELL_ARG", "JUST_WORKING_DIRECTORY",
-                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND"}
+                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND",
+                    "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
+                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
 # A Docker socket carries the agent user's full power (bind-mount any readable path, write
 # anywhere the agent can), so lane sessions, which carry TASK_WORKTREE, may not run a container
 # CLI or choose a daemon. Only unsandboxed agent processes use agent's rootless Docker.
@@ -1333,6 +1334,8 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
                             if isinstance(source.get(key), dict))
     npm_config_override = any(name.lower().startswith("npm_config_")
                               for environment in environments for name in environment)
+    npm_config_override |= any(name in {"PAGER", "MANPAGER", "BROWSER"}
+                               for environment in environments[1:] for name in environment)
     command = data.get("command")
     if not isinstance(command, str) or not command.strip():
         return Denial("input.invalid", "Shell command is unrecognized; blocked by policy.")
@@ -1468,7 +1471,7 @@ def lane_session() -> bool:
 
 def unsafe_env_name(name: str) -> bool:
     name = name.removesuffix("+").split("[", 1)[0]
-    return name.lower().startswith("npm_config_") or name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES) or lane_session() and (
+    return name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES) or lane_session() and (
         name in CONTAINER_ENV_NAMES or name.startswith(CONTAINER_ENV_PREFIXES))
 
 
@@ -1941,12 +1944,13 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
     if package_runner:
         # Literal flags are inspections; positional help is npm-only because
         # other runners may resolve it as a script or binary shorthand.
+        if (runner == "npm" and npm_config_override
+                and (args[:1] == ["help"] or args in (["--help"], ["-h"]))):
+            return Denial("command.unsafe_environment", "npm configuration environment overrides are blocked.")
         if args in (["--help"], ["-h"], ["--version"], ["-v"]):
             return None
         if (runner == "npm" and args[:1] == ["help"] and (len(args) == 1 or
                 len(args) == 2 and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args[1]))):
-            if npm_config_override or any(name.lower().startswith("npm_config_") for name in os.environ):
-                return Denial("command.unsafe_environment", "npm configuration environment overrides are blocked.")
             # No manifest is needed, but a changed .npmrc may select a viewer.
             try:
                 directory = Path(cwd).resolve()
@@ -2314,6 +2318,9 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     unwrapped = unwrap_command(tokens)
     if isinstance(unwrapped, str):
         return unwrapped
+    npm_config_override |= any(
+        ENV_ASSIGNMENT.fullmatch(token) and token.split("=", 1)[0].lower().startswith("npm_config_")
+        for token in tokens[:len(tokens) - len(unwrapped)])
     tokens = unwrapped
     if not tokens:
         return None
