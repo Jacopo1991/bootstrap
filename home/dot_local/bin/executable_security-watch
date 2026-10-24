@@ -92,6 +92,11 @@ def main():
         pass
     except (OSError, ValueError) as error:
         report["errors"].append("previous report unreadable: " + str(error))
+    # Carry accepted counts even when the next report is incomplete or a root fails.
+    # Older reports have no map: seed it only from roots that passed every check.
+    counts = report["last_clean_counts"] = previous.get("last_clean_counts", {
+        r["root"]: r["package_count"] for r in previous.get("roots", [])
+        if r.get("status") in ("clean", "findings") and r.get("package_count", 0) > 0})
     persist()
     try:
         config = approved_config(home, state, report)
@@ -130,11 +135,11 @@ def main():
                     raise RuntimeError("scanner diagnostics contain errors")
                 if relative in SENTINELS and not any(p["name"] == SENTINELS[relative] for p in packages):
                     raise RuntimeError("missing sentinel package: " + SENTINELS[relative])
-                baseline = next((r.get("package_count", 0) for r in previous.get("roots", [])
-                                 if r["root"] == relative), 0)
+                baseline = counts.get(relative, 0)
                 if len(packages) < baseline / 2:
                     raise RuntimeError(f"sharp package count drop: {baseline} to {len(packages)}")
                 entry.update(status="findings" if scan.returncode else "clean", results=data)
+                counts[relative] = len(packages)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired) as error:
                 entry.update(status="error", error=str(error))
                 report["errors"].append(relative + ": " + str(error))

@@ -123,6 +123,9 @@ class DailyJob(unittest.TestCase):
         self.assertEqual([r["status"] for r in self.report["roots"]],
                          ["findings", "findings", "findings", "not installed", "findings"])
         self.assertEqual(self.report["errors"], [])
+        self.assertEqual(self.report["last_clean_counts"],
+                         {r["root"]: r["package_count"] for r in self.report["roots"]
+                          if r["status"] == "findings"})
         self.assertEqual((self.home / "pings").read_text(), "security-watch 1\n")
 
     def test_native_expiry_and_success_status(self):
@@ -284,6 +287,8 @@ if mode == "diagnostic":
     print("ERROR extractor: unreadable directory", file=sys.stderr)
 packages = [{"package": {"name": name, "version": "1.0", "ecosystem": "PyPI"}}
             for name in names]
+if "SCAN_COUNT" in os.environ:
+    packages = [packages[i % len(packages)] for i in range(int(os.environ["SCAN_COUNT"]))]
 print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]}))
 ''')
         path.chmod(0o755)
@@ -315,11 +320,44 @@ print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]
             node_package(self.npm, f"extra-{index}")
         self.assertEqual(self.scan().returncode, 0)
         self.assertEqual(self.report["roots"][0]["package_count"], 10)
+        # Upgrade an older report: only its accepted root counts seed the map.
+        del self.report["last_clean_counts"]
+        (self.home / ".local/state/security/latest.json").write_text(json.dumps(self.report))
         for index in range(8):
             (self.npm / f"node_modules/extra-{index}/package.json").unlink()
         self.assertEqual(self.scan().returncode, 1)
         self.assertIn("sharp package count drop: 10 to 2", self.report["roots"][0]["error"])
         self.assertEqual(self.report["roots"][1]["status"], "clean")
+
+    def test_package_count_drop_keeps_last_clean_baseline(self):
+        self.fake_scanner()
+        self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="500").returncode, 0)
+        self.assertEqual(self.report["roots"][-1]["package_count"], 500)
+        baseline = self.report["last_clean_counts"]
+        for day in (2, 3):
+            with self.subTest(day=day):
+                self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="10").returncode, 1)
+                entry = self.report["roots"][-1]
+                self.assertEqual(entry["package_count"], 10)
+                self.assertEqual(entry["status"], "error")
+                self.assertIn("sharp package count drop: 500 to 10", entry["error"])
+                self.assertEqual(self.report["last_clean_counts"], baseline)
+                self.assertEqual((self.home / "pings").read_text().splitlines()[-1],
+                                 "security-watch 1")
+        self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="600").returncode, 0)
+        self.assertTrue(all(count == 600 for count in self.report["last_clean_counts"].values()))
+
+    def test_rejected_and_interrupted_scans_preserve_baseline(self):
+        self.fake_scanner()
+        self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="500").returncode, 0)
+        root = ".local/share/bootstrap/npm"
+        for mode in ("empty", "diagnostic", "missing-sentinel", "terminate"):
+            with self.subTest(mode=mode):
+                self.assertNotEqual(self.scan(SCAN_MODE=mode, SCAN_COUNT="5000").returncode, 0)
+                self.assertEqual(self.report["last_clean_counts"][root], 500)
+                self.assertEqual(self.scan(SCAN_MODE="healthy", SCAN_COUNT="10").returncode, 1)
+                self.assertIn("sharp package count drop: 500 to 10",
+                              self.report["roots"][0]["error"])
 
     def test_missing_real_sentinels(self):
         self.approve()
@@ -350,6 +388,7 @@ print(json.dumps({"results": [] if mode == "empty" else [{"packages": packages}]
     def test_initial_latest_is_incomplete_before_refresh_and_termination(self):
         self.approve()
         self.assertEqual(self.scan().returncode, 0)
+        baseline = self.report["last_clean_counts"]
         path = self.bin / "systemctl"
         path.write_text('''#!/usr/bin/python3
 import json, os, signal
@@ -363,6 +402,7 @@ os.kill(os.getppid(), signal.SIGTERM)
         self.assertTrue((self.home / "saw-incomplete").exists())
         self.assertEqual(self.report["status"], "incomplete")
         self.assertEqual(self.report["roots"], [])
+        self.assertEqual(self.report["last_clean_counts"], baseline)
         self.assertEqual((self.home / "pings").read_text().splitlines()[-1], "security-watch 1")
 
     def test_reports_precede_status_and_survive_decode_error(self):
