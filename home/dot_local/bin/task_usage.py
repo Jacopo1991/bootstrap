@@ -269,18 +269,30 @@ class ClaudeStream:
         return event["result"] + "\n" if event.get("type") == "result" and isinstance(event.get("result"), str) else ""
 
 
+def process_start(pid):
+    """Linux start ticks identify a process even after its PID is reused."""
+    try:
+        fields = Path(f"/proc/{int(pid)}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[19] if fields[0] not in {"Z", "X"} else None
+    except (OSError, ValueError, TypeError, IndexError):
+        return None
+
+
+def release(home, vendor, pid):
+    if vendor in VENDORS and pid is not None:
+        try:
+            (_dir(home) / "running" / vendor / f"{pid}.json").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def claim(home, vendor, kind, pid, now=None):
     """Record a started lane or review process, so the 5-hour rules can count what runs machine-wide."""
     now = now or datetime.now(timezone.utc)
-    directory = _dir(home) / "running" / vendor
     try:
-        for old in directory.glob("*.json"):
-            if now - _stamp(_json(old).get("at", "1970-01-01T00:00:00+00:00")) > timedelta(days=2):
-                old.unlink()
-    except (OSError, ValueError):
-        pass
-    try:
-        _write(directory / f"{pid}.json", {"kind": kind, "pid": pid, "at": now.isoformat()})
+        _write(_dir(home) / f"{vendor}-last-start.json", {"at": now.isoformat()})
+        _write(_dir(home) / "running" / vendor / f"{pid}.json",
+               {"kind": kind, "pid": pid, "start": process_start(pid), "at": now.isoformat()})
     except OSError:
         pass
 
@@ -289,21 +301,21 @@ def _claims(home, vendor):
     for path in (_dir(home) / "running" / vendor).glob("*.json"):
         entry = _json(path)
         try:
-            yield _stamp(entry["at"]), entry["pid"]
+            at, pid = _stamp(entry["at"]), entry["pid"]
+            if entry.get("start") and entry["start"] == process_start(pid):
+                yield at, pid
+                continue
         except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
             pass
 
 
 def running(home, vendor):
-    """Lanes and reviews of this vendor whose process is alive, machine-wide."""
-    count = 0
-    for _, pid in _claims(home, vendor):
-        try:
-            os.kill(int(pid), 0)
-            count += 1
-        except (OSError, ValueError, TypeError):
-            pass
-    return count
+    """Live lanes and reviews of this vendor, pruning dead and reused claims."""
+    return sum(1 for _ in _claims(home, vendor))
 
 
 def _five(reading, pol, now, ran):
@@ -477,7 +489,8 @@ def assessments(home, now):
     seen = {}
     for vendor, item in readings(home, now).items():
         since = item.get("at")
-        ran = bool(since) and (running(home, vendor) > 0 or any(at > since for at, _ in _claims(home, vendor)))
+        last = _json(_dir(home) / f"{vendor}-last-start.json").get("at", "")
+        ran = bool(since) and (running(home, vendor) > 0 or last > since.isoformat())
         seen[vendor] = found = assess(item, pol, now, ran)
         if found["stale"]:
             notes.append(f"pace warning: {vendor} usage reading is {(now - since) / timedelta(minutes=1):.0f} min old "
