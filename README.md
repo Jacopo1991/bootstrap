@@ -1170,10 +1170,10 @@ PyPI and about six for npm (its database is about 200 MB).
   (`pre-commit gc`) and the hook install creates it too.
 - **Vulnerability data:** `osv-db-refresh` downloads the PyPI, npm, crates.io, Go,
   Packagist and RubyGems databases (only changed files, zip-checked). The tools script
-  runs it on install, and the user timer `osv-db-refresh.timer` runs it weekly
-  (`OnCalendar=weekly`, `Persistent=true`, so a week missed while the distro was stopped
-  is caught up on the next start). It is a plain download with no agent runs, enabled by
-  `qmd-setup.sh` next to `qmd-index.timer`.
+  runs it on install. The user timer `osv-db-refresh.timer` now runs security-watch
+  daily, refreshing these databases before scanning installed environments
+  (`OnCalendar=daily`, `Persistent=true` catches up after downtime). It uses no agent
+  runs and is enabled by `qmd-setup.sh` next to `qmd-index.timer`.
 - **Errors:** `osv-db-refresh` tries every ecosystem, logs `ERROR <ecosystem>` for each
   failure, keeps that ecosystem's previous database and exits non-zero, so the unit
   shows in `systemctl --user --failed` and `journalctl --user -u osv-db-refresh`. Only a
@@ -1297,8 +1297,8 @@ file; a job whose key is missing skips its ping silently.
 | --- | --- | --- | --- |
 | `qmd-index` | `qmd-index.timer` (AgentDev) | every 15 minutes | `QMD_INDEX_URL` |
 | `task-watch` | `task-watch.timer` (PM enables after review) | every 15 minutes | `TASK_WATCH_URL` |
-| `osv-db-refresh` | `osv-db-refresh.timer` (AgentDev) | weekly | `OSV_DB_REFRESH_URL` |
-| `security-watch` | `security-watch.timer` (AgentDev) | daily | `SECURITY_WATCH_URL` |
+| `osv-db-refresh` | `osv-db-refresh.timer` via security-watch (AgentDev) | daily | `OSV_DB_REFRESH_URL` |
+| `security-watch` | `osv-db-refresh.timer` (same timer, AgentDev) | daily | `SECURITY_WATCH_URL` |
 | `gh-skill-update` | `gh-skill-update.timer` (AgentDev) | daily | `GH_SKILL_UPDATE_URL` |
 | `windows-skills-update` | `MachineBootstrap-Skills-Update` task | daily 09:15 | `WINDOWS_SKILLS_UPDATE_URL` |
 | `windows-minutes-watchdog` | `MachineBootstrap-Minutes-Watchdog` task | daily 09:45 | `WINDOWS_MINUTES_WATCHDOG_URL` |
@@ -1334,10 +1334,12 @@ file; a job whose key is missing skips its ping silently.
 
 ## Daily installed-environment security scan
 
-`security-watch.timer` runs daily, catches up after downtime, and adds up to one hour
-of random delay. Installation enables it alongside the existing weekly OSV refresh
-timer. Each scan first starts the existing `osv-db-refresh.service` and waits for it;
-refresh failure fails the run even when cached data can still be scanned.
+Security-watch replaces the old refresh-only schedule using the existing
+`osv-db-refresh.timer`; there is no separate `security-watch.timer`, so the timer
+count stays the same. The timer now runs daily, catches up after downtime, adds up
+to one hour of random delay, and starts `security-watch.service`. Each scan first
+starts the existing `osv-db-refresh.service` and waits for it; refresh failure fails
+the run even when cached data can still be scanned.
 
 The fixed roots, relative to the agent HOME, are:
 
@@ -1350,9 +1352,9 @@ The scanner is pinned to osv-scanner 2.6.0. Scans use `--offline`,
 `--offline-vulnerabilities`, `--no-resolve`, `--no-ignore` and the bundled
 `python/wheelegg` and `javascript/packagejson` plugins alongside default lockfile
 plugins. Gitignored environments are included. Scanner path exclusions omit
-customer-harness/CustomerHarness, typo3-dkm/typo3-dkm-plugin/Typo3/DKM, secrets,
-project-data and .git directories (case insensitive). Directory symlinks are not
-traversed by the scanner. Missing required roots and scan errors fail the run;
+customer-harness/CustomerHarness, typo3-dkm/typo3-dkm-plugin/Typo3/DKM,
+photo-organizer, secrets, project-data and .git directories (case insensitive).
+Directory symlinks are not traversed by the scanner. Missing required roots and scan errors fail the run;
 an absent optional GPU environment is explicitly reported.
 
 Exemptions use native `osv-scanner.toml` `[[IgnoredVulns]]` entries with an advisory

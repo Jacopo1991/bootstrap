@@ -140,6 +140,17 @@ class DailyJob(unittest.TestCase):
         self.assertEqual(self.report["roots"][0]["status"], "error")
         self.assertEqual(self.report["roots"][1]["status"], "clean")
 
+    def test_refresh_precedes_scanner(self):
+        scanner = str((self.bin / "osv-scanner").resolve())
+        (self.bin / "osv-scanner").unlink()
+        self.tool("osv-scanner", 'test -f "$HOME/refresh" || exit 99\n'
+                  'exec "$FIXTURE_SCANNER" "$@"\n')
+        self.ignore("2099-01-01")
+        result = self.scan(FIXTURE_SCANNER=scanner)
+        self.assertEqual(result.returncode, 0, result.stderr + str(self.report))
+        self.assertEqual((self.home / "refresh").read_text(),
+                         "--user start osv-db-refresh.service\n")
+
     def test_private_roots_and_symlink_targets_are_not_scanned(self):
         self.ignore("2099-01-01")
         for name in ("customer-harness", "typo3-dkm-plugin", "secrets"):
@@ -150,6 +161,15 @@ class DailyJob(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + str(self.report))
         sources = json.dumps(self.report["roots"][-1])
         self.assertNotIn("probe-node", sources)
+
+    def test_photo_organizer_venv_is_never_read(self):
+        self.ignore("2099-01-01")
+        python_package(self.home / "dev_workspace/photo-organizer/.venv")
+        result = self.scan()
+        self.assertEqual(result.returncode, 0, result.stderr + str(self.report))
+        sources = json.dumps(self.report["roots"][-1])
+        self.assertIn("public/.venv", sources)
+        self.assertNotIn("photo-organizer", sources)
 
     def test_missing_root_and_status_write_failure(self):
         self.ignore("2099-01-01")
@@ -180,14 +200,16 @@ class DailyJob(unittest.TestCase):
 class Wiring(unittest.TestCase):
     def test_daily_units_and_gate(self):
         units = ROOT / "home/dot_config/systemd/user"
-        timer = (units / "security-watch.timer").read_text()
+        timer = (units / "osv-db-refresh.timer").read_text()
         self.assertIn("OnCalendar=daily", timer)
         self.assertIn("Persistent=true", timer)
-        self.assertEqual((units / "timers.target.wants/symlink_security-watch.timer").read_text().strip(),
-                         "../security-watch.timer")
+        self.assertIn("Unit=security-watch.service", timer)
+        self.assertFalse((units / "security-watch.timer").exists())
+        self.assertFalse((units / "timers.target.wants/symlink_security-watch.timer").exists())
         self.assertIn("TimeoutStartSec=45min", (units / "security-watch.service").read_text())
-        self.assertIn("enable --now security-watch.timer",
-                      (ROOT / "home/dot_local/share/bootstrap/executable_qmd-setup.sh").read_text())
+        setup = (ROOT / "home/dot_local/share/bootstrap/executable_qmd-setup.sh").read_text()
+        self.assertIn("enable --now osv-db-refresh.timer", setup)
+        self.assertNotIn("security-watch.timer", setup)
         self.assertIn("run python3 ci/security-watch-test.py", (ROOT / "ci/lint.sh").read_text())
 
 

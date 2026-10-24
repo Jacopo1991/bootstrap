@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Check the pre-commit gate's OSV data: the npm lock's accepted-risk exception and its
-expiry, the weekly osv-db-refresh units and their enablement, and that osv-db-refresh
+expiry, the daily refresh-and-scan timer and its enablement, and that osv-db-refresh
 reports every failure, keeps the previous data and stamps only a full success.
 
 Real-scanner checks use a synthetic offline npm database in a temporary HOME.
@@ -127,9 +127,12 @@ class Units(unittest.TestCase):
         self.assertNotIn("claude", (UNITS / "osv-db-refresh.service").read_text())
         self.assertNotIn("codex", (UNITS / "osv-db-refresh.service").read_text())
 
-    def test_timer_weekly_persistent_and_enabled(self):
+    def test_timer_daily_persistent_and_enabled(self):
         timer = units("osv-db-refresh.timer")
-        self.assertEqual(timer["Timer"]["OnCalendar"], "weekly")
+        self.assertEqual(timer["Timer"]["OnCalendar"], "daily")
+        self.assertEqual(timer["Timer"]["Unit"], "security-watch.service")
+        self.assertEqual(units("security-watch.service")["Service"]["ExecStart"],
+                         "%h/.local/bin/security-watch")
         self.assertEqual(timer["Timer"]["Persistent"], "true")
         self.assertEqual(timer["Install"]["WantedBy"], "timers.target")
         link = UNITS / "timers.target.wants/symlink_osv-db-refresh.timer"
@@ -145,7 +148,8 @@ class Units(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not available")
     def test_systemd_accepts_the_timer_calendar(self):
-        result = subprocess.run(["systemd-analyze", "calendar", "weekly"],
+        calendar = units("osv-db-refresh.timer")["Timer"]["OnCalendar"]
+        result = subprocess.run(["systemd-analyze", "calendar", calendar],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 

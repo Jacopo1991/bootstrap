@@ -16,7 +16,7 @@ ROOTS = ((".local/share/bootstrap/npm", False),
          (".local/share/bootstrap/gpu-venv", True),
          ("dev_workspace", False))
 EXCLUDES = ("customer-harness", "CustomerHarness", "typo3-dkm-plugin", "typo3-dkm",
-            "Typo3", "DKM", "secrets", "project-data", ".git")
+            "Typo3", "DKM", "photo-organizer", "secrets", "project-data", ".git")
 
 
 def run(args, timeout):
