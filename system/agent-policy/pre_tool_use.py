@@ -52,7 +52,9 @@ UNSAFE_ENV_NAMES = {"PATH", "IFS", "ENV", "HOME", "SHELL", "PAGER", "EDITOR", "V
                     "NODE_OPTIONS", "NODE_PATH", "SSH_ASKPASS", "GITHUB_TOKEN",
                     "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "MAKEFLAGS", "MFLAGS", "MAKEFILES",
                     "JUSTFILE", "JUST_SHELL", "JUST_SHELL_ARG", "JUST_WORKING_DIRECTORY",
-                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND"}
+                    "JUST_JUSTFILE", "JUST_JUSTFILE_NAME", "JUST_DOTENV_COMMAND",
+                    "npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
+                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
 # A Docker socket carries the agent user's full power (bind-mount any readable path, write
 # anywhere the agent can), so lane sessions, which carry TASK_WORKTREE, may not run a container
 # CLI or choose a daemon. Only unsandboxed agent processes use agent's rootless Docker.
@@ -2330,8 +2332,8 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     external = external_binary(tokens[0], cwd, root)
     if external is not None:
         executable = external.name.lower()
-    # npm configuration is command-specific, regardless of key or spelling.
-    # Evaluated wrappers have been stripped, including their env assignments.
+    # Beyond the globally unsafe names above, any npm configuration spelling is
+    # refused on package commands. Evaluated wrappers and assignments are stripped.
     if inline_npm_config and executable in {"npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"}:
         return Denial("command.unsafe_environment", "Inline npm configuration on package commands is blocked.")
     if executable in {"printf", "echo"} and not print_allowlist(tokens):

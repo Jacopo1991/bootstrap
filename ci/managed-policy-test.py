@@ -269,6 +269,9 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
     (root / "ci").mkdir()
     fixture("ci/lint.sh", "#!/bin/sh\necho safe\n")
     fixture("build.js", "console.log('safe');\n")
+    (root / "compatibility").mkdir()
+    fixture("compatibility/justfile", "check:\n    echo safe\n")
+    fixture("compatibility/Makefile", "check:\n\techo safe\n")
     fixture_git("add", ".")
     fixture_git("commit", "-qm", "base recipes")
     fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
@@ -284,8 +287,8 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
     exec(compile(main_source, main_policy.__file__, "exec"), main_policy.__dict__)
     fixture("package.json", '{"scripts":{"check":"echo safe"}}\n')
     with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
-        def compare(command):
-            event = {"tool_name": "Bash", "cwd": temp, "tool_input": {"command": command}}
+        def compare(command, cwd=temp):
+            event = {"tool_name": "Bash", "cwd": str(cwd), "tool_input": {"command": command}}
             return (main_policy.evaluate(event, (root,)), policy.evaluate(event, (root,)))
 
         names = [case("npm_config_" + name)
@@ -318,6 +321,42 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
             before, after = compare("npm help config")
             assert before and after, (before, after)
 
+        # Round 7: measure both directions separately from the must-refuse table.
+        # These recipes were committed with the fixture base, so changed-recipe
+        # checks cannot mask the environment rule. Make is always refused by
+        # both hooks even for this echo-only recipe; its rows carry no signal.
+        comparison_cwd = root / "compatibility"
+        assert compare("just check", comparison_cwd) == (None, None)
+        make_before, make_after = compare("make check", comparison_cwd)
+        assert make_before == make_after == (
+            "Make definitions cannot be judged reliably; use task check for the gate.")
+        restored = {"npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
+                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
+        managers = {"npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"}
+        commands = ("npm run check", "npm install x", "npx x", "npm help config",
+                    "npm --version", "npx --version", "pnpm --version", "yarn --version",
+                    "yarnpkg --version", "bun --version",
+                    "git status", "task check", "make check", "just check")
+        newly_refused = set()
+        expected_refused = set()
+        for name in names:
+            for command in commands:
+                text = f"{name}=fixture {command}"
+                before, after = compare(text, comparison_cwd)
+                assert not before or after, ("main refusal lost", text, before, after)
+                intended_refusal = command.split()[0] in managers or name in restored
+                assert bool(after) == (bool(before) or intended_refusal), (text, before, after)
+                if not before and after:
+                    newly_refused.add(text)
+                if not before and intended_refusal:
+                    expected_refused.add(text)
+                if command in ("git status", "task check", "just check"):
+                    assert bool(after) == (name in restored), (text, after)
+        assert newly_refused == expected_refused, newly_refused ^ expected_refused
+        print(f"T-39 bidirectional table: {len(names) * len(commands)} inputs, "
+              f"0 newly allowed, {len(newly_refused)} newly refused; make rows carry no signal")
+        print("T-39 newly refused against 69870f4:", *sorted(newly_refused), sep="\n  ")
+
         newly_allowed = set()
         inspections = ["npm help", "npm help config", "command -v task just uv npm",
                        "command -v task >/dev/null", "command -v task >/dev/null 2>&1"]
@@ -327,6 +366,9 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
                         for command in ("git status", "task check")]
         for command in inspections:
             before, after = compare(command)
+            if command.split("=", 1)[0] in restored:
+                assert before and after, (command, before, after)
+                continue
             assert after is None, (command, after)
             if before:
                 newly_allowed.add(command)
@@ -335,10 +377,6 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
         expected |= {f"{runner} {flag}" for runner in ("npm", "pnpm") for flag in ("-h", "-v")}
         expected |= {f"{runner} {flag}" for runner in ("yarn", "yarnpkg", "bun")
                      for flag in ("--help", "-h", "--version", "-v")}
-        expected |= {f"{name}=fixture {command}"
-                     for name in ("npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
-                                  "npm_config_prefix", "NPM_CONFIG_PREFIX")
-                     for command in ("git status", "task check")}
         assert newly_allowed == expected, ("unexpected main compatibility delta", newly_allowed ^ expected)
         print("T-39 newly allowed against 69870f4:", *sorted(newly_allowed), sep="\n  ")
         # Verify the configuration-boundary comment using policy/config data;
