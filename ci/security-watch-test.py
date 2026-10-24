@@ -53,6 +53,8 @@ class InstalledProbe(unittest.TestCase):
             self.assertIn("osv-scanner version: 2.6.0", version.stdout)
             fixture(root)
             python_package(root / "venv")
+            python_package(root / "venv", "pre_commit")
+            python_package(root / "venv", "inspect_ai")
             node_package(root / "npm")
             config = root / "empty.toml"
             config.write_text("")
@@ -68,6 +70,9 @@ class InstalledProbe(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 data = json.loads(result.stdout)
                 packages = [p for source in data["results"] for p in source["packages"]]
+                if ecosystem == "PyPI":
+                    self.assertTrue({"pre_commit", "inspect_ai"} <=
+                                    {p["package"]["name"] for p in packages})
                 self.assertTrue(any(p["package"]["name"] == name and
                                     p["package"]["version"] == version and
                                     any(v["id"] == "PROBE-2026-1" for v in p["vulnerabilities"])
