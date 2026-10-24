@@ -1535,11 +1535,15 @@ def unwrap_command(tokens: list[str]) -> list[str] | str:
 
 
 def pure_lookup(tokens: list[str]) -> bool:
-    return bool(tokens) and (
-        tokens[0] == "command" and len(tokens) == 3 and tokens[1] in {"-v", "-V"}
-        and bool(re.fullmatch(r"[A-Za-z0-9_.+-]+", tokens[2]))
-        or tokens[0] in {"type", "which"} and len(tokens) == 2
-        and bool(re.fullmatch(r"[A-Za-z0-9_.+-]+", tokens[1])))
+    if not tokens:
+        return False
+    if tokens[0] == "command" and len(tokens) >= 3 and tokens[1] in {"-v", "-V"}:
+        names = tokens[2:]
+    elif tokens[0] in {"type", "which"} and len(tokens) >= 2:
+        names = tokens[1:]
+    else:
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9_+][A-Za-z0-9_.+-]*", name) for name in names)
 
 
 def git_subcommand(tokens: list[str], cwd: str) -> str | None:
@@ -1922,12 +1926,18 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
     package_runner = runner in {"npm", "pnpm", "yarn", "bun"}
     script_name = None
     if package_runner:
+        # Help/version are inspections, including for runners with script shorthand.
+        # Keep the grammar literal so options cannot select another execution mode.
+        if (args in (["--help"], ["-h"], ["--version"], ["-v"])
+                or args and args[0] == "help" and len(args) <= 2
+                and all(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", arg)
+                        for arg in args[1:])):
+            return None
         if args and args[0] in {"exec", "dlx", "x", "create"}:
             return "Fetch-and-run package commands are blocked."
         if runner in {"yarn", "bun"} and (not args or args[0] not in {"run", "install"}):
             return "Use explicit run or install; other runner forms cannot be judged reliably."
-        if args and args[0] in {"outdated", "audit", "list", "ls", "view", "info",
-                               "--version", "--help"}:
+        if args and args[0] in {"outdated", "audit", "list", "ls", "view", "info"}:
             return None
         if not args or args[0] not in {"run", "run-script", "test", "start", "stop", "restart",
                                       "install", "ci", "add", "remove", "uninstall", "update"}:

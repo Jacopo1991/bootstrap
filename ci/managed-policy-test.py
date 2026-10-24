@@ -271,6 +271,26 @@ with tempfile.TemporaryDirectory() as temp:
     fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
     fixture_git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     fixture_git("checkout", "-qb", "lane")
+    # T-39: npm help config is quoted exactly in the t37 fixtures. The wrapper
+    # command is absent; reconstruct the executable-location inspection described
+    # there as a plain lookup of the task, gate and installer tools.
+    with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
+        for command in ("npm help config", "command -v task just uv npm"):
+            assert judge(command) is None, (command, judge(command))
+        for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun"):
+            for action in ("help", "help install", "--help", "-h", "--version", "-v"):
+                command = f"{runner} {action}"
+                assert judge(command) is None, (command, judge(command))
+            for action in ("help --prefix other", "help install --global", "--help exec evil"):
+                assert judge(f"{runner} {action}"), (runner, action)
+        for command in ("xargs npm install", "setsid npm install", "nohup npm install",
+                        "env -S 'npm install'", "sh -c 'npm install'",
+                        "command npm install", "command -v task -- npm install",
+                        "command -v", "command -v --help", "type --all task"):
+            assert judge(command), command
+    # Help must not need a package manifest or inspect executable lifecycle hooks.
+    with patch.object(policy, "program_text", side_effect=AssertionError("help read a recipe")):
+        assert judge("npm help config") is None
     for command in ("just check", "make check", "npm run check", "pnpm run check"):
         assert judge(command), command  # Unchanged is not an execution exemption.
     assert judge("task check") is None
@@ -788,7 +808,9 @@ with tempfile.TemporaryDirectory() as temp:
             "task review proj 5 --record review.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     # pure_lookup_forms: standalone and read-only chains; execution wrappers stay denied.
-    for lookup in ("command -v task", "command -V task", "type task", "which task"):
+    for lookup in ("command -v task", "command -V task", "type task", "which task",
+                   "command -v task just uv npm", "command -V task just",
+                   "type task just", "which task just"):
         for command in (lookup, "pwd; " + lookup, "pwd && " + lookup):
             assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     assert policy.evaluate_command("command git push", temp, root, (root,))
