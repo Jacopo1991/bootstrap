@@ -276,48 +276,68 @@ with tempfile.TemporaryDirectory() as temp:
     # there as a plain lookup of the task, gate and installer tools.
     with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
         # type only reports command information, including with --all.
-        for command in ("npm help config", "command -v task just uv npm", "type --all task"):
+        for command in ("npm help", "npm help config", "command -v task just uv npm", "type --all task"):
             assert judge(command) is None, (command, judge(command))
         for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun"):
             for action in ("--help", "-h", "--version", "-v"):
                 command = f"{runner} {action}"
                 assert judge(command) is None, (command, judge(command))
-            for action in ("help", "help --prefix other", "help install --global",
+            for action in ("help --prefix other", "help install --global",
                            "help --prefix", "help install exec", "help ../x", "help a=b",
                            "--help exec evil"):
                 assert judge(f"{runner} {action}"), (runner, action)
-        for command in ("xargs npm install", "setsid npm install", "nohup npm install",
-                        "env -S 'npm install'", "sh -c 'npm install'",
-                        "command npm install", "command -v task -- npm install",
+        # Use an allowed installer body so wrapper refusals cannot be masked by
+        # the unrelated non-shell build.js restriction in the normal fixture.
+        fixture("package.json", '{"scripts":{"check":"echo safe"}}\n')
+        inner = "npm install"
+        for wrapped in (f"xargs {inner}", f"setsid {inner}", f"nohup {inner}",
+                        f"env -S '{inner}'", f"sh -c '{inner}'", f"command {inner}"):
+            assert judge(inner) is None, (inner, judge(inner))
+            assert judge(wrapped), wrapped  # Hiding an allowed command stays refused.
+        fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+        for command in ("command -v task -- npm install",
                         "command -v", "command -v --help"):
             assert judge(command), command
     # Help must not need a package manifest or inspect executable lifecycle hooks.
     with patch.object(policy, "program_text", side_effect=AssertionError("help read a recipe")):
-        assert judge("npm help config") is None
+        for command in ("npm help", "npm help config"):
+            assert judge(command) is None
     # Round 3: Yarn/Bun help can be a script shorthand, even with a topic.
     fixture("package.json", '{"scripts":{"help":"sudo true","check":"node build.js"}}\n')
     for runner in ("pnpm", "yarn", "yarnpkg", "bun"):
         for action in ("help", "help config"):
             assert judge(f"{runner} {action}"), (runner, action)
-    assert judge("npm help config") is None  # Does not execute the help script.
+    for command in ("npm help", "npm help config"):
+        assert judge(command) is None  # Does not execute the help script.
     fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
-    # npm help accepts exactly one literal topic and no config flags on either side.
+    # npm help accepts zero or one literal topic and no config flags on either side.
     for command in ("npm --userconfig=other help config", "npm --userconfig other help config",
                     "npm help config --userconfig=other", "npm help config --viewer=browser",
                     "npm --viewer=browser help config", "npm help --browser=./viewer"):
         assert judge(command), command
-    for name in ("npm_config_viewer", "NPM_CONFIG_BROWSER", "npm_config_userconfig"):
+    for name in ("npm_config_viewer", "NPM_CONFIG_BROWSER", "npm_config_userconfig", "Npm_Config_viewer"):
         for command in (f"{name}=fixture npm help config", f"env {name}=fixture npm help config"):
             assert judge(command), command
         with patch.dict(os.environ, {name: "fixture"}):
-            assert judge("npm help config"), name
+            for command in ("git status", "task check"):
+                assert judge(command) is None, (name, command)
+            for command in ("npm help", "npm help config", "env npm help config"):
+                assert judge(command), (name, command)
         for location in ("event", "tool_input"):
             for key in ("env", "environment"):
-                payload = {"tool_name": "Bash", "cwd": temp,
-                           "tool_input": {"command": "npm help config"}}
-                target = payload if location == "event" else payload["tool_input"]
-                target[key] = {name: "fixture"}
-                assert policy.evaluate(payload, (root,)), (name, location, key)
+                for command in ("git status", "task check", "npm help", "npm help config"):
+                    payload = {"tool_name": "Bash", "cwd": temp,
+                               "tool_input": {"command": command}}
+                    target = payload if location == "event" else payload["tool_input"]
+                    target[key] = {name: "fixture"}
+                    result = policy.evaluate(payload, (root,))
+                    assert bool(result) == command.startswith("npm help"), (name, location, key, command, result)
+    # Per-tool config follows recursive script evaluation, too.
+    fixture("help.sh", "#!/bin/sh\nnpm help config\n")
+    payload = {"tool_name": "Bash", "cwd": temp, "env": {"Npm_Config_viewer": "fixture"},
+               "tool_input": {"command": "bash help.sh"}}
+    assert policy.evaluate(payload, (root,))
+    assert judge("bash help.sh") is None
     # Help needs no manifest, including below a changed ancestor .npmrc.
     (root / "help-only").mkdir()
     help_event = {"tool_name": "Bash", "cwd": str(root / "help-only"),
@@ -852,8 +872,14 @@ with tempfile.TemporaryDirectory() as temp:
     for lookup in ("command -v task", "command -V task", "type task", "which task",
                    "command -v task just uv npm", "command -V task just",
                    "type task just", "which task just"):
-        for command in (lookup, "pwd; " + lookup, "pwd && " + lookup):
-            assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+        for suffix in ("", " >/dev/null", " > /dev/null", " >/dev/null 2>&1",
+                       " 2>/dev/null", " 2>&1 >/dev/null"):
+            for command in (lookup + suffix, "pwd; " + lookup + suffix, "pwd && " + lookup + suffix):
+                assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+    for command in (">/dev/null command -v task", "command -v task >out.txt",
+                    "command -v task '>/dev/null'", r"command -v task \>/dev/null",
+                    "command -v task >>/dev/null", "command -v task >/dev/null-extra"):
+        assert policy.evaluate_command(command, temp, root, (root,)), command
     assert policy.evaluate_command("command git push", temp, root, (root,))
     for command in ("task status proj", "task check", "task runner-check proj runner.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command

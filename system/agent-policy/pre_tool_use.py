@@ -1331,13 +1331,13 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
     for source in (event, data):
         environments.extend(source[key] for key in ("env", "environment")
                             if isinstance(source.get(key), dict))
-    if any(name.startswith(("npm_config_", "NPM_CONFIG_"))
-           for environment in environments for name in environment):
-        return Denial("command.unsafe_environment", "npm configuration environment overrides are blocked.")
+    npm_config_override = any(name.lower().startswith("npm_config_")
+                              for environment in environments for name in environment)
     command = data.get("command")
     if not isinstance(command, str) or not command.strip():
         return Denial("input.invalid", "Shell command is unrecognized; blocked by policy.")
-    reason = evaluate_command(command, cwd, root, approved_roots)
+    reason = evaluate_command(command, cwd, root, approved_roots,
+                              npm_config_override=npm_config_override)
     if not reason or isinstance(reason, Denial):
         return reason
     return Denial(command_rule(reason), reason)
@@ -1468,7 +1468,7 @@ def lane_session() -> bool:
 
 def unsafe_env_name(name: str) -> bool:
     name = name.removesuffix("+").split("[", 1)[0]
-    return name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES) or lane_session() and (
+    return name.lower().startswith("npm_config_") or name in UNSAFE_ENV_NAMES or name.startswith(UNSAFE_ENV_PREFIXES) or lane_session() and (
         name in CONTAINER_ENV_NAMES or name.startswith(CONTAINER_ENV_PREFIXES))
 
 
@@ -1695,7 +1695,7 @@ def print_allowlist(tokens: list[str]) -> bool:
 
 def judge_program(text: str, cwd: str, root: Path,
                   approved_roots: tuple[Path, ...] | None, depth: int,
-                  allow_cd: bool = True) -> str | None:
+                  allow_cd: bool = True, npm_config_override: bool = False) -> str | None:
     # This deliberately accepts a small shell language. Do not interpret another
     # language as shell, expand variables, execute a parser, or discard unknown syntax.
     lines = text.splitlines()
@@ -1739,7 +1739,7 @@ def judge_program(text: str, cwd: str, root: Path,
                 "pushd", "popd", "hash", "rehash", "enable", "disable", "autoload",
                 "emulate", "zmodload", "noglob", "nocorrect", "repeat", "foreach", "end", "-"}:
             return "Script shell state or command modifiers cannot be judged safely."
-    return evaluate_command(body, cwd, root, approved_roots, depth)
+    return evaluate_command(body, cwd, root, approved_roots, depth, npm_config_override)
 
 
 LANE_TEMP_ROOTS = (Path("/tmp"), Path("/var/tmp"))
@@ -1785,7 +1785,8 @@ def external_binary(token: str, cwd: str, root: Path) -> Path | None:
 
 
 def script_reason(tokens: list[str], cwd: str, root: Path,
-                  approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
+                  approved_roots: tuple[Path, ...] | None, depth: int,
+                  npm_config_override: bool = False) -> str | None:
     head = Path(tokens[0]).name.lower()
     path = None
     external = external_binary(tokens[0], cwd, root)
@@ -1829,7 +1830,8 @@ def script_reason(tokens: list[str], cwd: str, root: Path,
         return "Script path must be literal."
     try:
         return judge_program(program_text(path), cwd, root, approved_roots, depth + 1,
-                             allow_cd=head != "source" and tokens[0] != ".")
+                             allow_cd=head != "source" and tokens[0] != ".",
+                             npm_config_override=npm_config_override)
     except (OSError, ValueError, RuntimeError):
         return "Script cannot be read or judged safely."
 
@@ -1890,7 +1892,8 @@ def recipe_changed(path: Path, root: Path) -> bool:
 
 
 def trusted_script_changes(text: str, cwd: str, root: Path,
-                           approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
+                           approved_roots: tuple[Path, ...] | None, depth: int,
+                           npm_config_override: bool = False) -> str | None:
     """Judge unchanged bodies too; only the task check entry retains gate trust.
 
     Recipe lines can execute in separate shells, so cwd changes are refused.
@@ -1898,11 +1901,13 @@ def trusted_script_changes(text: str, cwd: str, root: Path,
     """
     if depth >= INDIRECTION_DEPTH:
         return "Script/recipe recursion limit reached."
-    return judge_program(text, cwd, root, approved_roots, depth, allow_cd=False)
+    return judge_program(text, cwd, root, approved_roots, depth, allow_cd=False,
+                         npm_config_override=npm_config_override)
 
 
 def recipe_reason(tokens: list[str], cwd: str, root: Path,
-                  approved_roots: tuple[Path, ...] | None, depth: int) -> str | None:
+                  approved_roots: tuple[Path, ...] | None, depth: int,
+                  npm_config_override: bool = False) -> str | None:
     runner = Path(tokens[0]).name.lower()
     runner = {"yarnpkg": "yarn"}.get(runner, runner)
     if runner in {"bunx", "pnpx"}:
@@ -1921,7 +1926,8 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
             return "npx binary is not already installed in node_modules/.bin."
         if not path.resolve().is_relative_to(Path(cwd).resolve() / "node_modules"):
             return "npx binary must resolve within local node_modules."
-        return evaluate_segment([str(path), *args[1:]], cwd, root, approved_roots, depth + 1)
+        return evaluate_segment([str(path), *args[1:]], cwd, root, approved_roots, depth + 1,
+                                npm_config_override)
     names = {"just": ("justfile", "Justfile", ".justfile"),
              "make": ("GNUmakefile", "makefile", "Makefile"),
              "gmake": ("GNUmakefile", "makefile", "Makefile"),
@@ -1937,8 +1943,10 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         # other runners may resolve it as a script or binary shorthand.
         if args in (["--help"], ["-h"], ["--version"], ["-v"]):
             return None
-        if (runner == "npm" and len(args) == 2 and args[0] == "help"
-                and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args[1])):
+        if (runner == "npm" and args[:1] == ["help"] and (len(args) == 1 or
+                len(args) == 2 and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", args[1]))):
+            if npm_config_override or any(name.lower().startswith("npm_config_") for name in os.environ):
+                return Denial("command.unsafe_environment", "npm configuration environment overrides are blocked.")
             # No manifest is needed, but a changed .npmrc may select a viewer.
             try:
                 directory = Path(cwd).resolve()
@@ -2046,7 +2054,8 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
                     return "Changed Just syntax cannot be judged reliably."
             bodies = ["\n".join(body) for body in bodies]
         for body in bodies:
-            reason = trusted_script_changes(body, str(directory), root, approved_roots, depth + 1)
+            reason = trusted_script_changes(body, str(directory), root, approved_roots, depth + 1,
+                                            npm_config_override)
             if reason:
                 return reason
     except ValueError as exc:
@@ -2059,12 +2068,13 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
 
 
 def evaluate_command(command: str, cwd: str, root: Path,
-                     approved_roots: tuple[Path, ...] | None, depth: int = 0) -> str | None:
+                     approved_roots: tuple[Path, ...] | None, depth: int = 0,
+                     npm_config_override: bool = False) -> str | None:
     repeat = re.fullmatch(
         r"for [A-Za-z_][A-Za-z0-9_]* in (?:\$\(seq 1 [0-9]+\)|\{1\.\.[0-9]+\});\s*do (.+?);\s*done\s*",
         command)
     if repeat:
-        return evaluate_command(repeat[1], cwd, root, approved_roots, depth)
+        return evaluate_command(repeat[1], cwd, root, approved_roots, depth, npm_config_override)
     if "$(" in command or "`" in command:
         return "Dynamic ($(...), backtick) shell commands are blocked."
     loop = re.fullmatch(r"for ([A-Za-z_][A-Za-z0-9_]*) in (.+?);\s*do (.+?);\s*done\s*", command)
@@ -2084,7 +2094,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
             for value in operands:
                 expanded = body.replace("${" + variable + "}", shlex.quote(value)).replace(
                     "$" + variable, shlex.quote(value))
-                reason = evaluate_command(expanded, cwd, root, approved_roots, depth)
+                reason = evaluate_command(expanded, cwd, root, approved_roots, depth, npm_config_override)
                 if reason:
                     return reason
             return None
@@ -2130,16 +2140,17 @@ def evaluate_command(command: str, cwd: str, root: Path,
                         quote = char
                         word_start = False
                         continue
-                    if word_start and char == "2":
-                        target = offset + 2
+                    if word_start and char in {"2", ">"}:
+                        redirect = "2>" if char == "2" else ">"
+                        target = offset + len(redirect)
                         while target < len(text) and text[target].isspace():
                             target += 1
                         for spelling, expected in (
                                 (text[offset:target] + "/dev/null",
-                                 ["2", ">", "/dev/null"]),
+                                 (["2"] if char == "2" else []) + [">", "/dev/null"]),
                                 ("2>&1", ["2", ">&", "1"])):
                             end = offset + len(spelling)
-                            if (text.startswith("2>", offset)
+                            if (text.startswith(redirect, offset)
                                     and text.startswith(spelling, offset)
                                     and (end == len(text) or text[end].isspace())):
                                 prefix = shlex.shlex(text[:offset], posix=True,
@@ -2147,9 +2158,10 @@ def evaluate_command(command: str, cwd: str, root: Path,
                                 prefix.whitespace_split = True
                                 prefix.commenters = ""
                                 index = len(list(prefix))
-                                # Normalize only stderr redirects following a
+                                # Normalize only null/stderr redirects following a
                                 # command word; never discard leading redirects.
-                                preceding = unwrap_command(tokens[:index])
+                                preceding = unwrap_command([token for i, token in enumerate(tokens[:index])
+                                                            if i not in drop])
                                 if (isinstance(preceding, list) and preceding
                                         and preceding[0] not in {"if", "then", "else", "elif", "do"}
                                         and not re.match(r"(?:\d*[<>]|&[<>])", preceding[0])
@@ -2277,7 +2289,7 @@ def evaluate_command(command: str, cwd: str, root: Path,
                 return "Script path cannot be resolved safely."
         if seen_changing and indirect:
             return "Run scripts and recipes separately from commands that may change their definitions."
-        reason = evaluate_segment(tokens, effective, root, approved_roots, depth)
+        reason = evaluate_segment(tokens, effective, root, approved_roots, depth, npm_config_override)
         if reason:
             return reason
         if unwrapped:
@@ -2296,7 +2308,8 @@ def evaluate_command(command: str, cwd: str, root: Path,
 
 
 def evaluate_segment(tokens: list[str], cwd: str, root: Path,
-                     approved_roots: tuple[Path, ...] | None, depth: int = 0) -> str | None:
+                     approved_roots: tuple[Path, ...] | None, depth: int = 0,
+                     npm_config_override: bool = False) -> str | None:
     """Apply the single-command rules to one chain segment (wrappers already vetted)."""
     unwrapped = unwrap_command(tokens)
     if isinstance(unwrapped, str):
@@ -2369,10 +2382,10 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     tokens = command_tokens
     if not tokens:
         return None
-    reason = script_reason(tokens, cwd, root, approved_roots, depth)
+    reason = script_reason(tokens, cwd, root, approved_roots, depth, npm_config_override)
     if reason:
         return Denial("command.script", reason)
-    reason = recipe_reason(tokens, cwd, root, approved_roots, depth)
+    reason = recipe_reason(tokens, cwd, root, approved_roots, depth, npm_config_override)
     if reason:
         return Denial("command.recipe", reason)
     args = [t for t in tokens[1:] if not t.startswith("-")]
