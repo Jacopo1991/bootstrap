@@ -1,7 +1,7 @@
 # Root-owned Codex requirements: install.sh copies this file to /etc/codex/requirements.toml.
 # Codex enforces requirements above user, project and session config; the agent account can
 # neither edit nor override them. Only the guardrails live here: the policy hooks and the
-# forbidden/prompt command rules. Approval policy, sandbox mode and the routine Git/gh allow
+# forbidden/prompt command rules and permission profiles. Approval policy and the routine Git/gh allow
 # rules stay preferences in ~/.codex (no allowed_* lists, no allow_managed_hooks_only).
 
 # Read-deny for every sandboxed tool command: credentials and private data. `--sandbox` cannot be
@@ -82,6 +82,24 @@ prefix_rules = [
 
 [permissions.lane]
 extends = ":workspace"
+
+# Managed profiles cannot be redefined in user config. Keep the network policy here;
+# config.toml's features.network_proxy activates the proxy that enforces these hosts.
+[permissions.lane.network]
+enabled = true
+enable_socks5 = false
+allow_local_binding = true
+
+[permissions.lane.network.domains]
+"pypi.org" = "allow"
+"files.pythonhosted.org" = "allow"
+"registry.npmjs.org" = "allow"
+"github.com" = "allow"
+"objects.githubusercontent.com" = "allow"
+"codeload.github.com" = "allow"
+"raw.githubusercontent.com" = "allow"
+"release-assets.githubusercontent.com" = "allow"
+"openrouter.ai" = "allow"
 
 [permissions.lane.filesystem]
 "~/.ssh" = "deny"

@@ -42,23 +42,23 @@ network_domains = ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org", "
 codex = tomllib.loads((ROOT / "home/.chezmoitemplates/codex-config.toml").read_text(encoding="utf-8"))
 assert codex["approval_policy"] == "on-request"
 assert codex["approvals_reviewer"] == "user"
-assert codex["sandbox_mode"] == "workspace-write"
+assert "sandbox_mode" not in codex  # Managed permission profiles select the sandbox.
 # The network proxy injects variables after shell_environment_policy filtering; do not regress
 # to that ineffective workaround for sandbox proxy variables.
 assert not {"ALL_PROXY", "all_proxy"}.intersection(
     codex.get("shell_environment_policy", {}).get("exclude", []))
-assert "writable_roots" not in codex["sandbox_workspace_write"]
-# Sandbox network is on for local tests and the paid probe. The proxy allows only the exact
-# openrouter.ai host plus local binding for tests that start a local server.
-assert codex["sandbox_workspace_write"]["network_access"] is True
-assert codex["features"]["network_proxy"] == {
-    "enabled": True, "allow_local_binding": True, "domains": {host: "allow" for host in network_domains},
-    "enable_socks5": False}
+assert "sandbox_workspace_write" not in codex
+# Proxy activation is separate from the selected profile's network policy.
+assert codex["features"]["network_proxy"] is True
 # Guardrails live in root-owned managed config (ci/managed-policy-test.py checks the shape):
 # the hooks feature and hooks in /etc/codex/requirements.toml, none in the user config.
 assert "hooks" not in codex and "hooks" not in codex["features"]
 assert not (ROOT / "home/dot_codex/hooks.json").exists()
 requirements = tomllib.loads((ROOT / "system/codex-requirements.toml").read_text(encoding="utf-8"))
+assert requirements["permissions"]["lane"]["network"] == {
+    "enabled": True, "allow_local_binding": True, "enable_socks5": False,
+    "domains": {host: "allow" for host in network_domains}}, "lane network policy"
+assert "network" not in requirements["permissions"]["review"], "review has no network"
 assert requirements["features"] == {"hooks": True}
 codex_hooks = {"hooks": {k: v for k, v in requirements["hooks"].items() if k != "managed_dir"}}
 assert set(codex_hooks["hooks"]) == {"PreToolUse", "PermissionRequest", "UserPromptSubmit"}
@@ -141,7 +141,7 @@ extra_denies = {"~/.claude/.credentials.json", "~/.gemini", "~/project-data",
                 *(f"~/cortex/cortex-kb-{n}" for n in ("typo3-dkm", "customer-harness", "photo-organizer"))}
 assert {"~/.ssh", "~/.config/gh", "~/.codex/auth.json", "~/.npmrc"} <= claude_reads
 for name, profile in requirements["permissions"].items():
-    assert set(profile) == {"extends", "filesystem"}, name
+    assert set(profile) == {"extends", "filesystem"} | ({"network"} if name == "lane" else set()), name
     assert profile["filesystem"] == dict.fromkeys(claude_reads | extra_denies, "deny"), name
 launch = (ROOT / "home/dot_local/bin/executable_task").read_text(encoding="utf-8")
 for cache in ("UV_CACHE_DIR", "PIP_CACHE_DIR", "PRE_COMMIT_HOME", "npm_config_cache"):

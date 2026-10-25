@@ -110,7 +110,8 @@ assert requirements["default_permissions"] == "lane"
 profiles = requirements["permissions"]
 assert set(profiles) == {"lane", "review"}, set(profiles)
 assert profiles["lane"]["extends"] == ":workspace" and profiles["review"]["extends"] == ":read-only"
-assert set(profiles["lane"]) == set(profiles["review"]) == {"extends", "filesystem"}
+assert set(profiles["lane"]) == {"extends", "filesystem", "network"}
+assert set(profiles["review"]) == {"extends", "filesystem"}
 assert profiles["lane"]["filesystem"] == profiles["review"]["filesystem"]
 assert set(profiles["lane"]["filesystem"].values()) == {"deny"}
 for path in keys(requirements):  # the read-deny profile keys are the one deliberate selection limit
