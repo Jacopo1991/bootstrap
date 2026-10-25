@@ -1914,6 +1914,14 @@ def archive_lane_final(work):
             report.write_text("\n".join(lines).rstrip() + "\n")
 
 
+def lane_git_grants(path: Path) -> list[str]:
+    """Codex `--add-dir` grants so a lane can commit and merge in its linked worktree. Never `<common>`, `config`, `hooks` or `info`."""
+    git_dir, common = (Path(git(path, "rev-parse", "--path-format=absolute", flag)) for flag in ("--git-dir", "--git-common-dir"))
+    if git_dir.parent != common / "worktrees":
+        raise Stop(f"Codex lanes need a linked worktree; {path} keeps its Git dir in {common}, whose hooks and config must stay read-only.")
+    return [x for part in (git_dir, common / "objects", common / "refs", common / "logs") for x in ("--add-dir", str(part))]
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
     path = task.worktree()
@@ -1956,7 +1964,7 @@ def lane(args):
         raise Stop(f"{binary} is not installed or available on PATH.")
     task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
-    command = (["codex", "exec", "-c", 'default_permissions="lane"', "--model", cli_model,
+    command = (["codex", "exec", "-c", 'default_permissions="lane"', *lane_git_grants(path), "--model", cli_model,
                 "-c", f"model_reasoning_effort={args.effort}", "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", args.effort,
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])

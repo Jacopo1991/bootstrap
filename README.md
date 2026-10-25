@@ -405,7 +405,15 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   commands the sandbox runs; the `codex` process reads `~/.codex/auth.json` itself. A private
   project's own lane therefore cannot read its repo until that project gets its own profile.
   `checks/agent-drift.py` reports `codex-deny-list-missing` when the installed requirements
-  lack these profiles. PM proof after install, one `codex sandbox -c 'default_permissions="review"' --
+  lack these profiles. Git writes (T-53): `:workspace` leaves a linked worktree's metadata
+  read-only, so `task lane` (Codex builder only) adds exactly four `--add-dir` grants, resolved
+  with `git rev-parse --path-format=absolute`: the worktree's own git dir and the shared
+  `<common>/objects`, `<common>/refs` and `<common>/logs`. A lane can therefore commit and merge on
+  its task branch. `hooks`, `config` and `info` stay read-only because a writable hook or config
+  runs as code outside the sandbox at the next Git command, and no other worktree's dir is
+  granted. A checkout whose git dir is the common dir is refused (`Stop`). The shared `refs`
+  also let a lane move other local branches; the policy hook, not the sandbox, blocks that.
+  Reviews, red teams and realigns use `review` and get no Git grants. PM proof after install, one `codex sandbox -c 'default_permissions="review"' --
   test -r <path>` per denied path (must fail; never print contents) and the controls
   `/etc/hostname` and `~/.bashrc` (must succeed); repeat with `"lane"`; then run one Codex lane
   and one Codex review normally. Also confirm `codex exec` with `-c default_permissions` starts

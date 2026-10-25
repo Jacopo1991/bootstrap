@@ -4762,6 +4762,7 @@ store.write_text(json.dumps(prs))
             self.assertIn(model, call['args'])
             if vendor == 'codex':
                 self.assertEqual(call['args'][:3], ['exec', '-c', 'default_permissions="review"'])
+                self.assertNotIn('--add-dir', call['args'])
             else:
                 self.assertIn('dontAsk', call['args'])
         wrapper.unlink()
@@ -6350,8 +6351,15 @@ store.write_text(json.dumps(prs))
             with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
                 self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
-            self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"', "--model", "gpt-6.1-sol",
+            git_dir, common = (self.git(wt, "rev-parse", "--path-format=absolute", flag) for flag in ("--git-dir", "--git-common-dir"))
+            self.assertNotEqual(git_dir, common)
+            grants = [git_dir, f"{common}/objects", f"{common}/refs", f"{common}/logs"]
+            self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"',
+                                            *(a for g in grants for a in ("--add-dir", g)), "--model", "gpt-6.1-sol",
                                             "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
+            added = [call["args"][i + 1] for i, a in enumerate(call["args"]) if a == "--add-dir"]
+            for forbidden in (common, f"{common}/config", f"{common}/hooks", f"{common}/info", f"{common}/worktrees"):
+                self.assertNotIn(forbidden, added)
             self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
                                  name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
             self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
@@ -7888,6 +7896,15 @@ store.write_text(json.dumps(prs))
         prompt = self.state("direct-request") / "review-prompt.md"
         self.assertIn("Preserve the user's uncommitted files and explain the behavior change.", prompt.read_text())
         self.assertIn("--allowedTools Read Grep Glob", out)
+
+    def test_codex_lane_refuses_a_checkout_whose_git_dir_is_the_common_dir(self):
+        with self.assertRaisesRegex(TASK_MODULE.Stop, "linked worktree"):
+            TASK_MODULE.lane_git_grants(self.repo)
+
+    def test_realign_and_review_run_commands_get_no_git_grants(self):
+        source = (ROOT / "home/dot_local/bin/executable_task").read_text()
+        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -m gpt-6-luna", source)
+        self.assertEqual(source.count("lane_git_grants("), 2)  # definition and the one lane call
 
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
         self.raw_task("start", "proj", "5", "--builder", "claude")
