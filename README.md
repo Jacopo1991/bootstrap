@@ -830,6 +830,31 @@ It runs from the task worktree, detaches and prints its pid. The final response 
 running, finished with its exit code, or interrupted. A live lane cannot be
 launched twice. Commit, check, report and other-vendor review still precede merge.
 
+### Installing a bootstrap change
+
+After every install of a guard, hook, sandbox profile, permission or `task`
+change, the PM runs `task smoke` from a normal shell. The change counts as
+installed only when it passes; the install record in STATUS names the run id and
+the result.
+
+```sh
+task smoke                    # both builders (default); or --builder codex|claude
+```
+
+It creates `~/dev_workspace/task-smoke-<run>` (one commit on `main`, no remote)
+and `~/cortex/cortex-kb-task-smoke-<run>`, then runs the normal path for each
+builder: `task start`, an unrelated commit on `main`, `task lane` on the cheapest
+model at low effort, the lane's commit, merge of `main` and report, `task check`,
+`task review --run` with the cheapest reviewer of the other vendor, and
+`task merge`. It prints `PASS`, or `FAIL <step>: <first error line>` for each
+step, and stops that builder at its first failure. It writes
+`~/.local/state/task/smoke/<run>.json`. A pass removes the scratch project; a
+FAIL keeps it and prints the paths, and `task smoke --clean <run>` removes them.
+
+A smoke costs two cheap lanes (Codex `gpt-6-luna`, Claude `haiku`) and two cheap
+reviews (Claude `haiku` on the Codex build, Codex `gpt-6-luna` on the Claude
+build).
+
 ### Cortex knowledge search (qmd)
 
 [qmd](https://www.npmjs.com/package/@tobilu/qmd) (MIT) indexes the Markdown in
