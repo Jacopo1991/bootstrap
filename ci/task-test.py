@@ -8092,6 +8092,23 @@ store.write_text(json.dumps(prs))
         self.assertIn("WARNING: dependency files changed (requirements.txt)", out)
         self.assertIn("main checkout's environment is now out of date", out)
 
+    def test_merge_flags_cooldown_config_files_as_dependency_changes(self):
+        wt, _ = self.started()
+        self.commit_in(wt, ".npmrc", "min-release-age=0\n")
+        self.commit_in(wt, "uv.toml", 'exclude-newer = "2099-01-01T00:00:00Z"\n')
+        self.prepare_merge_evidence("5")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: dependency files changed (", out)
+        self.assertIn(".npmrc", out)
+        self.assertIn("uv.toml", out)
+
+    def test_merge_flags_tool_uv_table_in_pyproject(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "pyproject.toml", '[tool.uv]\nexclude-newer = "2099-01-01T00:00:00Z"\n')
+        self.prepare_merge_evidence("5")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: dependency files changed (pyproject.toml)", out)
+
     def test_merge_runs_only_repository_sync_recipe_for_dependency_change(self):
         justfile = self.repo / "justfile"
         justfile.write_text(justfile.read_text() + "\nsync:\n    echo sync\n")
