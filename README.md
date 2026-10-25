@@ -1269,9 +1269,12 @@ PyPI and about six for npm (its database is about 200 MB).
 
 `agy` (Antigravity CLI 1.4.0) is a third vendor for research, read-only audits and plan
 red-teams. Bootstrap installs the release tarball pinned in `pins.env` (`AGY_URL`,
-`AGY_SHA256`): the SHA-256 is checked before extraction, the binary is kept under
-`~/.local/share/bootstrap/agy/<version>/` and `~/.local/bin/agy` links to it. The vendor's
-install script is never run. The drift report reads back `agy --version`.
+`AGY_SHA256`): the archive SHA-256 is checked before extraction, and bootstrap restores the
+pinned binary when its version or contents differ. The installed binary and version directory
+are made read-only, and `~/.local/bin/agy` is a wrapper that sets
+`AGY_CLI_DISABLE_AUTO_UPDATE=true` before executing the pinned binary. An owner can undo those
+permissions; the drift check reports `agy-version-drift` if the version or recorded binary SHA
+changes. The vendor's install script is never run.
 
 - **Who runs it:** the PM, from an unsandboxed shell (`agy -p "<prompt>"`, `--add-dir <path>`).
   The policy hook refuses `agy` and `antigravity` in every lane session (T-48). It refuses

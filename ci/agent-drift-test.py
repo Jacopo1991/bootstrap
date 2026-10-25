@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Hosted tests for read-only installed-set drift detection."""
 import json
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -118,9 +119,10 @@ assert drift.VERSION_COMMANDS["agy"] == ["agy", "--version"]
 assert drift.URL_VERSIONS["agy"] == ("AGY_URL", "/download/")
 assert "antigravity" not in drift.EXPECTED_BINARIES
 tools_text = (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
-agy_block = tools_text[tools_text.index('download "$AGY_URL"'):tools_text.index("pre_commit_root=")]
+assert '{{ include ".chezmoitemplates/agy-install.sh" }}' in tools_text
+agy_block = (ROOT / "home/.chezmoitemplates/agy-install.sh").read_text(encoding="utf-8")
 assert agy_block.index('download "$AGY_URL" "$AGY_SHA256"') < agy_block.index('tar -xzf "$tmp/agy.tar.gz"')
-assert agy_block.index('tar -xzf "$tmp/agy.tar.gz"') < agy_block.index('ln -sfn "$agy_root/antigravity" "$HOME/.local/bin/agy"')
+assert agy_block.index('tar -xzf "$tmp/agy.tar.gz"') < agy_block.index('install -m 0755 "$tmp/antigravity" "$agy_root/antigravity"')
 assert "install.sh" not in agy_block and "antigravity.google" not in tools_text and "| bash" not in agy_block
 template_text = (ROOT / "home/run_onchange_after_10-tools.sh.tmpl").read_text(encoding="utf-8")
 assert f"agy {pins['AGY_VERSION']} release sha256: {pins['AGY_SHA256']}" in template_text
@@ -144,12 +146,22 @@ with tempfile.TemporaryDirectory() as temp:
     agy_link = bin_dir / "agy"
     agy_link.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     agy_link.chmod(0o755)
+    agy_binary = home / ".local/share/bootstrap/agy/1.4.0/antigravity"
+    agy_binary.parent.mkdir(parents=True)
+    agy_binary.write_bytes(b"pinned fake binary")
+    (agy_binary.parent / "antigravity.sha256").write_text(
+        hashlib.sha256(agy_binary.read_bytes()).hexdigest(), encoding="ascii")
     agy_findings = lambda findings: [f for f in findings if f.endswith(":agy") or ":agy:" in f]
     assert agy_findings(drift.scan(ROOT, home, run=fake_runner("antigravity 1.4.0"))) == []
     assert "cli-version-drift:agy" in drift.scan(ROOT, home, run=fake_runner("antigravity 1.3.9"))
+    assert "agy-version-drift" in drift.scan(ROOT, home, run=fake_runner("antigravity 1.3.9"))
     assert "cli-version-drift:agy" in drift.scan(ROOT, home, run=fake_runner(""))
     agy_link.unlink()
     assert "cli-path-drift:agy" in drift.scan(ROOT, home, run=fake_runner("antigravity 1.4.0"))
+    agy_link.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    agy_link.chmod(0o755)
+    agy_binary.write_bytes(b"changed fake binary")
+    assert "agy-version-drift" in drift.scan(ROOT, home, run=fake_runner("antigravity 1.4.0"))
 # The installed Codex requirements must carry the checked-in read-deny profiles.
 with tempfile.TemporaryDirectory() as temp:
     installed = Path(temp) / "requirements.toml"
