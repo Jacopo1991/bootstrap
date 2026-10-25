@@ -640,8 +640,9 @@ accept `codex` and `claude` reviewer model names, keyed by builder vendor.
 `[review.high]` additionally accepts `red_team_model` for Codex (default `gpt-6.1-sol`)
 and `red_team_model_claude` for Claude (default `sonnet`).
 Missing keys use built-in defaults; per-repository high-path lists replace their
-defaults. Unknown keys and malformed values are refused. Risk enforcement fails
-closed on invalid policy, while usage pacing reports its existing defaults fallback.
+defaults. An unknown or malformed `[review]` table (for example `[review.low]`) keeps its
+defaults with one warning; the other review tables are kept. Risk enforcement fails closed on an unreadable or unparseable policy
+file, while usage pacing reports its existing defaults fallback.
 
 #### Usage pacing
 
@@ -723,10 +724,33 @@ or repeating end is safe. Lanes default to high effort, configurable with `--eff
 
 The policy is TOML at the path in `~/.config/task/usage-policy-path`, default
 `~/cortex/cortex-kb-company/policy/usage-pacing.toml`; `task` only reads it and the company PM writes it.
-A missing file or key means the built-in defaults; an invalid file is reported and the defaults apply.
+A missing file or key means the built-in defaults. An unknown or invalid key prints one warning line
+naming it (`pace warning: <file>: unknown key <key>; ignored, other keys kept`); that key keeps its
+default and every other key is kept. An unreadable or unparseable file is reported and all defaults apply.
 [`docs/usage-pacing.example.toml`](docs/usage-pacing.example.toml) shows every key at its default:
 `[reserve]` (claude 25, codex 10), `[spare_resets]` (claude 0, codex 1), `priority`, `ahead_margin` (10),
 `under_use_percent` (60), `under_use_hours` (36), `boost_five_hour_max` (50, percent 0–100) and `research_backlog`.
+
+Two company decisions shape vendor spend. **Decision-23 (Codex daily ramp):** with
+`codex_ramp = { per_day = 20, ceiling = 80 }` (no key, no ramp) a new Codex lane, `task review --run`
+or `task redteam` launches only while Codex weekly use is at or below `min(ceiling, per_day × started
+day)`. Day 1 starts at the last weekly reset (`resets_at` − 7 days), so an early reset restarts at day 1.
+Running work is never stopped. A refusal exits 4 and names the used %, the allowance and the day; a
+routine lane does not move to Codex past its ramp. `task usage` shows the day, the allowance and
+`within ramp` or `past ramp`. Hold-switch, always-on service, security and money work may launch above
+the allowance and the ceiling with `--ramp-exempt hold|service|security|money` on `task lane`,
+`task review --run` and `task redteam`; each use is written to the overrides ledger (kind `ramp_exempt`).
+High risk alone is not an exemption. Claude has no ramp. **Decision-22 (Claude 3-point brake)** stays
+outside `task` for now; the PM applies it by hand.
+
+After the vendor readings `task usage` prints a `fallback:` block with one line per vendor that is past
+its Codex ramp, braked (automated share used up, or ahead of pace), near or out of its 5-hour window
+(the warning band, including a missing or stale reading) or blocked by an open foundation defect,
+for example `codex past ramp (day 1, 20 %): builds -> Claude lane; reviews of Claude work -> wait`.
+Builds fall back to the other vendor's lane unless that vendor is also listed (then `wait`); reviews of
+the other vendor's work wait, or run one at a time in the 5-hour warning band. The PM records a
+foundation defect by hand as `blocked = { codex = "<reason>" }`. Nothing is printed when every vendor
+is normal.
 
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and

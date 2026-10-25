@@ -526,7 +526,7 @@ def pace_check(args, kind, vendor, tier, task):
     if args.no_pace or os.environ.get("TASK_NO_PACE"):
         task_usage.log(HOME, f"--no-pace: {kind} {task.repo.name}/{task.id} not paced")
         return None
-    decision = task_usage.gate(HOME, kind, vendor, tier, task.repo.name, task.id)
+    decision = task_usage.gate(HOME, kind, vendor, tier, task.repo.name, task.id, exempt=args.ramp_exempt or "")
     print("\n".join(decision["notes"]), end="\n" if decision["notes"] else "")
     until, vendor = decision["spend"], decision["vendor"]
     if until and vendor not in active_boosts():
@@ -537,6 +537,14 @@ def pace_check(args, kind, vendor, tier, task):
     if decision["hold"]:
         print(f"task {kind}: held back by usage pacing: {decision['hold']} (retry later; --no-pace overrides)")
     return decision
+
+
+def ledger_ramp_exempt(args, task, vendor, model, tier, past_ramp):
+    """Record a --ramp-exempt launch in the overrides ledger, like extra rounds (decision-23)."""
+    if args.ramp_exempt:
+        task_usage.record_override(HOME, task.repo.name, task.id, model, tier, f"ramp-exempt {args.ramp_exempt}",
+                                   kind="ramp_exempt", exemption=args.ramp_exempt, vendor=vendor, past_ramp=past_ramp)
+        print(f"override recorded: ramp-exempt {args.ramp_exempt} on {vendor}{' past its daily ramp' if past_ramp else ''}")
 
 
 def plan_time(value):
@@ -814,7 +822,7 @@ def realign(args):
     with tempfile.TemporaryDirectory(dir=state) as temporary:
         source = Path(temporary) / "prompt.md"
         source.write_text(prompt)
-        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -m gpt-6-luna -c model_reasoning_effort=high -",
+        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -c 'web_search=\"live\"' -m gpt-6-luna -c model_reasoning_effort=high -",
                      info["kb"], source, failed_reply)
         directory.mkdir(parents=True, exist_ok=True)
         failed_reply.replace(reply)
@@ -1023,6 +1031,11 @@ def redteam(args):
     risk, policy, _ = risk_context(task, path, record)
     if risk != "high":
         raise Stop(f"risk {risk}: red-team is allowed only for high tasks")
+    vendor = "claude" if record["builder"] == "codex" else "codex"
+    hold, exempted = task_usage.ramp_gate(HOME, "red-team", vendor, task.repo.name, task.id, args.ramp_exempt or "")
+    if hold:
+        print(f"task redteam: held back by usage pacing: {hold} (retry later)")
+        return 4
     head = sha(path, "HEAD")
     state = task_state(task)
     output = state / f"redteam-{head}.md"
@@ -1036,16 +1049,16 @@ def redteam(args):
         wrapped = wrapper.is_file()
         if wrapped:
             brief = wrapper.read_text(encoding="utf-8") + "\n\n" + brief
-        vendor = "claude" if record["builder"] == "codex" else "codex"
         model = policy["red_team_model_claude" if vendor == "claude" else "red_team_model"]
+        ledger_ramp_exempt(args, task, vendor, model, record.get("tier", "routine"), bool(exempted))
         binary = shutil.which(vendor)
         if not binary:
             raise Stop(f"risk high: {vendor} is not available on PATH")
-        command = ([binary, "exec", "-c", 'default_permissions="review"', "-m", model,
+        command = ([binary, "exec", "-c", 'default_permissions="review"', "-c", 'web_search="live"', "-m", model,
                                  "-c", "model_reasoning_effort=high", "--skip-git-repo-check", "-C", str(path),
                                  "-o", str(temporary), "-"] if vendor == "codex" else
                    [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
-                    "--allowedTools", "Read", "Grep", "Glob", "Bash(git --no-optional-locks:*)"])
+                    "--allowedTools", "Read", "Grep", "Glob", "WebSearch", "WebFetch", "Bash(git --no-optional-locks:*)"])
         with tempfile.TemporaryFile() as source, temporary.open('w') as output_stream:
             source.write(brief.encode()); source.seek(0)
             process = launch_unit('review', task.repo, task.name, command, cwd=path,
@@ -2014,10 +2027,10 @@ def lane(args):
         raise Stop(f"{binary} is not installed or available on PATH.")
     task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
-    command = (["codex", "exec", "-c", 'default_permissions="lane"', *lane_git_grants(task), "--model", cli_model,
+    command = (["codex", "exec", "-c", 'default_permissions="lane"', "-c", 'web_search="live"', *lane_git_grants(task), "--model", cli_model,
                 "-c", f"model_reasoning_effort={args.effort}", "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", args.effort,
-                "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
+                "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep WebSearch WebFetch"])
     lane_record = work / "lane.json"
     with (work / "lane.lock").open("a") as lock:
         # The worker waits for the launcher to publish its pid before proceeding.
@@ -2079,6 +2092,7 @@ def lane(args):
             atomic_json(task_state(task) / "rounds.json", dict(used=used + 1, extra=extra))
             if extra != rounds.get("extra", 0):
                 task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
+            ledger_ramp_exempt(args, task, builder, model, tier, bool(decision and decision["ramp_exempt"]))
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid, "unit": child.unit,
                                       "process_start": task_usage.process_start(child.pid),
@@ -3565,6 +3579,7 @@ def review_locked(args):
                 return 4
             if risk == "high" and reviewer_route[0] in active_boosts() and (record.get("tier") == "hard" or args.final):
                 reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
+            ledger_ramp_exempt(args, task, reviewer_route[0], reviewer_route[1], "routine", bool(decision and decision["ramp_exempt"]))
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]
@@ -3642,8 +3657,8 @@ def review_locked(args):
             if vendor == "claude":
                 events = "--output-format stream-json --verbose " if args.run else ""
                 return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
-                        "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
-            return (f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' {add_dir}"
+                        "--allowedTools Read Grep Glob WebSearch WebFetch 'Bash(git --no-optional-locks:*)'")
+            return (f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -c 'web_search=\"live\"' {add_dir}"
                     f"-m {shlex.quote(model)} -c model_reasoning_effort=high -")
         command = reviewer_command(*reviewer_route)
         if not args.run:
@@ -5111,6 +5126,9 @@ def main(argv=None):
         sub.add_argument("repo")
         sub.add_argument("id")
         if name in {"start", "lane", "review"}: sub.add_argument("--plan")
+        if name in {"lane", "review", "redteam"}:
+            sub.add_argument("--ramp-exempt", choices=("hold", "service", "security", "money"),
+                             help="hold-switch, always-on service, security or money work may launch past the Codex ramp (ledgered)")
         if name == "wait":
             sub.add_argument("--max", type=float, default=30, help="maximum wait in minutes (default 30)")
         if name in {"start", "lane"}:

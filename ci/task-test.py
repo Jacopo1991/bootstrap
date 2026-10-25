@@ -344,7 +344,7 @@ class TaskTool(unittest.TestCase):
                 ('codex', ['codex', 'exec', '-c', 'default_permissions="lane"', '--model', 'gpt-6.1-sol',
                            '--output-last-message', str(work / 'proof-final'), '-']),
                 ('claude', ['claude', '-p', '--permission-mode', 'acceptEdits',
-                            '--allowedTools', 'Bash Read Write Edit Glob Grep'])):
+                            '--allowedTools', 'Bash Read Write Edit Glob Grep WebSearch WebFetch'])):
             with self.subTest(vendor=vendor), mock.patch.dict(os.environ, self.env, clear=True):
                 environment = TASK_MODULE.lane_environment(TASK_MODULE.Task(self.repo, '5'), vendor)
                 release = work / 'proof-release'
@@ -5129,29 +5129,34 @@ store.write_text(json.dumps(prs))
         for model in ('opus', 'claude-opus-5-5', 'fable', 'claude-fable-5-1', 'gpt-6.1-sol'):
             self.assertIn('risk normal', self.raw_task('review', 'proj', '5', '--record', 'missing', '--reviewer', 'claude', model, code=1))
 
-    def test_risk_policy_selects_reviewers_and_invalid_policy_fails_closed(self):
+    def test_risk_policy_selects_reviewers_and_unparseable_policy_fails_closed(self):
         self.started()
         self.risk_policy_fixture('[review.normal]\ncodex = "sonnet"\n')
         self.assertIn('--model sonnet', self.raw_task('review', 'proj', '5'))
         self.risk_policy_fixture('[review.normal]\ncodex = "opus"\n')
         self.assertIn('risk normal', self.raw_task('review', 'proj', '5', code=1))
-        self.risk_policy_fixture('[review.normal]\nunknown = 1\n')
-        self.assertIn('invalid review.normal', self.raw_task('check', 'proj', '5', code=1))
+        self.risk_policy_fixture('[review.normal]\nunknown = 1\n')  # warned; [review.normal] keeps its defaults
+        self.assertIn('invalid review.normal; ignored, other keys kept', self.raw_task('check', 'proj', '5'))
+        self.risk_policy_fixture('[review.normal\n')
+        self.assertIn('usage-pacing.toml', self.raw_task('check', 'proj', '5', code=1))
 
-    def test_risk_status_invalid_review_reports_problem_and_uses_defaults(self):
+    def test_risk_status_invalid_review_reports_problem_and_keeps_the_other_keys(self):
         wt, _ = self.started()
         self.commit_in(wt, 'b.txt')
-        for text in ('[review.normal]\nunknown = 1\n',
-                     '[review]\nhigh_paths = { proj = ["b.txt"] }\n[review.low]\nmax_rounds = 0\n'):
+        for text, problem, risk in (('[review.normal]\nunknown = 1\n', 'invalid review.normal;', 'normal'),
+                                    ('[review]\nhigh_paths = { proj = ["b.txt"] }\n[review.low]\nmax_rounds = 0\n',
+                                     'invalid review.low.max_rounds;', 'high')):  # the valid high_paths stay in force
             with self.subTest(policy=text):
                 self.risk_policy_fixture(text)
                 out = self.raw_task('status', 'proj')
-                self.assertIn('invalid review.', out)
-                self.assertIn('built-in defaults used', out)
-                self.assertIn('risk=normal', out)
+                self.assertIn(problem + ' ignored, other keys kept', out)
+                self.assertNotIn('built-in defaults used', out)
+                self.assertIn(f'risk={risk}', out)
                 self.assertIn('branch=t5', out)
                 self.assertNotIn('Traceback', out)
-                self.assertIn('invalid review.', self.raw_task('review', 'proj', '5', code=1))
+                self.assertIn(problem, self.raw_task('review', 'proj', '5'))
+        self.risk_policy_fixture('[review\n')  # an unparseable file still fails closed for risk
+        self.assertIn('usage-pacing.toml', self.raw_task('review', 'proj', '5', code=1))
 
     def test_risk_forced_high_global_and_company_repo_paths_refuse_lowering(self):
         wt, _ = self.started()
@@ -5233,7 +5238,8 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call['brief'], wrapper.read_text() + '\n\n' + brief.read_text())
             self.assertIn(model, call['args'])
             if vendor == 'codex':
-                self.assertEqual(call['args'][:3], ['exec', '-c', 'default_permissions="review"'])
+                self.assertEqual(call['args'][:5], ['exec', '-c', 'default_permissions="review"',
+                                                  '-c', 'web_search="live"'])
                 self.assertNotIn('--add-dir', call['args'])
             else:
                 self.assertIn('dontAsk', call['args'])
@@ -5296,7 +5302,8 @@ store.write_text(json.dumps(prs))
         meta = json.loads((self.state() / 'redteam.json').read_text())
         call = json.loads((wt / '.work/redteam-call.json').read_text())
         self.assertEqual(call, dict(args=['-p', '--permission-mode', 'dontAsk', '--model', 'haiku', '--effort', 'high',
-                         '--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(git --no-optional-locks:*)'],
+                         '--allowedTools', 'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch',
+                         'Bash(git --no-optional-locks:*)'],
                          brief=brief.read_text(), locks='0'))
         self.assertEqual(meta['commit'], head)
         self.assertEqual((meta['vendor'], meta['model'], meta['ambition_wrapper']), ('claude', 'haiku', False))
@@ -6827,6 +6834,7 @@ store.write_text(json.dumps(prs))
             self.assertNotEqual(git_dir, common)
             grants = [git_dir, f"{common}/objects", f"{common}/refs", f"{common}/logs"]
             self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"',
+                                           "-c", 'web_search="live"',
                                             *(a for g in grants for a in ("--add-dir", g)), "--model", "gpt-6.1-sol",
                                             "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
             added = [call["args"][i + 1] for i, a in enumerate(call["args"]) if a == "--add-dir"]
@@ -7068,7 +7076,7 @@ store.write_text(json.dumps(prs))
         self.assertEqual(call["args"], ["-p", "--output-format", "stream-json", "--verbose",
                                        "--model", "sonnet", "--effort", "high",
                                        "--permission-mode", "acceptEdits", "--allowedTools",
-                                       "Bash Read Write Edit Glob Grep",
+                                       "Bash Read Write Edit Glob Grep WebSearch WebFetch",
                                        "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         allowed = settings["sandbox"]["filesystem"]["allowWrite"]
@@ -7259,6 +7267,75 @@ store.write_text(json.dumps(prs))
         until = json.loads((self.home / ".local/state/task/boost.json").read_text())["claude"]
         self.assertIn(f"boost on for claude until {until}", self.pace_log())
         self.assertIn(f"boost: claude until {until}", self.raw_task("status", "proj"))
+
+    def ramp_policy(self, extra=""):
+        policy = self.home / "policy.toml"
+        policy.write_text("codex_ramp = { per_day = 20, ceiling = 80 }\n" + extra)
+        (self.home / ".config/task").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config/task/usage-policy-path").write_text(str(policy))
+
+    def ramp_ledger(self):
+        path = self.home / ".local/state/task/usage/overrides.jsonl"
+        return [row for row in map(json.loads, path.read_text().splitlines()) if row.get("kind") == "ramp_exempt"] if path.exists() else []
+
+    def test_ramp_lane_past_the_codex_ramp_is_refused_and_an_exempt_lane_is_ledgered(self):
+        self.ramp_policy()
+        self.readings(codex=(30, 167))  # day 1 of the window: allowance 20 %
+        wt, out = self.pace_lane(builder="codex", code=4)
+        self.assertIn("held back by usage pacing: codex past its daily ramp: weekly used 30 % > allowance 20 % (day 1", out)
+        self.assertFalse((wt / ".work/lane.json").exists())
+        self.assertEqual(self.ramp_ledger(), [])
+        out = self.raw_task("lane", "proj", "5", "--ramp-exempt", "bogus", code=2)
+        self.raw_task("lane", "proj", "5", "--ramp-exempt", "hold")
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
+        rows = self.ramp_ledger()
+        self.assertEqual([(r["exemption"], r["vendor"], r["past_ramp"], r["override"]) for r in rows],
+                         [("hold", "codex", True, "ramp-exempt hold")])
+        self.assertIn("ramp_exempt on routine", self.raw_task("status", "proj"))
+
+    def test_ramp_leaves_claude_lanes_unchanged(self):
+        self.ramp_policy("ahead_margin = 90\n")  # 50 % on day 1 is past a 20 %/day ramp; keep it on pace
+        self.readings(claude=(50, 167), codex=(30, 167))
+        wt, out = self.pace_lane()
+        self.assertNotIn("ramp", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+
+    def test_ramp_review_and_redteam_on_codex_are_refused_unless_exempt(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.raw_task("start", "proj", "5", "--builder", "claude", "--refresh")  # Codex reviews and red-teams
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise the codex ramp')
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
+        self.ramp_policy()
+        self.readings(codex=(45, 6 * 24 - 3))  # day 2: allowance 40 %
+        out = self.raw_task("review", "proj", "5", "--run", code=4)
+        self.assertIn("codex past its daily ramp: weekly used 45 % > allowance 40 % (day 2", out)
+        self.assertFalse((wt / ".work/reviewer-call.json").exists())
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```\n"
+        out = self.raw_task("review", "proj", "5", "--run", "--ramp-exempt", "security", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertIn("override recorded: ramp-exempt security on codex past its daily ramp", out)
+        brief = self.home / "brief.md"
+        brief.write_text("Attack the task.\n")
+        out = self.raw_task("redteam", "proj", "5", "--brief", str(brief), code=4)
+        self.assertIn("task redteam: held back by usage pacing: codex past its daily ramp", out)
+        binary = self.home / "bin/codex"
+        binary.write_text('#!/usr/bin/env python3\nimport pathlib, sys\nsys.stdin.read()\n'
+                          'pathlib.Path(sys.argv[sys.argv.index("-o")+1]).write_text("Reviewed risks\\n")\n')
+        self.raw_task("redteam", "proj", "5", "--brief", str(brief), "--ramp-exempt", "money")
+        self.assertEqual(json.loads((self.state() / "redteam.json").read_text())["vendor"], "codex")
+        self.assertEqual([(r["exemption"], r["past_ramp"]) for r in self.ramp_ledger()], [("security", True), ("money", True)])
+
+    def test_usage_prints_the_codex_ramp_and_the_fallback_block(self):
+        self.readings(claude=(50, 84), codex=(10, 167), five=10)
+        self.assertNotIn("fallback:", self.raw_task("usage"))
+        self.ramp_policy('blocked = { claude = "hook defect T-70" }\nbogus = 1\n')
+        self.readings(claude=(50, 84), codex=(30, 167), five=10)
+        out = self.raw_task("usage")
+        self.assertIn("  ramp: day 1, allowance 20 % (20 %/day, ceiling 80 %); past ramp", out)
+        self.assertIn("unknown key bogus; ignored, other keys kept", out)
+        self.assertIn("fallback:\n  claude blocked by a foundation defect (hook defect T-70): builds -> wait; reviews of Codex work -> wait\n"
+                      "  codex past ramp (day 1, 20 %): builds -> wait; reviews of Claude work -> wait", out)
 
     def test_pace_review_holds_exhausted_reviewer_and_final_goes_deeper_when_under_used(self):
         self.stub_reviewers()
@@ -7476,7 +7553,7 @@ store.write_text(json.dumps(prs))
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
         self.assertEqual(call["args"][:6], ["-p", "--output-format", "stream-json", "--verbose", "--model", "opus"])
         self.assertEqual(call["args"][6:], ["--effort", "high", "--permission-mode", "acceptEdits",
-                                            "--allowedTools", "Bash Read Write Edit Glob Grep",
+                                            "--allowedTools", "Bash Read Write Edit Glob Grep WebSearch WebFetch",
                                             "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         self.assertFalse(Path(call["tmpdir"]).exists())
@@ -8191,7 +8268,7 @@ store.write_text(json.dumps(prs))
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
         self.assertIn(f"claude -p --add-dir {self.kb} --permission-mode dontAsk --model haiku --effort high "
-                      "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)' <", out)
+                      "--allowedTools Read Grep Glob WebSearch WebFetch 'Bash(git --no-optional-locks:*)' <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         self.assertIn("Worktree:", prompt.read_text())
@@ -8235,6 +8312,12 @@ store.write_text(json.dumps(prs))
                             env=dict(self.env, CODEX_THREAD_ID="runner-test", REVIEW_STUB_REPLY=reply))
         call = json.loads((wt / ".work/reviewer-call.json").read_text())
         self.assertEqual(call["args"], expected_args[1:])
+        if builder == "claude":
+            self.assertIn('web_search="live"', call["args"])
+            self.assertEqual(call["args"][call["args"].index('web_search="live"') - 1], "-c")
+        else:
+            self.assertIn("WebSearch", call["args"])
+            self.assertIn("WebFetch", call["args"])
         self.assertEqual(call["cwd"], str(wt))
         self.assertEqual(call["prompt"], prompt)
         if builder == "claude":
@@ -8510,7 +8593,7 @@ store.write_text(json.dumps(prs))
 
     def test_realign_and_review_run_commands_get_no_git_grants(self):
         source = (ROOT / "home/dot_local/bin/executable_task").read_text()
-        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -m gpt-6-luna", source)
+        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -c 'web_search=\\\"live\\\"' -m gpt-6-luna", source)
         self.assertEqual(source.count("lane_git_grants("), 2)  # definition and the one lane call
 
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
@@ -8518,7 +8601,7 @@ store.write_text(json.dumps(prs))
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' --add-dir {self.kb} "
+        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -c 'web_search=\"live\"' --add-dir {self.kb} "
                       "-m gpt-6-luna -c model_reasoning_effort=high - <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
@@ -9978,7 +10061,7 @@ class WatcherTests(unittest.TestCase):
         path.write_text('{}')
         self.assertNotIn('P2:claude', self.scan())
 
-    def test_invalid_review_warns_uses_defaults_and_keeps_watching_other_sources(self):
+    def test_invalid_review_key_is_ignored_other_keys_kept_and_watching_continues(self):
         self.readings.stop()
         self.write('cortex/cortex-kb-company/policy/usage-pacing.toml',
                    '[reserve]\nclaude = 0\n[review.normal]\nunknown = 1\n')
@@ -9990,8 +10073,9 @@ class WatcherTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as warnings:
             found = self.scan()
         self.assertIn('invalid review.normal', warnings.getvalue())
-        self.assertIn('built-in defaults used', warnings.getvalue())
-        self.assertIn('P2:claude', found)  # 80 % exceeds the default 75 %, not the invalid file's 100 %.
+        self.assertIn('ignored, other keys kept', warnings.getvalue())
+        self.assertNotIn('built-in defaults used', warnings.getvalue())
+        self.assertNotIn('P2:claude', found)  # the valid reserve.claude = 0 is kept (100 % threshold), so 80 % does not trip it.
         self.assertIn('P4:broken.timer', found)
 
     def test_p4_only_registered_units_and_errors_do_not_clear(self):
@@ -10279,6 +10363,8 @@ for step in (['add', 'smoke.txt'], ['commit', '-qm', 'smoke: write smoke.txt'], 
 pathlib.Path('.work/report.md').write_text("# Task report\\n\\n## What changed\\n\\nsmoke.txt.\\n\\n## How I verified\\n\\nSteps in order.\\n\\n"
                                            "## Criteria\\n\\n#1 met: smoke.txt contains ok\\n\\n## Not done\\n\\n(none)\\n\\n"
                                            "## Noticed, not done\\n\\n(none)\\n")
+with pathlib.Path('.work/report.md').open('a') as report:
+    report.write(os.environ.get('SMOKE_WEB_LOOKUP', 'Web lookup: astral-sh/uv release v-test https://github.com/astral-sh/uv/releases') + '\\n')
 if '--output-last-message' in sys.argv:
     pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
 """
@@ -10332,6 +10418,46 @@ class SmokeTests(unittest.TestCase):
         return {'repo': self.home / 'dev_workspace' / f'task-smoke-{run}',
                 'kb': self.home / 'cortex' / f'cortex-kb-task-smoke-{run}',
                 'state': self.home / '.local/state/task' / f'task-smoke-{run}'}
+
+    def smoke_module(self):
+        loader = importlib.machinery.SourceFileLoader('task_smoke_web_test', str(SMOKE_HELPER))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        helper = importlib.util.module_from_spec(spec)
+        loader.exec_module(helper)
+        return helper
+
+    def test_both_builder_briefs_require_web_lookup_and_file_edit_tool(self):
+        helper = self.smoke_module()
+        for builder, (_, ident) in helper.BUILDERS.items():
+            with self.subTest(builder=builder):
+                prompt = helper.PROMPT.format(ident=ident, builder=builder)
+                self.assertIn('with your file-edit tool', prompt)
+                self.assertIn('never an inline interpreter (`python -c`, heredocs)', prompt)
+                self.assertIn('with your web tool', prompt)
+                self.assertIn('https://github.com/astral-sh/uv/releases', prompt)
+                self.assertIn('Web lookup: <fact and source URL>', prompt)
+
+    def test_lookup_report_line_must_be_present_and_nonempty_without_pinning_value(self):
+        helper = self.smoke_module()
+        wt = self.home / 'report-test'
+        (wt / '.work').mkdir(parents=True)
+        report = wt / '.work/report.md'
+        for line in ('', 'Web lookup:', 'Web lookup:   ', 'Web lookup:\t',
+                     'Web lookup:\n## Not done\nnone'):
+            with self.subTest(line=line):
+                report.write_text('#1 met: smoke.txt contains ok\n' + line + '\n')
+                self.assertIn('Web lookup:', helper.report_error(wt, ''))
+        for value in ('any changing public fact', 'v999 https://github.com/astral-sh/uv/releases'):
+            report.write_text('#1 met: smoke.txt contains ok\nWeb lookup: ' + value + '\n')
+            self.assertIsNone(helper.report_error(wt, ''))
+
+    def test_missing_lookup_fails_at_report_step_for_each_builder(self):
+        for builder in ('codex', 'claude'):
+            with self.subTest(builder=builder):
+                out = self.smoke('--builder', builder, code=1, env=dict(self.env, SMOKE_WEB_LOOKUP=''))
+                self.assertIn('FAIL report:', out)
+                self.assertIn('Web lookup:', out)
+                self.assertNotRegex(out, r'(?m)^  (PASS|FAIL) (check|review|merge)$')
 
     def test_stub_run_passes_every_step_for_both_builders(self):
         out = self.smoke()
