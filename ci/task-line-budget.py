@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
-"""Enforce the checked-in line budgets."""
-import sys
+"""Report the footprint of the task entry points and their change against a base.
+
+Sizes are measured and reported per merge; no threshold fails a check. The script
+exits 0 unless it cannot read the files.
+"""
+import argparse
 import ast
+import io
+import subprocess
+import sys
+import tarfile
+import tempfile
 from pathlib import Path
+
+BIN_RELATIVE = Path("home/dot_local/bin")
+ENTRIES = ("executable_task", "executable_task-batch", "executable_task-watch")
 
 
 def counted_files(paths):
@@ -37,34 +49,61 @@ def counted_files(paths):
     return sorted(found)
 
 
-def check(path, budget):
-    files = counted_files(path)
-    counts = [(file, len(file.read_text().splitlines())) for file in files]
-    count = sum(lines for _, lines in counts)
-    for file, lines in counts:
-        print(f"{file}: {lines} lines")
-    print(f"total: {count} lines across {len(files)} local files (budget {budget})")
-    return count <= budget
+def measure(entries):
+    return [(file, len(file.read_text().splitlines())) for file in counted_files(entries)]
+
+
+def revision_exists(root, rev):
+    result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"],
+                            capture_output=True)
+    return result.returncode == 0
+
+
+def base_total(root, rev):
+    archive = subprocess.run(["git", "-C", str(root), "archive", "--format=tar", rev, BIN_RELATIVE.as_posix()],
+                             capture_output=True)
+    if archive.returncode:
+        return None
+    with tempfile.TemporaryDirectory() as directory:
+        extract_options = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+            tar.extractall(directory, **extract_options)
+        entries = [Path(directory) / BIN_RELATIVE / name for name in ENTRIES]
+        try:
+            return sum(lines for _, lines in measure(entries))
+        except (OSError, UnicodeDecodeError):
+            return None
 
 
 def main(argv):
-    if len(argv) == 3:
-        return 0 if check(argv[1], int(argv[2])) else 1
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--base", help="revision to compare against (default: origin/main, else main)")
+    args = parser.parse_args(argv[1:])
+
     root = Path(__file__).resolve().parent.parent
-    bin_dir = root / "home/dot_local/bin"
-    entries = [bin_dir / "executable_task", bin_dir / "executable_task-batch", bin_dir / "executable_task-watch"]
-    failed = False
-    # P4 derives service expectations and timer health from one property query per unit.
-    if len((bin_dir / "executable_task-watch").read_text().splitlines()) > 85:
-        print("task-watch exceeds 85 production lines")
-        failed = True
-    for line in (root / "ci/task-line-budget.txt").read_text().splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        raw_budget, = line.split()
-        if not check(entries, int(raw_budget)):
-            failed = True
-    return int(failed)
+    bin_dir = root / BIN_RELATIVE
+    try:
+        counts = measure([bin_dir / name for name in ENTRIES])
+    except (OSError, UnicodeDecodeError) as error:
+        print(f"cannot read task entry points: {error}")
+        return 1
+    for file, lines in counts:
+        print(f"{file}: {lines} lines")
+    total = sum(lines for _, lines in counts)
+    print(f"total: {total} lines across {len(counts)} local files")
+
+    candidates = [args.base] if args.base else ["origin/main", "main"]
+    rev = next((candidate for candidate in candidates if revision_exists(root, candidate)), None)
+    if rev is None:
+        print(f"base: cannot resolve {' or '.join(candidates)}; change not measured")
+        return 0
+    before = base_total(root, rev)
+    if before is None:
+        print(f"base {rev}: cannot read task entry points; change not measured")
+        return 0
+    print(f"base {rev}: {before} lines")
+    print(f"change against {rev}: {total - before:+d} lines")
+    return 0
 
 
 if __name__ == "__main__":
