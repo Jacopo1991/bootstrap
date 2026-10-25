@@ -344,7 +344,7 @@ class TaskTool(unittest.TestCase):
                 ('codex', ['codex', 'exec', '-c', 'default_permissions="lane"', '--model', 'gpt-6.1-sol',
                            '--output-last-message', str(work / 'proof-final'), '-']),
                 ('claude', ['claude', '-p', '--permission-mode', 'acceptEdits',
-                            '--allowedTools', 'Bash Read Write Edit Glob Grep'])):
+                            '--allowedTools', 'Bash Read Write Edit Glob Grep WebSearch WebFetch'])):
             with self.subTest(vendor=vendor), mock.patch.dict(os.environ, self.env, clear=True):
                 environment = TASK_MODULE.lane_environment(TASK_MODULE.Task(self.repo, '5'), vendor)
                 release = work / 'proof-release'
@@ -5238,7 +5238,8 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call['brief'], wrapper.read_text() + '\n\n' + brief.read_text())
             self.assertIn(model, call['args'])
             if vendor == 'codex':
-                self.assertEqual(call['args'][:3], ['exec', '-c', 'default_permissions="review"'])
+                self.assertEqual(call['args'][:5], ['exec', '-c', 'default_permissions="review"',
+                                                  '-c', 'web_search="live"'])
                 self.assertNotIn('--add-dir', call['args'])
             else:
                 self.assertIn('dontAsk', call['args'])
@@ -5301,7 +5302,8 @@ store.write_text(json.dumps(prs))
         meta = json.loads((self.state() / 'redteam.json').read_text())
         call = json.loads((wt / '.work/redteam-call.json').read_text())
         self.assertEqual(call, dict(args=['-p', '--permission-mode', 'dontAsk', '--model', 'haiku', '--effort', 'high',
-                         '--allowedTools', 'Read', 'Grep', 'Glob', 'Bash(git --no-optional-locks:*)'],
+                         '--allowedTools', 'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch',
+                         'Bash(git --no-optional-locks:*)'],
                          brief=brief.read_text(), locks='0'))
         self.assertEqual(meta['commit'], head)
         self.assertEqual((meta['vendor'], meta['model'], meta['ambition_wrapper']), ('claude', 'haiku', False))
@@ -6832,6 +6834,7 @@ store.write_text(json.dumps(prs))
             self.assertNotEqual(git_dir, common)
             grants = [git_dir, f"{common}/objects", f"{common}/refs", f"{common}/logs"]
             self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"',
+                                           "-c", 'web_search="live"',
                                             *(a for g in grants for a in ("--add-dir", g)), "--model", "gpt-6.1-sol",
                                             "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
             added = [call["args"][i + 1] for i, a in enumerate(call["args"]) if a == "--add-dir"]
@@ -7073,7 +7076,7 @@ store.write_text(json.dumps(prs))
         self.assertEqual(call["args"], ["-p", "--output-format", "stream-json", "--verbose",
                                        "--model", "sonnet", "--effort", "high",
                                        "--permission-mode", "acceptEdits", "--allowedTools",
-                                       "Bash Read Write Edit Glob Grep",
+                                       "Bash Read Write Edit Glob Grep WebSearch WebFetch",
                                        "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         allowed = settings["sandbox"]["filesystem"]["allowWrite"]
@@ -7550,7 +7553,7 @@ store.write_text(json.dumps(prs))
         call = __import__("json").loads((wt / ".work/model-call.json").read_text())
         self.assertEqual(call["args"][:6], ["-p", "--output-format", "stream-json", "--verbose", "--model", "opus"])
         self.assertEqual(call["args"][6:], ["--effort", "high", "--permission-mode", "acceptEdits",
-                                            "--allowedTools", "Bash Read Write Edit Glob Grep",
+                                            "--allowedTools", "Bash Read Write Edit Glob Grep WebSearch WebFetch",
                                             "--settings", str(wt / ".work/claude-settings.json")])
         settings = json.loads((wt / ".work/claude-settings.json").read_text())
         self.assertFalse(Path(call["tmpdir"]).exists())
@@ -8248,7 +8251,7 @@ store.write_text(json.dumps(prs))
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
         self.assertIn(f"claude -p --add-dir {self.kb} --permission-mode dontAsk --model haiku --effort high "
-                      "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)' <", out)
+                      "--allowedTools Read Grep Glob WebSearch WebFetch 'Bash(git --no-optional-locks:*)' <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
         self.assertIn("Worktree:", prompt.read_text())
@@ -8292,6 +8295,12 @@ store.write_text(json.dumps(prs))
                             env=dict(self.env, CODEX_THREAD_ID="runner-test", REVIEW_STUB_REPLY=reply))
         call = json.loads((wt / ".work/reviewer-call.json").read_text())
         self.assertEqual(call["args"], expected_args[1:])
+        if builder == "claude":
+            self.assertIn('web_search="live"', call["args"])
+            self.assertEqual(call["args"][call["args"].index('web_search="live"') - 1], "-c")
+        else:
+            self.assertIn("WebSearch", call["args"])
+            self.assertIn("WebFetch", call["args"])
         self.assertEqual(call["cwd"], str(wt))
         self.assertEqual(call["prompt"], prompt)
         if builder == "claude":
@@ -8567,7 +8576,7 @@ store.write_text(json.dumps(prs))
 
     def test_realign_and_review_run_commands_get_no_git_grants(self):
         source = (ROOT / "home/dot_local/bin/executable_task").read_text()
-        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -m gpt-6-luna", source)
+        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -c 'web_search=\\\"live\\\"' -m gpt-6-luna", source)
         self.assertEqual(source.count("lane_git_grants("), 2)  # definition and the one lane call
 
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
@@ -8575,7 +8584,7 @@ store.write_text(json.dumps(prs))
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' --add-dir {self.kb} "
+        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -c 'web_search=\"live\"' --add-dir {self.kb} "
                       "-m gpt-6-luna -c model_reasoning_effort=high - <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
@@ -10337,6 +10346,8 @@ for step in (['add', 'smoke.txt'], ['commit', '-qm', 'smoke: write smoke.txt'], 
 pathlib.Path('.work/report.md').write_text("# Task report\\n\\n## What changed\\n\\nsmoke.txt.\\n\\n## How I verified\\n\\nSteps in order.\\n\\n"
                                            "## Criteria\\n\\n#1 met: smoke.txt contains ok\\n\\n## Not done\\n\\n(none)\\n\\n"
                                            "## Noticed, not done\\n\\n(none)\\n")
+with pathlib.Path('.work/report.md').open('a') as report:
+    report.write(os.environ.get('SMOKE_WEB_LOOKUP', 'Web lookup: astral-sh/uv release v-test https://github.com/astral-sh/uv/releases') + '\\n')
 if '--output-last-message' in sys.argv:
     pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
 """
@@ -10390,6 +10401,46 @@ class SmokeTests(unittest.TestCase):
         return {'repo': self.home / 'dev_workspace' / f'task-smoke-{run}',
                 'kb': self.home / 'cortex' / f'cortex-kb-task-smoke-{run}',
                 'state': self.home / '.local/state/task' / f'task-smoke-{run}'}
+
+    def smoke_module(self):
+        loader = importlib.machinery.SourceFileLoader('task_smoke_web_test', str(SMOKE_HELPER))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        helper = importlib.util.module_from_spec(spec)
+        loader.exec_module(helper)
+        return helper
+
+    def test_both_builder_briefs_require_web_lookup_and_file_edit_tool(self):
+        helper = self.smoke_module()
+        for builder, (_, ident) in helper.BUILDERS.items():
+            with self.subTest(builder=builder):
+                prompt = helper.PROMPT.format(ident=ident, builder=builder)
+                self.assertIn('with your file-edit tool', prompt)
+                self.assertIn('never an inline interpreter (`python -c`, heredocs)', prompt)
+                self.assertIn('with your web tool', prompt)
+                self.assertIn('https://github.com/astral-sh/uv/releases', prompt)
+                self.assertIn('Web lookup: <fact and source URL>', prompt)
+
+    def test_lookup_report_line_must_be_present_and_nonempty_without_pinning_value(self):
+        helper = self.smoke_module()
+        wt = self.home / 'report-test'
+        (wt / '.work').mkdir(parents=True)
+        report = wt / '.work/report.md'
+        for line in ('', 'Web lookup:', 'Web lookup:   ', 'Web lookup:\t',
+                     'Web lookup:\n## Not done\nnone'):
+            with self.subTest(line=line):
+                report.write_text('#1 met: smoke.txt contains ok\n' + line + '\n')
+                self.assertIn('Web lookup:', helper.report_error(wt, ''))
+        for value in ('any changing public fact', 'v999 https://github.com/astral-sh/uv/releases'):
+            report.write_text('#1 met: smoke.txt contains ok\nWeb lookup: ' + value + '\n')
+            self.assertIsNone(helper.report_error(wt, ''))
+
+    def test_missing_lookup_fails_at_report_step_for_each_builder(self):
+        for builder in ('codex', 'claude'):
+            with self.subTest(builder=builder):
+                out = self.smoke('--builder', builder, code=1, env=dict(self.env, SMOKE_WEB_LOOKUP=''))
+                self.assertIn('FAIL report:', out)
+                self.assertIn('Web lookup:', out)
+                self.assertNotRegex(out, r'(?m)^  (PASS|FAIL) (check|review|merge)$')
 
     def test_stub_run_passes_every_step_for_both_builders(self):
         out = self.smoke()
