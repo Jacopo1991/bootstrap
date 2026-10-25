@@ -1813,6 +1813,12 @@ def lane_environment(task, builder="codex"):
             raise Stop("Lane TMPDIR must stay inside the task worktree.")
         temporary.mkdir(parents=True, exist_ok=True)
     env["TMPDIR"] = str(temporary.resolve())
+    if builder == "codex":
+        for name, directory in (("UV_CACHE_DIR", "uv-cache"), ("PIP_CACHE_DIR", "pip-cache"),
+                                ("PRE_COMMIT_HOME", "pre-commit"), ("npm_config_cache", "npm-cache")):
+            cache = temporary / directory
+            cache.mkdir(parents=True, exist_ok=True)
+            env[name] = str(cache.resolve())
     env["TASK_WORKTREE"] = str(task.path.resolve())
     if not env.get("SECRETSPEC_REASON", "").strip():
         env["SECRETSPEC_REASON"] = f"lane {task.repo.name}/{task.id}"

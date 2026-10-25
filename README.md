@@ -419,6 +419,10 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   writable, a lane can also move other local branches (`git branch -f`, `-D`, `-m`), as it could
   before T-52. The policy hook does not refuse those yet (`git update-ref` is refused; `branch`
   is not checked), so this is an accepted risk until cortex-core T-42 #5 adds that refusal.
+  Codex builder lanes get private uv, pip, pre-commit and npm caches under their worktree's
+  .work/tmp; Claude lanes keep their existing environment. The shared ~/.cache/uv,
+  ~/.cache/pip, ~/.cache/pre-commit and ~/.npm stay read-only to lanes because the PM's
+  unsandboxed tools and trusted checks reuse them.
   Reviews, red teams and realigns use `review` and get no Git grants. PM proof after install, one `codex sandbox -c 'default_permissions="review"' --
   test -r <path>` per denied path (must fail; never print contents) and the controls
   `/etc/hostname` and `~/.bashrc` (must succeed); repeat with `"lane"`; then run `task smoke`

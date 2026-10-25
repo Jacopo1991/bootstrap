@@ -84,6 +84,10 @@ case "$1 $2" in
     echo OK ;;
   "check ")
     [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
+    if [ -f smoke_check.py ]; then
+      grep -Fq 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' justfile || exit 1
+      uv run --no-project --with colorama==0.4.6 python smoke_check.py || exit $?
+    fi
     [ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
     echo "Ran 3 tests in 0.01s"; echo OK ;;
   "mcp-probe ") echo "probe passed" ;;
@@ -6384,6 +6388,29 @@ store.write_text(json.dumps(prs))
         self.assertIn("lane: finished (exit 0)", self.raw_task("status", "proj"))
         self.assertFalse((self.home / "runner-record.json").exists())
 
+    def test_lane_caches_are_private_to_codex_and_claude_environment_is_unchanged(self):
+        wt, _ = self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        codex = TASK_MODULE.lane_environment(task, "codex")
+        private = Path(codex["TMPDIR"])
+        self.assertEqual(private, wt / ".work/tmp")
+        expected = {
+            "UV_CACHE_DIR": private / "uv-cache",
+            "PIP_CACHE_DIR": private / "pip-cache",
+            "PRE_COMMIT_HOME": private / "pre-commit",
+            "npm_config_cache": private / "npm-cache",
+        }
+        for name, path in expected.items():
+            self.assertEqual(Path(codex[name]), path)
+            self.assertTrue(path.is_dir())
+            self.assertTrue(path.resolve().is_relative_to(wt.resolve()))
+        grants = TASK_MODULE.lane_git_grants(task)
+        self.assertFalse(any("/.cache/" in entry for entry in grants))
+        with mock.patch.object(TASK_MODULE, "new_lane_temporary", return_value=wt / ".work/tmp/lane-12345678"):
+            claude = TASK_MODULE.lane_environment(task, "claude")
+        for name in expected:
+            self.assertNotIn(name, claude)
+
     def assert_claude_temporary_path(self, temporary, call=None):
         root = Path("/tmp") / f"claude-{os.getuid()}"
         # Locate the outer grant from the fixture's actual location, independently
@@ -9738,6 +9765,12 @@ if 'Verdict:' in prompt:
     judged = 'pass' if verdict == 'PASS' else 'fail'
     print(f"```review\\nVerdict: {verdict}\\nCommit: {head}\\n#1 {judged}: smoke.txt contains ok\\n```\\nBlocking: none\\nNotes: none")
     sys.exit(0)
+if 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' in prompt:
+    checked = subprocess.run(['uv', 'run', '--no-project', '--with', 'colorama==0.4.6',
+                              'python', 'smoke_check.py'], capture_output=True, text=True)
+    if checked.returncode:
+        print(checked.stderr or checked.stdout, file=sys.stderr)
+        sys.exit(1)
 pathlib.Path('smoke.txt').write_text('ok\\n')
 if os.environ.get('SMOKE_STUB_RO') == '1':
     # T-53's defect: the agent's commit is refused, and the agent stops under its stop rule.
@@ -9768,6 +9801,11 @@ class SmokeTests(unittest.TestCase):
         for name, body in stubs.items():
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
+        uv = bin_dir / 'uv'
+        uv.write_text("#!/bin/sh\n[ \"$SMOKE_UV_FAIL\" = 1 ] && { echo 'error: uv cache is read-only' >&2; exit 1; }\n"
+                      "[ \"$1 $2\" = 'run --no-project' ] || exit 2\n"
+                      "echo \"$PWD\" >> \"$HOME/uv-runs\"\nexit 0\n")
+        uv.chmod(0o755)
         shutil.copy(SMOKE_HELPER, bin_dir / 'task-smoke')
         (bin_dir / 'task-smoke').chmod(0o755)  # chezmoi sets this on install
         self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY,
@@ -9803,6 +9841,10 @@ class SmokeTests(unittest.TestCase):
         self.assertNotIn('FAIL', out)
         record = json.loads((self.home / '.local/state/task/smoke' / f'{run}.json').read_text())
         self.assertEqual(record['result'], 'PASS')
+        uv_runs = (self.home / 'uv-runs').read_text().splitlines()
+        repo = self.scratch(run)['repo']
+        self.assertEqual(len(uv_runs), 4)
+        self.assertTrue(all(Path(path).is_relative_to(repo) for path in uv_runs), uv_runs)
         self.assertEqual({name: b['result'] for name, b in record['builders'].items()}, {'codex': 'PASS', 'claude': 'PASS'})
         for path in self.scratch(run).values():
             self.assertFalse(path.exists(), f"a passing run removes {path}")
@@ -9822,6 +9864,11 @@ class SmokeTests(unittest.TestCase):
         for path in self.scratch(run).values():
             self.assertTrue(path.exists(), f"a FAIL keeps {path}")
         self.assertIn(f"task smoke --clean {run}", out)
+
+    def test_uv_cache_write_failure_fails_smoke_at_lane_step(self):
+        out = self.smoke('--builder', 'codex', code=1, env=dict(self.env, SMOKE_UV_FAIL='1'))
+        self.assertRegex(out, r"(?m)^  FAIL lane: error: uv cache is read-only$")
+        self.assertNotRegex(out, r"(?m)^  (PASS|FAIL) commit$")
 
     def test_existing_scratch_paths_are_refused_and_left_alone(self):
         loader = importlib.machinery.SourceFileLoader('task_smoke_for_test', str(SMOKE_HELPER))
