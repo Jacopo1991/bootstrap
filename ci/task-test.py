@@ -10035,7 +10035,7 @@ class WatcherTests(unittest.TestCase):
         path.write_text('{}')
         self.assertNotIn('P2:claude', self.scan())
 
-    def test_invalid_review_warns_uses_defaults_and_keeps_watching_other_sources(self):
+    def test_invalid_review_key_is_ignored_other_keys_kept_and_watching_continues(self):
         self.readings.stop()
         self.write('cortex/cortex-kb-company/policy/usage-pacing.toml',
                    '[reserve]\nclaude = 0\n[review.normal]\nunknown = 1\n')
@@ -10047,8 +10047,9 @@ class WatcherTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as warnings:
             found = self.scan()
         self.assertIn('invalid review.normal', warnings.getvalue())
-        self.assertIn('built-in defaults used', warnings.getvalue())
-        self.assertIn('P2:claude', found)  # 80 % exceeds the default 75 %, not the invalid file's 100 %.
+        self.assertIn('ignored, other keys kept', warnings.getvalue())
+        self.assertNotIn('built-in defaults used', warnings.getvalue())
+        self.assertNotIn('P2:claude', found)  # the valid reserve.claude = 0 is kept (100 % threshold), so 80 % does not trip it.
         self.assertIn('P4:broken.timer', found)
 
     def test_p4_only_registered_units_and_errors_do_not_clear(self):
