@@ -303,7 +303,9 @@ model files; no model service or credentials are used.
 
 The existing chezmoi apply manages Codex and Claude Code's global instructions,
 native permissions, and one shared pre-tool policy hook. Codex uses the supported `on-request` approval policy, routes approvals to
-the user, and sets `workspace-write` with sandbox networking off. The retired
+the user, and uses the managed `lane` profile, which extends `:workspace` and enables
+network access through a host allowlist proxy. The `review` profile extends
+`:read-only` and has no network access. The retired
 `untrusted` policy is not valid in the pinned Codex version.
 Claude Code uses the founder-approved `acceptEdits` mode, allows routine
 Git/gh commands, and uses the native Linux sandbox with unsandboxed retries disabled and startup failing if the sandbox is
@@ -520,7 +522,7 @@ Install the Microsoft VS Code Remote - SSH extension. In VS Code press F1, choos
 
 **Starting a project.** `new-project create <name>` (in `~/.local/bin`) creates the code repository `~/dev_workspace/<name>` and the knowledge repository `~/cortex/cortex-kb-<name>`, each on `main` with a first commit. The knowledge repository gets `INTENT.md`, `STATUS.md`, `README.md` and `AGENTS.md` at the root, and a Backlog.md `backlog/` from `backlog init` (integration mode none, task prefix `T`, `auto_commit`, `remote_operations` and `check_active_branches` all false) for tasks and decisions. Both repositories get the standard pre-commit gate (see [Local quality gate](#local-quality-gate-pre-commit)) before the first commit, so that commit already passes it. The command ends by printing "run chezmoi apply to add it to the qmd index". Add `--local-only` for projects without GitHub. Otherwise the PM creates the two private GitHub repositories with the standard ruleset and then runs `new-project publish <name>`. The founder or the PM runs it from a normal shell as the agent user; agent sessions cannot, because the policy hook blocks `git init` there on purpose.
 
-**Lane downloads.** Both sandboxes enable network access to `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `github.com`, `objects.githubusercontent.com`, `codeload.github.com`, `raw.githubusercontent.com`, `release-assets.githubusercontent.com` and `openrouter.ai`. Codex uses its domain proxy with SOCKS disabled. Both vendors can write the uv, pre-commit, pip and npm caches. Installs and lint downloads run inside the sandbox. The Codex chezmoi modifier enforces managed keys while retaining local `[projects.*]` trust entries.
+**Lane downloads.** Both sandboxes enable network access to `pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`, `github.com`, `objects.githubusercontent.com`, `codeload.github.com`, `raw.githubusercontent.com`, `release-assets.githubusercontent.com` and `openrouter.ai`. Codex's managed `[permissions.lane.network]` enables access, disables SOCKS and allows local binding for tests; its `.domains` table allows exactly those hosts. User config enables the enforcing proxy with `[features] network_proxy = true`. The `review` profile has no network section. Both vendors can write the uv, pre-commit, pip and npm caches. Installs and lint downloads run inside the sandbox. The Codex chezmoi modifier enforces managed keys while retaining local `[projects.*]` trust entries.
 
 **One repository per session.** Agents commit only in the repository the session was opened in. Build lanes report in chat; the PM records `STATUS.md`, backlog tasks and decisions in the knowledge repository.
 
@@ -1779,9 +1781,11 @@ Git/gh ask rules. The deny list and PreToolUse hook remain active as managed set
 The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
 Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
 and `/usr/bin/gh *`: bare names alone only match argument-less calls.
-Claude Code's `sandbox.network.allowedDomains` is exactly `pypi.org`,
-`files.pythonhosted.org`, `registry.npmjs.org` and `openrouter.ai` (no wildcards).
-Codex's network proxy allows exactly `openrouter.ai`. These are the host rules
+Claude Code's `sandbox.network.allowedDomains` and Codex's managed
+`permissions.lane.network.domains` allow exactly `pypi.org`,
+`files.pythonhosted.org`, `registry.npmjs.org`, `github.com`,
+`objects.githubusercontent.com`, `codeload.github.com`, `raw.githubusercontent.com`,
+`release-assets.githubusercontent.com` and `openrouter.ai` (no wildcards). These are the host rules
 pinned in `ci/agent-config-test.py`; the same test pins both vendors' writable
 cache paths. The native GitHub CLI may use its existing credential store;
 agents must never read or print credential files.
@@ -1795,8 +1799,16 @@ including inherited repository selectors and attached API method values.
 The previous never-merge, workspace, Git metadata/configuration and secret
 checks remain in force.
 
-Codex keeps `workspace-write`, `network_access = true`, the network proxy with
-the package registry, GitHub download and `openrouter.ai` hosts allowed, `on-request` and the user approval reviewer.
+Codex uses the managed `lane` permission profile extending `:workspace`, with
+`network.enabled = true`, `enable_socks5 = false` and `allow_local_binding = true`.
+The network policy lives in `/etc/codex/requirements.toml`; a config-defined
+profile of the same name conflicts with the managed profile. User config sets
+`[features] network_proxy = true` to activate enforcement. The old
+`[sandbox_workspace_write] network_access` setting is ignored for managed profiles
+and has been removed. The `[features.network_proxy]` policy table has been
+replaced by the profile policy above and a boolean activation flag. The `review`
+profile extends `:read-only` without network. Approval policy stays `on-request`
+with the user approval reviewer.
 Four native allow prefixes permit routine Git/gh to run outside the sandbox
 without a prompt. Explicit forbidden prefixes (in
 `/etc/codex/requirements.toml`) and the shared hook block the forbidden operations above.

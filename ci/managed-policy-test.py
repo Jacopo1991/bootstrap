@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 import tomllib
 import types
+import unittest
 from unittest.mock import patch
 
 from policy_test_env import isolate_policy_environment
@@ -110,7 +111,8 @@ assert requirements["default_permissions"] == "lane"
 profiles = requirements["permissions"]
 assert set(profiles) == {"lane", "review"}, set(profiles)
 assert profiles["lane"]["extends"] == ":workspace" and profiles["review"]["extends"] == ":read-only"
-assert set(profiles["lane"]) == set(profiles["review"]) == {"extends", "filesystem"}
+assert set(profiles["lane"]) == {"extends", "filesystem", "network"}
+assert set(profiles["review"]) == {"extends", "filesystem"}
 assert profiles["lane"]["filesystem"] == profiles["review"]["filesystem"]
 assert set(profiles["lane"]["filesystem"].values()) == {"deny"}
 for path in keys(requirements):  # the read-deny profile keys are the one deliberate selection limit
@@ -252,6 +254,267 @@ assert install.index('sudo mv -f -- "$policy_temp" "$policy_dir/$script"') < pub
 spec = importlib.util.spec_from_file_location("managed_policy", ROOT / "system/agent-policy/pre_tool_use.py")
 policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
+
+
+class T42PolicyTests(unittest.TestCase):
+    """Commands are inert inputs; only fixture setup invokes Git."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.environment = patch.dict(os.environ, {
+            "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(self.root / "home"),
+            "TMPDIR": str(self.root), "TASK_WORKTREE": str(self.root),
+            "PYTHONDONTWRITEBYTECODE": "1"}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        subprocess.run(["git", "init", "-q", "-b", "lane"], cwd=self.root, check=True)
+
+    def judge(self, command):
+        return policy.evaluate({"tool_name": "Bash", "cwd": str(self.root),
+                                "tool_input": {"command": command}}, (self.root,))
+
+    def check_commands(self, commands, allowed):
+        for command in commands:
+            with self.subTest(command=command):
+                reason = self.judge(command)
+                self.assertEqual(reason is None, allowed, (command, reason))
+
+    def test_npm_writing_forms(self):
+        (self.root / "package.json").write_text(json.dumps({"scripts": {
+            "check": "echo safe", "preinstall": "echo safe", "prepare": "echo safe"}}))
+        self.check_commands(("npm audit fix", "npm audit fix --force", "npm audit fix --dry-run",
+                             "npm audit --package-lock-only", "npm audit --userconfig=other",
+                             "npm view pkg --json --prefix=other", "npm info pkg --onload-script=evil",
+                             "npm install pkg", "npm ci", "npm update", "npm uninstall pkg",
+                             "npm pkg set scripts.x=evil", "npm exec evil", "npm run evil",
+                             "npm run check", "npm test", "npm start", "npm stop", "npm restart",
+                             "npm run-script check", "npm add pkg", "npm remove pkg",
+                             "npm ls *", "npm view pkg* version"), False)
+
+    def test_npm_readonly_forms(self):
+        self.check_commands(("npm audit", "npm audit --json", "npm ls", "npm view pkg",
+                             "npm info pkg", "npm list", "npm outdated", "npm ls --json",
+                             "npm view @scope/pkg@1.0.0 version --json"), True)
+
+    def test_other_package_branches(self):
+        self.check_commands(("pnpm audit --fix", "pnpm audit --fix --force",
+                             "pnpm list --global-dir=other", "pnpm outdated --config.foo=bar",
+                             "pnpm view pkg --reporter=evil", "yarn audit --fix", "bun audit --fix",
+                             "pnpm dlx evil", "bunx evil", "pnpx evil", "npx evil"), False)
+        self.check_commands(("pnpm audit", "pnpm list", "pnpm ls --json", "pnpm view pkg",
+                             "pnpm info pkg", "pnpm outdated", "npm --version", "pnpm --help",
+                             "yarn --version", "bun --help"), True)
+
+    def test_uv_cooldown_and_runners(self):
+        for runner in ("uv sync", "uv pip install pkg", "uvx tool", "uv tool run tool", "uv run evil"):
+            for name in ("UV_EXCLUDE_NEWER", "UV_NO_CONFIG", "UV_CONFIG_FILE", "UV_CONSTRAINT",
+                         "UV_INDEX_URL", "UV_FUTURE_OVERRIDE"):
+                self.check_commands((f"{name}=fixture {runner}", f"env {name}=fixture {runner}"), False)
+            for option in ("--exclude-newer 2026-10-25", "--exclude-newer=2026-10-25",
+                           "--exclude-newer-package pkg=2026-10-25",
+                           "--exclude-newer-package=pkg=2026-10-25"):
+                self.check_commands((runner + " " + option,), False)
+        self.check_commands(("uvx evil", "uv tool run evil",
+                             "uv --no-config tool run evil", "uvx --from pkg evil",
+                             "uv tool --offline run evil", "uv tool -q run evil",
+                             "env -u UV_EXCLUDE_NEWER uv sync", "env --unset=UV_NO_CONFIG uv sync"), False)
+        self.check_commands(("uv sync", "uv pip install pkg", "uv --version", "uvx --help"), True)
+
+    def test_git_other_branches(self):
+        for option in ("-f", "-D", "-m", "--force", "--delete", "--move", "-M", "-d"):
+            self.check_commands((f"git branch {option} other", f"git branch {option} other renamed",
+                                 f"git branch {option} lane"), False)
+        self.check_commands(("git branch new-lane lane",), False)
+        self.check_commands(("git branch", "git branch --list", "git branch -a",
+                             "git branch --show-current", "git branch new-lane"), True)
+
+    # Loosenings: refusal cases precede the corresponding positive cases.
+    def test_a6_systemctl_negative(self):
+        verbs = ("start", "stop", "restart", "enable", "disable", "mask", "daemon-reload",
+                 "edit", "set-property", "kill", "reset-failed", "import-environment", "set-environment")
+        self.check_commands([f"systemctl --user {verb} fixture" for verb in verbs] + [
+            "systemctl status fixture", "systemctl --system --user status fixture",
+            "systemctl --user --machine=other status fixture", "systemctl --user -H other status fixture",
+            "systemctl --user show --root=/tmp", "systemctl --user --help",
+            "systemctl --user status --host=other", "systemctl --user status --output=evil",
+            "systemctl --user status *", "systemctl --user status unit?"], False)
+        self.assertIsNotNone(policy.host_command_reason(
+            ["/mnt/c/systemctl", "--user", "status"], "systemctl"))
+
+    def test_a6_systemctl_positive(self):
+        self.check_commands([f"systemctl --user {verb} --no-pager" for verb in (
+            "list-unit-files", "list-units", "list-timers", "status", "is-active",
+            "is-enabled", "is-failed")] + [
+            "systemctl --user show fixture.timer --property=LoadState --property ActiveState --no-pager",
+            "systemctl --user -p LoadState show fixture.timer"], True)
+
+    def test_a7_lookup_negative(self):
+        self.check_commands(("command ls", "command -p sh", "command -v jq | sh",
+                             "command -v jq | bash", "command -V jq | bash", "command -v",
+                             "command -v --help"), False)
+
+    def test_a7_lookup_positive(self):
+        self.check_commands(("command -v jq curl qmd", "command -V jq curl qmd"), True)
+
+    def test_a8_copy_negative(self):
+        (self.root / ".work/src").mkdir(parents=True)
+        (self.root / ".work/src/file").write_text("fixture")
+        (self.root / ".work/escape").symlink_to(self.root.parent, target_is_directory=True)
+        for flag in ("-r", "-R", "-a"):
+            self.check_commands((f"cp {flag} .work/src /outside",
+                                 f"cp {flag} .work/escape .work/copy",
+                                 f"cp {flag} ~/.codex .work/copy", f"cp {flag} ~/.claude .work/copy",
+                                 f"cp {flag} ~/project-data .work/copy",
+                                 f"cp {flag} ~/.ssh .work/copy"), False)
+
+    def test_a9_commit_negative(self):
+        self.check_commands(('git commit -m "title\n$(evil)"', 'git commit -m "title\n`evil`"',
+                             'git commit -m "title\n${EVIL}"', 'echo "title\nbody"',
+                             'git commit -m "title\nbody" -m "second\nbody"',
+                             'git commit --author "title\nbody"',
+                             'git add file && git commit -m "title\nbody"'), False)
+        self.check_commands(('git status; echo commit -m "title\nbody"',
+                             'git commit -m "title\nbody"suffix',
+                             'git commit -m "title\nbody" --author "name\nother"'), False)
+        reason = self.judge('git add file && git commit -m "title\nbody"')
+        self.assertEqual(reason.rule_id, "git.state_chain")
+
+    def test_a9_commit_positive(self):
+        with patch.object(policy, "secret_scan", return_value=None):
+            self.check_commands(('git commit -m "title\n\nbody"',
+                                 "git commit --message 'title\nbody'",
+                                 'git commit --message="title\nbody"',
+                                 'git commit -m "subject" -m "line 1\nline 2"',
+                                 'git commit -q -m "subject\n\nCo-Authored-By: X <x@example.com>"',
+                                 'git commit -q -m "title\nbody"'), True)
+        with patch.object(policy, "secret_scan", return_value="fixture staged secret") as scan:
+            self.check_commands(('git commit -m "title\nbody"',), False)
+            scan.assert_called_once_with(self.root)
+
+    def test_a10_synthetic_negative(self):
+        (self.root / ".work/src").mkdir(parents=True)
+        (self.root / "docs").mkdir()
+        self.check_commands(("cp -r .work/src docs", "cp -a docs .work/copy",
+                             'git commit -m "unfinished'), False)
+
+    def test_a10_synthetic_positive(self):
+        self.check_commands(("systemctl --user list-unit-files --no-pager",
+                             "systemctl --user list-timers --no-pager",
+                             "command -v jq curl qmd", f"ls {self.root}"), True)
+
+    def test_a11_uv_negative(self):
+        for command in ("uv run evil", "uv run --no-project --with pkg==1.0 evil"):
+            self.check_commands((f"UV_EXCLUDE_NEWER=fixture {command}",
+                                 f"env UV_CACHE_DIR=fixture {command}",
+                                 command + " --exclude-newer=2026-01-01",
+                                 command + " --exclude-newer-package pkg=2026-01-01"), False)
+
+    def test_a11_uv_positive(self):
+        self.check_commands(("uv run evil", "uv run --no-project --with pkg==1.0 evil"), True)
+
+    def test_a12_ranges_negative(self):
+        self.check_commands(("npm view pkg* version", "npm view pkg@* version",
+                             "npm view pkg@>=1 version", "npm view pkg@<2 version",
+                             "npm view pkg@^2 --prefix=other", "npm view pkg@^2 other@^3",
+                             "npm view pkg@^2 version extra", "npm view pkg@file:../x version",
+                             'npm info "pkg@git+https://example.invalid/x"',
+                             "npm view pkg@../x version", "npm view p^kg@2 version"), False)
+
+    def test_a12_ranges_positive(self):
+        self.check_commands(("npm view pkg@^2 version", "npm view pkg@~2 version",
+                             "npm view pkg@=2.0.0 version", "npm view pkg@1.0.0-beta version",
+                             'npm view "pkg@>=1 <2" version', 'npm view pkg@">=1" version',
+                             'npm view "pkg@1 || 2" version', 'npm info "pkg@*"',
+                             'npm view "@scope/pkg@>=1" version', "npm info pkg@^2"), True)
+
+    def test_a13_refs_negative(self):
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/fixture.git"],
+                       cwd=self.root, check=True)
+        for command in ("git checkout -B other", "git checkout -Bother", "git checkout -qB other",
+                        "git switch -C other", "git switch --force-create other"):
+            self.check_commands((command,), False)
+        for verb in ("fetch", "pull"):
+            for refspec in ("main:other", "+main:other", "main:lane", "main:refs/heads/lane",
+                            "+refs/heads/*:refs/heads/*"):
+                self.check_commands((f"git {verb} origin '{refspec}'",), False)
+        subprocess.run(["git", "remote", "add", "local", "/tmp/fixture.git"], cwd=self.root, check=True)
+        subprocess.run(["git", "config", "branch.lane.remote", "local"], cwd=self.root, check=True)
+        self.check_commands(("git pull",), False)
+
+    def test_a13_refs_positive(self):
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/fixture.git"],
+                       cwd=self.root, check=True)
+        self.assertEqual(subprocess.check_output(["git", "symbolic-ref", "--short", "HEAD"],
+                                               cwd=self.root, text=True).strip(), "lane")
+        self.check_commands(("git fetch origin", "git fetch origin main", "git pull",
+                             "git pull origin", "git fetch origin main:refs/remotes/origin/main",
+                             "git fetch origin '+refs/heads/*:refs/remotes/origin/*'"), True)
+
+    def test_a14_systemctl_negative(self):
+        self.check_commands(("systemctl --user cat fixture", "systemctl --user show fixture",
+                             "systemctl --user show -p Environment",
+                             "systemctl --user show --property=EnvironmentFiles",
+                             "systemctl --user show --property LoadState,Environment",
+                             "systemctl --user -p LoadState show -p EnvironmentFiles",
+                             "systemctl --user show --property=LoadState --property=Environment",
+                             "systemctl --user list-units --type=service --state=*"), False)
+
+    def test_a14_systemctl_positive(self):
+        self.check_commands(("systemctl --user list-units --all --type=service --state=running",
+                             "systemctl --user show fixture --property=LoadState,ActiveState",
+                             "systemctl --user -p LoadState show fixture --property ActiveState",
+                             "systemctl --user show -p LoadState --property=ActiveState"), True)
+
+    def test_a15_remote_negative(self):
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/fixture.git"],
+                       cwd=self.root, check=True)
+        self.check_commands((
+            "git remote add m https://github.com/o/r --mirror=fetch",
+            "git remote update", "git remote set-url origin https://github.com/o/r",
+            "git remote set-url --add origin https://github.com/o/r",
+            "git remote -v add m https://github.com/o/r", "git remote set-head origin -a",
+            "git remote set-branches origin main", "git remote rename origin other",
+            "git remote remove origin", "git remote rm origin", "git remote prune origin",
+            "git remote show -n origin", "git remote get-url --all origin",
+            "git remote show origin other", "git remote get-url", "git remote --verbose",
+            "git config remote.origin.fetch '+refs/*:refs/*'",
+            "git config --add branch.main.merge refs/heads/x",
+            "git config --get-all remote.origin.fetch", "git config --get-regexp remote.*",
+            "git -c remote.origin.fetch=+refs/*:refs/* fetch origin",
+            "GIT_CONFIG_COUNT=1 git fetch origin",
+            "git fetch --tags --force origin", "git fetch -t -f origin",
+            "git fetch --force -t origin", "git fetch -f --tags origin"), False)
+
+    def test_a15_remote_positive(self):
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/fixture.git"],
+                       cwd=self.root, check=True)
+        self.check_commands(("git remote", "git remote -v", "git remote show origin",
+                             "git remote get-url origin", "git config --list", "git config -l",
+                             "git config --get remote.origin.fetch",
+                             "git config --local --show-origin --show-scope --get remote.origin.url",
+                             "git fetch --tags origin", "git fetch --force origin"), True)
+
+    def test_a15_remote_without_lane(self):
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/example/fixture.git"],
+                       cwd=self.root, check=True)
+        os.environ.pop("TASK_WORKTREE")
+        self.check_commands(("git remote add m https://github.com/o/r --mirror=fetch",
+                             "git remote update", "git fetch --tags --force origin"), True)
+
+    def test_a16_tags_negative(self):
+        self.check_commands(tuple(f"git tag {option} fixture" for option in (
+            "-f", "-d", "-fa", "-df", "--force", "--delete", "--del", "--for", "-af")), False)
+        self.check_commands(("git tag -l v*", "git tag 'v*'", "git tag -lf 'v*'",
+                             "git tag -l '$HOME*'"), False)
+
+    def test_a16_tags_positive(self):
+        self.check_commands(("git tag", "git tag -l", "git tag -l 'v*'", "git tag fixture"), True)
+
+
+t42_result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(T42PolicyTests))
+assert t42_result.wasSuccessful(), "T-42 policy regressions"
 
 # Script and recipe controls inspect inert fixture text; no denied command runs.
 with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
@@ -413,18 +676,18 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
                            "help --prefix", "help install exec", "help ../x", "help a=b",
                            "--help exec evil"):
                 assert judge(f"{runner} {action}"), (runner, action)
-        # Use an allowed installer body so wrapper refusals cannot be masked by
+        # Use an allowed pnpm installer body so wrapper refusals cannot be masked by
         # the unrelated non-shell build.js restriction in the normal fixture.
         fixture("package.json", '{"scripts":{"check":"echo safe"}}\n')
-        inner = "npm install"
-        for wrapped in (f"xargs {inner}", f"setsid {inner}", f"nohup {inner}",
-                        f"env -S '{inner}'", f"sh -c '{inner}'", f"command {inner}"):
-            assert judge(inner) is None, (inner, judge(inner))
-            assert judge(wrapped), wrapped  # Hiding an allowed command stays refused.
-            if wrapped.startswith("sh -c"):
-                reason = judge(wrapped)
-                assert reason == "Inline shell and interpreter programs are blocked.", reason
-                assert reason.rule_id == "shell.interpreter", reason
+        for inner in ("npm install", "pnpm install"):
+            for wrapped in (f"xargs {inner}", f"setsid {inner}", f"nohup {inner}",
+                            f"env -S '{inner}'", f"sh -c '{inner}'", f"command {inner}"):
+                assert (judge(inner) is None) == (inner == "pnpm install"), (inner, judge(inner))
+                assert judge(wrapped), wrapped  # Hiding an allowed command stays refused.
+                if wrapped.startswith("sh -c"):
+                    reason = judge(wrapped)
+                    assert reason == "Inline shell and interpreter programs are blocked.", reason
+                    assert reason.rule_id == "shell.interpreter", reason
         fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
         for command in ("command -v task -- npm install",
                         "command -v", "command -v --help"):
@@ -587,7 +850,7 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
         assert judge(command), command
     fixture("package.json", '{"scripts":{"check":"bash allowed.sh","precheck":"echo ready"}}')
     for runner in ("npm", "pnpm", "yarn", "bun"):
-        assert judge(f"{runner} run check") is None
+        assert (judge(f"{runner} run check") is None) == (runner != "npm")
     fixture_git("update-ref", "-d", "refs/remotes/origin/main")
     assert judge("just check") is None  # Local main is a valid fallback.
 
@@ -628,7 +891,7 @@ with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
         actions = ("install", "ci", "run check") if runner in {"npm", "pnpm"} else (
             "install", "run check")
         for action in actions:
-            assert judge(f"{runner} {action}") is None, (runner, action)
+            assert (judge(f"{runner} {action}") is None) == (runner != "npm"), (runner, action)
         if runner in {"yarn", "bun"}:
             for action in ("ci", "test", "list", "update", "check"):
                 assert judge(f"{runner} {action}"), (runner, action)
@@ -797,7 +1060,8 @@ with tempfile.TemporaryDirectory() as temp:
     commands = ("just check", "npm run check", "pnpm run check",
                 "yarn run check", "bun run check", "npm install", "pnpm ci")
     for command in commands:
-        assert judge(command) is None, (command, judge(command))
+        # T-42 permits only read-only npm commands, even with safe scripts.
+        assert (judge(command) is None) == (not command.startswith("npm ")), (command, judge(command))
     assert judge("make check")
     assert judge("task check") is None
     for script in ("gate.sh", "child.sh"):
@@ -928,7 +1192,7 @@ with tempfile.TemporaryDirectory() as temp:
         fixture_git("add", ".")
         fixture_git("commit", "-qm", "unchanged positive print scenario")
         for runner in ("just check", "npm run check", "pnpm run check"):
-            assert judge(runner) is None, (runner, body)
+            assert (judge(runner) is None) == (not runner.startswith("npm ")), (runner, body)
     for body in ("printf [ab]", "printf {a,b}", "printf *", "printf ?", "printf ~"):
         assert judge(body), body
     # Round 6: escaped quotes outside quotes cannot hide an unquoted glob.

@@ -1,17 +1,9 @@
 approval_policy = "on-request"
 approvals_reviewer = "user"
-sandbox_mode = "workspace-write"
 
-[sandbox_workspace_write]
-# Network on inside the sandbox, but only through Codex's own proxy (below), which allows the
-# package registries, GitHub downloads and openrouter.ai; tests can reach 127.0.0.1.
-# git and gh network commands keep running outside the sandbox (policy hook).
-network_access = true
-
-# The hooks feature and the policy hooks are pinned in /etc/codex/requirements.toml.
-[features.network_proxy]
-enabled = true
-allow_local_binding = true
-domains = { "pypi.org" = "allow", "files.pythonhosted.org" = "allow", "registry.npmjs.org" = "allow", "github.com" = "allow", "objects.githubusercontent.com" = "allow", "codeload.github.com" = "allow", "raw.githubusercontent.com" = "allow", "release-assets.githubusercontent.com" = "allow", "openrouter.ai" = "allow" }
-# Keep the HTTP proxy and its domain policy, but do not expose a SOCKS proxy to commands.
-enable_socks5 = false
+# Managed permission profiles select filesystem and network access. Legacy sandbox
+# settings are ignored; feature-level proxy policy is replaced by profile policy.
+# Activate the proxy here; lane hosts, SOCKS and loopback policy live in
+# /etc/codex/requirements.toml. The review profile has no network access.
+[features]
+network_proxy = true
