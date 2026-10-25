@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Check the pre-commit gate's OSV data: the npm lock's accepted-risk exception and its
-expiry, the weekly osv-db-refresh units and their enablement, and that osv-db-refresh
+expiry, the daily refresh-and-scan timer and its enablement, and that osv-db-refresh
 reports every failure, keeps the previous data and stamps only a full success.
 
-The real-scanner checks run when osv-scanner and an offline npm database are present
-(after install); everything else runs anywhere.
+Real-scanner checks use a synthetic offline npm database in a temporary HOME.
 """
 import datetime as dt
 import json
@@ -15,6 +14,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 NPM = ROOT / "home/dot_local/share/bootstrap/npm"
@@ -23,7 +23,6 @@ REFRESH = ROOT / "home/dot_local/bin/executable_osv-db-refresh"
 ADVISORY = "GHSA-vfj7-8cjw-p6xm"
 EXPIRY = dt.date(2027, 1, 5)
 ECOSYSTEMS = ["PyPI", "npm", "crates.io", "Go", "Packagist", "RubyGems"]
-REAL_DB = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "osv-scalibr"
 
 
 def units(name: str) -> dict[str, dict[str, str]]:
@@ -73,18 +72,25 @@ class IgnoreEntry(unittest.TestCase):
         self.assertEqual(lock["packages"]["node_modules/sprintf-js"]["version"], "1.0.3")
 
 
-@unittest.skipUnless(shutil.which("osv-scanner") and (REAL_DB / "npm/all.zip").is_file(),
-                     "osv-scanner or the offline npm database is not installed")
+@unittest.skipUnless(shutil.which("osv-scanner"), "osv-scanner is not installed")
 class IgnoreWithScanner(unittest.TestCase):
     """The hook's exact command, with the config found next to the lockfile."""
 
     def scan(self, config: str | None) -> subprocess.CompletedProcess:
         temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        db = temp / "cache/osv-scalibr/npm/all.zip"
+        db.parent.mkdir(parents=True)
+        advisory = {"id": ADVISORY, "modified": "2026-01-01T00:00:00Z",
+                    "affected": [{"package": {"name": "braces", "ecosystem": "npm"},
+                                  "versions": ["3.0.3"]}]}
+        with zipfile.ZipFile(db, "w") as archive:
+            archive.writestr(ADVISORY + ".json", json.dumps(advisory))
         shutil.copy(NPM / "package-lock.json", temp / "package-lock.json")
         if config is not None:
             (temp / "osv-scanner.toml").write_text(config)
-        env = dict(os.environ, XDG_CACHE_HOME=str(REAL_DB.parent))
-        return subprocess.run(["osv-scanner", "scan", "source", "--offline", "package-lock.json"],
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(temp), "TMPDIR": str(temp),
+               "XDG_CACHE_HOME": str(temp / "cache")}
+        return subprocess.run([shutil.which("osv-scanner"), "scan", "source", "--offline", "package-lock.json"],
                               cwd=temp, env=env, capture_output=True, text=True, timeout=120)
 
     def test_committed_exception_passes_until_it_expires(self):
@@ -121,9 +127,12 @@ class Units(unittest.TestCase):
         self.assertNotIn("claude", (UNITS / "osv-db-refresh.service").read_text())
         self.assertNotIn("codex", (UNITS / "osv-db-refresh.service").read_text())
 
-    def test_timer_weekly_persistent_and_enabled(self):
+    def test_timer_daily_persistent_and_enabled(self):
         timer = units("osv-db-refresh.timer")
-        self.assertEqual(timer["Timer"]["OnCalendar"], "weekly")
+        self.assertEqual(timer["Timer"]["OnCalendar"], "daily")
+        self.assertEqual(timer["Timer"]["Unit"], "security-watch.service")
+        self.assertEqual(units("security-watch.service")["Service"]["ExecStart"],
+                         "%h/.local/bin/security-watch")
         self.assertEqual(timer["Timer"]["Persistent"], "true")
         self.assertEqual(timer["Install"]["WantedBy"], "timers.target")
         link = UNITS / "timers.target.wants/symlink_osv-db-refresh.timer"
@@ -139,7 +148,8 @@ class Units(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not available")
     def test_systemd_accepts_the_timer_calendar(self):
-        result = subprocess.run(["systemd-analyze", "calendar", "weekly"],
+        calendar = units("osv-db-refresh.timer")["Timer"]["OnCalendar"]
+        result = subprocess.run(["systemd-analyze", "calendar", calendar],
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -175,9 +185,10 @@ class Refresh(unittest.TestCase):
         ping.write_text(f'#!/bin/sh\necho "$@" >> {self.pings}\n')
         ping.chmod(0o755)
         self.cache = self.temp / "cache" / "osv-scalibr"
-        self.env = dict(os.environ, XDG_CACHE_HOME=str(self.temp / "cache"),
-                        JOB_PINGS_FILE=str(self.temp / "no-pings.env"),  # never ping for real from a test
-                        PATH=f"{bin_dir}:{os.environ['PATH']}")
+        self.env = {"HOME": str(self.temp), "TMPDIR": str(self.temp),
+                    "XDG_CACHE_HOME": str(self.temp / "cache"),
+                    "JOB_PINGS_FILE": str(self.temp / "no-pings.env"),
+                    "PATH": f"{bin_dir}:/usr/bin:/bin"}
 
     def run_refresh(self, **fake: str) -> subprocess.CompletedProcess:
         return subprocess.run(["bash", str(REFRESH)], env=dict(self.env, **fake),

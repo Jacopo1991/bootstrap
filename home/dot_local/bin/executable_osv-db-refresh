@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the OSV offline vulnerability databases that the osv-scanner pre-commit hook
 # reads (it never fetches at commit time). Bootstrap runs this on install and
-# osv-db-refresh.timer runs it weekly; run it from a normal shell to refresh by hand.
+# osv-db-refresh.timer runs it daily via security-watch; refresh by hand from a normal shell.
 # Only changed databases are downloaded. Every ecosystem is tried; any failure is
 # reported and makes the command (and the timer's unit) fail. Only a fully successful
 # run updates the .last-refresh stamp that the drift report checks.

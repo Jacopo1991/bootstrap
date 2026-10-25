@@ -24,7 +24,7 @@ allowed_helpers = {"task_limits.py", "task_routing.py", "task_usage.py", "task_l
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
 for script in (ROOT / "home/dot_local/bin").iterdir():
     if script.is_file():
-        assert script.name.removeprefix("executable_") in expected | allowed_helpers, script.name
+        assert script.name.removeprefix("executable_") in expected | allowed_helpers | {"security-watch"}, script.name
 # Exercise imports from the installed layout, outside the source directory.
 with tempfile.TemporaryDirectory() as temp:
     installed = Path(temp) / ".local/bin"
