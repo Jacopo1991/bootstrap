@@ -3,6 +3,7 @@ Description=Remove finished worktrees and merged branches; report stray folders 
 
 [Service]
 Type=oneshot
+ExecCondition=%h/.local/bin/task hold --check
 # Removes only clean, unlocked, merged worktrees and merged local branches older than a
 # day; everything else is reported in ~/.local/state/workspace-tidy/report.txt.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
