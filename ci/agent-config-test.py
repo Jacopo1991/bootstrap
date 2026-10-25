@@ -251,9 +251,10 @@ with tempfile.TemporaryDirectory() as temp:
     for command in ("git log 2>&1 | head", "git log > out.txt && git status",
                     "git status > output; pwd", "git status; rg --pre-glob '*.txt' needle",
                     "git status; rg --search-zip needle", "git status; rg -z needle",
-                    "UV_CACHE_DIR=.work/uv-cache uv sync", "time timeout 5s uv sync",
+                    "time timeout 5s uv sync",
                     "\npwd\n\nls\n", "pwd;\nls"):
         assert policy.evaluate(event(command), roots) is None, command
+    assert policy.evaluate(event("UV_CACHE_DIR=.work/uv-cache uv sync"), roots) is not None
     for helper in ("find . -fls output", "find . -fprint output", "find . -fprint0 output",
                    "find . -fprintf output x", "find . -exec true +", "find . -execdir true +",
                    "find . -ok true +", "find . -okdir true +", "find . -delete",

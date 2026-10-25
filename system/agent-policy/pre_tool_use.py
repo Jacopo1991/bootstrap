@@ -563,10 +563,14 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
             key, separator, value = argument.partition("=")
             if key not in attached_values or not separator or not value:
                 return "Unsupported remote option; use ordinary flags or supported --key=value options."
+    if (lane_session() and subcommand == "fetch"
+            and any(arg in {"-f", "--force"} for arg in arguments)
+            and any(arg in {"-t", "--tags"} for arg in arguments)):
+        return "Lane fetch cannot force-update local tags."
     if not operands:
-        if subcommand != "fetch" or arguments:
-            return "Git network commands require an explicit named GitHub remote (except plain fetch)."
-        # Bare fetch uses the current branch's configured remote, then origin.
+        if subcommand not in {"fetch", "pull"} or arguments:
+            return "Git network commands require an explicit named GitHub remote (except plain fetch/pull)."
+        # Bare fetch/pull uses the current branch's configured remote, then origin.
         # Resolve that choice before checking URLs; checking origin alone would
         # miss a local/non-GitHub upstream selected by Git.
         remote = "origin"
@@ -593,6 +597,10 @@ def git_network_remote(arguments: list[str], target: Path, subcommand: str) -> s
             return "Cannot identify the default fetch remote safely; specify origin."
     else:
         remote = operands[0]
+    if lane_session() and subcommand in {"fetch", "pull"} and any(
+            ":" in refspec and not refspec.split(":", 1)[1].startswith("refs/remotes/")
+            for refspec in operands[1:]):
+        return "Lane fetch/pull refspec destinations must be under refs/remotes/."
     if subcommand == "fetch":
         # A fetch group can expand one name into multiple unchecked remotes.
         try:
@@ -808,6 +816,19 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
                      arguments[:1] == ["show"] and "-n" in arguments and all(
                          arg == "-n" or not arg.startswith("-") for arg in arguments[1:]))
                  or subcommand == "worktree" and arguments[:1] == ["list"])
+    if lane_session() and subcommand == "branch" and not read_only:
+        # Creation of a fresh branch cannot move an existing ref. Force, delete,
+        # rename, copy and configuration forms can affect shared lane refs.
+        if len(arguments) != 1 or not plain_branch_name(arguments[0]) or arguments[0].startswith("-"):
+            return "Lane branch changes permit only listing or creation of a fresh branch; shared ref mutations are blocked."
+    if lane_session() and subcommand == "checkout" and any(
+            re.match(r"-[qfmldtp23]*B", arg) for arg in arguments):
+        return "Lane checkout cannot force-create or reset a branch."
+    if lane_session() and subcommand == "remote" and not (
+            arguments in ([], ["-v"])
+            or len(arguments) == 2 and arguments[0] in {"show", "get-url"}
+            and arguments[1] and not arguments[1].startswith("-")):
+        return "Lane remote commands permit only listing, show <name> or get-url <name>."
     if cross_repo and not read_only and not sibling_fetch:
         return "Git writes outside the current repository are blocked."
     if subcommand == "merge":
@@ -832,6 +853,11 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
         return key == option or (key not in known and key.startswith("--")
                                  and len(key) > 2 and option.startswith(key))
 
+    if lane_session() and subcommand == "tag" and any(
+            re.match(r"^-[^-]*[fd]", arg)
+            or option_matches(arg, "--force") or option_matches(arg, "--delete")
+            for arg in arguments):
+        return "Lane tag force-update and deletion are blocked."
     if any(option_matches(arg, "--output") for arg in arguments):
         return "Git output-file options are blocked; redirect only inside the current repository."
     if subcommand == "clean":
@@ -906,7 +932,21 @@ def git_policy(tokens: list[str], cwd: str, root: Path,
     for arg in arguments:
         if arg == "--":
             literal_diff_paths = True
-        if SHELL_EXPANSION.search(arg) and (cross_repo or subcommand not in READ_ONLY_GIT):
+        remote_refspec = (subcommand in {"fetch", "pull"} and ":" in arg
+                          and arg.split(":", 1)[1].startswith("refs/remotes/")
+                          and re.fullmatch(r"\+?[A-Za-z0-9_./*-]+:refs/remotes/[A-Za-z0-9_./*-]+", arg)
+                          and all(char != "*" or quoted for char, (quoted, _) in zip(
+                              getattr(arg, "spelling", arg),
+                              shell_quote_state(getattr(arg, "spelling", arg)))))
+        tag_list_pattern = (lane_session() and subcommand == "tag" and len(arguments) == 2
+                            and arguments[0] == "-l" and arg == arguments[1]
+                            and not arg.startswith("-")
+                            and re.fullmatch(r"[A-Za-z0-9_./*?-]+", arg)
+                            and all(char not in "*?" or quoted for char, (quoted, _) in zip(
+                                getattr(arg, "spelling", arg),
+                                shell_quote_state(getattr(arg, "spelling", arg)))))
+        if (SHELL_EXPANSION.search(arg) and (cross_repo or subcommand not in READ_ONLY_GIT)
+                and not remote_refspec and not tag_list_pattern):
             return "Expanded Git operands are blocked; use literal repository paths."
         value = arg.split("=", 1)[1] if arg.startswith("--") and "=" in arg else arg
         if (subcommand == "diff" and "--no-index" in arguments
@@ -1261,7 +1301,8 @@ def regex_prose_positions(tokens: list[str], executable: str) -> set[int]:
 
 def host_command_reason(tokens: list[str], executable: str) -> str | None:
     """Block host execution and real Windows path arguments, not gh prose."""
-    if ((tokens[0] != "[" and SHELL_EXPANSION.search(tokens[0])) or executable in HOST_NAMES | HOST_OPS
+    if ((tokens[0] != "[" and SHELL_EXPANSION.search(tokens[0]))
+            or executable in HOST_NAMES | (HOST_OPS - {"systemctl"})
             or HOST_EXECUTABLE.search(tokens[0])
             or WINDOWS_PATH.search(tokens[0])):
         return "Host, Windows, and operating-system commands are blocked."
@@ -1269,6 +1310,50 @@ def host_command_reason(tokens: list[str], executable: str) -> str | None:
     if any(WINDOWS_PATH.search(token) for index, token in enumerate(tokens[1:], 1)
            if index not in prose):
         return "Windows path arguments are blocked."
+    if executable == "systemctl":
+        return systemctl_inspection_reason(tokens[1:])
+    return None
+
+
+def systemctl_inspection_reason(arguments: list[str]) -> str | None:
+    """Only local user-manager inspection, with bounded formatting options."""
+    verbs = {"list-unit-files", "list-units", "list-timers", "status", "show",
+             "is-active", "is-enabled", "is-failed"}
+    user = False
+    operands = []
+    properties = []
+    list_options = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--user":
+            user = True
+        elif argument == "--no-pager":
+            pass
+        elif argument == "--all" or re.fullmatch(r"--(?:type|state)=[A-Za-z][A-Za-z0-9_,-]*", argument):
+            list_options = True
+        elif argument in {"-p", "--property"}:
+            index += 1
+            if index >= len(arguments) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_,]*", arguments[index]):
+                return "systemctl inspection requires literal property names."
+            properties.extend(arguments[index].split(","))
+        elif argument.startswith("--property="):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_,]*", argument.split("=", 1)[1]):
+                return "systemctl inspection requires literal property names."
+            properties.extend(argument.split("=", 1)[1].split(","))
+        elif argument.startswith("-") or not re.fullmatch(r"[A-Za-z0-9_@.:+-]+", argument):
+            return "systemctl scope, remote selectors and unsupported options are blocked."
+        else:
+            operands.append(argument)
+        index += 1
+    if not user or not operands or operands[0] not in verbs:
+        return "Only read-only systemctl --user inspection verbs are allowed."
+    if list_options and operands[0] != "list-units":
+        return "systemctl list options are allowed only with list-units."
+    if any(name in {"Environment", "EnvironmentFiles"} or not name for name in properties):
+        return "systemctl environment properties are blocked."
+    if operands[0] == "show" and not properties:
+        return "systemctl show requires explicit non-environment properties."
     return None
 
 
@@ -1408,11 +1493,11 @@ def shell_quote_state(command: str) -> list[tuple[bool, bool]]:
     """
     states: list[tuple[bool, bool]] = []
     quote: str | None = None
+    quote_start = 0
+    multiline_spans = []
     index = 0
     while index < len(command):
         char = command[index]
-        if quote and char in "\n\r":
-            raise ValueError("Quoted multi-line shell strings are blocked.")
         if (char == "\\" and quote != "'" and index + 1 < len(command)
                 and (quote is None or command[index + 1] in '$`"\\\n\r')):
             if command[index + 1] in "\n\r":
@@ -1423,14 +1508,43 @@ def shell_quote_state(command: str) -> list[tuple[bool, bool]]:
         quoted = quote is not None
         if quote:
             if char == quote:
+                if any(c in command[quote_start:index] for c in "\n\r"):
+                    multiline_spans.append((quote_start, index))
                 quote = None
         elif char in "'\"":
             quote = char
+            quote_start = index
             quoted = True
         states.append((quoted, False))
         index += 1
     if quote:
         raise ValueError("Shell syntax is unrecognized; blocked by policy.")
+    if multiline_spans:
+        if len(multiline_spans) != 1:
+            raise ValueError("Quoted multi-line shell strings are blocked.")
+        start, end = multiline_spans[0]
+        message = command[start + 1:end]
+        # Only a complete quoted message word; the rest is parsed normally so
+        # git.state_chain and the staged-secret scan still apply.
+        prefix = command[:start]
+        try:
+            lexer = shlex.shlex(prefix, posix=True, punctuation_chars=";&|<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            words = list(lexer)
+            separators = [i for i, word in enumerate(words) if word in CHAIN_SEPARATORS]
+            if separators:
+                words = words[separators[-1] + 1:]
+        except ValueError:
+            words = []
+        parsed = git_target(words, ".") if words and words[0] in {"git", "/usr/bin/git"} else None
+        valid = (words and words[0] in {"git", "/usr/bin/git"}
+                 and parsed is not None and parsed[1] == "commit"
+                 and (words[-1] in {"-m", "--message"} or words[-1] == "--message=")
+                 and (end + 1 == len(command) or command[end + 1].isspace())
+                 and not any(part in message for part in ("$(", "`", "${")))
+        if not valid:
+            raise ValueError("Quoted multi-line shell strings are blocked.")
     return states
 
 
@@ -2002,7 +2116,9 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         if runner in {"yarn", "bun"} and (not args or args[0] not in {"run", "install"}):
             return "Use explicit run or install; other runner forms cannot be judged reliably."
         if args and args[0] in {"outdated", "audit", "list", "ls", "view", "info"}:
-            return None
+            return package_inspection_reason(args)
+        if runner == "npm":
+            return "Only read-only npm forms are allowed; installs, package writes and script execution are blocked."
         if not args or args[0] not in {"run", "run-script", "test", "start", "stop", "restart",
                                       "install", "ci", "add", "remove", "uninstall", "update"}:
             return "Package runner shorthand and global options cannot be judged reliably."
@@ -2101,6 +2217,37 @@ def recipe_reason(tokens: list[str], cwd: str, root: Path,
         return "Recipe definition or merge base cannot be read safely."
     except (OSError, RuntimeError, subprocess.SubprocessError):
         return "Recipe definition or merge base cannot be read safely."
+    return None
+
+
+def package_inspection_reason(arguments: list[str]) -> str | None:
+    """Explicit read-only flags; no config overrides or nested writing verbs."""
+    verb, *arguments = arguments
+    flags = {"--json", "--long", "--parseable", "--all", "--dev", "--production"}
+    if verb in {"view", "info"}:
+        operands = [argument for argument in arguments if argument not in flags]
+        if not 1 <= len(operands) <= 2:
+            return "Package metadata inspection requires one package and an optional field."
+        package = operands[0]
+        name, separator, version = package.rpartition("@")
+        if not separator or not name:
+            name, version = package, ""
+        if (not re.fullmatch(r"(?:@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_][A-Za-z0-9_.-]*", name)
+                or version and not re.fullmatch(r"[A-Za-z0-9_.^~=<>|* -]+", version)
+                or separator and name != package and not version
+                or len(operands) == 2 and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", operands[1])):
+            return "Package metadata requires a literal registry package, version range and field."
+        spelling = getattr(package, "spelling", package)
+        if any(char in "<>|* " and not quoted for char, (quoted, _) in zip(
+                spelling, shell_quote_state(spelling))):
+            return "Package range shell metacharacters must be quoted."
+        return None
+    for argument in arguments:
+        if argument in flags:
+            continue
+        if verb == "audit" or argument.startswith("-") or not re.fullmatch(
+                r"[A-Za-z0-9_@][A-Za-z0-9_@./:+-]*", argument):
+            return "Package inspection permits only read-only flags and literal package or field names; writing forms and configuration overrides are blocked."
     return None
 
 
@@ -2357,6 +2504,7 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
         ENV_ASSIGNMENT.fullmatch(token) and token.split("=", 1)[0].lower().startswith("npm_config_")
         for token in tokens[:len(tokens) - len(unwrapped)])
     npm_config_override |= inline_npm_config
+    unwrapped_prefix = tokens[:len(tokens) - len(unwrapped)]
     tokens = unwrapped
     if not tokens:
         return None
@@ -2373,6 +2521,23 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     # refused on package commands. Evaluated wrappers and assignments are stripped.
     if inline_npm_config and executable in {"npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"}:
         return Denial("command.unsafe_environment", "Inline npm configuration on package commands is blocked.")
+    if executable in {"uv", "uvx"}:
+        if any(token.split("=", 1)[0].startswith("UV_")
+               or token.startswith(("--unset=UV_", "-uUV_"))
+               for token in unwrapped_prefix):
+            return Denial("command.unsafe_environment", "Inline UV configuration on installer commands is blocked.")
+        if any(token.split("=", 1)[0] in {
+                "--exclude-newer", "--exclude-newer-package", "--no-config", "--config-file"}
+               for token in tokens[1:]):
+            return "Installer cooldown and configuration overrides are blocked."
+        if tokens[1:] not in (["--help"], ["-h"], ["--version"], ["-V"]):
+            if executable == "uvx" or tokens[1:3] == ["tool", "run"]:
+                return "Fetch-and-run uv runners cannot be judged safely."
+            if tokens[1:2] == ["tool"] and (len(tokens) < 3 or tokens[2] not in {
+                    "install", "upgrade", "uninstall", "list", "dir"}):
+                return "uv tool permits only explicit installer or inspection verbs; hidden runner forms are blocked."
+            if len(tokens) < 2 or tokens[1].startswith("-"):
+                return "uv global options and runner shorthand cannot be judged safely."
     if executable in {"printf", "echo"} and not print_allowlist(tokens):
         return "Shell print syntax cannot be judged safely."
     if re.match(r"(?:\d*[<>]|&[<>])", tokens[0]) or (
@@ -2413,6 +2578,9 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     if executable == "uniq" and len([t for t in tokens[1:] if not t.startswith("-")]) > 1:
         return "uniq with an output file operand is blocked; redirect inside the repository instead."
     output_operators = {">", ">>", ">|", "&>", "&>>", ">&", "<>"}
+    if (executable in {"npm", "pnpm"} and tokens[1:2] in (["view"], ["info"])
+            and any(token in output_operators for token in tokens)):
+        return "Package metadata inspection requires quoted range operators; redirects are blocked."
     metadata = git_metadata(root) if executable in WRITERS | {"sed"} or any(
         token in output_operators for token in tokens) else None
     for i, token in enumerate(tokens):
