@@ -411,14 +411,16 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   `<common>/objects`, `<common>/refs` and `<common>/logs`. A lane can therefore commit and merge on
   its task branch. `hooks`, `config` and `info` stay read-only because a writable hook or config
   runs as code outside the sandbox at the next Git command, and no other worktree's dir is
-  granted. A checkout whose git dir is the common dir is refused (`Stop`). The shared `refs`
-  also let a lane move other local branches; the policy hook, not the sandbox, blocks that.
+  granted. A checkout whose git dir is the common dir is refused (`Stop`). With the shared `refs`
+  writable, a lane can also move other local branches (`git branch -f`, `-D`, `-m`), as it could
+  before T-52. The policy hook does not refuse those yet (`git update-ref` is refused; `branch`
+  is not checked), so this is an accepted risk until cortex-core T-42 #5 adds that refusal.
   Reviews, red teams and realigns use `review` and get no Git grants. PM proof after install, one `codex sandbox -c 'default_permissions="review"' --
   test -r <path>` per denied path (must fail; never print contents) and the controls
-  `/etc/hostname` and `~/.bashrc` (must succeed); repeat with `"lane"`; then run one Codex lane
-  and one Codex review normally. Also confirm `codex exec` with `-c default_permissions` starts
-  under the requirements (no "overrides cannot both be set" error) and that `~/.codex/config.toml`
-  `sandbox_mode` does not conflict.
+  `/etc/hostname` and `~/.bashrc` (must succeed); repeat with `"lane"`; then run `task smoke`
+  (T-56); the change counts as installed only when it passes. Also confirm `codex exec` with
+  `-c default_permissions` starts under the requirements (no "overrides cannot both be set" error)
+  and that `~/.codex/config.toml` `sandbox_mode` does not conflict.
 
 Both installers refuse to run unless the policy scripts, `/usr/bin/env`, `/usr/bin/python3`,
 `/usr/bin/git` and the root-owned `/usr/local/bin/gitleaks` (installed by `install.sh`), and
