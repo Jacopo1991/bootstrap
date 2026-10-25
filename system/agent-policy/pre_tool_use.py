@@ -7,6 +7,7 @@ Claude Code and Codex run it from their root-owned managed settings, as
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import glob
 import json
 import os
@@ -96,6 +97,15 @@ SHELL_EXPANSION = re.compile(r"[$~*?\[\]{}]")
 GIT_OVERRIDE_ENV = {"GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
                     "GIT_EXEC_PATH", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                     "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PAGER", "GIT_EXTERNAL_DIFF"}
+# Antigravity CLI (agy, T-48): a research-only third vendor. Its Google sign-in lives in ~/.gemini,
+# which no agent session may reach through a tool; lanes may not run agy at all.
+AGY_EXECUTABLES = {"agy", "antigravity"}
+AGY_LANE_REASON = ("Antigravity CLI (agy) is not available to lanes yet (T-48): the PM runs it from an "
+                   "unsandboxed shell for research, read-only audits and plan red-teams.")
+CREDENTIAL_DIR = ".gemini"
+CREDENTIAL_REASON = ("The Antigravity sign-in folder ~/.gemini holds Jacopo's Google token; agent sessions "
+                     "may not read or write it (T-48).")
+SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 
 
 def policy_subprocess(*args, **kwargs):
@@ -1275,6 +1285,22 @@ def task_state_path(path_text: str, cwd: str) -> bool:
         return ".local/state/task" in path_text.replace("\\", "/")
 
 
+def credential_path(path_text: str, cwd: str) -> bool:
+    """True for an operand inside ~/.gemini, or a glob that may match that folder. Any access counts,
+    reads included: the folder holds the Google token, so no tool may touch it."""
+    try:
+        folder = (Path.home() / CREDENTIAL_DIR).resolve(strict=False)
+        target = Path(os.path.expandvars(path_text)).expanduser()
+        if not target.is_absolute():
+            target = Path(cwd) / target
+        if fnmatch.fnmatchcase(str(folder), str(target)):
+            return True
+        resolved = target.resolve(strict=False)
+        return resolved == folder or folder in resolved.parents
+    except (OSError, ValueError, RuntimeError):
+        return CREDENTIAL_DIR in path_text
+
+
 def task_state_write_reason(tokens: list[str], cwd: str) -> str | None:
     """Permit read commands, while protecting private state from writes."""
     unwrapped = unwrap_command(tokens)
@@ -1309,6 +1335,8 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
                  if isinstance(data.get(k), str)]
         if any(task_state_path(path, cwd) for path in paths):
             return Denial("task.private_state_write", "Agent writes to private task state are blocked.")
+        if any(credential_path(path, cwd) for path in paths):
+            return Denial("credential.protected_path", CREDENTIAL_REASON)
         metadata = git_metadata(root)
         if not paths or any(not writable(p, cwd, root, metadata) for p in paths):
             return Denial("filesystem.write_boundary", "File writes outside the current repository or into Git metadata are blocked.")
@@ -1321,6 +1349,8 @@ def evaluate(event: dict, approved_roots: tuple[Path, ...] | None = None) -> str
                            patch, re.MULTILINE)
         if any(task_state_path(path, cwd) for path in paths):
             return Denial("task.private_state_write", "Agent writes to private task state are blocked.")
+        if any(credential_path(path, cwd) for path in paths):
+            return Denial("credential.protected_path", CREDENTIAL_REASON)
         metadata = git_metadata(root)
         if not paths or any(not writable(p, cwd, root, metadata) for p in paths):
             return Denial("filesystem.write_boundary", "Patch writes outside the current repository or into Git metadata are blocked.")
@@ -2183,6 +2213,8 @@ def evaluate_command(command: str, cwd: str, root: Path,
         state_reason = task_state_write_reason(tokens, cwd)
         if state_reason:
             return Denial("task.private_state_write", state_reason)
+        if any(credential_path(token, cwd) for token in tokens):
+            return Denial("credential.protected_path", CREDENTIAL_REASON)
     had_chain = len(all_tokens) > 1
     while all_tokens and all_tokens[0][:1] == ["set"]:
         options = all_tokens[0][1:]
@@ -2328,10 +2360,15 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
     tokens = unwrapped
     if not tokens:
         return None
+    if any(token == SKIP_PERMISSIONS_FLAG or token.startswith(SKIP_PERMISSIONS_FLAG + "=") for token in tokens):
+        return Denial("agent.skip_permissions", "--dangerously-skip-permissions is refused in every session: "
+                      "it skips tool permission prompts (T-48).")
     executable = Path(tokens[0]).name.lower()
     external = external_binary(tokens[0], cwd, root)
     if external is not None:
         executable = external.name.lower()
+    if executable in AGY_EXECUTABLES and lane_session():
+        return Denial("agy.lane_boundary", AGY_LANE_REASON)
     # Beyond the globally unsafe names above, any npm configuration spelling is
     # refused on package commands. Evaluated wrappers and assignments are stripped.
     if inline_npm_config and executable in {"npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"}:
