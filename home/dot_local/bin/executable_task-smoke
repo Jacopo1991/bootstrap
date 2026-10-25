@@ -34,10 +34,12 @@ PROMPT = """# Lane smoke {ident} ({builder})
 This is an install smoke test on a scratch project. Do these steps in this worktree, in order, then stop:
 
 Before editing, run uv run --no-project --with colorama==0.4.6 python smoke_check.py and stop if it fails.
-1. Create `smoke.txt` containing exactly one line: `ok`.
+1. Create `smoke.txt` containing exactly one line: `ok`, with your file-edit tool, never an inline interpreter (`python -c`, heredocs).
 2. `git add smoke.txt` and `git commit -m "smoke: write smoke.txt"`.
 3. `git merge main`. Main has one new commit, so Git creates a merge commit; if it leaves the merge uncommitted, commit it.
 4. Fill `.work/report.md`: What changed, How I verified, Criteria (`#1 met: smoke.txt contains ok`), Not done, Noticed, not done and Check.
+5. Look up the latest astral-sh/uv release tag at https://github.com/astral-sh/uv/releases with your web tool.
+   Add a non-empty line to `.work/report.md`: `Web lookup: <fact and source URL>`.
 
 Do not run `task check`, do not push and do not merge.
 """
@@ -172,9 +174,11 @@ def merge_error(wt, repo, log):
 
 def report_error(wt, log):
     text = read(wt / ".work/report.md")
-    if re.search(r"(?m)^#1 met:", text) and "(fill in)" not in text:
-        return None
-    return lane_error(log, ".work/report.md is not filled in (no `#1 met:` line)")
+    if not re.search(r"(?m)^#1 met:", text) or "(fill in)" in text:
+        return lane_error(log, ".work/report.md is not filled in (no `#1 met:` line)")
+    if not re.search(r"(?m)^Web lookup:[^\S\r\n]*\S[^\r\n]*$", text):
+        return lane_error(log, ".work/report.md has no non-empty `Web lookup:` line")
+    return None
 
 
 def review_verdict(repo, name):
