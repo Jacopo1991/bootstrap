@@ -1172,10 +1172,10 @@ PyPI and about six for npm (its database is about 200 MB).
   (`pre-commit gc`) and the hook install creates it too.
 - **Vulnerability data:** `osv-db-refresh` downloads the PyPI, npm, crates.io, Go,
   Packagist and RubyGems databases (only changed files, zip-checked). The tools script
-  runs it on install, and the user timer `osv-db-refresh.timer` runs it weekly
-  (`OnCalendar=weekly`, `Persistent=true`, so a week missed while the distro was stopped
-  is caught up on the next start). It is a plain download with no agent runs, enabled by
-  `qmd-setup.sh` next to `qmd-index.timer`.
+  runs it on install. The user timer `osv-db-refresh.timer` now runs security-watch
+  daily, refreshing these databases before scanning installed environments
+  (`OnCalendar=daily`, `Persistent=true` catches up after downtime). It uses no agent
+  runs and is enabled by `qmd-setup.sh` next to `qmd-index.timer`.
 - **Errors:** `osv-db-refresh` tries every ecosystem, logs `ERROR <ecosystem>` for each
   failure, keeps that ecosystem's previous database and exits non-zero, so the unit
   shows in `systemctl --user --failed` and `journalctl --user -u osv-db-refresh`. Only a
@@ -1202,8 +1202,8 @@ PyPI and about six for npm (its database is about 200 MB).
   checks the config and hook in both new repositories. `ci/osv-db-test.py` checks the
   npm exception (one ID, a reason, the expiry date, still matching the lock), the units
   and their enablement, and that `osv-db-refresh` reports failures, keeps old data and
-  stamps only a full success. With osv-scanner and the offline npm database installed,
-  it also checks that the exception passes the lock until it expires, that an expired
+  stamps only a full success. With osv-scanner installed, a synthetic offline npm
+  database checks that the exception passes the lock until it expires, that an expired
   copy blocks it and that the lock without the exception is blocked.
 
 ### Package caps (the litellm lock rule)
@@ -1367,7 +1367,8 @@ file; a job whose key is missing skips its ping silently.
 | --- | --- | --- | --- |
 | `qmd-index` | `qmd-index.timer` (AgentDev) | every 15 minutes | `QMD_INDEX_URL` |
 | `task-watch` | `task-watch.timer` (PM enables after review) | every 15 minutes | `TASK_WATCH_URL` |
-| `osv-db-refresh` | `osv-db-refresh.timer` (AgentDev) | weekly | `OSV_DB_REFRESH_URL` |
+| `osv-db-refresh` | `osv-db-refresh.timer` via security-watch (AgentDev) | daily | `OSV_DB_REFRESH_URL` |
+| `security-watch` | `osv-db-refresh.timer` (same timer, AgentDev) | daily | `SECURITY_WATCH_URL` |
 | `gh-skill-update` | `gh-skill-update.timer` (AgentDev) | daily | `GH_SKILL_UPDATE_URL` |
 | `windows-skills-update` | `MachineBootstrap-Skills-Update` task | daily 09:15 | `WINDOWS_SKILLS_UPDATE_URL` |
 | `windows-minutes-watchdog` | `MachineBootstrap-Minutes-Watchdog` task | daily 09:45 | `WINDOWS_MINUTES_WATCHDOG_URL` |
@@ -1376,7 +1377,7 @@ file; a job whose key is missing skips its ping silently.
 - **Files** (one `KEY=https://hc-ping.com/<uuid>` per line, nothing else needed): in AgentDev
   `~/project-data/healthchecks/pings.env` (runtime data, never Git; `chmod 600`); on Windows
   `%LOCALAPPDATA%\machine-bootstrap\pings.env` (keep it readable by your account only). AgentDev
-  needs the first three keys, Windows the last three. A ping URL is a secret: it is read at run
+  needs the AgentDev keys, Windows the last three. A ping URL is a secret: it is read at run
   time, handed to curl on stdin and never printed, logged, put in a command line or in Backrest's
   `config.json`. `JOB_PINGS_FILE` overrides the AgentDev path (tests use it).
 - **Never in the way:** `job-ping` (installed to `~/.local/bin`; `windows\job-ping.ps1` on
@@ -1400,6 +1401,97 @@ file; a job whose key is missing skips its ping silently.
   inventory-mirror jobs, which were not part of this change.
 - **Tests:** `ci/job-ping-test.py` (which URL, silent skips, timeouts, no URL in a command line, dead
   network) runs in `ci/lint.sh`; the Windows twin is tested in `ci/founder-tasks-test.ps1`.
+
+## Daily installed-environment security scan
+
+Security-watch replaces the old refresh-only schedule using the existing
+`osv-db-refresh.timer`; there is no separate `security-watch.timer`, so the timer
+count stays the same. The timer now runs daily, catches up after downtime, adds up
+to one hour of random delay, and starts `security-watch.service`. Each scan first
+starts the existing `osv-db-refresh.service` and waits for it; refresh failure fails
+the run even when cached data can still be scanned.
+
+The fixed roots, relative to the agent HOME, are:
+
+- `.local/share/bootstrap/npm` (including installed `node_modules` and the lockfile);
+- `.local/share/bootstrap/pre-commit/venv` and `.local/share/bootstrap/inspect/venv`;
+- `.local/share/bootstrap/gpu-venv` when installed;
+- `dev_workspace`, recursively, including project venv metadata and lockfiles.
+
+The scanner is pinned to osv-scanner 2.6.0. Scans use `--offline`,
+`--offline-vulnerabilities`, `--no-resolve`, `--no-ignore` and the bundled
+`python/wheelegg` and `javascript/packagejson` plugins alongside default lockfile
+plugins. Gitignored environments are included. Scanner path exclusions omit only
+top-level children of `~/dev_workspace` named
+customer-harness/CustomerHarness, typo3-dkm/typo3-dkm-plugin/Typo3/DKM,
+photo-organizer, secrets and project-data (case insensitive). Dependencies such as
+`node_modules/secrets` remain in scope. `.git`, `.worktrees` and `.work` are
+excluded at any depth within each scan root, also case insensitive. The service
+additionally masks the listed private repositories and `~/project-data` with
+`InaccessiblePaths=`; it leaves cortex and the security state directory accessible.
+Directory and file symlinks are not read by the scanner (covered by fixture canaries).
+Missing required roots and scan errors fail the run; an absent optional GPU
+environment has status `absent`, does not fail the run and is never counted as
+clean. Every scanned root must return packages.
+The npm tree must include `@openai/codex`, pre-commit must include `pre-commit`,
+and Inspect must include `inspect-ai`, with PEP 503 name normalisation.
+`dev_workspace` must include `@openai/codex`, present in the main bootstrap
+checkout's tracked `home/dot_local/share/bootstrap/npm/package-lock.json`.
+Error/fatal and `fserr` diagnostics fail the root. Fixture probes of scanner 2.6.0
+produce `fserr (non-permission error): ... not implemented` for a chmod-000 directory,
+and `Error during extraction:` for corrupt package.json and METADATA files.
+The count guard fails a root below half the highest count of its last 7 accepted
+runs. Rejected counts never enter history. Run `security-watch --accept-counts`
+after an intentional shrink: it performs the full scan with normal pings and exit
+codes, resetting history separately for roots that pass every other check.
+Empty roots, diagnostics and missing sentinels cannot be accepted. Resets appear
+in the report and STATUS.
+
+Exemptions use native `osv-scanner.toml` `[[IgnoredVulns]]` entries with an advisory
+`id`, `ignoreUntil` and `reason`. The only approved source is
+`~/.local/share/bootstrap/npm/osv-scanner.toml`; a missing file means no exemptions.
+The wrapper validates it with `tomllib`: non-empty ID and reason, a TOML date no
+more than 90 days ahead, and no other tables or fields. A symlink is refused.
+Every root receives one explicit `--config` pointing to the validated snapshot
+(or an empty file), so configs planted in projects or dependencies have no effect.
+JSON, Markdown and STATUS list the exemptions with reasons, expiry and whether
+they are effective. Exemptions expire at the start of `ignoreUntil` in UTC;
+exemptions apply to all roots (the approved reasons must be understood globally).
+Expired exemptions expose the finding again.
+
+Dated JSON reports under `~/.local/state/security/` contain scanner findings and
+diagnostics per root; `latest.json` points to the latest result by content. A dated
+Markdown summary and the `## Security` section of `~/cortex/cortex-core/STATUS.md`
+show package/advisory counts and advisory IDs per root (the first five IDs in
+STATUS). The job replaces only that section, preserving adjacent sections.
+Exemption IDs/reasons, advisory IDs and errors are collapsed to one line and
+limited to 200 characters in STATUS, with a leading `#` escaped.
+Atomic `counts.json` holds each root's last seven accepted counts, also carried
+by every dated JSON report. Missing, corrupt or non-dict latest/count state falls
+back to the newest valid dated report. Without one this is a first run with
+no baseline; the normal extraction, diagnostic and sentinel checks still apply.
+Dated JSON/Markdown pairs older than 60 days are pruned by filename timestamp,
+always retaining the newest valid dated report and the special state/config files.
+A non-blocking `state/run.lock` covers the entire run, including manual resets;
+overlapping runs exit with a clear error. This does not guard other writers of STATUS.
+It calls `job-ping security-watch 0` for a clean completed scan, or `1` for findings,
+refresh/scan errors or a failed status update. Pings pending: `SECURITY_WATCH_URL` must be
+added to the existing owner-managed pings file (Jacopo's action); until then failures show
+in STATUS and the journal. No report body is sent.
+The unit masks `~/project-data` read-only (`TemporaryFileSystem=`) and binds back only
+`~/project-data/healthchecks` (`BindReadOnlyPaths=`), so job-ping's default `pings.env` stays
+readable. job-ping is best effort by design: it always exits 0, so no wrapper change is needed,
+and a missing key or unreachable endpoint never fails the scan. Fixture tests verify calls,
+not delivery; the live proof reads the unit's view of the pings path after install.
+
+Refresh has a 30-minute budget and each of five roots has two minutes, within the
+45-minute unit timeout. An incomplete record replaces `latest.json` and the dated
+reports before work begins. SIGTERM stops scanning and leaves an incomplete result
+and failure ping. Reports are written before STATUS, and survive STATUS decode or
+write errors. Reports use a private umask. This wrapper does not install or repair packages.
+`ci/security-watch-test.py` and `ci/osv-db-test.py` use synthetic packages and local
+advisory zip fixtures, temporary HOME/state and stubbed refresh/ping commands; they
+never refresh a real feed or scan an installed environment.
 
 ## Backups (Backrest on Windows)
 

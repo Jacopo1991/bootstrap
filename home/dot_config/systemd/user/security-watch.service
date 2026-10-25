@@ -1,0 +1,26 @@
+[Unit]
+Description=Daily offline scan of installed environments and project lockfiles
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.local/share/mise/shims:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.local/bin/security-watch
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+InaccessiblePaths=-%h/dev_workspace/customer-harness
+InaccessiblePaths=-%h/dev_workspace/CustomerHarness
+InaccessiblePaths=-%h/dev_workspace/typo3-dkm-plugin
+InaccessiblePaths=-%h/dev_workspace/typo3-dkm
+InaccessiblePaths=-%h/dev_workspace/Typo3
+InaccessiblePaths=-%h/dev_workspace/DKM
+InaccessiblePaths=-%h/dev_workspace/photo-organizer
+InaccessiblePaths=-%h/dev_workspace/secrets
+InaccessiblePaths=-%h/dev_workspace/project-data
+# Hide ~/project-data (runtime data), then bind back only the Healthchecks pings directory
+# (job-ping reads its pings.env there), read-only.
+TemporaryFileSystem=%h/project-data:ro
+BindReadOnlyPaths=-%h/project-data/healthchecks
+TimeoutStartSec=45min

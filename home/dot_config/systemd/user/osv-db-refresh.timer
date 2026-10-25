@@ -1,9 +1,10 @@
 [Unit]
-Description=Refresh the OSV offline vulnerability databases weekly
+Description=Refresh OSV data and scan installed environments daily
 
 [Timer]
-OnCalendar=weekly
-# The distro is often stopped; catch up on the next start instead of skipping a week.
+OnCalendar=daily
+Unit=security-watch.service
+# The distro is often stopped; catch up on the next start instead of skipping a day.
 Persistent=true
 RandomizedDelaySec=1h
 
