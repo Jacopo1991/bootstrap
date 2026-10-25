@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import unittest
 from unittest import mock
 import tempfile
@@ -14,6 +15,49 @@ import monthly_pins as pins
 
 
 class ResolverTests(unittest.TestCase):
+    def test_agy_release_bump_leaves_no_old_pin_outside_named_prose_and_fixtures(self) -> None:
+        root = Path(pins.__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            copy = Path(directory) / "repo"
+            copy.mkdir()
+            for name in ("home", "checks", "docs", "ci"):
+                shutil.copytree(root / name, copy / name)
+            shutil.copy2(root / "README.md", copy / "README.md")
+            pins_path = copy / "home/.chezmoitemplates/pins.env"
+            source = pins_path.read_text(encoding="utf-8")
+            values = pins.parse_pins(source)
+            old_version = values["AGY_VERSION"]
+            old_sha = values["AGY_SHA256"]
+            notes: list[str] = []
+            artifact = b"fixture official agy 1.4.8 archive"
+            release = {"assets": [{"name": "agy_cli_linux_x64.tar.gz",
+                                   "browser_download_url": "https://example.invalid/agy-1.4.8.tar.gz"}]}
+            with mock.patch.object(pins, "latest_release", return_value=("1.4.8", release)), \
+                 mock.patch.object(pins, "request_bytes", return_value=artifact) as request:
+                updated, _resolved = pins.update_release_pin(
+                    source, values, notes, label="agy", repo="google-antigravity/antigravity-cli",
+                    version_key="AGY_VERSION", url_key="AGY_URL", sha_key="AGY_SHA256",
+                    asset_name=lambda _version: "agy_cli_linux_x64.tar.gz",
+                )
+            request.assert_called_once_with("https://example.invalid/agy-1.4.8.tar.gz")
+            pins_path.write_text(updated, encoding="utf-8")
+
+            findings = []
+            for path in [copy / "README.md"] + [
+                    path for directory_path in (copy / "home", copy / "checks", copy / "docs")
+                    for path in directory_path.rglob("*") if path.is_file()]:
+                content = path.read_text(encoding="utf-8", errors="replace")
+                relative = path.relative_to(copy).as_posix()
+                for needle in (old_version, old_sha):
+                    if needle in content and not (relative == "README.md" and needle == old_version):
+                        findings.append((relative, needle))
+            for pattern in ("*.py", "*.sh"):
+                for path in (copy / "ci").glob(pattern):
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                    findings.extend((path.relative_to(copy).as_posix(), needle)
+                                    for needle in (old_version, old_sha) if needle in content)
+            self.assertEqual(findings, [], "stale agy pin remains after simulated monthly bump")
+
     def test_agy_release_refresh_updates_version_url_and_asset_digest(self) -> None:
         old = (
             "AGY_VERSION='1.4.0'\n"
@@ -22,22 +66,22 @@ class ResolverTests(unittest.TestCase):
         )
         artifact = b"fixture official agy release archive"
         release = {"assets": [{"name": "agy_cli_linux_x64.tar.gz",
-                               "browser_download_url": "https://example.invalid/agy-1.4.7.tar.gz"}]}
+                               "browser_download_url": "https://example.invalid/agy-1.4.8.tar.gz"}]}
         pin_values = pins.parse_pins(old)
         notes: list[str] = []
-        with mock.patch.object(pins, "latest_release", return_value=("1.4.7", release)), \
+        with mock.patch.object(pins, "latest_release", return_value=("1.4.8", release)), \
              mock.patch.object(pins, "request_bytes", return_value=artifact) as request:
             updated, resolved = pins.update_release_pin(
                 old, pin_values, notes, label="agy", repo="google-antigravity/antigravity-cli",
                 version_key="AGY_VERSION", url_key="AGY_URL", sha_key="AGY_SHA256",
                 asset_name=lambda version: "agy_cli_linux_x64.tar.gz",
             )
-        request.assert_called_once_with("https://example.invalid/agy-1.4.7.tar.gz")
-        self.assertEqual(resolved["AGY_VERSION"], "1.4.7")
-        self.assertIn("AGY_VERSION='1.4.7'", updated)
-        self.assertIn("AGY_URL='https://example.invalid/agy-1.4.7.tar.gz'", updated)
+        request.assert_called_once_with("https://example.invalid/agy-1.4.8.tar.gz")
+        self.assertEqual(resolved["AGY_VERSION"], "1.4.8")
+        self.assertIn("AGY_VERSION='1.4.8'", updated)
+        self.assertIn("AGY_URL='https://example.invalid/agy-1.4.8.tar.gz'", updated)
         self.assertIn(f"AGY_SHA256='{hashlib.sha256(artifact).hexdigest()}'", updated)
-        self.assertIn("Updated agy to 1.4.7", notes[0])
+        self.assertIn("Updated agy to 1.4.8", notes[0])
 
     def test_only_stable_exact_versions_are_accepted(self) -> None:
         for value in ("24.21.0", "0.159.2", "2026.9.17"):

@@ -43,9 +43,6 @@ just_expected=${JUST_URL##*/download/}
 [[ $("$HOME/.local/bin/just" --version) == "just ${just_expected%%/*}" ]]
 # Antigravity CLI (agy): the release tarball is SHA-checked before restore.
 # The vendor's install script is never run. Lanes cannot run agy (policy hook, T-48).
-# shellcheck disable=SC1009,SC1054,SC1056,SC1072,SC1073,SC1083
-{{ include ".chezmoitemplates/agy-install.sh" }}
-# shellcheck enable=SC1009,SC1054,SC1056,SC1072,SC1073,SC1083
 install_agy
 pre_commit_root="$HOME/.local/share/bootstrap/pre-commit"
 mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$pre_commit_root/venv"

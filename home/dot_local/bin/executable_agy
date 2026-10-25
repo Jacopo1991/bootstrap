@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-export AGY_CLI_DISABLE_AUTO_UPDATE=true
-exec "$HOME/.local/share/bootstrap/agy/1.4.7/antigravity" "$@"

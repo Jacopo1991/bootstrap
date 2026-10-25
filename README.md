@@ -1267,14 +1267,15 @@ PyPI and about six for npm (its database is about 200 MB).
 
 ### Antigravity CLI (agy)
 
-`agy` (Antigravity CLI 1.4.7) is a third vendor for research, read-only audits and plan
+`agy` (Antigravity CLI) is a third vendor for research, read-only audits and plan
 red-teams. Bootstrap installs the release tarball pinned in `pins.env` (`AGY_URL`,
-`AGY_SHA256`): the archive SHA-256 is checked before extraction, and bootstrap restores the
-pinned binary when its version or contents differ. The installed binary and version directory
+`AGY_SHA256`): the archive SHA-256 is checked before extraction. When the rendered bootstrap
+run-on-change script executes, it replaces a pinned binary whose contents differ. It redownloads
+and verifies the release archive on each run. The installed binary and version directory
 are made read-only, and `~/.local/bin/agy` is a wrapper that sets
 `AGY_CLI_DISABLE_AUTO_UPDATE=true` before executing the pinned binary. An owner can undo those
 permissions; the drift check reports `agy-version-drift` if the version or recorded binary SHA
-changes. The vendor's install script is never run. Version 1.4.7 is inside the seven-day release
+changes. The vendor's install script is never run. The pinned release is inside the seven-day
 cooldown, but is taken as a security-fix exception to Jacopo's 2026-10-25 rule never to run
 outdated, potentially vulnerable versions. Its release fixes cross-user plugin MCP OAuth token
 use; 1.4.6 also closed sandbox access to `~/.docker` and `~/.kube`, and 1.4.4 fixed telemetry
