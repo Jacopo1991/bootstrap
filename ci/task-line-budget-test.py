@@ -1,58 +1,93 @@
 #!/usr/bin/env python3
-"""Exercise the line budget checker at and above its limit."""
+"""Exercise the footprint report: sizes are printed, nothing fails on size, change is against a base."""
+import os
 import subprocess
 import sys
 import tempfile
-import contextlib
-import importlib.util
-import io
 from pathlib import Path
-from unittest.mock import patch
 
 checker = Path(__file__).with_name("task-line-budget.py")
-with tempfile.TemporaryDirectory() as directory:
-    fixture = Path(directory) / "fixture"
-    for count, expected in ((3, 0), (4, 1)):
-        fixture.write_text("line\n" * count)
-        result = subprocess.run([sys.executable, checker, fixture, "3"],
-                                text=True, capture_output=True)
-        assert result.returncode == expected, result
-        assert f"total: {count} lines across 1 local files (budget 3)" in result.stdout, result.stdout
+# Fixture repositories must not inherit a build lane's git environment.
+clean_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
 
-    entry = Path(directory) / "executable_task"
-    entry.write_text("import task_extra\nentry\n")
-    (Path(directory) / "task_extra.py").write_text("extra\nextra\nextra\n")
-    result = subprocess.run([sys.executable, checker, entry, "4"],
-                            text=True, capture_output=True)
-    assert result.returncode == 1, result
-    assert "5 lines across 2 local files (budget 4)" in result.stdout, result.stdout
-    assert f"{entry}: 2 lines" in result.stdout, result.stdout
-    assert f"{Path(directory) / 'task_extra.py'}: 3 lines" in result.stdout, result.stdout
 
-    # The default budget covers task's three entry points and their task_* modules,
-    # including transitive imports, but excludes independently scheduled jobs.
+def make_root(directory):
     root = Path(directory) / "repo"
     bin_dir = root / "home/dot_local/bin"
     bin_dir.mkdir(parents=True)
     (root / "ci").mkdir()
-    (root / "ci/task-line-budget.txt").write_text("6\n")
-    (bin_dir / "executable_task").write_text("import task_extra\n")
+    (root / "ci/task-line-budget.py").write_text(checker.read_text())
+    return root, bin_dir
+
+
+def run_checker(root, *args):
+    return subprocess.run([sys.executable, root / "ci/task-line-budget.py", *args],
+                          cwd=root, text=True, capture_output=True, env=clean_env)
+
+
+def git(root, *args):
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Budget Test",
+                    "-c", "user.email=budget-test@example.invalid", *args],
+                   check=True, capture_output=True, env=clean_env)
+
+
+with tempfile.TemporaryDirectory() as directory:
+    # An over-size tree reports its size and still exits 0.
+    root, bin_dir = make_root(Path(directory) / "large")
+    (bin_dir / "executable_task").write_text("import task_extra\n" + "line\n" * 9000)
+    (bin_dir / "executable_task-batch").write_text("batch\n")
+    (bin_dir / "executable_task-watch").write_text("watch\n" * 200)
+    (bin_dir / "task_extra.py").write_text("extra\n" * 500)
+    (bin_dir / "executable_security-watch").write_text("outside footprint\n" * 100)
+    result = run_checker(root, "--base", "no-such-rev")
+    assert result.returncode == 0, result
+    assert f"{bin_dir / 'executable_task'}: 9001 lines" in result.stdout, result.stdout
+    assert f"{bin_dir / 'task_extra.py'}: 500 lines" in result.stdout, result.stdout
+    assert "total: 9702 lines across 4 local files" in result.stdout, result.stdout
+    assert "security-watch" not in result.stdout, result.stdout
+    assert "cannot resolve no-such-rev; change not measured" in result.stdout, result.stdout
+
+    # An entry point that cannot be read is the only failure.
+    root, bin_dir = make_root(Path(directory) / "missing")
     (bin_dir / "executable_task-batch").write_text("batch\n")
     (bin_dir / "executable_task-watch").write_text("watch\n")
-    (bin_dir / "task_extra.py").write_text("import task_nested\n")
-    (bin_dir / "task_nested.py").write_text("nested\nnested\n")
-    for name in ("executable_security-watch", "executable_workspace-tidy", "unrelated.py"):
-        (bin_dir / name).write_text("outside budget\n" * 100)
-    spec = importlib.util.spec_from_file_location("line_budget", checker)
-    budget = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(budget)
-    output = io.StringIO()
-    with patch.object(budget, "__file__", str(root / "ci/task-line-budget.py")):
-        with contextlib.redirect_stdout(output):
-            assert budget.main([str(checker)]) == 0, output.getvalue()
-    counted = {line.split(": ", 1)[0] for line in output.getvalue().splitlines()
-               if line.startswith(str(bin_dir))}
-    assert counted == {str(bin_dir / name) for name in (
-        "executable_task", "executable_task-batch", "executable_task-watch",
-        "task_extra.py", "task_nested.py")}, output.getvalue()
-    assert "total: 6 lines across 5 local files (budget 6)" in output.getvalue()
+    result = run_checker(root)
+    assert result.returncode == 1, result
+    assert "cannot read task entry points" in result.stdout, result.stdout
+
+    # The change line compares the working tree with the base revision.
+    root, bin_dir = make_root(Path(directory) / "git")
+    (bin_dir / "executable_task").write_text("import task_extra\nentry\n")
+    (bin_dir / "executable_task-batch").write_text("batch\n")
+    (bin_dir / "executable_task-watch").write_text("watch\n")
+    (bin_dir / "task_extra.py").write_text("extra\nextra\nextra\n")
+    git(root, "init", "-q")
+    git(root, "symbolic-ref", "HEAD", "refs/heads/main")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "base")
+    base_commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], check=True,
+                                 capture_output=True, text=True, env=clean_env).stdout.strip()
+    (bin_dir / "executable_task").write_text("import task_extra\nentry\nmore\nmore\nmore\n")
+    result = run_checker(root)
+    assert result.returncode == 0, result
+    assert "total: 10 lines across 4 local files" in result.stdout, result.stdout
+    assert "base main: 7 lines" in result.stdout, result.stdout
+    assert "change against main: +3 lines" in result.stdout, result.stdout
+
+    # origin/main is preferred over main when it exists.
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "grow")
+    git(root, "update-ref", "refs/remotes/origin/main", base_commit)
+    result = run_checker(root)
+    assert result.returncode == 0, result
+    assert "base origin/main: 7 lines" in result.stdout, result.stdout
+    assert "change against origin/main: +3 lines" in result.stdout, result.stdout
+
+    # Without origin/main, main is the base; --base overrides both.
+    git(root, "update-ref", "-d", "refs/remotes/origin/main")
+    result = run_checker(root)
+    assert result.returncode == 0, result
+    assert "change against main: +0 lines" in result.stdout, result.stdout
+    result = run_checker(root, "--base", base_commit)
+    assert result.returncode == 0, result
+    assert "change against " + base_commit + ": +3 lines" in result.stdout, result.stdout
