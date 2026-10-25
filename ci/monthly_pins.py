@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,12 @@ ROOT = Path(__file__).resolve().parents[1]
 API = "https://api.github.com"
 MAX_DOWNLOAD = 150 * 1024 * 1024
 MONTHLY_BRANCH_PREFIX = "automation/monthly-pin-bump-"
+COOLDOWN_DAYS = 7
+# Hashed Python locks refreshed under the cooldown; the GPU lock needs its PyTorch index reviewed by hand.
+PYTHON_LOCKS = (
+    "home/dot_local/share/bootstrap/pre-commit/requirements.lock",
+    "home/dot_local/share/bootstrap/inspect/requirements.lock",
+)
 
 
 class ResolveError(RuntimeError):
@@ -424,13 +431,37 @@ def latest_python_312() -> str:
     )
 
 
-def npm_latest(name: str) -> str:
+def cooldown_cutoff(now: dt.datetime) -> dt.datetime:
+    return now - dt.timedelta(days=COOLDOWN_DAYS)
+
+
+def utc_stamp(moment: dt.datetime) -> str:
+    return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def npm_cooldown_candidate(name: str, cutoff: dt.datetime) -> tuple[str, list[str]]:
+    """Newest stable version up to the latest tag published before cutoff, and the younger ones skipped."""
     encoded = name.replace("/", "%2f")
     metadata = request_json(f"https://registry.npmjs.org/{encoded}")
-    version = str(metadata.get("dist-tags", {}).get("latest", ""))
-    if not stable_version(version):
+    latest = str(metadata.get("dist-tags", {}).get("latest", ""))
+    if not stable_version(latest):
         raise ResolveError("npm latest tag is not a stable exact version")
-    return version
+    times = metadata.get("time") or {}
+    eligible: list[str] = []
+    young: list[str] = []
+    for version in metadata.get("versions") or {}:
+        if not stable_version(version) or version_is_newer(version, latest):
+            continue
+        try:
+            published = dt.datetime.fromisoformat(str(times[version]).replace("Z", "+00:00"))
+        except (KeyError, ValueError):
+            continue
+        (eligible if published <= cutoff else young).append(version)
+    if not eligible:
+        raise ResolveError(f"no {name} release is older than the {COOLDOWN_DAYS}-day cooldown")
+    chosen = max(eligible, key=version_tuple)
+    skipped = sorted((v for v in young if version_is_newer(v, chosen)), key=version_tuple)
+    return chosen, skipped
 
 
 def npm_lock_has_full_integrity(lock: dict[str, Any]) -> bool:
@@ -447,7 +478,7 @@ def npm_lock_has_full_integrity(lock: dict[str, Any]) -> bool:
     return True
 
 
-def update_npm(root: Path, staged: dict[str, str], notes: list[str]) -> None:
+def update_npm(root: Path, staged: dict[str, str], notes: list[str], now: dt.datetime) -> None:
     package_path = root / "home/dot_local/share/bootstrap/npm/package.json"
     lock_path = root / "home/dot_local/share/bootstrap/npm/package-lock.json"
     package_text = staged.get(str(package_path), package_path.read_text(encoding="utf-8"))
@@ -455,15 +486,22 @@ def update_npm(root: Path, staged: dict[str, str], notes: list[str]) -> None:
     try:
         package = json.loads(package_text)
         deps = package["dependencies"]
-        candidates = {name: npm_latest(name) for name in ("@openai/codex", "ccusage")}
+        cutoff = cooldown_cutoff(now)
+        candidates = {}
+        for name in ("@openai/codex", "ccusage"):
+            candidates[name], skipped = npm_cooldown_candidate(name, cutoff)
+            if skipped:
+                notes.append(f"Skipped young npm candidate {name} {', '.join(skipped)}: "
+                             f"published within the {COOLDOWN_DAYS}-day cooldown.")
         for name, candidate in candidates.items():
             if version_is_newer(candidate, deps[name]):
                 deps[name] = candidate
                 notes.append(f"Updated npm tool {name} to {candidate}.")
             elif candidate == deps[name]:
-                notes.append(f"Current npm tool {name} pin is latest stable.")
+                notes.append(f"Current npm tool {name} pin is the newest stable release outside the cooldown.")
             else:
-                notes.append(f"Retained npm tool {name}; registry latest tag is older than the committed version.")
+                notes.append(f"Retained npm tool {name}; the newest release outside the cooldown is older "
+                             "than the committed version.")
         new_package_text = json.dumps(package, indent=2) + "\n"
         with tempfile.TemporaryDirectory(prefix="bootstrap-npm-lock-") as temp_name:
             temp = Path(temp_name)
@@ -473,13 +511,13 @@ def update_npm(root: Path, staged: dict[str, str], notes: list[str]) -> None:
             try:
                 generated = subprocess.run(
                     ["npm", "install", "--package-lock-only", "--lockfile-version=2",
-                     "--ignore-scripts", "--no-audit", "--no-fund"],
+                     "--ignore-scripts", "--no-audit", "--no-fund", "--before=" + utc_stamp(cutoff)],
                     cwd=temp, check=False, capture_output=True, text=True, timeout=900, env=env
                 )
             except (OSError, subprocess.TimeoutExpired):
                 raise ResolveError("npm lock generation failed or timed out") from None
             if generated.returncode:
-                raise ResolveError("npm lock generation failed")
+                raise ResolveError(f"npm lock generation with --before={utc_stamp(cutoff)} failed")
             lock_result = json.loads((temp / "package-lock.json").read_text(encoding="utf-8"))
             if not npm_lock_has_full_integrity(lock_result):
                 raise ResolveError("generated lock lacks complete package integrity metadata")
@@ -501,6 +539,33 @@ def update_npm(root: Path, staged: dict[str, str], notes: list[str]) -> None:
 
 def staged_text(path: Path, staged: dict[str, str]) -> str:
     return staged.get(str(path), path.read_text(encoding="utf-8"))
+
+
+def update_python_locks(root: Path, staged: dict[str, str], notes: list[str], now: dt.datetime) -> None:
+    """Re-run each lock's own uv pip compile command with --upgrade and the cooldown passed explicitly."""
+    cutoff = utc_stamp(cooldown_cutoff(now))
+    env = {key: value for key, value in os.environ.items() if key != "GH_TOKEN"}
+    for relative in PYTHON_LOCKS:
+        path = root / relative
+        try:
+            text = staged_text(path, staged)
+            header = re.search(r"^#    (uv pip compile .+)$", text, re.MULTILINE)
+            args = shlex.split(header.group(1)) if header else []
+            if args[:3] != ["uv", "pip", "compile"] or "--output-file" not in args[:-1]:
+                raise ResolveError("lock header does not record its uv pip compile command")
+            with tempfile.TemporaryDirectory(prefix="bootstrap-python-lock-") as temp_name:
+                output = Path(temp_name) / "requirements.lock"
+                args[args.index("--output-file") + 1] = str(output)
+                run_quietly([*args, "--upgrade", "--exclude-newer", cutoff,
+                             "--custom-compile-command", header.group(1)], cwd=root, env=env)
+                result = output.read_text(encoding="utf-8")
+            if result == text:
+                notes.append(f"Current Python lock {relative} is newest outside the cooldown.")
+            else:
+                staged[str(path)] = result
+                notes.append(f"Refreshed Python lock {relative} with uv --exclude-newer {cutoff}.")
+        except (ResolveError, OSError) as exc:
+            notes.append(f"Retained Python lock {relative}: {exc}.")
 
 
 def update_mise_config(root: Path, pins: dict[str, str], staged: dict[str, str]) -> None:
@@ -576,7 +641,7 @@ def update(root: Path, dry_run: bool) -> str:
 
     staged[str(pins_path)] = pins_text
     try:
-        update_npm(root, staged, notes)
+        update_npm(root, staged, notes, now)
     finally:
         # Keep top-level npm versions and their duplicate environment pins aligned.
         try:
@@ -590,6 +655,7 @@ def update(root: Path, dry_run: bool) -> str:
         except (KeyError, ValueError, json.JSONDecodeError):
             pass
 
+    update_python_locks(root, staged, notes, now)
     pins = parse_pins(staged_text(pins_path, staged))
     notes.append("Retained Claude Code version and installer hash: this version pairing is not resolved by the updater; its moving installer requires manual review.")
     notes.append("Retained apt signing-key hashes; key rotation requires a separately reviewed official-key change.")

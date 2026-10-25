@@ -1292,7 +1292,8 @@ PyPI and about six for npm (its database is about 200 MB).
   `home/dot_local/share/bootstrap/pre-commit/requirements.lock` (`uv pip compile
   --generate-hashes`), installed with `uv pip sync --require-hashes` into
   `~/.local/share/bootstrap/pre-commit/venv` and linked to `~/.local/bin/pre-commit`.
-  The monthly pin updater does not cover them, so bump them by hand.
+  The monthly pin updater refreshes this lock and the inspect lock with
+  `uv pip compile --upgrade --exclude-newer` (see Monthly pin review).
 - **Sandbox:** inside the agent sandbox `~/.cache` is read-only. pre-commit then runs
   local hooks from its existing store, so the tools script creates the store
   (`pre-commit gc`) and the hook install creates it too.
@@ -1787,6 +1788,12 @@ vendor apt lock against that vendor's own signed repository. It refreshes exact
 stable releases when the official release artifact can be identified and
 checksum-pinned, keeps Node on the 24 LTS line and Python on 3.12, and regenerates
 the full npm lock with lockfile version 2 before requiring `npm ci` to pass.
+The npm tools and Python locks keep a 7-day cooldown (T-43): each npm tool moves
+to the newest stable version published more than 7 days ago, read from the
+packument's `time` field; the npm lock is regenerated with an explicit `--before`
+date; and the hashed pre-commit and inspect locks are recompiled with uv
+`--upgrade --exclude-newer` at the same cutoff. A younger release that was
+skipped is named in the summary. The GPU lock stays a manual update.
 Every unresolved component stays at its previous pin and is listed in the
 workflow summary and pull request body. Claude Code's moving installer/version pairing is not resolved by this updater and
 requires manual review; signing-key rotations remain pinned for manual review.
@@ -1804,6 +1811,20 @@ must enable **Allow GitHub Actions to create and approve pull requests**. Keep
 the existing `gate` job required and allow the `workflow_dispatch` event under
 any Actions execution policy. A manual run defaults to a read-only candidate
 preview; select the non-preview option only when a pull request is intended.
+
+The uv cooldown applies only where versions are chosen: this monthly bump and a
+hand-run lock upgrade. Outside agent sessions (the policy hook refuses inline
+`--exclude-newer`), upgrade a `uv.lock` with the cutoff passed explicitly:
+
+```bash
+uv lock --upgrade --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+It never goes in the user uv config, `uv.toml` or `[tool.uv]`: there it refuses young
+exact pins and breaks existing locks (T-37). The policy hook refuses uv commands
+when a `uv.toml` or `pyproject.toml [tool.uv]` between the working directory and
+the repository root sets `exclude-newer` or `exclude-newer-package`, as it
+refuses the inline `--exclude-newer` and `UV_EXCLUDE_NEWER` forms.
 
 
 ### Repository commands and approved network access

@@ -322,6 +322,27 @@ class T42PolicyTests(unittest.TestCase):
                              "env -u UV_EXCLUDE_NEWER uv sync", "env --unset=UV_NO_CONFIG uv sync"), False)
         self.check_commands(("uv sync", "uv pip install pkg", "uv --version", "uvx --help"), True)
 
+    def test_uv_cooldown_in_worktree_config(self):
+        runners = ("uv sync", "uv pip install pkg", "uv lock --upgrade", "uv run evil")
+        sub = self.root / "pkg"
+        sub.mkdir()
+        for name, body in (("uv.toml", 'exclude-newer = "2099-01-01T00:00:00Z"\n'),
+                           ("uv.toml", '[exclude-newer-package]\npkg = "2099-01-01T00:00:00Z"\n'),
+                           ("uv.toml", '[pip]\nexclude-newer = "2099-01-01T00:00:00Z"\n'),
+                           ("pyproject.toml", '[project]\nname = "x"\n[tool.uv]\n'
+                                              'exclude-newer = "2099-01-01T00:00:00Z"\n')):
+            with self.subTest(name=name, body=body):
+                (self.root / name).write_text(body)
+                self.check_commands(runners, False)
+                self.assertFalse(policy.evaluate({"tool_name": "Bash", "cwd": str(sub),
+                                                  "tool_input": {"command": "uv sync"}}, (self.root,)) is None)
+                self.check_commands(("uv --version", "uvx --help"), True)
+                (self.root / name).unlink()
+        (self.root / "uv.toml").write_text('cache-dir = "fixture"\n')
+        (self.root / "pyproject.toml").write_text('[project]\nname = "x"\n[tool.uv]\npackage = false\n'
+                                                  '[tool.other]\nexclude-newer = "x"\n')
+        self.check_commands(("uv sync", "uv pip install pkg", "uv run evil"), True)
+
     def test_git_other_branches(self):
         for option in ("-f", "-D", "-m", "--force", "--delete", "--move", "-M", "-d"):
             self.check_commands((f"git branch {option} other", f"git branch {option} other renamed",

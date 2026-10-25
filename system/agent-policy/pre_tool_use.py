@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tomllib
 from datetime import datetime, timezone
 
 HOST_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd.exe",
@@ -2493,6 +2494,34 @@ def evaluate_command(command: str, cwd: str, root: Path,
     return None
 
 
+UV_COOLDOWN_KEYS = ("exclude-newer", "exclude-newer-package")
+
+
+def uv_config_cooldown(cwd: str, root: Path) -> bool:
+    """True when a uv.toml or pyproject.toml [tool.uv] from cwd up to the repository sets the cooldown (T-43)."""
+    try:
+        directory = Path(cwd).resolve()
+        while True:
+            for name in ("uv.toml", "pyproject.toml"):
+                config = directory / name
+                if not config.is_file():
+                    continue
+                try:
+                    data = tomllib.loads(config.read_text(encoding="utf-8"))
+                except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+                    return True
+                table = data if name == "uv.toml" else data.get("tool", {}).get("uv", {})
+                tables = [table, table.get("pip", {})] if isinstance(table, dict) else []
+                if any(isinstance(item, dict) and any(key in item for key in UV_COOLDOWN_KEYS)
+                       for item in tables):
+                    return True
+            if directory == root or root not in directory.parents:
+                return False
+            directory = directory.parent
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
 def evaluate_segment(tokens: list[str], cwd: str, root: Path,
                      approved_roots: tuple[Path, ...] | None, depth: int = 0,
                      npm_config_override: bool = False) -> str | None:
@@ -2530,6 +2559,8 @@ def evaluate_segment(tokens: list[str], cwd: str, root: Path,
                 "--exclude-newer", "--exclude-newer-package", "--no-config", "--config-file"}
                for token in tokens[1:]):
             return "Installer cooldown and configuration overrides are blocked."
+        if tokens[1:] not in (["--help"], ["-h"], ["--version"], ["-V"]) and uv_config_cooldown(cwd, root):
+            return "A cooldown override in uv.toml or pyproject.toml [tool.uv] is blocked."
         if tokens[1:] not in (["--help"], ["-h"], ["--version"], ["-V"]):
             if executable == "uvx" or tokens[1:3] == ["tool", "run"]:
                 return "Fetch-and-run uv runners cannot be judged safely."

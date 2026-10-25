@@ -3257,7 +3257,9 @@ def sync_dependencies_after_merge(repo: Path, old_head: str, new_head: str, upda
     if "not updated" in update_message or "up to date" in update_message or not old_head or old_head == new_head:
         return
     changed = git(repo, "diff", "--name-only", old_head, new_head).splitlines()
-    dependency_names = {"pyproject.toml", "uv.lock", "package.json", "package-lock.json", "pnpm-lock.yaml"}
+    # .npmrc and uv.toml (and pyproject.toml's [tool.uv]) can carry a cooldown override (T-43).
+    dependency_names = {"pyproject.toml", "uv.lock", "package.json", "package-lock.json", "pnpm-lock.yaml",
+                        ".npmrc", "uv.toml"}
     dependencies = [name for name in changed
                     if Path(name).name in dependency_names
                     or (Path(name).name.startswith("requirements")
