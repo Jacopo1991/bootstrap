@@ -49,3 +49,36 @@ def lane_limit(record, work):
         if limit:
             return limit
     return ""
+
+
+# T-62 (company decision-27): why a lane round ended. First match wins; the four setup causes cost
+# no round, anything else is the lane's own code-or-test round. Lines of the lane's prompt are ignored.
+ROUND_CAUSES = (
+    ("policy-denial", r"(denied|blocked) by (the )?(policy|hook|guard)|policy hook|hook (denied|blocked)"),
+    ("missing-tool-or-cache", r"command not found|is not installed|not on PATH|cache\b.*(read-only|not writable)"
+                              r"|(failed to (initialize|create|open|write)|cannot write)\b.*cache"),
+    ("sandbox-or-permission", r"read-only file system|permission denied|operation not permitted|sandbox\w* (denied|blocked)"),
+    ("lane-infrastructure", r"Lane launch failed|stream (error|disconnected)|connection (reset|refused)|overloaded"
+                            r"|service unavailable"),
+)
+SETUP_CAUSES = {cause for cause, _ in ROUND_CAUSES}
+
+
+def round_cause(record, work):
+    if record.get("state") in {"tampered", "timed_out"}:
+        return "code-or-test"
+    if record.get("exit_code") == 127:
+        return "missing-tool-or-cache"
+    if lane_limit(record, work):
+        return "lane-infrastructure"
+    try:
+        known = set((work / "prompt.md").read_text(errors="replace").splitlines())
+    except OSError:
+        known = set()
+    text = ""
+    for name in ("lane.log", "final.md"):
+        try:
+            text += "\n".join(line for line in (work / name).read_text(errors="replace").splitlines()[-400:] if line not in known) + "\n"
+        except OSError:
+            continue
+    return next((cause for cause, pattern in ROUND_CAUSES if re.search(pattern, text, re.I)), "code-or-test")

@@ -630,6 +630,12 @@ does not waive this rule. High-tier close requires current review and red-team e
 limit is reached; it refuses the flag below the limit. Total grants are capped at
 the policy's `extra_rounds` per task. Round counts persist across `start --refresh`,
 as do the ledgered extra grants.
+Setup failures cost no round (company decision-27): when a round ends, `task lane` records
+its cause in `rounds.json` from the lane's exit and log (`policy-denial`,
+`sandbox-or-permission`, `missing-tool-or-cache`, `lane-infrastructure` or `code-or-test`;
+the pattern table is `ROUND_CAUSES` in `task_limits.py`). Only `code-or-test` rounds count
+against `max_rounds` and `extra_rounds`. For a blind round the table missed, the PM or seat
+runs `task lane <repo> <id> --setup-round N "reason"` (ledgered; launches nothing).
 `task lane ... --effort low|medium|high` forwards effort to either vendor and records
 it; default is high.
 
@@ -932,7 +938,14 @@ step, and stops that builder at its first failure. It writes
 `~/.local/state/task/smoke/<run>.json`. A pass removes the scratch project; a
 FAIL keeps it and prints the paths, and `task smoke --clean <run>` removes them.
 
-A smoke costs two cheap lanes (Codex `gpt-6-luna`, Claude `haiku`) and two cheap
+Each builder then runs a second lane on the scratch project that runs the real
+`just check` of `~/dev_workspace/company`, `~/dev_workspace/bootstrap` and
+`~/cortex/cortex-core` (when it has a justfile) on throwaway clones and a
+`task-smoke-<run>` branch; the same checks run outside any lane first. A check
+that fails in the lane but passes outside is a setup failure and fails the smoke
+(company decision-27); one that fails outside too is a `WARN`, not a setup failure.
+
+A smoke costs four cheap lanes (two each on Codex `gpt-6-luna` and Claude `haiku`) and two cheap
 reviews (Claude `haiku` on the Codex build, Codex `gpt-6-luna` on the Claude
 build).
 

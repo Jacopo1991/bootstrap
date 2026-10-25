@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 import task_lock
-from task_limits import bwrap_denial, cli_limit, lane_limit
+from task_limits import bwrap_denial, cli_limit, lane_limit, round_cause, SETUP_CAUSES
 from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
@@ -1995,8 +1995,56 @@ def lane_git_grants(task: Task) -> list[str]:  # the worktree's Git dir (always 
     return [x for part in (base["git_dir"], *(f"{base['common']}/{name}" for name in ("objects", "refs", "logs"))) for x in ("--add-dir", part)]
 
 
+def end_round(task, run, work, state, code):
+    """Record why the round ended in the private rounds.json; a setup cause frees the round (T-62)."""
+    path = task_state(task) / "rounds.json"
+    rounds = read_json_object(path)
+    cause = round_cause(dict(run, state=state, exit_code=code), work)
+    number = (run.get("usage_run") or {}).get("round") or rounds.get("used", 0)
+    rounds.setdefault("rounds", []).append(dict(round=number, cause=cause, counted=cause not in SETUP_CAUSES, ended_at=utc_now()))
+    if cause in SETUP_CAUSES:
+        refund_grant(task, rounds, number, cause)
+    atomic_json(path, rounds)
+
+
+def refund_grant(task, rounds, number, reason):
+    """A setup-caused round launched with --extra-round gives its grant back (ledgered next to the grant)."""
+    if number in rounds.get("grants", []):
+        rounds["grants"].remove(number)
+        rounds["extra"] = max(rounds.get("extra", 0) - 1, 0)
+        task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds refund", f"round {number}", reason)
+
+
+def setup_round(task, number, reason):
+    """`task lane --setup-round N REASON`: the PM or seat frees a round the classifier counted (ledgered)."""
+    path = task_state(task) / "rounds.json"
+    rounds = read_json_object(path)
+    used = rounds.get("used", 0)
+    if not number.isdigit() or not 1 <= int(number) <= used or not reason.strip():
+        raise Stop(f"--setup-round needs a started round (1-{used}) and a nonempty reason")
+    number = int(number)
+    run = read_json_object(task.worktree() / ".work/lane.json")
+    if number == used and run.get("state") == "running" and lane_alive(run):
+        raise Stop(f"round {number} is still running")
+    entries = rounds.setdefault("rounds", [])
+    entry = next((item for item in entries if item.get("round") == number), None)
+    if entry is None:
+        entry = dict(round=number, cause="unrecorded")
+        entries.append(entry)
+    if not entry.get("counted", True):
+        raise Stop(f"round {number} already does not count ({entry.get('marked') or entry['cause']})")
+    entry.update(counted=False, marked=reason)
+    refund_grant(task, rounds, number, reason)
+    atomic_json(path, rounds)
+    task_usage.record_override(HOME, task.repo.name, task.id, "setup round", f"round {number}", reason)
+    print(f"round {number} marked setup-caused ({reason}); it does not count against the round limit")
+    return 0
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
+    if getattr(args, "setup_round", None):
+        return setup_round(task, *args.setup_round)
     worktree_metadata_ok(task)
     path = task.worktree()
     record = load_record(task)
@@ -2063,11 +2111,13 @@ def lane(args):
             rounds = read_json_object(task_state(task) / "rounds.json")
             used = rounds.get("used", (previous.get("usage_run") or {}).get("round", 0))
             extra = rounds.get("extra", 0)
+            # Setup-caused rounds stay in the record but cost no round (company decision-27).
+            counted = used - sum(not item.get("counted", True) for item in rounds.get("rounds", []))
             if args.extra_round is not None and not args.extra_round.strip():
                 raise Stop(f"risk {risk}: --extra-round needs a nonempty reason")
-            if args.extra_round is not None and used < limits["max_rounds"] + extra:
+            if args.extra_round is not None and counted < limits["max_rounds"] + extra:
                 raise Stop(f"risk {risk}: --extra-round is allowed only when the round limit is reached")
-            if used >= limits["max_rounds"] + extra:
+            if counted >= limits["max_rounds"] + extra:
                 if not args.extra_round or not limits["extra_rounds"]:
                     raise Stop(f"risk {risk}: maximum {limits['max_rounds'] + extra} build/fix rounds; use --extra-round REASON")
                 if extra >= limits["extra_rounds"]:
@@ -2104,7 +2154,8 @@ def lane(args):
                 if os.environ.get('TASK_PLAN'): (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
                 atomic_json(lane_record, dict(unit=child.unit, state='skipped: hold', ended_at=utc_now()))
                 print('skipped: hold'); return 1
-            atomic_json(task_state(task) / "rounds.json", dict(used=used + 1, extra=extra))
+            grants = rounds.get("grants", []) + ([used + 1] if extra != rounds.get("extra", 0) else [])
+            atomic_json(task_state(task) / "rounds.json", dict(rounds, used=used + 1, extra=extra, grants=grants))
             if extra != rounds.get("extra", 0):
                 task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
             ledger_ramp_exempt(args, task, builder, model, tier, bool(decision and decision["ramp_exempt"]))
@@ -2187,6 +2238,7 @@ def lane(args):
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     stop_child_group(child)
+                    end_round(task, run, work, "timed_out", None)
                     finalize_lane_record(lane_record, run, "tampered" if tamper_reason(task) else "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
                 except (SystemExit, KeyboardInterrupt):
@@ -2200,7 +2252,12 @@ def lane(args):
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
         state = "tampered" if tamper_reason(task) else "interrupted" if interrupted else "timed_out" if timed_out else result
-        finalize_lane_record(lane_record, run, state, exit_code=None if interrupted or timed_out else code or int(state == "tampered"))
+        exit_code = None if interrupted or timed_out else code or int(state == "tampered")
+        try:
+            end_round(task, run, work, state, exit_code)
+        except OSError as error:
+            print(f"Round cause not recorded: {error}", file=sys.stderr)
+        finalize_lane_record(lane_record, run, state, exit_code=exit_code)
     return code
 
 
@@ -5163,6 +5220,8 @@ def main(argv=None):
         if name == "lane":
             sub.add_argument("--effort", choices=("low", "medium", "high"), default="high")
             sub.add_argument("--extra-round", metavar="REASON")
+            sub.add_argument("--setup-round", nargs=2, metavar=("ROUND", "REASON"),
+                             help="mark an earlier round setup-caused so it does not count (ledgered); launches nothing")
             sub.add_argument("--no-boost", action="store_true")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
