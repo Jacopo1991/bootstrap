@@ -7,5 +7,6 @@ export DISABLE_AUTOUPDATER=1
 # pre-commit lock: {{ include "dot_local/share/bootstrap/pre-commit/requirements.lock" | sha256sum }}
 # inspect lock: {{ include "dot_local/share/bootstrap/inspect/requirements.lock" | sha256sum }}
 # mise config:{{ include "dot_config/mise/config.toml" | sha256sum }}
+# agy 1.4.0 release sha256: fd96967583c1eed94733c039638fa59b71ddbd823c75ebc8dd0e677463565aad
 {{ include ".chezmoitemplates/pins.env" }}
 {{ include ".chezmoitemplates/tools.sh" }}

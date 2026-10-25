@@ -25,6 +25,7 @@
       "Read(~/.npmrc)",
       "Read(~/.claude.json)",
       "Read(~/.codex/auth.json)",
+      "Read(~/.gemini/**)",
       "Read(//etc/shadow)",
       "Read(//etc/sudoers)",
       "Read(//etc/sudoers.d/**)",
