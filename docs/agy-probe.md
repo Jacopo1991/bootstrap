@@ -23,6 +23,11 @@ Then Jacopo sets the data options in the CLI, since no settings key is documente
 - `/config`: `Enable Telemetry` off;
 - Remote Control off (no `agy remote-control serve` daemon).
 
+The PM then reads both settings back from `/config` and records them in the table below. If a
+settings key for either one appears in `~/.gemini/antigravity-cli/settings.json`, the PM records
+only the key name and its value. The PM never prints or opens the credential files in that folder.
+A key found this way is a follow-up for bootstrap and the drift check; it is not added here.
+
 ## 2. One prompt per available model
 
 From the PM's unsandboxed shell, for each model the CLI lists (the model list comes from the

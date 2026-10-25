@@ -1215,17 +1215,21 @@ install script is never run. The drift report reads back `agy --version`.
 - **Who runs it:** the PM, from an unsandboxed shell (`agy -p "<prompt>"`, `--add-dir <path>`).
   The policy hook refuses `agy` and `antigravity` in every lane session (T-48). It refuses
   `--dangerously-skip-permissions` in every session.
-- **Data:** public material only until Google's data terms are checked. The CLI's README says
+- **Data:** public material only until Google's data terms are checked. According to Google's
+  forum reply of 2026-10-09, prompts are not collected for training when `Enable Telemetry` is
+  off; public material only until the probe confirms that. The CLI's README says
   Google collects and uses "Interactions data" by default, with an opt-out in settings. No
   `settings.json` key for that opt-out, or for Remote Control, is documented in the release
   notes we pinned, so bootstrap writes no settings file. The opt-outs are Jacopo's account
   action in the CLI (`/config`: `Enable Telemetry` off; Remote Control off).
 - **Credentials:** the Google sign-in lives in `~/.gemini/` (credentials under
-  `~/.gemini/antigravity-cli/`). Claude's `Read(~/.gemini/**)` deny in the managed guardrails
-  also feeds the sandbox read-deny. The policy hook refuses any Bash, Write, Edit or
-  `apply_patch` access to `~/.gemini` in both vendors; Codex has no native read-deny in this
-  repository, so the hook is its guard. The hook matches command tokens, so a recursive search
-  from the home folder (for example `grep -r ... ~`) is not caught by it.
+  `~/.gemini/antigravity-cli/`). Both vendors' sandboxes deny reads of `~/.gemini`: Claude's
+  `Read(~/.gemini/**)` deny and sandbox read-deny in the managed guardrails, and Codex's
+  `~/.gemini` filesystem deny in `system/codex-requirements.toml` (T-52, the `lane` and `review`
+  profiles). The policy hook adds token-level refusals of any Bash, Write, Edit or `apply_patch`
+  access to `~/.gemini` in both vendors. The hook matches command tokens, so it does not catch a
+  recursive search from the home folder (for example `grep -r ... ~`); the sandbox read-deny is
+  the control for those reads.
 - **Login and probe:** the one-time login and the probe are in [docs/agy-probe.md](docs/agy-probe.md).
 
 ## Skills, prompt reminders and the minutes watchdog
