@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -13,6 +14,31 @@ import monthly_pins as pins
 
 
 class ResolverTests(unittest.TestCase):
+    def test_agy_release_refresh_updates_version_url_and_asset_digest(self) -> None:
+        old = (
+            "AGY_VERSION='1.4.0'\n"
+            "AGY_URL='https://github.com/google-antigravity/antigravity-cli/releases/download/1.4.0/agy_cli_linux_x64.tar.gz'\n"
+            "AGY_SHA256='fd96967583c1eed94733c039638fa59b71ddbd823c75ebc8dd0e677463565aad'\n"
+        )
+        artifact = b"fixture official agy release archive"
+        release = {"assets": [{"name": "agy_cli_linux_x64.tar.gz",
+                               "browser_download_url": "https://example.invalid/agy-1.4.7.tar.gz"}]}
+        pin_values = pins.parse_pins(old)
+        notes: list[str] = []
+        with mock.patch.object(pins, "latest_release", return_value=("1.4.7", release)), \
+             mock.patch.object(pins, "request_bytes", return_value=artifact) as request:
+            updated, resolved = pins.update_release_pin(
+                old, pin_values, notes, label="agy", repo="google-antigravity/antigravity-cli",
+                version_key="AGY_VERSION", url_key="AGY_URL", sha_key="AGY_SHA256",
+                asset_name=lambda version: "agy_cli_linux_x64.tar.gz",
+            )
+        request.assert_called_once_with("https://example.invalid/agy-1.4.7.tar.gz")
+        self.assertEqual(resolved["AGY_VERSION"], "1.4.7")
+        self.assertIn("AGY_VERSION='1.4.7'", updated)
+        self.assertIn("AGY_URL='https://example.invalid/agy-1.4.7.tar.gz'", updated)
+        self.assertIn(f"AGY_SHA256='{hashlib.sha256(artifact).hexdigest()}'", updated)
+        self.assertIn("Updated agy to 1.4.7", notes[0])
+
     def test_only_stable_exact_versions_are_accepted(self) -> None:
         for value in ("24.21.0", "0.159.2", "2026.9.17"):
             with self.subTest(value=value):

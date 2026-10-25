@@ -541,6 +541,8 @@ def update(root: Path, dry_run: bool) -> str:
          lambda v: f"gitleaks_{v}_linux_x64.tar.gz"),
         ("ShellCheck", "koalaman/shellcheck", "SHELLCHECK_VERSION", "SHELLCHECK_URL", "SHELLCHECK_SHA256",
          lambda v: f"shellcheck-v{v}.linux.x86_64.tar.xz"),
+        ("agy", "google-antigravity/antigravity-cli", "AGY_VERSION", "AGY_URL", "AGY_SHA256",
+         lambda _v: "agy_cli_linux_x64.tar.gz"),
     ]
     for label, repo, version_key, url_key, sha_key, asset in specs:
         pins_text, pins = update_release_pin(

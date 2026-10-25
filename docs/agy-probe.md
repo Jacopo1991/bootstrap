@@ -1,6 +1,6 @@
 # Antigravity CLI (agy) probe
 
-For the PM, after bootstrap has installed `agy` 1.4.0 (T-48). Agents do not run these steps:
+For the PM, after bootstrap has installed the pinned `agy` 1.4.7 (T-61). Agents do not run these steps:
 the login is Jacopo's, and the probe runs from an unsandboxed PM shell, because lane sessions
 are refused `agy` by the policy hook.
 
