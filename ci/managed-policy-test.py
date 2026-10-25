@@ -43,6 +43,7 @@ RESTRICTING = {"disableBypassPermissionsMode", "disableAutoMode", "defaultMode",
                "allow_managed_hooks_only", "allowed_approval_policies", "allowed_sandbox_modes",
                "allowed_permission_profiles", "default_permissions", "allowed_approvals_reviewers",
                "permissions", "remote_sandbox_config"}
+READ_DENY_KEYS = {"permissions", "allowed_permission_profiles", "default_permissions"}
 
 
 def keys(value, path=()):
@@ -101,9 +102,19 @@ assert claude_hooks == {
 
 # --- Codex ---------------------------------------------------------------------------------
 requirements = tomllib.loads((ROOT / "system/codex-requirements.toml").read_text(encoding="utf-8"))
-assert set(requirements) == {"features", "hooks", "rules"}, set(requirements)
-for path in keys(requirements):
-    assert path[-1] not in RESTRICTING, path
+assert set(requirements) == {"features", "hooks", "rules", "permissions", "allowed_permission_profiles",
+                             "default_permissions"}, set(requirements)
+# Read-deny profiles: only lane (writable, default) and review (read-only) may be selected.
+assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True}
+assert requirements["default_permissions"] == "lane"
+profiles = requirements["permissions"]
+assert set(profiles) == {"lane", "review"}, set(profiles)
+assert profiles["lane"]["extends"] == ":workspace" and profiles["review"]["extends"] == ":read-only"
+assert set(profiles["lane"]) == set(profiles["review"]) == {"extends", "filesystem"}
+assert profiles["lane"]["filesystem"] == profiles["review"]["filesystem"]
+assert set(profiles["lane"]["filesystem"].values()) == {"deny"}
+for path in keys(requirements):  # the read-deny profile keys are the one deliberate selection limit
+    assert path[0] in READ_DENY_KEYS or path[-1] not in RESTRICTING, path
 assert requirements["features"] == {"hooks": True}  # pins the hooks feature on, nothing else
 codex_events = dict(requirements["hooks"])
 assert codex_events.pop("managed_dir") == SCRIPTS

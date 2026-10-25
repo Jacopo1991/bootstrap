@@ -1,0 +1,5 @@
+#!/usr/bin/python3 -I
+"""Run the root-owned package cap gate, with no policy/config overrides."""
+import runpy
+
+runpy.run_path('/usr/local/lib/agent-policy/package_caps.py', run_name='__main__')

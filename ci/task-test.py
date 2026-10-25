@@ -14,6 +14,7 @@ import io
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import time
@@ -142,6 +143,9 @@ prompt = sys.stdin.read()
     'tmp_owner': pathlib.Path(os.environ['TMPDIR']).stat().st_uid,
     'task_worktree': os.environ.get('TASK_WORKTREE'),
 }))
+tamper = os.environ.get('LANE_STUB_TAMPER')
+if tamper:
+    pathlib.Path(tamper).write_text(('gitdir: ' if tamper.endswith('.git') else '') + '/elsewhere' + chr(10))
 release = os.environ.get('LANE_STUB_RELEASE')
 if release:
     import subprocess
@@ -3187,7 +3191,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(prompt.count('## INTENT.md\n'), 1)
         for value in ('INTENT.md', 'Pass test: ship the goal.', 'STATUS.md contents', 'Decision input', 'pass test', 'founder', 'direct: Direct title; milestone: m-1'):
             self.assertIn(value, prompt)
-        self.assertIn('--sandbox read-only', (self.kb / 'args-copy').read_text())
+        self.assertIn('default_permissions="review"', (self.kb / 'args-copy').read_text())
         self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
         self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
         stub.write_text('#!/usr/bin/env python3\nimport sys\nprint("partial reply")\nsys.exit(1)\n')
@@ -4761,7 +4765,8 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call['brief'], wrapper.read_text() + '\n\n' + brief.read_text())
             self.assertIn(model, call['args'])
             if vendor == 'codex':
-                self.assertEqual(call['args'][:3], ['exec', '--sandbox', 'read-only'])
+                self.assertEqual(call['args'][:3], ['exec', '-c', 'default_permissions="review"'])
+                self.assertNotIn('--add-dir', call['args'])
             else:
                 self.assertIn('dontAsk', call['args'])
         wrapper.unlink()
@@ -5016,14 +5021,14 @@ store.write_text(json.dumps(prs))
             binary.write_text(REVIEW_STUB)
             binary.chmod(0o755)
 
-    def wait_for_lane(self, wt, finished=True):
+    def wait_for_lane(self, wt, finished=True, state="finished"):
         import json
         import time
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if finished:
                 record = json.loads((wt / ".work/lane.json").read_text())
-                if record["state"] == "finished":
+                if record["state"] == state:
                     return record
             elif (wt / ".work/model-call.json").exists():
                 return json.loads((wt / ".work/model-call.json").read_text())
@@ -6350,8 +6355,15 @@ store.write_text(json.dumps(prs))
             with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
                 self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
-            self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
+            git_dir, common = (self.git(wt, "rev-parse", "--path-format=absolute", flag) for flag in ("--git-dir", "--git-common-dir"))
+            self.assertNotEqual(git_dir, common)
+            grants = [git_dir, f"{common}/objects", f"{common}/refs", f"{common}/logs"]
+            self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"',
+                                            *(a for g in grants for a in ("--add-dir", g)), "--model", "gpt-6.1-sol",
                                             "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
+            added = [call["args"][i + 1] for i, a in enumerate(call["args"]) if a == "--add-dir"]
+            for forbidden in (common, f"{common}/config", f"{common}/hooks", f"{common}/info", f"{common}/worktrees"):
+                self.assertNotIn(forbidden, added)
             self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
                                  name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
             self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
@@ -7889,12 +7901,102 @@ store.write_text(json.dumps(prs))
         self.assertIn("Preserve the user's uncommitted files and explain the behavior change.", prompt.read_text())
         self.assertIn("--allowedTools Read Grep Glob", out)
 
+    def git_paths(self, wt):
+        common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        return common, common / "worktrees" / wt.name
+
+    def test_start_records_git_paths_from_the_main_checkout_and_old_tasks_migrate(self):
+        wt, _ = self.started()
+        common, git_dir = self.git_paths(wt)
+        record = self.state() / "git-paths.json"
+        self.assertEqual(json.loads(record.read_text()), {"common": str(common), "git_dir": str(git_dir), "dot_git": str(wt / ".git")})
+        record.unlink()
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertEqual(TASK_MODULE.tamper_reason(TASK_MODULE.Task(self.repo, "5")), "")
+        self.assertEqual(json.loads(record.read_text())["git_dir"], str(git_dir))
+
+    def test_codex_lane_grants_stop_without_a_worktree_git_dir_or_with_worktree_config_on(self):
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            with self.assertRaisesRegex(TASK_MODULE.Stop, "does not exist"):
+                TASK_MODULE.lane_git_grants(TASK_MODULE.Task(self.repo, "5"))
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / ".work/prompt.md").write_text("Build.\n")
+        self.git(self.repo, "config", "extensions.worktreeConfig", "true")
+        self.assertIn("extensions.worktreeConfig is on", self.raw_task("lane", "proj", "5", code=1))
+        self.assertFalse((wt / ".work/model-call.json").exists())
+
+    def test_worktree_config_file_matters_only_with_the_extension_on(self):
+        wt, _ = self.started()
+        _, git_dir = self.git_paths(wt)
+        task = TASK_MODULE.Task(self.repo, "5")
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            (git_dir / "config.worktree").write_text("")
+            self.assertEqual(TASK_MODULE.tamper_reason(task), "")
+            (git_dir / "config.worktree").write_text("[core]\n\thooksPath = /x\n")
+            self.assertEqual(TASK_MODULE.tamper_reason(task), "", "ignored while the extension is unset")
+            self.git(self.repo, "config", "extensions.worktreeConfig", "true")
+            self.assertIn("config.worktree must be empty", TASK_MODULE.tamper_reason(task))
+            (git_dir / "config.worktree").write_text("")
+            self.assertEqual(TASK_MODULE.tamper_reason(task), "")
+
+    def test_lane_worker_end_marks_rewritten_git_metadata_tampered_and_entries_refuse_first(self):
+        self.stub_models()
+        wt, _ = self.started()
+        _, git_dir = self.git_paths(wt)
+        (wt / ".work/prompt.md").write_text("Build.\n")
+        for target in (git_dir / "commondir", git_dir / "gitdir", wt / ".git"):
+            with self.subTest(target=target.name):
+                original = target.read_text()
+                self.env["LANE_STUB_TAMPER"] = str(target)
+                self.raw_task("lane", "proj", "5", "--no-pace")
+                self.wait_for_lane(wt, state="tampered")
+                self.env.pop("LANE_STUB_TAMPER")
+                for command in (("check", "proj", "5"), ("check", "proj", "5", "--detach"), ("merge", "proj", "5"),
+                                ("review", "proj", "5", "--run")):
+                    out = self.raw_task(*command, code=1)
+                    self.assertIn("Git metadata tampered: ", out)
+                    self.assertNotIn("fatal", out, "refused before any Git ran in the worktree")
+                out = self.raw_task("check", cwd=wt, code=1)
+                self.assertIn("Git metadata tampered", out)
+                self.assertNotIn("fatal", out)
+                target.write_text(original)
+        self.assertEqual(self.git(wt, "status", "--porcelain"), "")
+
+    def test_a_normal_lane_passes_the_metadata_check_and_a_removed_worktree_is_skipped(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / ".work/prompt.md").write_text("Build.\n")
+        self.raw_task("lane", "proj", "5", "--no-pace")
+        self.assertEqual(self.wait_for_lane(wt)["state"], "finished")
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertEqual(TASK_MODULE.tamper_reason(TASK_MODULE.Task(self.repo, "5")), "")
+            self.assertEqual(TASK_MODULE.tamper_reason(TASK_MODULE.Task(self.repo, "9")), "")
+
+    def test_batch_runner_stops_on_a_tampered_lane_before_any_git(self):
+        loader = importlib.machinery.SourceFileLoader("batch_tamper_test", str(ROOT / "home/dot_local/bin/executable_task-batch"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        batch = importlib.util.module_from_spec(spec)
+        loader.exec_module(batch)
+        work = self.home / "work"
+        work.mkdir()
+        (work / "lane.json").write_text(json.dumps({"state": "tampered", "started_at": TASK_MODULE.utc_now()}))
+        with self.assertRaisesRegex(batch.Stop, "tampered"):
+            batch.Batch.lane_outcome(None, work)
+        source = (ROOT / "home/dot_local/bin/executable_task-batch").read_text()
+        self.assertIn('.get("state") in {"running", "tampered"}', source, "a resumed tampered lane also stops before finished()")
+
+    def test_realign_and_review_run_commands_get_no_git_grants(self):
+        source = (ROOT / "home/dot_local/bin/executable_task").read_text()
+        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -m gpt-6-luna", source)
+        self.assertEqual(source.count("lane_git_grants("), 2)  # definition and the one lane call
+
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
         self.raw_task("start", "proj", "5", "--builder", "claude")
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only --add-dir {self.kb} "
+        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' --add-dir {self.kb} "
                       "-m gpt-6-luna -c model_reasoning_effort=high - <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
@@ -7905,7 +8007,8 @@ store.write_text(json.dumps(prs))
     def test_direct_review_commands_do_not_add_kb_directory_without_backlog_file(self):
         self.raw_task("start", "proj", "direct-request", "--builder", "claude")
         out = self.raw_task("review", "proj", "direct-request")
-        self.assertIn("codex exec --sandbox read-only", out)
+        self.assertIn("codex exec -c 'default_permissions=\"review\"'", out)
+        self.assertNotIn("--sandbox", out)
         self.assertNotIn("--add-dir", out)
 
     def test_merge_gates_merge_result_without_changing_lane_and_is_idempotent(self):
@@ -9615,6 +9718,157 @@ class WatcherTests(unittest.TestCase):
         self.assertIn('OnCalendar=*:0/15', (units / 'task-watch.timer').read_text())
         self.assertFalse((units / 'timers.target.wants/symlink_task-watch.timer').exists())
         self.assertLessEqual(len(TOOL.with_name('executable_task-watch').read_text().splitlines()), 85)
+
+
+SMOKE_HELPER = ROOT / "home/dot_local/bin/executable_task-smoke"
+# One stand-in binary per builder name: the reviewer prompt carries "Verdict:", the lane prompt does not.
+SMOKE_AGENT = """#!/usr/bin/env python3
+import os, pathlib, subprocess, sys
+prompt = sys.stdin.read()
+
+
+def git(*args):
+    return subprocess.run(['git', '-c', 'user.name=lane', '-c', 'user.email=lane@example.invalid', *args],
+                          capture_output=True, text=True)
+
+
+if 'Verdict:' in prompt:
+    head = git('rev-parse', 'HEAD').stdout.strip()
+    verdict = os.environ.get('SMOKE_REVIEW_VERDICT', 'PASS')
+    judged = 'pass' if verdict == 'PASS' else 'fail'
+    print(f"```review\\nVerdict: {verdict}\\nCommit: {head}\\n#1 {judged}: smoke.txt contains ok\\n```\\nBlocking: none\\nNotes: none")
+    sys.exit(0)
+pathlib.Path('smoke.txt').write_text('ok\\n')
+if os.environ.get('SMOKE_STUB_RO') == '1':
+    # T-53's defect: the agent's commit is refused, and the agent stops under its stop rule.
+    print("fatal: Unable to create '/home/agent/dev_workspace/proj/.git/worktrees/t1/index.lock': Read-only file system", file=sys.stderr)
+    sys.exit(0)
+for step in (['add', 'smoke.txt'], ['commit', '-qm', 'smoke: write smoke.txt'], ['merge', '-q', '--no-edit', 'main']):
+    done = git(*step)
+    if done.returncode:
+        print(done.stderr, file=sys.stderr)
+        sys.exit(1)
+pathlib.Path('.work/report.md').write_text("# Task report\\n\\n## What changed\\n\\nsmoke.txt.\\n\\n## How I verified\\n\\nSteps in order.\\n\\n"
+                                           "## Criteria\\n\\n#1 met: smoke.txt contains ok\\n\\n## Not done\\n\\n(none)\\n\\n"
+                                           "## Noticed, not done\\n\\n(none)\\n")
+if '--output-last-message' in sys.argv:
+    pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
+"""
+
+
+class SmokeTests(unittest.TestCase):
+    """task smoke on a temporary HOME with stand-in agents: no real Codex, Claude, systemd or GitHub."""
+
+    def setUp(self):
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory(prefix='smoke-')))
+        bin_dir = self.home / 'bin'
+        bin_dir.mkdir()
+        stubs = {'just': STUBS['just'], 'gh': STUBS['gh'], 'pre-commit': STUBS['pre-commit'],
+                 'backlog': STUBS['backlog'], 'codex': SMOKE_AGENT, 'claude': SMOKE_AGENT}
+        for name, body in stubs.items():
+            (bin_dir / name).write_text(textwrap.dedent(body))
+            (bin_dir / name).chmod(0o755)
+        shutil.copy(SMOKE_HELPER, bin_dir / 'task-smoke')
+        (bin_dir / 'task-smoke').chmod(0o755)  # chezmoi sets this on install
+        self.env = dict(os.environ, HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY,
+                        TASK_SMOKE_TOOL=str(TOOL), TASK_HOLDER='test-seat',
+                        TASK_GATE_DIR=str(self.home / 'shared-gate'), TASK_LANE_TEMP_ROOT=str(self.home / 'task-lane'))
+        for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_SANDBOX", "CODEX_THREAD_ID", "SMOKE_STUB_RO"):
+            self.env.pop(marker, None)
+        (self.home / 'shared-gate').mkdir()
+        contract = self.home / '.agents/skills/slim-workflow/lane-contract.md'
+        contract.parent.mkdir(parents=True)
+        contract.write_text("# Fake lane contract\n")
+
+    def smoke(self, *args, code=0, env=None):
+        result = subprocess.run([sys.executable, str(self.home / 'bin/task-smoke'), *args], env=env or self.env,
+                                cwd=self.home, capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        return result.stdout + result.stderr
+
+    def run_id(self, out):
+        return re.search(r"(?m)^run: (\S+)$", out).group(1)
+
+    def scratch(self, run):
+        return {'repo': self.home / 'dev_workspace' / f'task-smoke-{run}',
+                'kb': self.home / 'cortex' / f'cortex-kb-task-smoke-{run}',
+                'state': self.home / '.local/state/task' / f'task-smoke-{run}'}
+
+    def test_stub_run_passes_every_step_for_both_builders(self):
+        out = self.smoke()
+        run = self.run_id(out)
+        steps = ('start', 'setup', 'lane', 'commit', 'merge main', 'report', 'check', 'review', 'merge')
+        for step in steps:
+            self.assertEqual(len(re.findall(rf"(?m)^  PASS {step}$", out)), 2, (step, out))
+        self.assertNotIn('FAIL', out)
+        record = json.loads((self.home / '.local/state/task/smoke' / f'{run}.json').read_text())
+        self.assertEqual(record['result'], 'PASS')
+        self.assertEqual({name: b['result'] for name, b in record['builders'].items()}, {'codex': 'PASS', 'claude': 'PASS'})
+        for path in self.scratch(run).values():
+            self.assertFalse(path.exists(), f"a passing run removes {path}")
+
+    def test_review_fail_verdict_fails_at_review_step(self):
+        out = self.smoke('--builder', 'codex', code=1, env=dict(self.env, SMOKE_REVIEW_VERDICT='FAIL'))
+        self.assertRegex(out, r"(?m)^  FAIL review: review verdict is FAIL$")
+        self.assertNotRegex(out, r"(?m)^  (PASS|FAIL) merge$")
+
+    def test_read_only_git_metadata_fails_at_commit_step(self):
+        out = self.smoke('--builder', 'codex', code=1, env=dict(self.env, SMOKE_STUB_RO='1'))
+        run = self.run_id(out)
+        self.assertIn("FAIL commit: fatal: Unable to create '/home/agent/dev_workspace/proj/.git/worktrees/t1/index.lock': "
+                      "Read-only file system", out)
+        self.assertRegex(out, r"(?m)^  PASS lane$")
+        self.assertNotRegex(out, r"(?m)^  (PASS|FAIL) (merge main|report|check|review|merge)")
+        for path in self.scratch(run).values():
+            self.assertTrue(path.exists(), f"a FAIL keeps {path}")
+        self.assertIn(f"task smoke --clean {run}", out)
+
+    def test_existing_scratch_paths_are_refused_and_left_alone(self):
+        loader = importlib.machinery.SourceFileLoader('task_smoke_for_test', str(SMOKE_HELPER))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        helper = importlib.util.module_from_spec(spec)
+        loader.exec_module(helper)
+        helper.WORKSPACE, helper.CORTEX, helper.STATE = (
+            self.home / 'dev_workspace', self.home / 'cortex', self.home / '.local/state/task')
+        run = '20990101T000000Z-aaaaaa'
+        for key in ('repo', 'kb', 'state'):
+            path = self.scratch(run)[key]
+            path.mkdir(parents=True)
+            (path / 'keep.txt').write_text('mine\n')
+            with self.assertRaisesRegex(helper.Stop, 'already exists; refusing to reuse it'):
+                helper.check_free(helper.paths(run))
+            self.assertEqual((path / 'keep.txt').read_text(), 'mine\n', f'{key} is left alone')
+            shutil.rmtree(path)
+        helper.check_free(helper.paths(run))  # nothing exists: no refusal
+
+    def test_clean_removes_exactly_what_the_run_created(self):
+        out = self.smoke('--builder', 'codex', code=1, env=dict(self.env, SMOKE_STUB_RO='1'))
+        run = self.run_id(out)
+        other = '20990101T000000Z-bbbbbb'
+        sibling = {'repo': self.home / 'dev_workspace' / f'task-smoke-{other}',
+                   'kb': self.home / 'cortex' / f'cortex-kb-task-smoke-{other}',
+                   'state': self.home / '.local/state/task' / f'task-smoke-{other}'}
+        for path in sibling.values():
+            path.mkdir(parents=True)
+        proj = self.home / '.local/state/task/proj'
+        proj.mkdir(parents=True)
+        self.smoke('--clean', 'not-a-run-id', code=1)
+        self.assertTrue(self.scratch(run)['repo'].exists(), 'a malformed run id removes nothing')
+        out = self.smoke('--clean', run)
+        for path in self.scratch(run).values():
+            self.assertFalse(path.exists(), f"clean removes {path}")
+        for path in sibling.values():
+            self.assertTrue(path.is_dir(), f"clean leaves {path}")
+        self.assertTrue(proj.is_dir(), 'clean leaves other task state')
+        self.assertTrue((self.home / '.local/state/task/smoke' / f'{run}.json').is_file(),
+                        'the run record stays, since install records cite it')
+        self.assertIn('nothing to remove', self.smoke('--clean', run))
+
+    def test_task_smoke_dispatches_to_the_helper(self):
+        result = subprocess.run([sys.executable, str(TOOL), 'smoke', '--clean', 'not-a-run-id'], env=self.env,
+                                cwd=self.home, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('run id', result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

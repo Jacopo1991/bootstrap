@@ -19,8 +19,9 @@ import tomllib
 EXPECTED_BINARIES = {"claude", "bws", "secretspec", "codex", "ccusage", "gitleaks",
                      "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "agy",
                      "playwright", "playwright-mcp", "osv-db-refresh", "pre-commit-enable",
+                     "package-cap-check",
                      "verify-enable", "gate-browser", "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch",
-                     "task-watch", "job-ping", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
+                     "task-watch", "task-smoke", "job-ping", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
 VERSION_COMMANDS = {
     "claude": ["claude", "--version"],
     "codex": ["codex", "--version"],
@@ -211,9 +212,22 @@ def installed_uv_tools(directory: Path) -> list[str]:
                   if entry.is_dir() and not entry.name.startswith("."))
 
 
+def codex_deny_list_missing(root: Path, installed: Path = Path("/etc/codex/requirements.toml")) -> bool:
+    """True when the installed Codex requirements lack the checked-in read-deny profiles."""
+    keys = ("default_permissions", "allowed_permission_profiles", "permissions")
+    try:
+        wanted = tomllib.loads((root / "system" / "codex-requirements.toml").read_text(encoding="utf-8"))
+        actual = tomllib.loads(installed.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return not wanted.get("permissions") or any(actual.get(key) != wanted.get(key) for key in keys)
+
+
 def scan(root: Path, home: Path, run=run_quiet) -> list[str]:
     """`run` is the command runner (run_quiet); tests inject a fake one."""
     findings: set[str] = set()
+    if codex_deny_list_missing(root):
+        findings.add("codex-deny-list-missing")
     rc, _ = run(["chezmoi", "verify"], home=home)
     if rc:
         findings.add("chezmoi-verify-failed")

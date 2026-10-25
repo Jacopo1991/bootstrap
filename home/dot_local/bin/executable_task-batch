@@ -253,6 +253,7 @@ class Batch:
 
     def lane_outcome(self, work):
         record = data(work / "lane.json")
+        if record.get("state") == "tampered": raise Stop("lane tampered with Git metadata; the PM inspects it before any further Git runs")
         try:
             started = datetime.fromisoformat(record["started_at"]).timestamp()
         except (KeyError, ValueError, TypeError):
@@ -325,7 +326,7 @@ class Batch:
         # Never launch a duplicate lane or overwrite the prompt of a running lane.
         previous_limit = lane_limit(data(work / "lane.json"), work) if resumed else ""
         if resumed:
-            was_running = data(work / "lane.json").get("state") == "running"
+            was_running = data(work / "lane.json").get("state") in {"running", "tampered"}
             self.require("wait", ident, "--max", box, retry=True)
             if was_running:
                 self.lane_outcome(work)

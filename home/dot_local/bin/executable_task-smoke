@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""task smoke: the normal lane path on a scratch project, once per builder (T-56).
+
+Creates ~/dev_workspace/task-smoke-<run> (one commit on main, no remote) and
+~/cortex/cortex-kb-task-smoke-<run> (a signed plan and one task per builder). Per builder:
+task start, an unrelated commit on main, task lane (cheapest model, low effort), then the lane's
+commit, merge and report read back from Git, then task check, task review --run (routed to the
+cheapest reviewer of the other vendor) and task merge. Prints PASS, or FAIL <step>: <first error
+line>, per step. A FAIL keeps the scratch project for `task smoke --clean <run>`; a pass removes it.
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/agent"))
+WORKSPACE = HOME / "dev_workspace"
+CORTEX = HOME / "cortex"
+STATE = HOME / ".local/state/task"
+TOOL = os.environ.get("TASK_SMOKE_TOOL") or shutil.which("task") or "task"
+# Task ids are T-<n>: a knowledge task file is found only for that form, so the builders get T-1 and T-2.
+BUILDERS = {"codex": ("gpt-6-luna", "T-1"), "claude": ("haiku", "T-2")}
+RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
+ERROR_LINE = re.compile(r"(?i)fatal|error|denied|read-only|refus")
+GIT = ["git", "-c", "user.name=task-smoke", "-c", "user.email=task-smoke@example.invalid", "-c", "commit.gpgsign=false"]
+PROMPT = """# Lane smoke {ident} ({builder})
+
+This is an install smoke test on a scratch project. Do these steps in this worktree, in order, then stop:
+
+1. Create `smoke.txt` containing exactly one line: `ok`.
+2. `git add smoke.txt` and `git commit -m "smoke: write smoke.txt"`.
+3. `git merge main`. Main has one new commit, so Git creates a merge commit; if it leaves the merge uncommitted, commit it.
+4. Fill `.work/report.md`: What changed, How I verified, Criteria (`#1 met: smoke.txt contains ok`), Not done, Noticed, not done and Check.
+
+Do not run `task check`, do not push and do not merge.
+"""
+TASK = """---
+id: {ident}
+title: "Smoke lane path for {builder}"
+status: To Do
+assignee: []
+milestone: m-1
+---
+
+## Outcome
+
+smoke.txt contains ok, written by a real lane, merged with main, and reviewed.
+
+## Scope
+
+smoke.txt only.
+
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [ ] #1 the file smoke.txt contains ok
+<!-- AC:END -->
+
+## Verification and tools
+
+Verify: `test -s smoke.txt`
+"""
+
+
+class Stop(Exception):
+    """A refusal or setup error; nothing that was there before this run is touched."""
+
+
+def paths(run):
+    return {"repo": WORKSPACE / f"task-smoke-{run}", "kb": CORTEX / f"cortex-kb-task-smoke-{run}",
+            "state": STATE / f"task-smoke-{run}"}
+
+
+def check_free(found):
+    for key, path in found.items():
+        if os.path.lexists(path):
+            raise Stop(f"{path} already exists; refusing to reuse it.")
+
+
+def new_run():
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+
+
+def git(cwd, *args):
+    return subprocess.run([*GIT, "-C", str(cwd), *args], capture_output=True, text=True)
+
+
+def commit(cwd, message):
+    for args in (("add", "-A"), ("commit", "-qm", message)):
+        result = git(cwd, *args)
+        if result.returncode:
+            raise Stop(lane_error(result.stderr + result.stdout, f"git {args[0]} failed in {cwd}"))
+
+
+def task(*args):
+    return subprocess.run([sys.executable, TOOL, *args], capture_output=True, text=True)
+
+
+def read(path):
+    return path.read_text(errors="replace") if path.is_file() else ""
+
+
+def lane_error(text, default):
+    """The first error-like line of a log, else the default."""
+    for line in text.splitlines():
+        if ERROR_LINE.search(line):
+            return line.strip()
+    return default
+
+
+def command_error(result):
+    lines = [line.strip() for line in (result.stdout + result.stderr).splitlines() if line.strip()]
+    return lane_error("\n".join(lines), lines[-1] if lines else f"exit {result.returncode}")
+
+
+def build_scratch(run, found):
+    name, repo, kb = f"task-smoke-{run}", found["repo"], found["kb"]
+    repo.mkdir(parents=True)
+    if git(repo, "init", "-q", "-b", "main").returncode:
+        raise Stop(f"git init failed in {repo}")
+    (repo / "justfile").write_text("check:\n    grep -qx ok smoke.txt\n")
+    (repo / ".task.toml").write_text(f'knowledge = "cortex-kb-{name}"\n')
+    (repo / "README.md").write_text("Scratch project for task smoke; `task smoke --clean` removes it.\n")
+    commit(repo, "scratch project")
+    (kb / "backlog/tasks").mkdir(parents=True)
+    (kb / "backlog/milestones").mkdir()
+    (kb / "backlog/milestones/m-1 - Goal.md").write_text("---\ntitle: Goal\n---\n")
+    (kb / "INTENT.md").write_text("---\ncurrent: m-1\n---\nPass test: the lane path works end to end.\n")
+    if git(kb, "init", "-q", "-b", "main").returncode:
+        raise Stop(f"git init failed in {kb}")
+    for builder, (_, ident) in BUILDERS.items():
+        (kb / f"backlog/tasks/t-{ident[2:]} - Smoke {builder}.md").write_text(TASK.format(ident=ident, builder=builder))
+    commit(kb, "smoke knowledge")
+    signed = task("plan", name, "--sign")
+    if signed.returncode:
+        raise Stop(command_error(signed))
+    commit(kb, "sign the smoke plan")
+
+
+def reset_smoke(repo):
+    """Main keeps an earlier builder's smoke.txt; remove it so this builder's lane writes it new."""
+    if not (repo / "smoke.txt").exists():
+        return None
+    (repo / "smoke.txt").unlink()
+    try:
+        commit(repo, "smoke: reset smoke.txt for the next builder")
+    except Stop as stop:
+        return str(stop)
+    return None
+
+
+def commit_error(wt, base, log):
+    if git(wt, "log", "-n1", "--format=%H", f"{base}..HEAD", "--", "smoke.txt").stdout.strip():
+        return None
+    return lane_error(log, "smoke.txt is not committed on the lane branch")
+
+
+def merge_error(wt, repo, log):
+    parents = git(wt, "rev-list", "--parents", "-n1", "HEAD").stdout.split()
+    main = git(repo, "rev-parse", "main").stdout.strip()
+    if len(parents) == 3 and git(wt, "merge-base", "--is-ancestor", main, "HEAD").returncode == 0:
+        return None
+    return lane_error(log, "HEAD is not a merge of main")
+
+
+def report_error(wt, log):
+    text = read(wt / ".work/report.md")
+    if re.search(r"(?m)^#1 met:", text) and "(fill in)" not in text:
+        return None
+    return lane_error(log, ".work/report.md is not filled in (no `#1 met:` line)")
+
+
+def review_verdict(repo, name):
+    """The verdict `task review --run` recorded for the task; it exits 0 on FAIL too."""
+    try:
+        return json.loads(read(STATE / repo.name / name / "review.json") or "{}").get("verdict")
+    except (ValueError, AttributeError):
+        return None
+
+
+def lane_outcome(wt):
+    try:
+        record = json.loads(read(wt / ".work/lane.json") or "{}")
+    except ValueError:
+        record = {}
+    return record.get("state", "unknown"), record.get("exit_code")
+
+
+def run_builder(run, found, builder, emit):
+    model, ident = BUILDERS[builder]
+    repo = found["repo"]
+    wt = repo / ".worktrees" / f"t{ident[2:]}"
+    steps = []
+
+    def done(step, error=None):
+        steps.append({"step": step, "result": "PASS" if error is None else "FAIL", "error": error or ""})
+        emit(f"  PASS {step}" if error is None else f"  FAIL {step}: {error}")
+        return error is None
+
+    error = reset_smoke(repo)
+    if error is None:
+        start = task("start", repo.name, ident, "--builder", builder)
+        error = None if start.returncode == 0 else command_error(start)
+    if not done("start", error):
+        return steps
+    base = git(wt, "rev-parse", "HEAD").stdout.strip()
+    (repo / f"unrelated-{builder}.txt").write_text(f"{builder} smoke\n")
+    try:
+        commit(repo, f"add unrelated-{builder}.txt")
+        setup = None
+    except Stop as stop:
+        setup = str(stop)
+    if not done("setup", setup):
+        return steps
+    (wt / ".work/prompt.md").write_text(PROMPT.format(ident=ident, builder=builder))
+    # `task lane` returns once the lane is detached; `task wait` returns when it has ended.
+    lane = task("lane", repo.name, ident, "--builder", builder, "--model", model, "--effort", "low", "--timeout", "15")
+    waited = task("wait", repo.name, ident, "--max", "20") if lane.returncode == 0 else lane
+    log = read(wt / ".work/lane.log")
+    state, exit_code = lane_outcome(wt)
+    error = None
+    if lane.returncode != 0:
+        error = command_error(lane)
+    elif waited.returncode != 0:
+        error = "the lane is still running after 20 minutes"
+    elif state != "finished" or exit_code != 0:
+        error = lane_error(log, f"the lane ended {state}, exit {exit_code}")
+    if not done("lane", error):
+        return steps
+    for step, error in (("commit", commit_error(wt, base, log)), ("merge main", merge_error(wt, repo, log)),
+                        ("report", report_error(wt, log))):
+        if not done(step, error):
+            return steps
+    check = task("check", repo.name, ident)
+    if not done("check", None if check.returncode == 0 else command_error(check)):
+        return steps
+    review = task("review", repo.name, ident, "--run")
+    verdict = review_verdict(repo, f"t{ident[2:]}")
+    error = command_error(review) if review.returncode else (None if verdict == "PASS" else f"review verdict is {verdict or 'missing'}")
+    if not done("review", error):
+        return steps
+    merged = task("merge", repo.name, ident)
+    error = None if merged.returncode == 0 else command_error(merged)
+    if error is None and git(repo, "show", "main:smoke.txt").stdout.strip() != "ok":
+        error = "main has no smoke.txt with ok after the merge"
+    done("merge", error)
+    return steps
+
+
+def make_writable(function, path, _info):
+    for item in (os.path.dirname(path), path):
+        try:
+            os.chmod(item, 0o700)
+        except OSError:
+            pass
+    function(path)
+
+
+def remove_run(found):
+    removed = []
+    for path in found.values():
+        if os.path.lexists(path):
+            if path.is_symlink():
+                raise Stop(f"{path} is a symlink; not removing it.")
+            shutil.rmtree(path, onerror=make_writable)
+            removed.append(str(path))
+    return removed
+
+
+def write_record(run, record):
+    target = STATE / "smoke" / f"{run}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, indent=2) + "\n")
+    temporary.replace(target)
+
+
+def clean(run):
+    if not RUN_ID.fullmatch(run):
+        print(f"task smoke --clean: a run id looks like 20261025T101500Z-abc123, not {run!r}.", file=sys.stderr)
+        return 1
+    removed = remove_run(paths(run))
+    for path in removed:
+        print(f"removed {path}")
+    if not removed:
+        print(f"nothing to remove for run {run}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="task smoke", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--builder", choices=("codex", "claude", "both"), default="both")
+    parser.add_argument("--clean", metavar="RUN_ID", help="remove a kept run's scratch project, knowledge and state")
+    args = parser.parse_args(argv)
+    if args.clean:
+        return clean(args.clean)
+    run = new_run()
+    found = paths(run)
+    try:
+        check_free(found)
+    except Stop as stop:
+        print(f"task smoke: {stop}", file=sys.stderr)
+        return 1
+    print(f"run: {run}", flush=True)
+
+    def emit(line):
+        print(line, flush=True)
+
+    try:
+        build_scratch(run, found)
+    except (Stop, OSError, subprocess.SubprocessError) as stop:
+        remove_run(found)
+        print(f"task smoke: setup failed: {stop}", file=sys.stderr)
+        return 1
+    names = list(BUILDERS) if args.builder == "both" else [args.builder]
+    record = {"run": run, "repo": str(found["repo"]), "knowledge": str(found["kb"]), "builders": {}, "result": "FAIL"}
+    try:
+        for builder in names:
+            emit(f"{builder} ({BUILDERS[builder][1]}, {BUILDERS[builder][0]}):")
+            steps = run_builder(run, found, builder, emit)
+            passed = len(steps) == 9 and all(step["result"] == "PASS" for step in steps)
+            record["builders"][builder] = {"result": "PASS" if passed else "FAIL", "steps": steps}
+        record["result"] = "PASS" if all(b["result"] == "PASS" for b in record["builders"].values()) else "FAIL"
+    except Exception as error:  # a crash is a failed run: keep its scratch project for inspection
+        record["error"] = f"{type(error).__name__}: {error}"
+        emit(f"  FAIL run: {record['error']}")
+    write_record(run, record)
+    if record["result"] == "PASS":
+        try:
+            remove_run(found)
+        except (Stop, OSError) as error:
+            emit(f"smoke {run}: PASS, but the scratch project could not be removed: {error}")
+            emit(f"Remove with: task smoke --clean {run}")
+            return 1
+        emit(f"smoke {run}: PASS (scratch project removed; record {STATE / 'smoke' / (run + '.json')})")
+        return 0
+    emit(f"smoke {run}: FAIL (record {STATE / 'smoke' / (run + '.json')})")
+    for path in found.values():
+        emit(f"kept {path}")
+    emit(f"Remove with: task smoke --clean {run}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
