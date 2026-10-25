@@ -59,7 +59,7 @@ with tempfile.TemporaryDirectory() as temp:
     version_dir = home / ".local/share/bootstrap/agy" / version
     version_dir.mkdir(parents=True)
     installed = version_dir / "antigravity"
-    installed.write_text("#!/bin/sh\nprintf '%s\\n' 'agy 1.4.8'\n", encoding="utf-8")
+    installed.write_text("#!/bin/sh\nprintf '%s\\n' 'agy 9.9.9'\n", encoding="utf-8")
     installed.chmod(0o755)
     bin_dir = home / ".local/bin"
     bin_dir.mkdir(parents=True)
