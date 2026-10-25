@@ -66,6 +66,8 @@ jobs:
             home/dot_config/mise/config.toml \
             home/dot_local/share/bootstrap/npm/package.json \
             home/dot_local/share/bootstrap/npm/package-lock.json \
+            home/dot_local/share/bootstrap/pre-commit/requirements.lock \
+            home/dot_local/share/bootstrap/inspect/requirements.lock \
             system/apt-base.lock system/apt-gh.lock system/apt-docker.lock system/apt-nvidia.lock
           git commit -m "chore: refresh monthly bootstrap pins"
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then

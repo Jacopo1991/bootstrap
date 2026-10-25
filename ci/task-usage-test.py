@@ -125,14 +125,20 @@ class Usage(unittest.TestCase):
         (self.home / ".config/task/usage-policy-path").write_text("~/elsewhere.toml\n")
         self.assertEqual(usage.policy(self.home)["under_use_hours"], 12)
         self.assertEqual(usage.policy(self.home)["ahead_margin"], 10)  # the pointed-to file replaces the default one
-        other.write_text("reserve = 5\n")
+        other.write_text("reserve = 5\nahead_margin = 4\n")
+        warnings = []
+        found = usage.policy(self.home, warnings)  # an invalid key keeps its default and warns
+        self.assertEqual((found["reserve"], found["ahead_margin"]), (usage.DEFAULTS["reserve"], 4))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("invalid reserve; ignored, other keys kept", warnings[0])
+        decision = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
+        self.assertFalse(any("built-in defaults used" in note for note in decision["notes"]))
+        self.assertTrue(any("invalid reserve" in note for note in decision["notes"]))
+        other.write_text("reserve = [\n")  # an unparseable file still falls back with a warning
         with self.assertRaises(ValueError):
             usage.policy(self.home)
         decision = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
         self.assertTrue(any("built-in defaults used" in note for note in decision["notes"]))
-        other.write_text("bogus = 1\n")
-        with self.assertRaises(ValueError):
-            usage.policy(self.home)
 
     def test_example_policy_file_parses_and_matches_the_defaults(self):
         example = tomllib.loads((ROOT / "docs/usage-pacing.example.toml").read_text())
@@ -178,12 +184,145 @@ class Usage(unittest.TestCase):
                      '[review]\nhigh_paths = []', '[review]\nhigh_paths = { proj = [1] }',
                      '[review]\nhigh_paths = { proj = [""] }', '[review]\nnormal = []'):
             with self.subTest(text=text):
-                path.write_text(text + '\n')
-                with self.assertRaisesRegex(ValueError, "review"):
-                    usage.policy(self.home)
+                path.write_text('ahead_margin = 4\n' + text + '\n')
                 pol, _, notes = usage.assessments(self.home, NOW)
-                self.assertEqual(pol, usage.DEFAULTS)
-                self.assertTrue(any('invalid review' in note and 'built-in defaults used' in note for note in notes))
+                self.assertEqual(pol, dict(usage.DEFAULTS, ahead_margin=4))  # review keeps its defaults, the rest is kept
+                policy_notes = [note for note in notes if 'usage-pacing.toml' in note]
+                self.assertEqual(len(policy_notes), 1)
+                self.assertRegex(policy_notes[0], 'invalid review.*other keys kept')
+
+    def write_policy(self, text):
+        path = self.home / "cortex/cortex-kb-company/policy/usage-pacing.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def codex_week(self, used, started, five=None):
+        """A Codex reading `started` into its weekly window (the window starts at resets_at - 7 days)."""
+        limits = {"primary": {"used_percent": used, "window_minutes": 10080, "resets_at": epoch(NOW + usage.WEEK - started)}}
+        if five is not None:
+            limits["secondary"] = {"used_percent": five, "window_minutes": 300, "resets_at": epoch(NOW + FIVE_LEFT)}
+        self.codex(json.dumps({"timestamp": (NOW - timedelta(minutes=5)).isoformat(), "payload": {"rate_limits": limits}}) + "\n")
+
+    RAMP = "codex_ramp = { per_day = 20, ceiling = 80 }\n"
+
+    def test_codex_ramp_day_allowance_and_ceiling(self):
+        self.write_policy(self.RAMP)
+        for started, day, allowance in ((timedelta(hours=2), 1, 20), (timedelta(days=2, hours=1), 3, 60),
+                                        (timedelta(days=4, hours=1), 5, 80), (timedelta(days=6, hours=23), 7, 80)):
+            with self.subTest(day=day):
+                self.codex_week(allowance, started)  # at the allowance: still allowed
+                found = self.verdict("codex")["ramp"]
+                self.assertEqual((found["day"], found["allowance"], found["over"]), (day, allowance, False))
+                self.assertEqual(usage.gate(self.home, "lane", "codex", "routine", "proj", "t1", NOW)["hold"], "")
+                self.assertIn(f"  ramp: day {day}, allowance {allowance} % (20 %/day, ceiling 80 %); within ramp",
+                              usage.report(self.home, NOW))
+                self.codex_week(allowance + 1, started)
+                self.assertTrue(self.verdict("codex")["ramp"]["over"])
+                self.assertIn("past ramp", "\n".join(usage.report(self.home, NOW)))
+
+    def test_codex_ramp_early_reset_restarts_at_day_one(self):
+        self.write_policy(self.RAMP)
+        self.codex_week(50, timedelta(days=4, hours=1))
+        self.assertEqual(self.verdict("codex")["ramp"]["day"], 5)
+        self.codex_week(25, timedelta(hours=1))  # the reset came early: resets_at moved, the window restarts
+        found = self.verdict("codex")["ramp"]
+        self.assertEqual((found["day"], found["allowance"], found["over"]), (1, 20, True))
+
+    def test_codex_ramp_refuses_with_values_and_exemption_launches(self):
+        self.write_policy(self.RAMP)
+        self.codex_week(45, timedelta(days=1, hours=3))  # day 2: allowance 40
+        decision = usage.gate(self.home, "review", "codex", "routine", "proj", "t1", NOW)
+        self.assertIn("codex past its daily ramp: weekly used 45 % > allowance 40 % (day 2, 20 %/day, ceiling 80 %); "
+                      "no new reviews on codex", decision["hold"])
+        self.assertEqual(decision["ramp_exempt"], "")
+        self.assertIn("held review proj/t1: codex past its daily ramp", (usage._dir(self.home) / "pace.log").read_text())
+        self.codex_week(95, timedelta(days=1, hours=3))  # above the ceiling too
+        decision = usage.gate(self.home, "lane", "codex", "routine", "proj", "t1", NOW, exempt="security")
+        self.assertEqual((decision["hold"], decision["ramp_exempt"]), ("", "security"))
+        self.assertTrue(any("ramp-exempt security" in note for note in decision["notes"]))
+        self.assertEqual(usage.ramp_gate(self.home, "red-team", "codex", "proj", "t1", "", NOW)[0][:25], "codex past its daily ramp")
+        self.assertEqual(usage.ramp_gate(self.home, "red-team", "codex", "proj", "t1", "money", NOW), ("", "money"))
+
+    def test_codex_ramp_routine_lane_does_not_move_to_codex_past_its_ramp(self):
+        self.write_policy(self.RAMP)
+        self.claude(80, 84)
+        self.codex_week(30, timedelta(hours=2))
+        decision = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
+        self.assertEqual(decision["vendor"], "claude")
+        self.assertIn("claude automated share used up", decision["hold"])
+
+    def test_codex_ramp_leaves_claude_unchanged(self):
+        self.write_policy(self.RAMP)
+        self.claude(50, 168 - 2)  # 50 % on day 1 of Claude's week would be far past a 20 %/day ramp
+        found = self.verdict("claude")
+        self.assertIsNone(found["ramp"])
+        decision = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
+        self.assertNotIn("ramp", decision["hold"])
+        self.assertFalse(any("ramp" in line for line in usage.report(self.home, NOW) if line.startswith("claude")))
+
+    def test_no_ramp_policy_means_no_ramp(self):
+        self.codex_week(90, timedelta(hours=2))
+        self.assertIsNone(self.verdict("codex")["ramp"])
+        self.assertEqual(usage.gate(self.home, "lane", "codex", "routine", "proj", "t1", NOW)["hold"], "")
+
+    def test_invalid_codex_ramp_and_unknown_key_are_warned_and_the_rest_kept(self):
+        for text in ("codex_ramp = 5", "codex_ramp = { per_day = 20 }", "codex_ramp = { per_day = 20, ceiling = 120 }",
+                     "codex_ramp = { per_day = 0, ceiling = 80 }", 'codex_ramp = { per_day = "20", ceiling = 80 }',
+                     "codex_ramp = { per_day = 20, ceiling = 80, extra = 1 }"):
+            with self.subTest(text=text):
+                warnings = []
+                self.write_policy(f"ahead_margin = 4\n{text}\n")
+                found = usage.policy(self.home, warnings)
+                self.assertEqual((found["codex_ramp"], found["ahead_margin"]), (None, 4))
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("invalid codex_ramp; ignored, other keys kept", warnings[0])
+        self.write_policy('bogus = 1\nahead_margin = 4\n[review.normal]\nmax_rounds = 5\n')
+        warnings = []
+        found = usage.policy(self.home, warnings)
+        self.assertEqual((found["ahead_margin"], found["review"]["normal"]["max_rounds"]), (4, 5))
+        self.assertNotIn("bogus", found)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("unknown key bogus; ignored, other keys kept", warnings[0])
+        self.assertIn("unknown key bogus", "\n".join(usage.report(self.home, NOW)))
+        self.write_policy('[review]\nhigh_paths = { proj = ["x/**"] }\n[review.low]\nmax_rounds = 0\n')
+        warnings = []
+        found = usage.policy(self.home, warnings)["review"]
+        self.assertEqual((found["high_paths"]["proj"], found["low"]["max_rounds"]), (["x/**"], 2))  # only the bad table is dropped
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("invalid review.low.max_rounds; ignored, other keys kept", warnings[0])
+        self.write_policy('blocked = { gemini = "x" }\n')
+        warnings = []
+        self.assertEqual(usage.policy(self.home, warnings)["blocked"], {})
+        self.assertIn("invalid blocked", warnings[0])
+
+    def fallback(self):
+        lines = usage.report(self.home, NOW)
+        return lines[lines.index("fallback:") + 1:] if "fallback:" in lines else None
+
+    def test_fallback_block_is_absent_when_every_vendor_is_normal(self):
+        self.write_policy(self.RAMP)
+        self.claude(50, 84)
+        self.codex_week(10, timedelta(hours=2))
+        self.assertIsNone(self.fallback())
+
+    def test_fallback_block_for_each_state(self):
+        self.write_policy(self.RAMP)
+        self.claude(50, 84)
+        self.codex_week(25, timedelta(hours=2))
+        self.assertEqual(self.fallback(), ["  codex past ramp (day 1, 20 %): builds -> Claude lane; reviews of Claude work -> wait"])
+        self.codex_week(10, timedelta(hours=2))
+        self.claude(80, 84)
+        self.assertEqual(self.fallback(), ["  claude braked (automated share used up): builds -> Codex lane; reviews of Codex work -> wait"])
+        self.claude(50, 84, five=.65)  # reserve 25: warning band from 60 %
+        self.assertEqual(self.fallback(), ["  claude near its 5-hour window: builds -> Codex lane; reviews of Codex work -> one at a time"])
+        self.claude(50, 84)
+        self.write_policy(self.RAMP + 'blocked = { codex = "sandbox defect T-12" }\n')
+        self.assertEqual(self.fallback(), ["  codex blocked by a foundation defect (sandbox defect T-12): "
+                                           "builds -> Claude lane; reviews of Claude work -> wait"])
+        self.claude(80, 84)  # both vendors out: no vendor to fall back to for builds
+        self.assertEqual(self.fallback(), [
+            "  claude braked (automated share used up): builds -> wait; reviews of Codex work -> wait",
+            "  codex blocked by a foundation defect (sandbox defect T-12): builds -> wait; reviews of Claude work -> wait"])
 
     def test_gate_unknown_reading_warns_and_changes_nothing(self):
         decision = usage.gate(self.home, "lane", "claude", "routine", "proj", "t1", NOW)
@@ -251,8 +390,9 @@ class Usage(unittest.TestCase):
         for value in ("-1", "101", "true", '"50"', "nan", "inf"):
             with self.subTest(value=value):
                 path.write_text(f"boost_five_hour_max = {value}\n")
-                with self.assertRaisesRegex(ValueError, "invalid boost_five_hour_max"):
-                    usage.policy(self.home)
+                warnings = []
+                self.assertEqual(usage.policy(self.home, warnings)["boost_five_hour_max"], 50)
+                self.assertRegex(warnings[0], "invalid boost_five_hour_max; ignored, other keys kept")
         path.write_text("boost_five_hour_max = 35.5\n")
         self.claude(40, 30, five=.36)
         self.assertIn("36 % ≥ 35.5 %", usage.boost_pauses(self.home, NOW)["claude"])

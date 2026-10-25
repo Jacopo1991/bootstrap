@@ -2,7 +2,8 @@
 # Real file: the path in ~/.config/task/usage-policy-path, default
 # /home/agent/cortex/cortex-kb-company/policy/usage-pacing.toml. A missing file or key means the values below.
 # Keys outside a [table] must come first (TOML), as here.
-# `task` only reads this file. An invalid file is reported and the built-in defaults apply.
+# `task` only reads this file. An unparseable file is reported and the built-in defaults apply;
+# an unknown or invalid key is warned and keeps its default, and every other key is kept.
 
 # When the allowance is tight (a vendor is ahead of pace), only the first repository in this
 # list that has an unmerged task gets new lanes.
@@ -22,6 +23,11 @@ boost_five_hour_max = 50
 # models on queued work and deeper hard/final other-vendor reviews). `task` never creates tasks from it.
 research_backlog = []
 
+# Decision-23 Codex daily ramp: new Codex launches only while weekly use <= min(ceiling, per_day x started
+# day of the window). No key means no ramp. Example: codex_ramp = { per_day = 20, ceiling = 80 }
+# Open foundation defects per vendor, set by hand by the PM for the `task usage` fallback block.
+# Example: blocked = { codex = "<reason>" }
+
 # Percent of the weekly allowance kept for Jacopo's own use. Automated lanes and reviews stop
 # when weekly use reaches 100 - reserve.
 [reserve]
@@ -34,7 +40,7 @@ codex = 10
 claude = 0
 codex = 1
 
-# Risk is independent of builder-routing tier. Unknown review keys are refused.
+# Risk is independent of builder-routing tier. Unknown review keys are warned and the [review] defaults kept.
 # Patterns use the whole repository-relative path; '*' in a pattern can span '/'.
 # Each configured repository list replaces its built-in list; other repos retain defaults.
 [review]

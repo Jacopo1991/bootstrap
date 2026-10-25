@@ -5129,29 +5129,34 @@ store.write_text(json.dumps(prs))
         for model in ('opus', 'claude-opus-5-5', 'fable', 'claude-fable-5-1', 'gpt-6.1-sol'):
             self.assertIn('risk normal', self.raw_task('review', 'proj', '5', '--record', 'missing', '--reviewer', 'claude', model, code=1))
 
-    def test_risk_policy_selects_reviewers_and_invalid_policy_fails_closed(self):
+    def test_risk_policy_selects_reviewers_and_unparseable_policy_fails_closed(self):
         self.started()
         self.risk_policy_fixture('[review.normal]\ncodex = "sonnet"\n')
         self.assertIn('--model sonnet', self.raw_task('review', 'proj', '5'))
         self.risk_policy_fixture('[review.normal]\ncodex = "opus"\n')
         self.assertIn('risk normal', self.raw_task('review', 'proj', '5', code=1))
-        self.risk_policy_fixture('[review.normal]\nunknown = 1\n')
-        self.assertIn('invalid review.normal', self.raw_task('check', 'proj', '5', code=1))
+        self.risk_policy_fixture('[review.normal]\nunknown = 1\n')  # warned; [review.normal] keeps its defaults
+        self.assertIn('invalid review.normal; ignored, other keys kept', self.raw_task('check', 'proj', '5'))
+        self.risk_policy_fixture('[review.normal\n')
+        self.assertIn('usage-pacing.toml', self.raw_task('check', 'proj', '5', code=1))
 
-    def test_risk_status_invalid_review_reports_problem_and_uses_defaults(self):
+    def test_risk_status_invalid_review_reports_problem_and_keeps_the_other_keys(self):
         wt, _ = self.started()
         self.commit_in(wt, 'b.txt')
-        for text in ('[review.normal]\nunknown = 1\n',
-                     '[review]\nhigh_paths = { proj = ["b.txt"] }\n[review.low]\nmax_rounds = 0\n'):
+        for text, problem, risk in (('[review.normal]\nunknown = 1\n', 'invalid review.normal;', 'normal'),
+                                    ('[review]\nhigh_paths = { proj = ["b.txt"] }\n[review.low]\nmax_rounds = 0\n',
+                                     'invalid review.low.max_rounds;', 'high')):  # the valid high_paths stay in force
             with self.subTest(policy=text):
                 self.risk_policy_fixture(text)
                 out = self.raw_task('status', 'proj')
-                self.assertIn('invalid review.', out)
-                self.assertIn('built-in defaults used', out)
-                self.assertIn('risk=normal', out)
+                self.assertIn(problem + ' ignored, other keys kept', out)
+                self.assertNotIn('built-in defaults used', out)
+                self.assertIn(f'risk={risk}', out)
                 self.assertIn('branch=t5', out)
                 self.assertNotIn('Traceback', out)
-                self.assertIn('invalid review.', self.raw_task('review', 'proj', '5', code=1))
+                self.assertIn(problem, self.raw_task('review', 'proj', '5'))
+        self.risk_policy_fixture('[review\n')  # an unparseable file still fails closed for risk
+        self.assertIn('usage-pacing.toml', self.raw_task('review', 'proj', '5', code=1))
 
     def test_risk_forced_high_global_and_company_repo_paths_refuse_lowering(self):
         wt, _ = self.started()
@@ -7301,6 +7306,75 @@ store.write_text(json.dumps(prs))
         self.assertIn(f"boost on for claude until {until}", self.pace_log())
         self.assertIn(f"boost: claude until {until}", self.raw_task("status", "proj"))
 
+    def ramp_policy(self, extra=""):
+        policy = self.home / "policy.toml"
+        policy.write_text("codex_ramp = { per_day = 20, ceiling = 80 }\n" + extra)
+        (self.home / ".config/task").mkdir(parents=True, exist_ok=True)
+        (self.home / ".config/task/usage-policy-path").write_text(str(policy))
+
+    def ramp_ledger(self):
+        path = self.home / ".local/state/task/usage/overrides.jsonl"
+        return [row for row in map(json.loads, path.read_text().splitlines()) if row.get("kind") == "ramp_exempt"] if path.exists() else []
+
+    def test_ramp_lane_past_the_codex_ramp_is_refused_and_an_exempt_lane_is_ledgered(self):
+        self.ramp_policy()
+        self.readings(codex=(30, 167))  # day 1 of the window: allowance 20 %
+        wt, out = self.pace_lane(builder="codex", code=4)
+        self.assertIn("held back by usage pacing: codex past its daily ramp: weekly used 30 % > allowance 20 % (day 1", out)
+        self.assertFalse((wt / ".work/lane.json").exists())
+        self.assertEqual(self.ramp_ledger(), [])
+        out = self.raw_task("lane", "proj", "5", "--ramp-exempt", "bogus", code=2)
+        self.raw_task("lane", "proj", "5", "--ramp-exempt", "hold")
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-luna")
+        rows = self.ramp_ledger()
+        self.assertEqual([(r["exemption"], r["vendor"], r["past_ramp"], r["override"]) for r in rows],
+                         [("hold", "codex", True, "ramp-exempt hold")])
+        self.assertIn("ramp_exempt on routine", self.raw_task("status", "proj"))
+
+    def test_ramp_leaves_claude_lanes_unchanged(self):
+        self.ramp_policy("ahead_margin = 90\n")  # 50 % on day 1 is past a 20 %/day ramp; keep it on pace
+        self.readings(claude=(50, 167), codex=(30, 167))
+        wt, out = self.pace_lane()
+        self.assertNotIn("ramp", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+
+    def test_ramp_review_and_redteam_on_codex_are_refused_unless_exempt(self):
+        self.stub_reviewers()
+        wt, _ = self.started()
+        self.raw_task("start", "proj", "5", "--builder", "claude", "--refresh")  # Codex reviews and red-teams
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise the codex ramp')
+        head = self.git(wt, "rev-parse", "HEAD")
+        self.raw_task("check", "proj", "5")
+        self.ramp_policy()
+        self.readings(codex=(45, 6 * 24 - 3))  # day 2: allowance 40 %
+        out = self.raw_task("review", "proj", "5", "--run", code=4)
+        self.assertIn("codex past its daily ramp: weekly used 45 % > allowance 40 % (day 2", out)
+        self.assertFalse((wt / ".work/reviewer-call.json").exists())
+        reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```\n"
+        out = self.raw_task("review", "proj", "5", "--run", "--ramp-exempt", "security", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertIn("override recorded: ramp-exempt security on codex past its daily ramp", out)
+        brief = self.home / "brief.md"
+        brief.write_text("Attack the task.\n")
+        out = self.raw_task("redteam", "proj", "5", "--brief", str(brief), code=4)
+        self.assertIn("task redteam: held back by usage pacing: codex past its daily ramp", out)
+        binary = self.home / "bin/codex"
+        binary.write_text('#!/usr/bin/env python3\nimport pathlib, sys\nsys.stdin.read()\n'
+                          'pathlib.Path(sys.argv[sys.argv.index("-o")+1]).write_text("Reviewed risks\\n")\n')
+        self.raw_task("redteam", "proj", "5", "--brief", str(brief), "--ramp-exempt", "money")
+        self.assertEqual(json.loads((self.state() / "redteam.json").read_text())["vendor"], "codex")
+        self.assertEqual([(r["exemption"], r["past_ramp"]) for r in self.ramp_ledger()], [("security", True), ("money", True)])
+
+    def test_usage_prints_the_codex_ramp_and_the_fallback_block(self):
+        self.readings(claude=(50, 84), codex=(10, 167), five=10)
+        self.assertNotIn("fallback:", self.raw_task("usage"))
+        self.ramp_policy('blocked = { claude = "hook defect T-70" }\nbogus = 1\n')
+        self.readings(claude=(50, 84), codex=(30, 167), five=10)
+        out = self.raw_task("usage")
+        self.assertIn("  ramp: day 1, allowance 20 % (20 %/day, ceiling 80 %); past ramp", out)
+        self.assertIn("unknown key bogus; ignored, other keys kept", out)
+        self.assertIn("fallback:\n  claude blocked by a foundation defect (hook defect T-70): builds -> wait; reviews of Codex work -> wait\n"
+                      "  codex past ramp (day 1, 20 %): builds -> wait; reviews of Claude work -> wait", out)
+
     def test_pace_review_holds_exhausted_reviewer_and_final_goes_deeper_when_under_used(self):
         self.stub_reviewers()
         wt, _ = self.started()
@@ -8132,6 +8206,23 @@ store.write_text(json.dumps(prs))
         out = self.task("merge", "proj", "5")
         self.assertIn("WARNING: dependency files changed (requirements.txt)", out)
         self.assertIn("main checkout's environment is now out of date", out)
+
+    def test_merge_flags_cooldown_config_files_as_dependency_changes(self):
+        wt, _ = self.started()
+        self.commit_in(wt, ".npmrc", "min-release-age=0\n")
+        self.commit_in(wt, "uv.toml", 'exclude-newer = "2099-01-01T00:00:00Z"\n')
+        self.prepare_merge_evidence("5")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: dependency files changed (", out)
+        self.assertIn(".npmrc", out)
+        self.assertIn("uv.toml", out)
+
+    def test_merge_flags_tool_uv_table_in_pyproject(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "pyproject.toml", '[tool.uv]\nexclude-newer = "2099-01-01T00:00:00Z"\n')
+        self.prepare_merge_evidence("5")
+        out = self.task("merge", "proj", "5")
+        self.assertIn("WARNING: dependency files changed (pyproject.toml)", out)
 
     def test_merge_runs_only_repository_sync_recipe_for_dependency_change(self):
         justfile = self.repo / "justfile"
@@ -10008,7 +10099,7 @@ class WatcherTests(unittest.TestCase):
         path.write_text('{}')
         self.assertNotIn('P2:claude', self.scan())
 
-    def test_invalid_review_warns_uses_defaults_and_keeps_watching_other_sources(self):
+    def test_invalid_review_key_is_ignored_other_keys_kept_and_watching_continues(self):
         self.readings.stop()
         self.write('cortex/cortex-kb-company/policy/usage-pacing.toml',
                    '[reserve]\nclaude = 0\n[review.normal]\nunknown = 1\n')
@@ -10020,8 +10111,9 @@ class WatcherTests(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()) as warnings:
             found = self.scan()
         self.assertIn('invalid review.normal', warnings.getvalue())
-        self.assertIn('built-in defaults used', warnings.getvalue())
-        self.assertIn('P2:claude', found)  # 80 % exceeds the default 75 %, not the invalid file's 100 %.
+        self.assertIn('ignored, other keys kept', warnings.getvalue())
+        self.assertNotIn('built-in defaults used', warnings.getvalue())
+        self.assertNotIn('P2:claude', found)  # the valid reserve.claude = 0 is kept (100 % threshold), so 80 % does not trip it.
         self.assertIn('P4:broken.timer', found)
 
     def test_p4_only_registered_units_and_errors_do_not_clear(self):
