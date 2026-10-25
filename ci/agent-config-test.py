@@ -47,10 +47,7 @@ assert codex["sandbox_mode"] == "workspace-write"
 # to that ineffective workaround for sandbox proxy variables.
 assert not {"ALL_PROXY", "all_proxy"}.intersection(
     codex.get("shell_environment_policy", {}).get("exclude", []))
-cache_paths = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
-assert codex["sandbox_workspace_write"]["writable_roots"] == cache_paths
-for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"):
-    assert forbidden not in codex["sandbox_workspace_write"]["writable_roots"]
+assert "writable_roots" not in codex["sandbox_workspace_write"]
 # Sandbox network is on for local tests and the paid probe. The proxy allows only the exact
 # openrouter.ai host plus local binding for tests that start a local server.
 assert codex["sandbox_workspace_write"]["network_access"] is True
@@ -78,6 +75,7 @@ assert claude["permissions"]["defaultMode"] == "acceptEdits"
 assert "ask" not in claude["permissions"]
 assert claude["permissions"]["allow"] == ["Bash(git *)", "Bash(gh *)",
     "Bash(/usr/bin/git *)", "Bash(/usr/bin/gh *)"]
+cache_paths = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
 assert claude["sandbox"] == {"enabled": True, "allowUnsandboxedCommands": False,
     # Bare names match only argument-less calls; keep the exact approved patterns.
     "failIfUnavailable": True,
@@ -146,6 +144,14 @@ for name, profile in requirements["permissions"].items():
     assert set(profile) == {"extends", "filesystem"}, name
     assert profile["filesystem"] == dict.fromkeys(claude_reads | extra_denies, "deny"), name
 launch = (ROOT / "home/dot_local/bin/executable_task").read_text(encoding="utf-8")
+for cache in ("UV_CACHE_DIR", "PIP_CACHE_DIR", "PRE_COMMIT_HOME", "npm_config_cache"):
+    assert cache in launch and "builder == \"codex\"" in launch
+assert 'temporary / directory' in launch
+smoke = (ROOT / "home/dot_local/bin/executable_task-smoke").read_text(encoding="utf-8")
+uv_step = "uv run --no-project --with colorama==0.4.6 python smoke_check.py"
+assert uv_step in smoke and "import colorama" in smoke
+readme = (ROOT / "README.md").read_text(encoding="utf-8")
+assert "private uv, pip, pre-commit and npm caches" in readme
 assert "--sandbox" not in launch
 assert launch.count('default_permissions="lane"') == 1 and launch.count('default_permissions=\\"review\\"') == 2
 assert launch.count('default_permissions="review"') == 1

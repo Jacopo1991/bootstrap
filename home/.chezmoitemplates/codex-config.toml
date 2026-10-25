@@ -3,8 +3,6 @@ approvals_reviewer = "user"
 sandbox_mode = "workspace-write"
 
 [sandbox_workspace_write]
-# Tool caches needed by sandboxed project checks. Keep these roots limited to caches.
-writable_roots = ["~/.cache/uv", "~/.cache/pre-commit", "~/.cache/pip", "~/.npm"]
 # Network on inside the sandbox, but only through Codex's own proxy (below), which allows the
 # package registries, GitHub downloads and openrouter.ai; tests can reach 127.0.0.1.
 # git and gh network commands keep running outside the sandbox (policy hook).

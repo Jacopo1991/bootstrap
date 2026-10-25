@@ -33,6 +33,7 @@ PROMPT = """# Lane smoke {ident} ({builder})
 
 This is an install smoke test on a scratch project. Do these steps in this worktree, in order, then stop:
 
+Before editing, run uv run --no-project --with colorama==0.4.6 python smoke_check.py and stop if it fails.
 1. Create `smoke.txt` containing exactly one line: `ok`.
 2. `git add smoke.txt` and `git commit -m "smoke: write smoke.txt"`.
 3. `git merge main`. Main has one new commit, so Git creates a merge commit; if it leaves the merge uncommitted, commit it.
@@ -123,7 +124,8 @@ def build_scratch(run, found):
     repo.mkdir(parents=True)
     if git(repo, "init", "-q", "-b", "main").returncode:
         raise Stop(f"git init failed in {repo}")
-    (repo / "justfile").write_text("check:\n    grep -qx ok smoke.txt\n")
+    (repo / "justfile").write_text("check:\n    uv run --no-project --with colorama==0.4.6 python smoke_check.py\n")
+    (repo / "smoke_check.py").write_text("import colorama\nprint(colorama.__version__)\n")
     (repo / ".task.toml").write_text(f'knowledge = "cortex-kb-{name}"\n')
     (repo / "README.md").write_text("Scratch project for task smoke; `task smoke --clean` removes it.\n")
     commit(repo, "scratch project")

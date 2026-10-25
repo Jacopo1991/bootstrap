@@ -419,6 +419,10 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   writable, a lane can also move other local branches (`git branch -f`, `-D`, `-m`), as it could
   before T-52. The policy hook does not refuse those yet (`git update-ref` is refused; `branch`
   is not checked), so this is an accepted risk until cortex-core T-42 #5 adds that refusal.
+  Codex builder lanes get private uv, pip, pre-commit and npm caches under their worktree's
+  .work/tmp; Claude lanes keep their existing environment. The shared ~/.cache/uv,
+  ~/.cache/pip, ~/.cache/pre-commit and ~/.npm stay read-only to lanes because the PM's
+  unsandboxed tools and trusted checks reuse them.
   Reviews, red teams and realigns use `review` and get no Git grants. PM proof after install, one `codex sandbox -c 'default_permissions="review"' --
   test -r <path>` per denied path (must fail; never print contents) and the controls
   `/etc/hostname` and `~/.bashrc` (must succeed); repeat with `"lane"`; then run `task smoke`
@@ -818,6 +822,34 @@ and review prompts identify the corresponding trusted or advisory log.
 Merge and published-merge repair preserve the trusted `check.log` in state
 and archive the lane log separately as `advisory-check.log`. Batch fix rounds
 read the log recorded by the latest check, including trusted PM checks.
+
+### Hold switch
+
+`task hold` shows the two holds. Jacopo uses `sudo agent-hold pull "reason"` and
+`sudo agent-hold release`; `agent-hold` shows his marker at `/etc/agent-hold`.
+Everyone else uses `task hold pull "reason"` with `TASK_HOLDER` set or `--holder <name>`.
+`task hold release` also requires `TASK_HOLDER` or `--holder <name>` and removes only
+`~/.local/state/task/hold`, never Jacopo's marker. Names provide attribution, not authentication;
+the filesystem and sandbox provide the write boundary.
+Existence holds work; the text is for people. Unreadable or nonregular markers also hold work.
+
+The only mode is drain: a step already launched finishes; nothing new launches, including
+retries and fallbacks. Every builder, reviewer, gate step, runner and workspace-tidy apply
+starts in a `systemd-run --user` unit. Each unit uses `ExecCondition=` with the installed `task hold --check`:
+it needs no holder and succeeds only when both markers are absent and inspectable.
+Skipped units are recorded as `skipped: hold`, with their unit name. A missing user manager
+fails closed; there is no process fallback. Gate-browser runs inside its existing gate unit,
+and a batch started by a runner runs inline in that runner's unit.
+`task merge` checks the hold once on entry in the PM's shell; its sync and publication
+continue in that process. A hold pulled after entry does not interrupt them.
+Status, usage, boost, lock display and hold inspection remain available.
+Running `just check` by hand and the printed manual reviewer command are operator paths
+outside the switch; the operator must respect the hold before launching them.
+For a stop beyond drain, pull a hold first, then use the existing
+`task cancel <repo> runner-<batch>` for runner units and
+`task cancel <repo> <id>` for recorded lanes. Reconcile interrupted work through the
+existing cancel path; interrupted work is never auto-merged. Inspect and reconcile
+before the appropriate owner releases the hold. There is no automatic stop or release.
 
 Always launch build lanes through `task lane`, including from a batch runner:
 

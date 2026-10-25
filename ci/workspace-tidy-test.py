@@ -14,6 +14,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from hold_fixture import install_checker
+from unit_fixture import install_units
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "home/dot_local/bin/executable_workspace-tidy"
@@ -41,6 +43,21 @@ def age(path: Path):
     gitdir = Path(run(path, "rev-parse", "--absolute-git-dir").stdout.strip())
     if (gitdir / "logs/HEAD").exists():
         os.utime(gitdir / "logs/HEAD", (OLD, OLD))
+
+
+def tidy_environment(home):
+    bin_dir = home / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    install_checker(home)
+    install_units(home)
+    task = bin_dir / 'task'
+    task.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
+    task.chmod(0o755)
+    env = dict(os.environ, HOME=str(home), PATH=f"{bin_dir}:{os.environ['PATH']}",
+               XDG_RUNTIME_DIR=str(home / 'runtime'), DBUS_SESSION_BUS_ADDRESS='unix:path=' + str(home / 'runtime/bus'),
+               GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    env.pop('CODEX_HOME', None)
+    return env
 
 
 class Tidy(unittest.TestCase):
@@ -112,8 +129,7 @@ class Tidy(unittest.TestCase):
 
 
     def tidy(self, *args):
-        env = dict(os.environ, HOME=str(self.home), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
-        env.pop("CODEX_HOME", None)
+        env = tidy_environment(self.home)
         result = subprocess.run(["python3", str(TOOL), *args], env=env, capture_output=True, text=True,
                                 timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -306,8 +322,7 @@ class Safety(unittest.TestCase):
         return path
 
     def tidy(self, apply=True):
-        env = dict(os.environ, HOME=str(self.home), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
-        env.pop("CODEX_HOME", None)
+        env = tidy_environment(self.home)
         result = subprocess.run(["python3", str(TOOL), *(["--apply"] if apply else [])], env=env, capture_output=True,
                                 text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
