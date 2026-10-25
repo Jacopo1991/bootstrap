@@ -5,6 +5,9 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import tempfile
+from hold_fixture import install_checker
+from unit_fixture import install_units
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "home/dot_local/bin/executable_gate-browser"
@@ -14,13 +17,39 @@ lane = subprocess.run([sys.executable, str(HELPER)], env=env, capture_output=Tru
 assert lane.returncode == 77, lane
 assert lane.stdout.strip() == "SKIP (lane: browser tests run in the trusted gate)"
 print("PASS: lane skip (77), before any server or argument handling", flush=True)
+with tempfile.TemporaryDirectory(prefix='browser-inline-') as temporary:
+    home = Path(temporary)
+    install_units(home)
+    probe_env = dict(os.environ, HOME=str(home), PATH=f"{home / 'bin'}:{os.environ['PATH']}",
+                     TASK_GATE_RUN_ID='inline-fixture', TASK_GATE_PORT_BASE='22000')
+    inline = subprocess.run([sys.executable, str(HELPER), '--server', 'false', 'no-such-spec.cjs'],
+                            cwd=home, env=probe_env, capture_output=True, text=True)
+    assert inline.returncode == 1, inline
+    assert 'no specs matched' in inline.stderr, inline
+    assert not (home / 'unit-calls.jsonl').exists(), inline
+print('PASS: gate-browser runs inside the existing gate unit, with no nested launch', flush=True)
 if not os.environ.get("TASK_GATE_RUN_ID"):
     print("SKIP (lane: browser tests run in the trusted gate)")
     sys.exit(77)
 
 base = int(os.environ["TASK_GATE_PORT_BASE"])
+admission = tempfile.TemporaryDirectory(prefix='browser-admission-')
+fixture_home = Path(admission.name)
+install_checker(fixture_home)
+install_units(fixture_home)
+real_home = Path.home()
+for relative in ('.local/bin/playwright', '.local/share/bootstrap/npm', '.cache/ms-playwright'):
+    link = fixture_home / relative
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(real_home / relative, target_is_directory=(real_home / relative).is_dir())
+hostile = fixture_home / 'bin/task'
+hostile.parent.mkdir(exist_ok=True)
+hostile.write_text('#!/bin/sh\ntouch "$HOME/hostile-checker-used"\nexit 0\n')
+hostile.chmod(0o755)
 for offset, fail in [(10, False), (11, True)]:
-    env = dict(os.environ)
+    env = dict(os.environ, HOME=str(fixture_home), PATH=f"{hostile.parent}:{os.environ['PATH']}")
+    env.update(XDG_RUNTIME_DIR=str(fixture_home / 'runtime'), DBUS_SESSION_BUS_ADDRESS='unix:path=' + str(fixture_home / 'runtime/bus'))
+    env.setdefault('TASK_GATE_SLOT', '0')
     if fail:
         env["GATE_BROWSER_FIXTURE_FAIL"] = "1"
     result = subprocess.run([
@@ -35,4 +64,5 @@ for offset, fail in [(10, False), (11, True)]:
     # A closed port proves both successful and failing test runs stopped their server.
     with socket.socket() as probe:
         assert probe.connect_ex(("127.0.0.1", base + offset)) != 0
+assert not (fixture_home / 'hostile-checker-used').exists()
 print("PASS: real Chromium, allocated ports, success/failure server teardown")

@@ -65,6 +65,8 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
                           timeout=120, stdin=subprocess.DEVNULL)
 
 
+
+
 def repos() -> list[Path]:
     """Main checkouts directly under ~/dev_workspace and ~/cortex."""
     found = []
@@ -554,7 +556,23 @@ def main() -> int:
                      "Databases and big files inside caches are included in the cache entry without individual hashes.")
     parser.add_argument("--apply", action="store_true",
                         help="remove finished worktrees and merged branches (otherwise report only)")
+    parser.add_argument('--_unit', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.apply and not args._unit:
+        helper = runpy.run_path(str(HOME / '.local/bin/task'), run_name='tidy_launch')
+        environment = helper['agent_environment']()
+        STATE.mkdir(parents=True, exist_ok=True)
+        with (STATE / 'run.log').open('w') as log:
+            process = helper['launch_unit']('tidy', Path.cwd(), 'apply',
+                [sys.executable, str(Path(__file__).resolve()), '--apply', '--_unit'],
+                cwd=Path.cwd(), env=environment, stdout=log, stderr=log)
+            code = process.wait()
+        result = 'skipped: hold' if process.skipped else 'finished'
+        helper['atomic_json'](STATE / 'unit.json', dict(unit=process.unit, result=result, exit_code=code))
+        if process.skipped: (STATE / 'report.txt').write_text('workspace-tidy: skipped: hold\n')
+        print((STATE / 'run.log').read_text(), end='')
+        print(f'workspace-tidy: {result}; unit: {process.unit}')
+        return 1 if process.skipped else code
     now, report, done = time.time(), [], []
     archive_helpers()['prune_evidence_archive'](HOME / '.local/state/task/archive', args.apply, report)
     in_use = paths_in_use()
@@ -580,4 +598,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try: sys.exit(main())
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f'workspace-tidy: {error}', file=sys.stderr); sys.exit(1)
