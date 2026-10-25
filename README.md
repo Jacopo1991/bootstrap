@@ -411,7 +411,11 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   `<common>/objects`, `<common>/refs` and `<common>/logs`. A lane can therefore commit and merge on
   its task branch. `hooks`, `config` and `info` stay read-only because a writable hook or config
   runs as code outside the sandbox at the next Git command, and no other worktree's dir is
-  granted. A checkout whose git dir is the common dir is refused (`Stop`). With the shared `refs`
+  granted. The grant is always `<common>/worktrees/<name>`, never `<common>` itself, and `task
+  lane` refuses when `extensions.worktreeConfig` is on. The lane-writable Git metadata (the
+  worktree's `.git`, `commondir`, `gitdir`, `config.worktree`) is checked against `task`'s records
+  after every lane, and before check, review and merge; a mismatch marks the lane `tampered`, stops
+  the batch runner and is never repaired automatically. With the shared `refs`
   writable, a lane can also move other local branches (`git branch -f`, `-D`, `-m`), as it could
   before T-52. The policy hook does not refuse those yet (`git update-ref` is refused; `branch`
   is not checked), so this is an accepted risk until cortex-core T-42 #5 adds that refusal.
