@@ -41,6 +41,15 @@ tar -xzf "$tmp/just.tar.gz" -C "$tmp" just
 cmp -s "$tmp/just" "$HOME/.local/bin/just" || install -m 0755 "$tmp/just" "$HOME/.local/bin/just"
 just_expected=${JUST_URL##*/download/}
 [[ $("$HOME/.local/bin/just" --version) == "just ${just_expected%%/*}" ]]
+# Antigravity CLI (agy): the pinned release tarball, checked against its SHA-256 before extraction.
+# The vendor's install script is never run. Lanes cannot run agy (policy hook, T-48).
+download "$AGY_URL" "$AGY_SHA256" "$tmp/agy.tar.gz"
+tar -xzf "$tmp/agy.tar.gz" -C "$tmp" antigravity
+agy_root="$HOME/.local/share/bootstrap/agy/$AGY_VERSION"
+mkdir -p "$agy_root"
+cmp -s "$tmp/antigravity" "$agy_root/antigravity" || install -m 0755 "$tmp/antigravity" "$agy_root/antigravity"
+ln -sfn "$agy_root/antigravity" "$HOME/.local/bin/agy"
+[[ $("$HOME/.local/bin/agy" --version) == *"$AGY_VERSION"* ]]
 pre_commit_root="$HOME/.local/share/bootstrap/pre-commit"
 mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$pre_commit_root/venv"
 mise exec -- uv pip sync --quiet --require-hashes --python "$pre_commit_root/venv/bin/python" "$pre_commit_root/requirements.lock"
