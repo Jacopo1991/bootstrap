@@ -2008,7 +2008,7 @@ def setup_round(task, number, reason):
 
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
-    if args.setup_round:
+    if getattr(args, "setup_round", None):
         return setup_round(task, *args.setup_round)
     worktree_metadata_ok(task)
     path = task.worktree()
