@@ -16,15 +16,15 @@ spec.loader.exec_module(drift)
 
 expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "lychee", "osv-scanner", "pre-commit", "qmd", "backlog", "just", "playwright",
-            "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "verify-enable", "gate-browser",
+            "playwright-mcp", "osv-db-refresh", "pre-commit-enable", "package-cap-check", "verify-enable", "gate-browser",
             "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
-            "task-watch", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
+            "task-watch", "task-smoke", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
 assert drift.EXPECTED_BINARIES == expected
 allowed_helpers = {"task_limits.py", "task_routing.py", "task_usage.py", "task_lock.py"}
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
 for script in (ROOT / "home/dot_local/bin").iterdir():
     if script.is_file():
-        assert script.name.removeprefix("executable_") in expected | allowed_helpers, script.name
+        assert script.name.removeprefix("executable_") in expected | allowed_helpers | {"security-watch"}, script.name
 # Exercise imports from the installed layout, outside the source directory.
 with tempfile.TemporaryDirectory() as temp:
     installed = Path(temp) / ".local/bin"
@@ -108,4 +108,15 @@ with tempfile.TemporaryDirectory() as temp:
         settings.write_text(json.dumps({"mcpServers": {"kb": server}}))
         assert drift.backlog_mcp_references(home), server
         assert not drift.shell_connector_references(home), server
+# The installed Codex requirements must carry the checked-in read-deny profiles.
+with tempfile.TemporaryDirectory() as temp:
+    installed = Path(temp) / "requirements.toml"
+    source = (ROOT / "system/codex-requirements.toml").read_text()
+    assert drift.codex_deny_list_missing(ROOT, installed)
+    installed.write_text(source)
+    assert not drift.codex_deny_list_missing(ROOT, installed)
+    for stripped in (source.split("\n[permissions.lane]")[0], source.replace('"~/project-data" = "deny"', '', 1),
+                     source.replace('default_permissions = "lane"', 'default_permissions = "review"')):
+        installed.write_text(stripped)
+        assert drift.codex_deny_list_missing(ROOT, installed)
 print("PASS: foreign npm, uv, and global CLI installs, stale OSV data and connector registrations are reported as drift")

@@ -23,6 +23,7 @@ require_root_owned_policy() {
   }
   for file in /usr/local/lib/agent-policy/pre_tool_use.py \
     /usr/local/lib/agent-policy/context_reminder.py \
+    /usr/local/lib/agent-policy/package-caps.toml \
     /usr/bin/env /usr/bin/python3 /usr/bin/git /usr/local/bin/gitleaks; do
     path=$(readlink -e -- "$file") || { echo "Missing managed-policy file: $file" >&2; exit 1; }
     while :; do

@@ -11,12 +11,17 @@ unit = args[args.index('--unit') + 1]
 root = home / 'units'
 root.mkdir(exist_ok=True)
 env = {}
+environment_file = pathlib.Path(next(arg.split('=', 1)[1] for arg in args if arg.startswith('EnvironmentFile=')))
+for assignment in shlex.split(environment_file.read_text()):
+    key, value = assignment.split('=', 1)
+    env[key] = value
 for arg in args:
     if arg.startswith('--setenv='):
         key, value = arg[9:].split('=', 1)
         env[key] = value
 with (home / 'unit-calls.jsonl').open('a') as stream:
-    stream.write(json.dumps(dict(args=args, env=env)) + '\n')
+    stream.write(json.dumps(dict(args=args, env=env, environment_file=str(environment_file),
+                                environment_file_mode=environment_file.stat().st_mode & 0o777)) + '\n')
 condition = next(arg.split('=', 1)[1] for arg in args if arg.startswith('ExecCondition='))
 if (home / 'pull-before-service').exists():
     (home / '.local/state/task/hold').write_text('service admission hold')

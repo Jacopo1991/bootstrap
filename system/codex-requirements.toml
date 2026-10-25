@@ -4,6 +4,26 @@
 # forbidden/prompt command rules. Approval policy, sandbox mode and the routine Git/gh allow
 # rules stay preferences in ~/.codex (no allowed_* lists, no allow_managed_hooks_only).
 
+# Read-deny for every sandboxed tool command: credentials and private data. `--sandbox` cannot be
+# combined with a permissions profile, so `task` launches Codex with `-c default_permissions="lane"`
+# or `"review"`. Each profile (below) extends the built-in one that keeps its write scope and adds
+# the denies. Only these two are allowed and the default is the writable one, so a lane cannot
+# select a weaker profile. The deny applies to commands run in the sandbox; the `codex` process
+# itself still reads ~/.codex/auth.json to authenticate.
+# `:workspace` leaves a linked worktree's Git metadata read-only, so `task lane` adds four
+# `--add-dir` grants (T-53): the worktree's own git dir, and the shared `objects`, `refs` and
+# `logs`. That is enough to commit and merge on the task branch. `hooks`, `config` and `info`
+# stay read-only: a writable hook or config would run outside the sandbox at the next Git command.
+# The worktree's git dir is always `<common>/worktrees/<name>`, never `<common>`. Files in it that
+# Git follows to config or hooks (`commondir`, `gitdir`, `config.worktree`, and the worktree's
+# `.git`) are checked against `task`'s own records after every lane and before check, review and
+# merge; `task lane` refuses when `extensions.worktreeConfig` is on. Reviews get no grants.
+default_permissions = "lane"
+
+[allowed_permission_profiles]
+lane = true
+review = true
+
 # Hooks run even if a user config turns the hooks feature off.
 [features]
 hooks = true
@@ -59,3 +79,57 @@ prefix_rules = [
   { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { any_of = ["secret", "ruleset"] }], decision = "forbidden", justification = "Merge, repository administration, deletion, secrets and rulesets are forbidden to this build lane." },
   { pattern = [{ any_of = ["gh", "/usr/bin/gh"] }, { token = "api" }, { any_of = ["-X", "--method"] }, { token = "DELETE" }], decision = "forbidden", justification = "GitHub API DELETE is forbidden; use read-only requests." },
 ]
+
+[permissions.lane]
+extends = ":workspace"
+
+[permissions.lane.filesystem]
+"~/.ssh" = "deny"
+"~/.aws" = "deny"
+"~/.azure" = "deny"
+"~/.kube" = "deny"
+"~/.gnupg" = "deny"
+"~/.config/gh" = "deny"
+"~/.config/gcloud" = "deny"
+"~/.docker/config.json" = "deny"
+"~/.netrc" = "deny"
+"~/.npmrc" = "deny"
+"~/.claude.json" = "deny"
+"~/.claude/.credentials.json" = "deny"
+"~/.codex/auth.json" = "deny"
+"~/.gemini" = "deny"
+"~/project-data" = "deny"
+"~/dev_workspace/typo3-dkm" = "deny"
+"~/dev_workspace/typo3-dkm-plugin" = "deny"
+"~/dev_workspace/customer-harness" = "deny"
+"~/dev_workspace/photo-organizer" = "deny"
+"~/cortex/cortex-kb-typo3-dkm" = "deny"
+"~/cortex/cortex-kb-customer-harness" = "deny"
+"~/cortex/cortex-kb-photo-organizer" = "deny"
+
+[permissions.review]
+extends = ":read-only"
+
+[permissions.review.filesystem]
+"~/.ssh" = "deny"
+"~/.aws" = "deny"
+"~/.azure" = "deny"
+"~/.kube" = "deny"
+"~/.gnupg" = "deny"
+"~/.config/gh" = "deny"
+"~/.config/gcloud" = "deny"
+"~/.docker/config.json" = "deny"
+"~/.netrc" = "deny"
+"~/.npmrc" = "deny"
+"~/.claude.json" = "deny"
+"~/.claude/.credentials.json" = "deny"
+"~/.codex/auth.json" = "deny"
+"~/.gemini" = "deny"
+"~/project-data" = "deny"
+"~/dev_workspace/typo3-dkm" = "deny"
+"~/dev_workspace/typo3-dkm-plugin" = "deny"
+"~/dev_workspace/customer-harness" = "deny"
+"~/dev_workspace/photo-organizer" = "deny"
+"~/cortex/cortex-kb-typo3-dkm" = "deny"
+"~/cortex/cortex-kb-customer-harness" = "deny"
+"~/cortex/cortex-kb-photo-organizer" = "deny"

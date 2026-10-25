@@ -814,7 +814,7 @@ def realign(args):
     with tempfile.TemporaryDirectory(dir=state) as temporary:
         source = Path(temporary) / "prompt.md"
         source.write_text(prompt)
-        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -",
+        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -m gpt-6-luna -c model_reasoning_effort=high -",
                      info["kb"], source, failed_reply)
         directory.mkdir(parents=True, exist_ok=True)
         failed_reply.replace(reply)
@@ -948,7 +948,7 @@ def handle_interruption(signum, _frame):
             lock_data = json.loads(lock.read_text())
             child_pgid = int(lock_data.get("child_pgid", 0))
             if lock_data.get('child_unit'):
-                subprocess.run(['systemctl', '--user', 'stop', lock_data['child_unit']], check=True)
+                stop_unit(lock_data['child_unit'])
             elif child_pgid:
                 os.killpg(child_pgid, signal.SIGTERM)
                 time.sleep(0.1)
@@ -1041,7 +1041,7 @@ def redteam(args):
         binary = shutil.which(vendor)
         if not binary:
             raise Stop(f"risk high: {vendor} is not available on PATH")
-        command = ([binary, "exec", "--sandbox", "read-only", "-m", model,
+        command = ([binary, "exec", "-c", 'default_permissions="review"', "-m", model,
                                  "-c", "model_reasoning_effort=high", "--skip-git-repo-check", "-C", str(path),
                                  "-o", str(temporary), "-"] if vendor == "codex" else
                    [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
@@ -1909,8 +1909,65 @@ def archive_lane_final(work):
             report.write_text("\n".join(lines).rstrip() + "\n")
 
 
+def git_baseline(task: Task) -> dict:  # derived from the main checkout (a lane cannot write it), kept in private state, never read from lane-writable files
+    record = task_state(task) / "git-paths.json"
+    saved = read_json_object(record)
+    if not saved:
+        common = Path(git(task.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        saved = {"common": str(common), "git_dir": str(common / "worktrees" / task.path.name), "dot_git": str(task.path / ".git")}
+        if not Path(saved["git_dir"]).is_dir():
+            raise Stop(f"{saved['git_dir']} does not exist; the PM must investigate {task.path} before any lane or check runs.")
+        with contextlib.suppress(OSError):  # a sandboxed advisory check derives the same paths again
+            atomic_json(record, saved)
+    return saved
+
+
+def worktree_config_on(common):
+    return run_git(common, "config", "--file", str(common / "config"), "--type=bool", "--get", "extensions.worktreeConfig").stdout.strip() == "true"
+
+
+def tamper_reason(task: Task) -> str:
+    if not (task.path / ".git").exists():  # a removed worktree (merge's already-merged retry) or a plain folder has nothing to check
+        return ""
+    base = git_baseline(task)
+    git_dir, common, dot_git = Path(base["git_dir"]), Path(base["common"]), Path(base["dot_git"])
+    for file, prefix, root, expected in ((dot_git, "gitdir: ", task.path, git_dir), (git_dir / "commondir", "", git_dir, common), (git_dir / "gitdir", "", git_dir, dot_git)):
+        value = file.read_text().strip() if file.is_file() else ""
+        if not value.startswith(prefix) or (root / value[len(prefix):]).resolve() != expected.resolve():
+            return f"Git metadata tampered: {file} must point at {expected}; nothing was repaired."
+    if (git_dir / "config.worktree").exists() and (git_dir / "config.worktree").stat().st_size and worktree_config_on(common):
+        return f"Git metadata tampered: {git_dir}/config.worktree must be empty while extensions.worktreeConfig is on; nothing was repaired."
+    return ""
+
+
+def worktree_metadata_ok(task: Task):
+    if reason := tamper_reason(task):
+        record = task.path / ".work/lane.json"
+        with contextlib.suppress(OSError):
+            atomic_json(record, {**read_json_object(record), "state": "tampered", "ended_at": utc_now()})
+        raise Stop(reason)
+
+
+def entry_task(args):
+    if args.command != "check" or args.repo and args.id:
+        return Task(resolve_repo(args.repo), args.id)
+    here = Path.cwd().resolve()
+    root = next((p for p in (here, *here.parents) if p.parent.name == ".worktrees"), None)
+    if root:
+        return Task(root.parent.parent, args.id or root.name)
+    return Task(main_repo(here), args.id) if args.id else None
+
+
+def lane_git_grants(task: Task) -> list[str]:  # the worktree's Git dir (always <common>/worktrees/<name>), objects, refs, logs; never <common>, config, hooks or info
+    base = git_baseline(task)
+    if worktree_config_on(Path(base["common"])):
+        raise Stop(f"extensions.worktreeConfig is on in {base['common']}/config; a lane could write config.worktree. Turn it off first.")
+    return [x for part in (base["git_dir"], *(f"{base['common']}/{name}" for name in ("objects", "refs", "logs"))) for x in ("--add-dir", part)]
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
+    worktree_metadata_ok(task)
     path = task.worktree()
     record = load_record(task)
     bind_plan(task, args)
@@ -1951,7 +2008,7 @@ def lane(args):
         raise Stop(f"{binary} is not installed or available on PATH.")
     task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
-    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
+    command = (["codex", "exec", "-c", 'default_permissions="lane"', *lane_git_grants(task), "--model", cli_model,
                 "-c", f"model_reasoning_effort={args.effort}", "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", args.effort,
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
@@ -2094,6 +2151,8 @@ def lane(args):
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     stop_child_group(child)
+                    finalize_lane_record(lane_record, run, "tampered" if tamper_reason(task) else "timed_out", exit_code=None)
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
                 except (SystemExit, KeyboardInterrupt):
                     interrupted = True
                     stop_child_group(child)
@@ -2104,8 +2163,8 @@ def lane(args):
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        finalize_lane_record(lane_record, run, "interrupted" if interrupted else "timed_out" if timed_out else result,
-                             exit_code=None if interrupted or timed_out else code)
+        state = "tampered" if tamper_reason(task) else "interrupted" if interrupted else "timed_out" if timed_out else result
+        finalize_lane_record(lane_record, run, state, exit_code=None if interrupted or timed_out else code or int(state == "tampered"))
     return code
 
 
@@ -2484,7 +2543,7 @@ signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
 code = 1
 try:
-    child = subprocess.Popen([executable, repo, source], stdin=subprocess.DEVNULL, pass_fds=task_lock.descriptors())
+    child = subprocess.Popen([executable, repo, source, '--_unit'], stdin=subprocess.DEVNULL, pass_fds=task_lock.descriptors())
     code = child.wait()
 finally:
     path = pathlib.Path(done)
@@ -2509,6 +2568,16 @@ def runner_service(unit, env=None):
         return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
     except OSError:
         return {}
+
+
+def stop_unit(unit, env=None):
+    stopped = subprocess.run(['systemctl', '--user', 'stop', unit], env=env, capture_output=True, text=True)
+    if stopped.returncode:
+        shown = subprocess.run(['systemctl', '--user', 'show', '--property=ActiveState', '--', unit],
+                               env=env, capture_output=True, text=True)
+        if shown.stdout.strip() not in ('ActiveState=inactive', 'ActiveState=failed') and not any(
+                text in shown.stderr.lower() for text in ('not found', 'could not be found')):
+            raise Stop(f'Cannot stop {unit}; kept the running record.')
 
 
 class UnitProcess:
@@ -2539,7 +2608,7 @@ class UnitProcess:
         return None if self.process.poll() is None else self.wait()
 
     def stop(self):
-        subprocess.run(['systemctl', '--user', 'stop', self.unit], check=True, env=self.env)
+        stop_unit(self.unit, self.env)
         self.process.wait()
 
 
@@ -2548,17 +2617,25 @@ def launch_unit(kind, repo, ident, command, *, cwd, env, stdin=subprocess.DEVNUL
     """All work starts behind the installed hold checker; no session fallback."""
     safe = lambda value: re.sub(r'[^A-Za-z0-9_-]', '-', str(value))[:60]
     unit = f'task-{safe(kind)}-{safe(Path(repo).name)}-{safe(ident)}-{secrets.token_hex(4)}'
-    launch = ['systemd-run', '--user', '--unit', unit, '--wait', '--pipe', '--service-type=exec',
-              '--working-directory', str(cwd), '-p',
-              f'ExecCondition={shlex.quote(str(HOME / ".local/bin/task"))} hold --check',
-              *[f'--setenv={key}={value}' for key, value in sorted(env.items())], '--',
-              *[unit if arg == '{task-unit}' else arg for arg in command]]
+    environment_file = None
     try:
+        with tempfile.NamedTemporaryFile(mode='w', prefix='task-unit-env-', delete=False) as stream:
+            environment_file = Path(stream.name)
+            for key, value in sorted(env.items()):
+                # EnvironmentFile double quotes preserve literal newlines; escape quotes and backslashes.
+                stream.write(key + '="' + value.replace('\\', '\\\\').replace('"', '\\"') + '"\n')
+        launch = ['systemd-run', '--user', '--unit', unit, '--wait', '--pipe', '--service-type=exec',
+                  '--working-directory', str(cwd), '-p',
+                  f'ExecCondition={shlex.quote(str(HOME / ".local/bin/task"))} hold --check',
+                  '-p', f'EnvironmentFile={environment_file}', '--',
+                  *[unit if arg == '{task-unit}' else arg for arg in command]]
         process = subprocess.Popen(launch, cwd=cwd, env=env, stdin=stdin, stdout=stdout, stderr=stderr,
                                    start_new_session=True)
+        return UnitProcess(process, unit, env)
     except OSError as error:
         raise Stop(f'systemd-run --user unavailable; launch failed closed: {error}') from error
-    return UnitProcess(process, unit, env)
+    finally:
+        if environment_file: environment_file.unlink(missing_ok=True)
 
 
 def runner_start(args):
@@ -2740,6 +2817,7 @@ def start_locked(args, repo):
     record_path = state / "task.json"
     state.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
+    worktree_metadata_ok(task)
     if record_path.exists() and not args.refresh and (read_json_object(record_path).get("branch") or not read_json_object(record_path).get("plan")):
         record = load_record(task)
         if record.get("branch") != branch:
@@ -3361,8 +3439,13 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         if os.environ.get('TASK_PLAN'): plan_budget(os.environ['TASK_PLAN'], usage_run, reserve=None)
         worker = [sys.executable, str(Path(__file__).resolve()), '--_review-unit', '{task-unit}',
                   str(path), str(prompt_file), str(reply_file), replaces or '', command]
-        with reply_file.with_name('review-unit.log').open('w') as log:
-            process = launch_unit('review', main_repo(path), path.name, worker, cwd=path, env=env, stdout=log, stderr=log)
+        try:
+            with reply_file.with_name('review-unit.log').open('w') as log:
+                process = launch_unit('review', main_repo(path), path.name, worker, cwd=path, env=env, stdout=log, stderr=log)
+        except Stop:
+            atomic_json(run_file, dict(run, state='launch_failed'))
+            if usage_run: (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
+            raise
         try:
             code = process.wait()
             if process.skipped:
@@ -3552,7 +3635,7 @@ def review_locked(args):
                 events = "--output-format stream-json --verbose " if args.run else ""
                 return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
                         "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
-            return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+            return (f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' {add_dir}"
                     f"-m {shlex.quote(model)} -c model_reasoning_effort=high -")
         command = reviewer_command(*reviewer_route)
         if not args.run:
@@ -4704,7 +4787,7 @@ def status(args):
                     lane_state, result = "ended by usage limit", f" ({limit})"
                 print(f"    lane: {lane_state}{result} pid={lane_run.get('pid', '?')} "
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
-                if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
+                if lane_state in {"interrupted", "timed_out", "tampered"} or lane_run.get("exit_code", 0) != 0:
                     attention.append(f"{path.name}: lane {lane_state}{result}")
                 try:
                     final = [line for line in (path / ".work/final.md").read_text(errors="replace").splitlines()
@@ -4801,7 +4884,7 @@ def cancel(args):
         record = repo / '.work' / f'{args.id}.json'
         data = read_json_object(record)
         if data.get('unit'):
-            subprocess.run(['systemctl', '--user', 'stop', data['unit']], check=True)
+            stop_unit(data['unit'])
             print(f"Cancelled {data['unit']}"); return 0
     prune_stale_gate_worktrees(repo)
     task = Task(repo, args.id)
@@ -4809,8 +4892,7 @@ def cancel(args):
     lane_run = read_json_object(lane_path)
     if lane_run.get('state') == 'running' and lane_alive(lane_run):
         if not lane_run.get('unit'): raise Stop('Lane has no unit; ask the PM to inspect the legacy run.')
-        try: subprocess.run(['systemctl', '--user', 'stop', lane_run['unit']], check=True)
-        except subprocess.CalledProcessError as error: raise Stop(f"Cannot stop {lane_run['unit']}; kept the running record.") from error
+        stop_unit(lane_run['unit'])
         finalize_lane_record(lane_path, lane_run, 'cancelled')
         print(f"Cancelled lane unit {lane_run['unit']}; kept {task.path}."); return 0
     run_path = task_state(task) / 'run.json'
@@ -4825,7 +4907,7 @@ def cancel(args):
     child_unit = read_json_object(lock).get('child_unit')
     units = list(filter(None, (child_unit, run.get('unit'))))
     if not units: raise Stop('Run has no unit; ask the PM to inspect the legacy run.')
-    for unit in units: subprocess.run(['systemctl', '--user', 'stop', unit], check=True)
+    for unit in units: stop_unit(unit)
     run.update(state='cancelled', ended_at=utc_now()); atomic_json(run_path, run)
     lock.unlink(missing_ok=True); prune_stale_gate_worktrees(repo)
     print('Cancelled task run.')
@@ -4992,6 +5074,16 @@ def hold(args):
     print(hold_status() or 'no hold')
 
 
+def smoke(args):
+    """`task smoke`: the lane path on a scratch project. task-smoke holds the logic, outside this budget."""
+    helper = shutil.which("task-smoke")
+    if helper is None:
+        print("task smoke: task-smoke is not on PATH; run chezmoi apply first.", file=sys.stderr)
+        return 1
+    flags = ["--clean", args.clean] if args.clean else ["--builder", args.builder]
+    return subprocess.run([helper, *flags], env=dict(os.environ, TASK_SMOKE_TOOL=str(Path(__file__).resolve()))).returncode
+
+
 def main(argv=None):
     global ACTIVE_FOREGROUND_TASK
     internal = sys.argv[1:] if argv is None else argv
@@ -5091,6 +5183,9 @@ def main(argv=None):
     sub.add_argument('reason', nargs='?')
     sub.add_argument('--holder')
     sub.add_argument('--check', action='store_true', help='exit nonzero if either hold exists or cannot be inspected')
+    sub = commands.add_parser("smoke", help="the lane path on a scratch project, per builder (install gate)")
+    sub.add_argument("--builder", choices=("codex", "claude", "both"), default="both")
+    sub.add_argument("--clean", metavar="RUN_ID", help="remove a kept smoke run's scratch project")
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
@@ -5112,6 +5207,8 @@ def main(argv=None):
     sub.add_argument("--rule")
     sub.add_argument("--repo")
     args = parser.parse_args(argv)
+    if args.command == "smoke":
+        return smoke(args)
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
     global GATE_LOCK_WAIT
@@ -5131,6 +5228,8 @@ def main(argv=None):
         if args.command == "review" or (args.command == "lane" and args._worker):
             for sig in (signal.SIGTERM, signal.SIGHUP):
                 handlers[sig] = signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+        if (args.command in {"check", "merge"} or args.command == "review" and args.run) and (target := entry_task(args)):
+            worktree_metadata_ok(target)
         task_lock.before_work(args, HOME, resolve_repo)
         if args.command == "note":
             if args.kind != "setup-done":

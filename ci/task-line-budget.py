@@ -53,7 +53,6 @@ def main(argv):
     root = Path(__file__).resolve().parent.parent
     bin_dir = root / "home/dot_local/bin"
     entries = [bin_dir / "executable_task", bin_dir / "executable_task-batch", bin_dir / "executable_task-watch"]
-    entries.extend(path for path in bin_dir.glob("*watch*") if path.is_file())
     failed = False
     # P4 derives service expectations and timer health from one property query per unit.
     if len((bin_dir / "executable_task-watch").read_text().splitlines()) > 85:

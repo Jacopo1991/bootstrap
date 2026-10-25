@@ -17,6 +17,7 @@ import re
 import subprocess
 import tempfile
 import tomllib
+import types
 from unittest.mock import patch
 
 from policy_test_env import isolate_policy_environment
@@ -42,6 +43,7 @@ RESTRICTING = {"disableBypassPermissionsMode", "disableAutoMode", "defaultMode",
                "allow_managed_hooks_only", "allowed_approval_policies", "allowed_sandbox_modes",
                "allowed_permission_profiles", "default_permissions", "allowed_approvals_reviewers",
                "permissions", "remote_sandbox_config"}
+READ_DENY_KEYS = {"permissions", "allowed_permission_profiles", "default_permissions"}
 
 
 def keys(value, path=()):
@@ -99,9 +101,19 @@ assert claude_hooks == {
 
 # --- Codex ---------------------------------------------------------------------------------
 requirements = tomllib.loads((ROOT / "system/codex-requirements.toml").read_text(encoding="utf-8"))
-assert set(requirements) == {"features", "hooks", "rules"}, set(requirements)
-for path in keys(requirements):
-    assert path[-1] not in RESTRICTING, path
+assert set(requirements) == {"features", "hooks", "rules", "permissions", "allowed_permission_profiles",
+                             "default_permissions"}, set(requirements)
+# Read-deny profiles: only lane (writable, default) and review (read-only) may be selected.
+assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True}
+assert requirements["default_permissions"] == "lane"
+profiles = requirements["permissions"]
+assert set(profiles) == {"lane", "review"}, set(profiles)
+assert profiles["lane"]["extends"] == ":workspace" and profiles["review"]["extends"] == ":read-only"
+assert set(profiles["lane"]) == set(profiles["review"]) == {"extends", "filesystem"}
+assert profiles["lane"]["filesystem"] == profiles["review"]["filesystem"]
+assert set(profiles["lane"]["filesystem"].values()) == {"deny"}
+for path in keys(requirements):  # the read-deny profile keys are the one deliberate selection limit
+    assert path[0] in READ_DENY_KEYS or path[-1] not in RESTRICTING, path
 assert requirements["features"] == {"hooks": True}  # pins the hooks feature on, nothing else
 codex_events = dict(requirements["hooks"])
 assert codex_events.pop("managed_dir") == SCRIPTS
@@ -241,7 +253,9 @@ policy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(policy)
 
 # Script and recipe controls inspect inert fixture text; no denied command runs.
-with tempfile.TemporaryDirectory() as temp:
+with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {
+        "PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+        "TMPDIR": tempfile.gettempdir(), "PYTHONDONTWRITEBYTECODE": "1"}, clear=True):
     root = Path(temp)
     def judge(command):
         return policy.evaluate({"tool_name": "Bash", "cwd": temp,
@@ -266,11 +280,224 @@ with tempfile.TemporaryDirectory() as temp:
     (root / "ci").mkdir()
     fixture("ci/lint.sh", "#!/bin/sh\necho safe\n")
     fixture("build.js", "console.log('safe');\n")
+    (root / "compatibility").mkdir()
+    fixture("compatibility/justfile", "check:\n    echo safe\n")
+    fixture("compatibility/Makefile", "check:\n\techo safe\n")
     fixture_git("add", ".")
     fixture_git("commit", "-qm", "base recipes")
     fixture_git("update-ref", "refs/remotes/origin/main", "HEAD")
     fixture_git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     fixture_git("checkout", "-qb", "lane")
+    # Round 6: measure the compatibility claim against the actual pinned main
+    # hook, never a second implementation of its rules. Commands are inert data.
+    main_source = subprocess.run(
+        ["git", "-C", str(ROOT), "show", "69870f4:system/agent-policy/pre_tool_use.py"],
+        capture_output=True, text=True, check=True).stdout
+    main_policy = types.ModuleType("t39_main_policy")
+    main_policy.__file__ = str(ROOT / "system/agent-policy/pre_tool_use.py")
+    exec(compile(main_source, main_policy.__file__, "exec"), main_policy.__dict__)
+    fixture("package.json", '{"scripts":{"check":"echo safe"}}\n')
+    with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
+        def compare(command, cwd=temp):
+            event = {"tool_name": "Bash", "cwd": str(cwd), "tool_input": {"command": command}}
+            return (main_policy.evaluate(event, (root,)), policy.evaluate(event, (root,)))
+
+        names = [case("npm_config_" + name)
+                 for name in ("userconfig", "globalconfig", "script_shell", "prefix",
+                              "min_release_age", "viewer", "browser", "loglevel")
+                 for case in (str.lower, str.upper, str.title)]
+        regressions = []
+        main_refusals = 0
+        for name in names:
+            for command in ("npm run check", "npm install x", "npx x", "npm help config"):
+                text = f"{name}=fixture {command}"
+                before, after = compare(text)
+                main_refusals += bool(before)
+                if before and not after:
+                    regressions.append(text)
+                assert after, ("inline package config must be refused", text)
+            # Cover every known manager, with and without evaluated wrappers.
+            for runner in ("npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"):
+                for prefix in ("", "env ", "timeout 3 env "):
+                    text = f"{prefix}{name}=fixture {runner} --version"
+                    reason = judge(text)
+                    assert reason and reason.rule_id == "command.unsafe_environment", (text, reason)
+        assert not regressions, regressions
+        print(f"T-39 inline table: {len(names) * 4} inputs, {main_refusals} main refusals preserved")
+        viewer = "NPM_CONFIG_VIEWER=browser NPM_CONFIG_BROWSER=./x.sh"
+        for command in ("yarn help", "yarn help x", f"{viewer} npm help config"):
+            before, after = compare(command)
+            assert before and after, (command, before, after)
+        with patch.dict(os.environ, {"NPM_CONFIG_VIEWER": "browser", "NPM_CONFIG_BROWSER": "./x.sh"}):
+            before, after = compare("npm help config")
+            assert before and after, (before, after)
+
+        # Round 7: measure both directions separately from the must-refuse table.
+        # These recipes were committed with the fixture base, so changed-recipe
+        # checks cannot mask the environment rule. Make is always refused by
+        # both hooks even for this echo-only recipe; its rows carry no signal.
+        comparison_cwd = root / "compatibility"
+        assert compare("just check", comparison_cwd) == (None, None)
+        make_before, make_after = compare("make check", comparison_cwd)
+        assert make_before == make_after == (
+            "Make definitions cannot be judged reliably; use task check for the gate.")
+        restored = {"npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL",
+                    "npm_config_prefix", "NPM_CONFIG_PREFIX"}
+        managers = {"npm", "npx", "pnpm", "yarn", "yarnpkg", "bun"}
+        commands = ("npm run check", "npm install x", "npx x", "npm help config",
+                    "npm --version", "npx --version", "pnpm --version", "yarn --version",
+                    "yarnpkg --version", "bun --version",
+                    "git status", "task check", "make check", "just check")
+        newly_refused = set()
+        expected_refused = set()
+        for name in names:
+            for command in commands:
+                text = f"{name}=fixture {command}"
+                before, after = compare(text, comparison_cwd)
+                assert not before or after, ("main refusal lost", text, before, after)
+                intended_refusal = command.split()[0] in managers or name in restored
+                assert bool(after) == (bool(before) or intended_refusal), (text, before, after)
+                if not before and after:
+                    newly_refused.add(text)
+                if not before and intended_refusal:
+                    expected_refused.add(text)
+                if command in ("git status", "task check", "just check"):
+                    assert bool(after) == (name in restored), (text, after)
+        assert newly_refused == expected_refused, newly_refused ^ expected_refused
+        print(f"T-39 bidirectional table: {len(names) * len(commands)} inputs, "
+              f"0 newly allowed, {len(newly_refused)} newly refused; make rows carry no signal")
+        print("T-39 newly refused against 69870f4:", *sorted(newly_refused), sep="\n  ")
+
+        newly_allowed = set()
+        inspections = ["npm help", "npm help config", "command -v task just uv npm",
+                       "command -v task >/dev/null", "command -v task >/dev/null 2>&1"]
+        inspections += [f"{runner} {flag}" for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun")
+                        for flag in ("--help", "-h", "--version", "-v")]
+        inspections += [f"{name}=fixture {command}" for name in names
+                        for command in ("git status", "task check")]
+        for command in inspections:
+            before, after = compare(command)
+            if command.split("=", 1)[0] in restored:
+                assert before and after, (command, before, after)
+                continue
+            assert after is None, (command, after)
+            if before:
+                newly_allowed.add(command)
+        expected = {"npm help", "npm help config", "command -v task just uv npm",
+                    "command -v task >/dev/null", "command -v task >/dev/null 2>&1"}
+        expected |= {f"{runner} {flag}" for runner in ("npm", "pnpm") for flag in ("-h", "-v")}
+        expected |= {f"{runner} {flag}" for runner in ("yarn", "yarnpkg", "bun")
+                     for flag in ("--help", "-h", "--version", "-v")}
+        assert newly_allowed == expected, ("unexpected main compatibility delta", newly_allowed ^ expected)
+        print("T-39 newly allowed against 69870f4:", *sorted(newly_allowed), sep="\n  ")
+        # Verify the configuration-boundary comment using policy/config data;
+        # never open the user's npmrc or a machine configuration file.
+        assert "Read(~/.npmrc)" in managed["permissions"]["deny"]
+        for path in ("/nonexistent/.npmrc", "/etc/npmrc", "/usr/local/etc/npmrc"):
+            event = {"tool_name": "Write", "cwd": temp, "tool_input": {"file_path": path}}
+            assert policy.evaluate(event, (root,)).rule_id == "filesystem.write_boundary", path
+    fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+    # T-39: npm help config is quoted exactly in the t37 fixtures. The wrapper
+    # command is absent; reconstruct the executable-location inspection described
+    # there as a plain lookup of the task, gate and installer tools.
+    with patch.dict(os.environ, {"TASK_WORKTREE": str(root)}):
+        # type only reports command information, including with --all.
+        for command in ("npm help", "npm help config", "command -v task just uv npm", "type --all task"):
+            assert judge(command) is None, (command, judge(command))
+        for runner in ("npm", "pnpm", "yarn", "yarnpkg", "bun"):
+            for action in ("--help", "-h", "--version", "-v"):
+                command = f"{runner} {action}"
+                assert judge(command) is None, (command, judge(command))
+            for action in ("help --prefix other", "help install --global",
+                           "help --prefix", "help install exec", "help ../x", "help a=b",
+                           "--help exec evil"):
+                assert judge(f"{runner} {action}"), (runner, action)
+        # Use an allowed installer body so wrapper refusals cannot be masked by
+        # the unrelated non-shell build.js restriction in the normal fixture.
+        fixture("package.json", '{"scripts":{"check":"echo safe"}}\n')
+        inner = "npm install"
+        for wrapped in (f"xargs {inner}", f"setsid {inner}", f"nohup {inner}",
+                        f"env -S '{inner}'", f"sh -c '{inner}'", f"command {inner}"):
+            assert judge(inner) is None, (inner, judge(inner))
+            assert judge(wrapped), wrapped  # Hiding an allowed command stays refused.
+            if wrapped.startswith("sh -c"):
+                reason = judge(wrapped)
+                assert reason == "Inline shell and interpreter programs are blocked.", reason
+                assert reason.rule_id == "shell.interpreter", reason
+        fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+        for command in ("command -v task -- npm install",
+                        "command -v", "command -v --help"):
+            assert judge(command), command
+    # Help must not need a package manifest or inspect executable lifecycle hooks.
+    with patch.object(policy, "program_text", side_effect=AssertionError("help read a recipe")):
+        for command in ("npm help", "npm help config"):
+            assert judge(command) is None
+    # Round 3: Yarn/Bun help can be a script shorthand, even with a topic.
+    fixture("package.json", '{"scripts":{"help":"sudo true","check":"node build.js"}}\n')
+    for runner in ("pnpm", "yarn", "yarnpkg", "bun"):
+        for action in ("help", "help config"):
+            assert judge(f"{runner} {action}"), (runner, action)
+    for command in ("npm help", "npm help config"):
+        assert judge(command) is None  # Does not execute the help script.
+    fixture("package.json", '{"scripts":{"check":"node build.js"}}\n')
+    # npm help accepts zero or one literal topic and no config flags on either side.
+    for command in ("npm --userconfig=other help config", "npm --userconfig other help config",
+                    "npm help config --userconfig=other", "npm help config --viewer=browser",
+                    "npm --viewer=browser help config", "npm help --browser=./viewer"):
+        assert judge(command), command
+    for name in ("npm_config_viewer", "NPM_CONFIG_BROWSER", "npm_config_userconfig", "Npm_Config_viewer"):
+        for command in (f"{name}=fixture npm help config", f"env {name}=fixture npm help config"):
+            assert judge(command), command
+        with patch.dict(os.environ, {name: "fixture"}):
+            for command in ("git status", "task check"):
+                assert judge(command) is None, (name, command)
+            for command in ("npm help", "npm help config", "env npm help config", "npm --help", "npm -h"):
+                assert judge(command), (name, command)
+        for location in ("event", "tool_input"):
+            for key in ("env", "environment"):
+                for command in ("git status", "task check", "npm help", "npm help config", "npm --help", "npm -h"):
+                    payload = {"tool_name": "Bash", "cwd": temp,
+                               "tool_input": {"command": command}}
+                    target = payload if location == "event" else payload["tool_input"]
+                    target[key] = {name: "fixture"}
+                    result = policy.evaluate(payload, (root,))
+                    assert bool(result) == command.startswith("npm "), (name, location, key, command, result)
+    # Generic inline npm configuration must not widen denials on other commands.
+    for command in ("npm_config_loglevel=warn git status", "npm_config_loglevel=warn task check"):
+        assert judge(command) is None, (command, judge(command))
+    for name in ("npm_config_script_shell", "NPM_CONFIG_SCRIPT_SHELL", "npm_config_prefix", "NPM_CONFIG_PREFIX"):
+        assert judge(f"{name}=evil npm run check").rule_id == "command.unsafe_environment", name
+    # Per-tool viewers can execute programs just like npm configuration can.
+    for name in ("PAGER", "MANPAGER", "BROWSER"):
+        for location in ("event", "tool_input"):
+            for key in ("env", "environment"):
+                for command in ("git status", "task check", "npm help", "npm help config", "npm --help", "npm -h"):
+                    payload = {"tool_name": "Bash", "cwd": temp,
+                               "tool_input": {"command": command}}
+                    target = payload if location == "event" else payload["tool_input"]
+                    target[key] = {name: "fixture"}
+                    result = policy.evaluate(payload, (root,))
+                    assert bool(result) == command.startswith("npm "), (name, location, key, command, result)
+    # Per-tool config follows recursive script evaluation, too.
+    fixture("help.sh", "#!/bin/sh\nnpm help config\n")
+    payload = {"tool_name": "Bash", "cwd": temp, "env": {"Npm_Config_viewer": "fixture"},
+               "tool_input": {"command": "bash help.sh"}}
+    assert policy.evaluate(payload, (root,))
+    assert judge("bash help.sh") is None
+    # Help needs no manifest, including below a changed ancestor .npmrc.
+    (root / "help-only").mkdir()
+    help_event = {"tool_name": "Bash", "cwd": str(root / "help-only"),
+                  "tool_input": {"command": "npm help config"}}
+    assert policy.evaluate(help_event, (root,)) is None
+    for config_directory in (root, root / "help-only"):
+        config = config_directory / ".npmrc"
+        config.write_text("viewer=browser\nbrowser=./viewer\n")
+        assert policy.evaluate(help_event, (root,)), config
+        config.unlink()
+    (root / ".npmrc").symlink_to("missing-npmrc")
+    assert judge("npm help config")
+    (root / ".npmrc").unlink()
+    assert judge("npm help config") is None
     for command in ("just check", "make check", "npm run check", "pnpm run check"):
         assert judge(command), command  # Unchanged is not an execution exemption.
     assert judge("task check") is None
@@ -463,8 +690,8 @@ with tempfile.TemporaryDirectory() as temp:
     def outside_temp():
         stack = [patch.object(policy, "LANE_TEMP_ROOTS", ()),
                  patch.object(policy, "scratch_root", return_value=None),
-                 patch.dict(os.environ)]
-        os.environ.pop("TMPDIR", None)
+                 patch.dict(os.environ, {key: value for key, value in os.environ.items()
+                                         if key != "TMPDIR"}, clear=True)]
         return stack
 
     outside = make_venv(base / "outside-venv")
@@ -788,9 +1015,17 @@ with tempfile.TemporaryDirectory() as temp:
             "task review proj 5 --record review.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command
     # pure_lookup_forms: standalone and read-only chains; execution wrappers stay denied.
-    for lookup in ("command -v task", "command -V task", "type task", "which task"):
-        for command in (lookup, "pwd; " + lookup, "pwd && " + lookup):
-            assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+    for lookup in ("command -v task", "command -V task", "type task", "which task",
+                   "command -v task just uv npm", "command -V task just",
+                   "type task just", "which task just"):
+        for suffix in ("", " >/dev/null", " > /dev/null", " >/dev/null 2>&1",
+                       " 2>/dev/null", " 2>&1 >/dev/null"):
+            for command in (lookup + suffix, "pwd; " + lookup + suffix, "pwd && " + lookup + suffix):
+                assert policy.evaluate_command(command, temp, root, (root,)) is None, command
+    for command in (">/dev/null command -v task", "command -v task >out.txt",
+                    "command -v task '>/dev/null'", r"command -v task \>/dev/null",
+                    "command -v task >>/dev/null", "command -v task >/dev/null-extra"):
+        assert policy.evaluate_command(command, temp, root, (root,)), command
     assert policy.evaluate_command("command git push", temp, root, (root,))
     for command in ("task status proj", "task check", "task runner-check proj runner.md"):
         assert policy.evaluate_command(command, temp, root, (root,)) is None, command

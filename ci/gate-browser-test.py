@@ -17,6 +17,17 @@ lane = subprocess.run([sys.executable, str(HELPER)], env=env, capture_output=Tru
 assert lane.returncode == 77, lane
 assert lane.stdout.strip() == "SKIP (lane: browser tests run in the trusted gate)"
 print("PASS: lane skip (77), before any server or argument handling", flush=True)
+with tempfile.TemporaryDirectory(prefix='browser-inline-') as temporary:
+    home = Path(temporary)
+    install_units(home)
+    probe_env = dict(os.environ, HOME=str(home), PATH=f"{home / 'bin'}:{os.environ['PATH']}",
+                     TASK_GATE_RUN_ID='inline-fixture', TASK_GATE_PORT_BASE='22000')
+    inline = subprocess.run([sys.executable, str(HELPER), '--server', 'false', 'no-such-spec.cjs'],
+                            cwd=home, env=probe_env, capture_output=True, text=True)
+    assert inline.returncode == 1, inline
+    assert 'no specs matched' in inline.stderr, inline
+    assert not (home / 'unit-calls.jsonl').exists(), inline
+print('PASS: gate-browser runs inside the existing gate unit, with no nested launch', flush=True)
 if not os.environ.get("TASK_GATE_RUN_ID"):
     print("SKIP (lane: browser tests run in the trusted gate)")
     sys.exit(77)
