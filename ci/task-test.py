@@ -143,6 +143,9 @@ prompt = sys.stdin.read()
     'tmp_owner': pathlib.Path(os.environ['TMPDIR']).stat().st_uid,
     'task_worktree': os.environ.get('TASK_WORKTREE'),
 }))
+tamper = os.environ.get('LANE_STUB_TAMPER')
+if tamper:
+    pathlib.Path(tamper).write_text(('gitdir: ' if tamper.endswith('.git') else '') + '/elsewhere' + chr(10))
 release = os.environ.get('LANE_STUB_RELEASE')
 if release:
     import subprocess
@@ -4763,6 +4766,7 @@ store.write_text(json.dumps(prs))
             self.assertIn(model, call['args'])
             if vendor == 'codex':
                 self.assertEqual(call['args'][:3], ['exec', '-c', 'default_permissions="review"'])
+                self.assertNotIn('--add-dir', call['args'])
             else:
                 self.assertIn('dontAsk', call['args'])
         wrapper.unlink()
@@ -5017,14 +5021,14 @@ store.write_text(json.dumps(prs))
             binary.write_text(REVIEW_STUB)
             binary.chmod(0o755)
 
-    def wait_for_lane(self, wt, finished=True):
+    def wait_for_lane(self, wt, finished=True, state="finished"):
         import json
         import time
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if finished:
                 record = json.loads((wt / ".work/lane.json").read_text())
-                if record["state"] == "finished":
+                if record["state"] == state:
                     return record
             elif (wt / ".work/model-call.json").exists():
                 return json.loads((wt / ".work/model-call.json").read_text())
@@ -6351,8 +6355,15 @@ store.write_text(json.dumps(prs))
             with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
                 self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
-            self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"', "--model", "gpt-6.1-sol",
+            git_dir, common = (self.git(wt, "rev-parse", "--path-format=absolute", flag) for flag in ("--git-dir", "--git-common-dir"))
+            self.assertNotEqual(git_dir, common)
+            grants = [git_dir, f"{common}/objects", f"{common}/refs", f"{common}/logs"]
+            self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"',
+                                            *(a for g in grants for a in ("--add-dir", g)), "--model", "gpt-6.1-sol",
                                             "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
+            added = [call["args"][i + 1] for i, a in enumerate(call["args"]) if a == "--add-dir"]
+            for forbidden in (common, f"{common}/config", f"{common}/hooks", f"{common}/info", f"{common}/worktrees"):
+                self.assertNotIn(forbidden, added)
             self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
                                  name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
             self.assertIn("GIT_AUTHOR_NAME", call["env_names"])
@@ -7889,6 +7900,96 @@ store.write_text(json.dumps(prs))
         prompt = self.state("direct-request") / "review-prompt.md"
         self.assertIn("Preserve the user's uncommitted files and explain the behavior change.", prompt.read_text())
         self.assertIn("--allowedTools Read Grep Glob", out)
+
+    def git_paths(self, wt):
+        common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        return common, common / "worktrees" / wt.name
+
+    def test_start_records_git_paths_from_the_main_checkout_and_old_tasks_migrate(self):
+        wt, _ = self.started()
+        common, git_dir = self.git_paths(wt)
+        record = self.state() / "git-paths.json"
+        self.assertEqual(json.loads(record.read_text()), {"common": str(common), "git_dir": str(git_dir), "dot_git": str(wt / ".git")})
+        record.unlink()
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertEqual(TASK_MODULE.tamper_reason(TASK_MODULE.Task(self.repo, "5")), "")
+        self.assertEqual(json.loads(record.read_text())["git_dir"], str(git_dir))
+
+    def test_codex_lane_grants_stop_without_a_worktree_git_dir_or_with_worktree_config_on(self):
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            with self.assertRaisesRegex(TASK_MODULE.Stop, "does not exist"):
+                TASK_MODULE.lane_git_grants(TASK_MODULE.Task(self.repo, "5"))
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / ".work/prompt.md").write_text("Build.\n")
+        self.git(self.repo, "config", "extensions.worktreeConfig", "true")
+        self.assertIn("extensions.worktreeConfig is on", self.raw_task("lane", "proj", "5", code=1))
+        self.assertFalse((wt / ".work/model-call.json").exists())
+
+    def test_worktree_config_file_matters_only_with_the_extension_on(self):
+        wt, _ = self.started()
+        _, git_dir = self.git_paths(wt)
+        task = TASK_MODULE.Task(self.repo, "5")
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            (git_dir / "config.worktree").write_text("")
+            self.assertEqual(TASK_MODULE.tamper_reason(task), "")
+            (git_dir / "config.worktree").write_text("[core]\n\thooksPath = /x\n")
+            self.assertEqual(TASK_MODULE.tamper_reason(task), "", "ignored while the extension is unset")
+            self.git(self.repo, "config", "extensions.worktreeConfig", "true")
+            self.assertIn("config.worktree must be empty", TASK_MODULE.tamper_reason(task))
+            (git_dir / "config.worktree").write_text("")
+            self.assertEqual(TASK_MODULE.tamper_reason(task), "")
+
+    def test_lane_worker_end_marks_rewritten_git_metadata_tampered_and_entries_refuse_first(self):
+        self.stub_models()
+        wt, _ = self.started()
+        _, git_dir = self.git_paths(wt)
+        (wt / ".work/prompt.md").write_text("Build.\n")
+        for target in (git_dir / "commondir", git_dir / "gitdir", wt / ".git"):
+            with self.subTest(target=target.name):
+                original = target.read_text()
+                self.env["LANE_STUB_TAMPER"] = str(target)
+                self.raw_task("lane", "proj", "5", "--no-pace")
+                self.wait_for_lane(wt, state="tampered")
+                self.env.pop("LANE_STUB_TAMPER")
+                for command in (("check", "proj", "5"), ("check", "proj", "5", "--detach"), ("merge", "proj", "5"),
+                                ("review", "proj", "5", "--run")):
+                    out = self.raw_task(*command, code=1)
+                    self.assertIn("Git metadata tampered: ", out)
+                    self.assertNotIn("fatal", out, "refused before any Git ran in the worktree")
+                out = self.raw_task("check", cwd=wt, code=1)
+                self.assertIn("Git metadata tampered", out)
+                self.assertNotIn("fatal", out)
+                target.write_text(original)
+        self.assertEqual(self.git(wt, "status", "--porcelain"), "")
+
+    def test_a_normal_lane_passes_the_metadata_check_and_a_removed_worktree_is_skipped(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / ".work/prompt.md").write_text("Build.\n")
+        self.raw_task("lane", "proj", "5", "--no-pace")
+        self.assertEqual(self.wait_for_lane(wt)["state"], "finished")
+        with mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertEqual(TASK_MODULE.tamper_reason(TASK_MODULE.Task(self.repo, "5")), "")
+            self.assertEqual(TASK_MODULE.tamper_reason(TASK_MODULE.Task(self.repo, "9")), "")
+
+    def test_batch_runner_stops_on_a_tampered_lane_before_any_git(self):
+        loader = importlib.machinery.SourceFileLoader("batch_tamper_test", str(ROOT / "home/dot_local/bin/executable_task-batch"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        batch = importlib.util.module_from_spec(spec)
+        loader.exec_module(batch)
+        work = self.home / "work"
+        work.mkdir()
+        (work / "lane.json").write_text(json.dumps({"state": "tampered", "started_at": TASK_MODULE.utc_now()}))
+        with self.assertRaisesRegex(batch.Stop, "tampered"):
+            batch.Batch.lane_outcome(None, work)
+        source = (ROOT / "home/dot_local/bin/executable_task-batch").read_text()
+        self.assertIn('.get("state") in {"running", "tampered"}', source, "a resumed tampered lane also stops before finished()")
+
+    def test_realign_and_review_run_commands_get_no_git_grants(self):
+        source = (ROOT / "home/dot_local/bin/executable_task").read_text()
+        self.assertIn("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\\\"review\\\"' -m gpt-6-luna", source)
+        self.assertEqual(source.count("lane_git_grants("), 2)  # definition and the one lane call
 
     def test_review_prints_read_only_codex_command_for_claude_builder(self):
         self.raw_task("start", "proj", "5", "--builder", "claude")
