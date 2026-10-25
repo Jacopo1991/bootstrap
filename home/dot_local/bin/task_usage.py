@@ -10,6 +10,7 @@ from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 import os
+import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,6 +31,8 @@ DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
             "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
             "boost_five_hour_max": 50,
+            "codex_ramp": None,  # decision-23: { per_day = <points>, ceiling = <0-100> }; None is no ramp
+            "blocked": {},  # vendor -> open foundation-defect reason, set by hand by the PM
             "review": {"high_paths": {"*": ["policy/**", "skills/**/SKILL.md", "skills/**/references/**",
                 "AGENTS.md", "CLAUDE.md", "home/dot_codex/AGENTS.md", "home/dot_claude/CLAUDE.md",
                 "INTENT.md", "decisions/**", "backlog/decisions/**"], "bootstrap": [
@@ -51,20 +54,27 @@ def risk_paths(repo, record, paths, policy):
 
 
 def review_policy(value, result):
-    if not isinstance(value, dict) or value.keys() - result.keys():
-        raise ValueError("invalid review keys")
+    """Apply each valid [review] table to `result`; return the problems of the others, which keep their defaults."""
+    if not isinstance(value, dict):
+        return ["invalid review keys"]
+    problems = [f"invalid review.{tier}" for tier in value.keys() - result.keys()]
     for tier, fields in value.items():
+        if tier not in result:
+            continue
         if not isinstance(fields, dict) or tier != "high_paths" and fields.keys() - result[tier].keys():
-            raise ValueError(f"invalid review.{tier}")
-        for key, item in fields.items():
-            valid = (isinstance(item, list) and all(isinstance(p, str) and p.strip() for p in item)
-                     if tier == "high_paths" else
-                     type(item) is int and item >= (1 if key == "max_rounds" else 0)
-                     if key in {"max_rounds", "extra_rounds"} else
-                     isinstance(item, str) and item.replace("-", "").replace(".", "").replace("_", "").isalnum())
-            if not valid:
-                raise ValueError(f"invalid review.{tier}.{key}")
+            problems.append(f"invalid review.{tier}")
+            continue
+        bad = next((key for key, item in fields.items() if not (
+                    isinstance(item, list) and all(isinstance(p, str) and p.strip() for p in item)
+                    if tier == "high_paths" else
+                    type(item) is int and item >= (1 if key == "max_rounds" else 0)
+                    if key in {"max_rounds", "extra_rounds"} else
+                    isinstance(item, str) and item.replace("-", "").replace(".", "").replace("_", "").isalnum())), None)
+        if bad is not None:
+            problems.append(f"invalid review.{tier}.{bad}")
+            continue
         result[tier].update(fields)
+    return problems
 
 
 def _json(path):
@@ -98,8 +108,12 @@ def _number(value, top=None):
     return type(value) in (int, float) and value >= 0 and (top is None or value <= top)
 
 
-def policy(home):
-    """Company policy TOML (pointer file, else the default path) over built-in defaults."""
+def policy(home, warnings=None):
+    """Company policy TOML (pointer file, else the default path) over built-in defaults.
+
+    An unreadable or unparseable file raises ValueError. An unknown or invalid key keeps its default and
+    adds one warning line to `warnings` (printed to stderr when no list is given); every other key is kept.
+    """
     pointer = _text(home / ".config/task/usage-policy-path")
     path = home / pointer[2:] if pointer.startswith("~/") else Path(pointer) if pointer else (
         home / "cortex/cortex-kb-company/policy/usage-pacing.toml")
@@ -111,12 +125,10 @@ def policy(home):
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise ValueError(f"{path}: {error}")
     for key, value in raw.items():
+        problems = [f"invalid {key}"]
         if key == "review":
-            try:
-                review_policy(value, result[key])
-            except ValueError as error:
-                raise ValueError(f"{path}: {error}") from error
-            valid = True
+            problems = review_policy(value, result[key])
+            valid = not problems
         elif key in ("reserve", "spare_resets"):
             valid = isinstance(value, dict) and all(
                 name in VENDORS and _number(item, 100 if key == "reserve" else None) for name, item in value.items())
@@ -124,11 +136,25 @@ def policy(home):
         elif key in ("priority", "research_backlog"):
             valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
             result[key] = value if valid else result[key]
+        elif key == "codex_ramp":
+            valid = (isinstance(value, dict) and value.keys() == {"per_day", "ceiling"}
+                     and _number(value["per_day"]) and value["per_day"] > 0 and _number(value["ceiling"], 100))
+            result[key] = value if valid else None
+        elif key == "blocked":
+            valid = isinstance(value, dict) and all(
+                name in VENDORS and isinstance(item, str) and item.strip() for name, item in value.items())
+            result[key] = value if valid else {}
         else:
             valid = key in DEFAULTS and _number(value, 100 if key == "boost_five_hour_max" else None)
-            result[key] = value if valid else result.get(key)
-        if not valid:
-            raise ValueError(f"{path}: invalid {key}")
+            problems = problems if key in DEFAULTS else [f"unknown key {key}"]
+            if valid:
+                result[key] = value
+        for problem in [] if valid else problems:
+            line = f"pace warning: {path}: {problem}; ignored, other keys kept"
+            if warnings is None:
+                print(line, file=sys.stderr)
+            else:
+                warnings.append(line)
     return result
 
 
@@ -369,6 +395,31 @@ def saved_boosts(home):
     return result
 
 
+def ramp(reading, pol, now):
+    """Decision-23 Codex daily ramp: started day of the weekly window, allowance and whether use is past it.
+
+    The window starts at the last weekly reset (resets_at - 7 days), so an early reset restarts at day 1.
+    None for Claude, without a `codex_ramp` policy, or without a current reading.
+    """
+    rule = pol.get("codex_ramp")
+    if reading["vendor"] != "codex" or not rule or reading["reason"]:
+        return None
+    day = min(7, max(1, (now - (reading["resets_at"] - WEEK)) // timedelta(days=1) + 1))
+    allowance = min(rule["ceiling"], rule["per_day"] * day)
+    return {"day": day, "allowance": allowance, "ceiling": rule["ceiling"], "per_day": rule["per_day"],
+            "over": reading["weekly"] > allowance}
+
+
+def ramp_hold(item, kind, exempt=""):
+    """Refusal text for a new Codex launch past its ramp, or "" (exempt work may launch above it)."""
+    found = item.get("ramp")
+    if not found or not found["over"] or exempt:
+        return ""
+    return (f"codex past its daily ramp: weekly used {item['weekly']:.0f} % > allowance {found['allowance']:g} % "
+            f"(day {found['day']}, {found['per_day']:g} %/day, ceiling {found['ceiling']:g} %); no new {kind}s on codex "
+            "until the allowance grows; running work continues; --ramp-exempt hold|service|security|money for exempt work")
+
+
 def assess(reading, pol, now, ran=False):
     """Add spare/limit and the pace verdict to a reading (see `task usage` for the meanings).
 
@@ -382,7 +433,7 @@ def assess(reading, pol, now, ran=False):
     released = left is not None and left <= pol["under_use_hours"]
     five = _five(reading, pol, now, ran)
     result = dict(reading, spare=spare, released=released, boost_pause=boost_pause(reading, pol, five),
-                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), **five)
+                  limit=100 - (0 if spare or released else pol["reserve"][vendor]), ramp=ramp(reading, pol, now), **five)
     if reading["reason"]:
         return dict(result, verdict="unknown")
     elapsed = min(100.0, max(0.0, 100 * (1 - left / (WEEK / timedelta(hours=1)))))
@@ -482,7 +533,7 @@ def assessments(home, now):
         return cache[home]
     notes = []
     try:
-        pol = policy(home)
+        pol = policy(home, notes)
     except ValueError as error:
         pol = json.loads(json.dumps(DEFAULTS))
         notes.append(f"pace warning: {error}; built-in defaults used")
@@ -511,7 +562,7 @@ def _ahead(item):
 def _room(home, vendor, item):
     """Room on both windows: not weekly exhausted or ahead, and the 5-hour window allows one more."""
     five = item["five"] != FIVE_OUT and (item["five"] != FIVE_WARN or not running(home, vendor))
-    return item["verdict"] != EXHAUSTED and not _ahead(item) and five
+    return item["verdict"] != EXHAUSTED and not _ahead(item) and five and not ramp_hold(item, "lane")
 
 
 def five_caps(home, now=None):
@@ -520,15 +571,16 @@ def five_caps(home, now=None):
     return {vendor: {FIVE_OUT: 0, FIVE_WARN: 1}.get(item["five"]) for vendor, item in seen.items()}
 
 
-def gate(home, kind, vendor, tier, repo, key, now=None):
+def gate(home, kind, vendor, tier, repo, key, now=None, exempt=""):
     """Pace check for one lane or review: which vendor, model hint, hold reason, notes.
 
     Returns vendor (maybe switched), hold (reason text or ""), cheaper (use the cheap routine model),
-    spend (ISO reset time when the vendor is under-used near its reset) and notes to print.
+    spend (ISO reset time when the vendor is under-used near its reset), notes to print, and
+    ramp_exempt ("" or the exemption that let a Codex launch past its ramp; the caller ledgers it).
     """
     now = now or datetime.now(timezone.utc)
     pol, seen, notes = assessments(home, now)
-    out = {"vendor": vendor, "hold": "", "cheaper": False, "spend": "", "notes": notes}
+    out = {"vendor": vendor, "hold": "", "cheaper": False, "spend": "", "notes": notes, "ramp_exempt": ""}
     other = "codex" if vendor == "claude" else "claude"
     found = seen[vendor]
     if found["verdict"] == "unknown":
@@ -553,6 +605,12 @@ def gate(home, kind, vendor, tier, repo, key, now=None):
         out["hold"] = (f"{out['vendor']} 5-hour window in the warning band"
                        f"{' (reading stale)' if found['stale'] else ' (no 5-hour reading)' if found['missing'] else ''}: "
                        f"{running(home, out['vendor'])} lane or review running; one at a time")
+    if not out["hold"]:
+        out["hold"] = ramp_hold(found, kind, exempt)
+        if exempt and found.get("ramp") and found["ramp"]["over"]:
+            out["ramp_exempt"] = exempt
+            notes.append(f"pace: codex past its daily ramp ({found['weekly']:.0f} % > {found['ramp']['allowance']:g} %); "
+                         f"launch allowed as ramp-exempt {exempt} work (ledgered)")
     if not out["hold"] and _ahead(found):
         out["cheaper"] = kind == "lane" and tier == "routine"
         top = _top(home, pol)
@@ -567,6 +625,17 @@ def gate(home, kind, vendor, tier, repo, key, now=None):
         note(home, seen[vendor], now, f"{repo}/{key}")
         log(home, f"held {kind} {repo}/{key}: {out['hold']}", now)
     return out
+
+
+def ramp_gate(home, kind, vendor, repo, key, exempt="", now=None):
+    """Only the Codex ramp, for launches without the full pace gate (red-team): hold text and exemption used."""
+    now = now or datetime.now(timezone.utc)
+    found = assessments(home, now)[1][vendor]
+    hold = ramp_hold(found, kind, exempt)
+    if hold:
+        note(home, found, now, f"{repo}/{key}")
+        log(home, f"held {kind} {repo}/{key}: {hold}", now)
+    return hold, exempt if exempt and found.get("ramp") and found["ramp"]["over"] else ""
 
 
 def batch_gate(home, builders, now=None):
@@ -639,7 +708,44 @@ def report(home, now=None):
                   f"  reading {item['at']:%Y-%m-%d %H:%M} UTC, {age:.0f} min old; week elapsed {item['elapsed']:.0f} %",
                   f"  pace: {item['verdict']}",
                   f"  policy: {_applied(vendor, item, pol, _top(home, pol))}"]
-    return lines
+        if item["ramp"]:
+            found = item["ramp"]
+            lines.append(f"  ramp: day {found['day']}, allowance {found['allowance']:g} % ({found['per_day']:g} %/day, "
+                         f"ceiling {found['ceiling']:g} %); {'past ramp: no new codex launches unless --ramp-exempt' if found['over'] else 'within ramp'}")
+    if pol["codex_ramp"] and seen["codex"]["verdict"] == "unknown":
+        lines.append("codex ramp: unknown without a current codex reading; not applied")
+    return lines + fallback_lines(pol, seen)
+
+
+def _states(vendor, item, pol):
+    """Why a vendor is not normal for new work: past ramp, braked, near its 5-hour window, blocked."""
+    found = []
+    if item.get("ramp") and item["ramp"]["over"]:
+        found.append(f"past ramp (day {item['ramp']['day']}, {item['ramp']['allowance']:g} %)")
+    if item["verdict"] == EXHAUSTED or _ahead(item):
+        found.append("braked (" + ("automated share used up" if item["verdict"] == EXHAUSTED else "ahead of pace") + ")")
+    if item["five"] == FIVE_OUT:
+        found.append("5-hour window used up")
+    elif item["five"] == FIVE_WARN:
+        found.append("near its 5-hour window" + (" (reading stale)" if item["stale"] else " (no 5-hour reading)" if item["missing"] else ""))
+    if pol["blocked"].get(vendor):
+        found.append(f"blocked by a foundation defect ({pol['blocked'][vendor]})")
+    return found
+
+
+def fallback_lines(pol, seen):
+    """One fallback line per vendor that is not normal; nothing when every vendor is normal."""
+    states = {vendor: _states(vendor, seen[vendor], pol) for vendor in VENDORS}
+    lines = []
+    for vendor in VENDORS:
+        if not states[vendor]:
+            continue
+        other = "codex" if vendor == "claude" else "claude"
+        only_band = all(state.startswith("near its 5-hour") for state in states[vendor])
+        builds = f"{other.capitalize()} lane" if not states[other] else "wait"
+        reviews = "one at a time" if only_band else "wait"
+        lines.append(f"{vendor} {', '.join(states[vendor])}: builds -> {builds}; reviews of {other.capitalize()} work -> {reviews}")
+    return ["fallback:"] + ["  " + line for line in lines] if lines else []
 
 
 def weekly_lines(home, now=None):
