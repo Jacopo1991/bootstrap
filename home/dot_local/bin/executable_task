@@ -1914,8 +1914,65 @@ def archive_lane_final(work):
             report.write_text("\n".join(lines).rstrip() + "\n")
 
 
+def git_baseline(task: Task) -> dict:  # derived from the main checkout (a lane cannot write it), kept in private state, never read from lane-writable files
+    record = task_state(task) / "git-paths.json"
+    saved = read_json_object(record)
+    if not saved:
+        common = Path(git(task.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        saved = {"common": str(common), "git_dir": str(common / "worktrees" / task.path.name), "dot_git": str(task.path / ".git")}
+        if not Path(saved["git_dir"]).is_dir():
+            raise Stop(f"{saved['git_dir']} does not exist; the PM must investigate {task.path} before any lane or check runs.")
+        with contextlib.suppress(OSError):  # a sandboxed advisory check derives the same paths again
+            atomic_json(record, saved)
+    return saved
+
+
+def worktree_config_on(common):
+    return run_git(common, "config", "--file", str(common / "config"), "--type=bool", "--get", "extensions.worktreeConfig").stdout.strip() == "true"
+
+
+def tamper_reason(task: Task) -> str:
+    if not (task.path / ".git").exists():  # a removed worktree (merge's already-merged retry) or a plain folder has nothing to check
+        return ""
+    base = git_baseline(task)
+    git_dir, common, dot_git = Path(base["git_dir"]), Path(base["common"]), Path(base["dot_git"])
+    for file, prefix, root, expected in ((dot_git, "gitdir: ", task.path, git_dir), (git_dir / "commondir", "", git_dir, common), (git_dir / "gitdir", "", git_dir, dot_git)):
+        value = file.read_text().strip() if file.is_file() else ""
+        if not value.startswith(prefix) or (root / value[len(prefix):]).resolve() != expected.resolve():
+            return f"Git metadata tampered: {file} must point at {expected}; nothing was repaired."
+    if (git_dir / "config.worktree").exists() and (git_dir / "config.worktree").stat().st_size and worktree_config_on(common):
+        return f"Git metadata tampered: {git_dir}/config.worktree must be empty while extensions.worktreeConfig is on; nothing was repaired."
+    return ""
+
+
+def worktree_metadata_ok(task: Task):
+    if reason := tamper_reason(task):
+        record = task.path / ".work/lane.json"
+        with contextlib.suppress(OSError):
+            atomic_json(record, {**read_json_object(record), "state": "tampered", "ended_at": utc_now()})
+        raise Stop(reason)
+
+
+def entry_task(args):
+    if args.command != "check" or args.repo and args.id:
+        return Task(resolve_repo(args.repo), args.id)
+    here = Path.cwd().resolve()
+    root = next((p for p in (here, *here.parents) if p.parent.name == ".worktrees"), None)
+    if root:
+        return Task(root.parent.parent, args.id or root.name)
+    return Task(main_repo(here), args.id) if args.id else None
+
+
+def lane_git_grants(task: Task) -> list[str]:  # the worktree's Git dir (always <common>/worktrees/<name>), objects, refs, logs; never <common>, config, hooks or info
+    base = git_baseline(task)
+    if worktree_config_on(Path(base["common"])):
+        raise Stop(f"extensions.worktreeConfig is on in {base['common']}/config; a lane could write config.worktree. Turn it off first.")
+    return [x for part in (base["git_dir"], *(f"{base['common']}/{name}" for name in ("objects", "refs", "logs"))) for x in ("--add-dir", part)]
+
+
 def lane(args):
     task = Task(resolve_repo(args.repo), args.id)
+    worktree_metadata_ok(task)
     path = task.worktree()
     record = load_record(task)
     bind_plan(task, args)
@@ -1956,7 +2013,7 @@ def lane(args):
         raise Stop(f"{binary} is not installed or available on PATH.")
     task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
-    command = (["codex", "exec", "-c", 'default_permissions="lane"', "--model", cli_model,
+    command = (["codex", "exec", "-c", 'default_permissions="lane"', *lane_git_grants(task), "--model", cli_model,
                 "-c", f"model_reasoning_effort={args.effort}", "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", args.effort,
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
@@ -2092,7 +2149,7 @@ def lane(args):
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     stop_child_group(child)
-                    finalize_lane_record(lane_record, run, "timed_out", exit_code=None)
+                    finalize_lane_record(lane_record, run, "tampered" if tamper_reason(task) else "timed_out", exit_code=None)
                     os.killpg(os.getpgrp(), signal.SIGKILL)
                 except (SystemExit, KeyboardInterrupt):
                     interrupted = True
@@ -2104,8 +2161,8 @@ def lane(args):
     except OSError as error:
         print(f"Lane launch failed: {error}", file=sys.stderr)
     finally:
-        finalize_lane_record(lane_record, run, "interrupted" if interrupted else "timed_out" if timed_out else "finished",
-                             exit_code=None if interrupted or timed_out else code)
+        state = "tampered" if tamper_reason(task) else "interrupted" if interrupted else "timed_out" if timed_out else "finished"
+        finalize_lane_record(lane_record, run, state, exit_code=None if interrupted or timed_out else code or int(state == "tampered"))
     return code
 
 
@@ -2712,6 +2769,7 @@ def start_locked(args, repo):
     record_path = state / "task.json"
     state.mkdir(parents=True, exist_ok=True)
     work.mkdir(parents=True, exist_ok=True)
+    worktree_metadata_ok(task)
     if record_path.exists() and not args.refresh and (read_json_object(record_path).get("branch") or not read_json_object(record_path).get("plan")):
         record = load_record(task)
         if record.get("branch") != branch:
@@ -4685,7 +4743,7 @@ def status(args):
                     lane_state, result = "ended by usage limit", f" ({limit})"
                 print(f"    lane: {lane_state}{result} pid={lane_run.get('pid', '?')} "
                       f"log={path / '.work/lane.log'} final={path / '.work/final.md'}")
-                if lane_state in {"interrupted", "timed_out"} or lane_run.get("exit_code", 0) != 0:
+                if lane_state in {"interrupted", "timed_out", "tampered"} or lane_run.get("exit_code", 0) != 0:
                     attention.append(f"{path.name}: lane {lane_state}{result}")
                 try:
                     final = [line for line in (path / ".work/final.md").read_text(errors="replace").splitlines()
@@ -5143,6 +5201,8 @@ def main(argv=None):
         if args.command == "review" or (args.command == "lane" and args._worker):
             for sig in (signal.SIGTERM, signal.SIGHUP):
                 handlers[sig] = signal.signal(sig, lambda signum, frame: sys.exit(128 + signum))
+        if (args.command in {"check", "merge"} or args.command == "review" and args.run) and (target := entry_task(args)):
+            worktree_metadata_ok(target)
         task_lock.before_work(args, HOME, resolve_repo)
         if args.command == "note":
             if args.kind != "setup-done":

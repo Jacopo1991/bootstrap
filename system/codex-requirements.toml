@@ -10,6 +10,14 @@
 # the denies. Only these two are allowed and the default is the writable one, so a lane cannot
 # select a weaker profile. The deny applies to commands run in the sandbox; the `codex` process
 # itself still reads ~/.codex/auth.json to authenticate.
+# `:workspace` leaves a linked worktree's Git metadata read-only, so `task lane` adds four
+# `--add-dir` grants (T-53): the worktree's own git dir, and the shared `objects`, `refs` and
+# `logs`. That is enough to commit and merge on the task branch. `hooks`, `config` and `info`
+# stay read-only: a writable hook or config would run outside the sandbox at the next Git command.
+# The worktree's git dir is always `<common>/worktrees/<name>`, never `<common>`. Files in it that
+# Git follows to config or hooks (`commondir`, `gitdir`, `config.worktree`, and the worktree's
+# `.git`) are checked against `task`'s own records after every lane and before check, review and
+# merge; `task lane` refuses when `extensions.worktreeConfig` is on. Reviews get no grants.
 default_permissions = "lane"
 
 [allowed_permission_profiles]
