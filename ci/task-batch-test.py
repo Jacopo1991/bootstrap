@@ -91,14 +91,19 @@ elif cmd == 'lane':
     prompt = (work / 'prompt.md').read_text()
     sys.path.insert(0, os.environ['TASK_TEST_ROUTING_DIR'])
     from task_routing import route
-    from task_usage import SPEND_DOWN, spend_down
+    from task_routing import guards
+    from task_usage import SPEND_DOWN, record_override, spend_down
     vendor = options[options.index('--builder') + 1]
     tier = options[options.index('--tier') + 1] if '--tier' in options else 'routine'
     explicit = options[options.index('--model') + 1] if '--model' in options else None
     override = options[options.index('--override') + 1] if '--override' in options else ''
     recorded = json.loads((state / 'task.json').read_text()).get('tier', 'routine')
-    routed_model = route(home, vendor, tier, explicit, override=override, recorded=recorded,
-                         allow=SPEND_DOWN if spend_down(home, vendor) else '')
+    until = spend_down(home, vendor)
+    allow = SPEND_DOWN if until else ''
+    routed_model = route(home, vendor, tier, explicit, override=override, recorded=recorded, allow=allow)
+    if allow and not override and guards(tier, recorded, routed_model, override, allow):  # as ledger_spend_down in `task lane`
+        record_override(home, repo.name, ident, routed_model, tier, SPEND_DOWN, kind='spend_down', vendor=vendor,
+                        until=until.isoformat(), past_ramp=False, model_guard=True)
     with (home / 'prompts.jsonl').open('a') as out:
         out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options,
                                  routed_model=routed_model)) + '\n')

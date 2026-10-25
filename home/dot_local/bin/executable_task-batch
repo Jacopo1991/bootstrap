@@ -349,11 +349,9 @@ class Batch:
             if run_lane:
                 try:
                     recorded = data(state / "task.json").get("tier", "routine")
-                    until = task_usage.spend_down(Path.home(), builder)  # decision-24: same allowance as `task lane`
-                    allow = task_usage.SPEND_DOWN if until else ""
-                    if guards(tier or recorded, recorded, model, task["override"], allow) and allow and not task["override"]:
-                        task_usage.record_override(Path.home(), self.repo.name, ident, model, recorded, allow, kind="spend_down",
-                                                   vendor=builder, until=until.isoformat(), past_ramp=False, model_guard=True)
+                    # decision-24: the same allowance as `task lane`, which alone ledgers the launch
+                    allow = task_usage.SPEND_DOWN if task_usage.spend_down(Path.home(), builder) else ""
+                    guards(tier or recorded, recorded, model, task["override"], allow)
                 except ValueError as error:
                     return f"parked: {error}"
                 round_start = time.monotonic()
