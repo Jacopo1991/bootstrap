@@ -5011,6 +5011,16 @@ def wait_task(args):
         time.sleep(min(10, max(0, deadline - time.monotonic())))
 
 
+def smoke(args):
+    """`task smoke`: the lane path on a scratch project. task-smoke holds the logic, outside this budget."""
+    helper = shutil.which("task-smoke")
+    if helper is None:
+        print("task smoke: task-smoke is not on PATH; run chezmoi apply first.", file=sys.stderr)
+        return 1
+    flags = ["--clean", args.clean] if args.clean else ["--builder", args.builder]
+    return subprocess.run([helper, *flags], env=dict(os.environ, TASK_SMOKE_TOOL=str(Path(__file__).resolve()))).returncode
+
+
 def main(argv=None):
     global ACTIVE_FOREGROUND_TASK
     parser = argparse.ArgumentParser(prog="task", description=__doc__,
@@ -5096,6 +5106,9 @@ def main(argv=None):
     sub = commands.add_parser("plan-budget")
     sub.add_argument("id"); sub.add_argument("--clear")
     task_lock.configure(commands)
+    sub = commands.add_parser("smoke", help="the lane path on a scratch project, per builder (install gate)")
+    sub.add_argument("--builder", choices=("codex", "claude", "both"), default="both")
+    sub.add_argument("--clean", metavar="RUN_ID", help="remove a kept smoke run's scratch project")
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
@@ -5117,6 +5130,8 @@ def main(argv=None):
     sub.add_argument("--rule")
     sub.add_argument("--repo")
     args = parser.parse_args(argv)
+    if args.command == "smoke":
+        return smoke(args)
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
     global GATE_LOCK_WAIT
