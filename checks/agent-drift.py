@@ -209,8 +209,21 @@ def installed_uv_tools(directory: Path) -> list[str]:
                   if entry.is_dir() and not entry.name.startswith("."))
 
 
+def codex_deny_list_missing(root: Path, installed: Path = Path("/etc/codex/requirements.toml")) -> bool:
+    """True when the installed Codex requirements lack the checked-in read-deny profiles."""
+    keys = ("default_permissions", "allowed_permission_profiles", "permissions")
+    try:
+        wanted = tomllib.loads((root / "system" / "codex-requirements.toml").read_text(encoding="utf-8"))
+        actual = tomllib.loads(installed.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return not wanted.get("permissions") or any(actual.get(key) != wanted.get(key) for key in keys)
+
+
 def scan(root: Path, home: Path) -> list[str]:
     findings: set[str] = set()
+    if codex_deny_list_missing(root):
+        findings.add("codex-deny-list-missing")
     rc, _ = run_quiet(["chezmoi", "verify"], home=home)
     if rc:
         findings.add("chezmoi-verify-failed")

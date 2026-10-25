@@ -813,7 +813,7 @@ def realign(args):
     with tempfile.TemporaryDirectory(dir=state) as temporary:
         source = Path(temporary) / "prompt.md"
         source.write_text(prompt)
-        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only -m gpt-6-luna -c model_reasoning_effort=high -",
+        run_reviewer("GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' -m gpt-6-luna -c model_reasoning_effort=high -",
                      info["kb"], source, failed_reply)
         directory.mkdir(parents=True, exist_ok=True)
         failed_reply.replace(reply)
@@ -1036,7 +1036,7 @@ def redteam(args):
         binary = shutil.which(vendor)
         if not binary:
             raise Stop(f"risk high: {vendor} is not available on PATH")
-        command = ([binary, "exec", "--sandbox", "read-only", "-m", model,
+        command = ([binary, "exec", "-c", 'default_permissions="review"', "-m", model,
                                  "-c", "model_reasoning_effort=high", "--skip-git-repo-check", "-C", str(path),
                                  "-o", str(temporary), "-"] if vendor == "codex" else
                    [binary, "-p", "--permission-mode", "dontAsk", "--model", model, "--effort", "high",
@@ -1956,7 +1956,7 @@ def lane(args):
         raise Stop(f"{binary} is not installed or available on PATH.")
     task_lock.work(HOME, task.repo, sha(path, 'HEAD'))
     final = work / "final.md"
-    command = (["codex", "exec", "--sandbox", "workspace-write", "--model", cli_model,
+    command = (["codex", "exec", "-c", 'default_permissions="lane"', "--model", cli_model,
                 "-c", f"model_reasoning_effort={args.effort}", "--output-last-message", str(final), "-"] if builder == "codex" else
                ["claude", "-p", "--output-format", "stream-json", "--verbose", "--model", cli_model, "--effort", args.effort,
                 "--permission-mode", "acceptEdits", "--allowedTools", "Bash Read Write Edit Glob Grep"])
@@ -3533,7 +3533,7 @@ def review_locked(args):
                 events = "--output-format stream-json --verbose " if args.run else ""
                 return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
                         "--allowedTools Read Grep Glob 'Bash(git --no-optional-locks:*)'")
-            return (f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only {add_dir}"
+            return (f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' {add_dir}"
                     f"-m {shlex.quote(model)} -c model_reasoning_effort=high -")
         command = reviewer_command(*reviewer_route)
         if not args.run:
