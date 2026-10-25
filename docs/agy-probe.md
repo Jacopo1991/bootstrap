@@ -1,6 +1,6 @@
 # Antigravity CLI (agy) probe
 
-For the PM, after bootstrap has installed `agy` 1.4.0 (T-48). Agents do not run these steps:
+For the PM, after bootstrap has installed the pinned `agy` release (T-61). Agents do not run these steps:
 the login is Jacopo's, and the probe runs from an unsandboxed PM shell, because lane sessions
 are refused `agy` by the policy hook.
 
@@ -11,7 +11,7 @@ login code, a token, or any part of `~/.gemini` into a prompt, a repository, a l
 
 Jacopo runs this once from Windows, as the `agent` user of the AgentDev distro:
 
-    wsl -d AgentDev -u agent -- agy -p "say hi"
+    wsl -d AgentDev -u agent -- bash -lc 'agy -p "say hi"'
 
 The CLI detects the headless session and prints an authorization URL and a code. Jacopo opens
 the URL in his own browser, signs in with his Google account (AI Pro), and enters the code.

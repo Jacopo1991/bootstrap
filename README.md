@@ -1325,11 +1325,19 @@ PyPI and about six for npm (its database is about 200 MB).
 
 ### Antigravity CLI (agy)
 
-`agy` (Antigravity CLI 1.4.0) is a third vendor for research, read-only audits and plan
+`agy` (Antigravity CLI) is a third vendor for research, read-only audits and plan
 red-teams. Bootstrap installs the release tarball pinned in `pins.env` (`AGY_URL`,
-`AGY_SHA256`): the SHA-256 is checked before extraction, the binary is kept under
-`~/.local/share/bootstrap/agy/<version>/` and `~/.local/bin/agy` links to it. The vendor's
-install script is never run. The drift report reads back `agy --version`.
+`AGY_SHA256`): the archive SHA-256 is checked before extraction. When the rendered bootstrap
+run-on-change script executes, it replaces a pinned binary whose contents differ. It redownloads
+and verifies the release archive on each run. The installed binary and version directory
+are made read-only, and `~/.local/bin/agy` is a wrapper that sets
+`AGY_CLI_DISABLE_AUTO_UPDATE=true` before executing the pinned binary. An owner can undo those
+permissions; the drift check reports `agy-version-drift` if the version or recorded binary SHA
+changes. The vendor's install script is never run. The pinned release is inside the seven-day
+cooldown, but is taken as a security-fix exception to Jacopo's 2026-10-25 rule never to run
+outdated, potentially vulnerable versions. Its release fixes cross-user plugin MCP OAuth token
+use; 1.4.6 also closed sandbox access to `~/.docker` and `~/.kube`, and 1.4.4 fixed telemetry
+settings reverting while settings load. The cooldown rule itself is unchanged.
 
 - **Who runs it:** the PM, from an unsandboxed shell (`agy -p "<prompt>"`, `--add-dir <path>`).
   The policy hook refuses `agy` and `antigravity` in every lane session (T-48). It refuses

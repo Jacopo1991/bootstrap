@@ -41,6 +41,7 @@ run bash ci/gitleaks-working-tree-test.sh
 run bash ci/boundary-test.sh
 run bash -n system/ssh.sh system/authorize-agent-key.sh ci/vscode-ssh-test.sh
 run python3 ci/monthly_pins_test.py
+run python3 ci/agy-install-test.py
 run python3 ci/agent-config-test.py
 run python3 ci/claude-lean-session-test.py
 run python3 ci/claude-managed-mods-test.py
