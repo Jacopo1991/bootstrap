@@ -7,6 +7,7 @@ output, config values, secrets, file contents, and task arguments are never emit
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -255,6 +256,17 @@ def scan(root: Path, home: Path, run=run_quiet) -> list[str]:
         rc, actual = run(args, home=home)
         if rc or not version_matches(expected, actual):
             findings.add("cli-version-drift:" + name)
+        if name == "agy":
+            binary = home / ".local/share/bootstrap/agy" / expected / "antigravity"
+            recorded = binary.with_name("antigravity.sha256")
+            try:
+                recorded_sha = recorded.read_text(encoding="ascii").strip()
+                actual_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            except OSError:
+                recorded_sha = actual_sha = ""
+            if (rc or not version_matches(expected, actual) or
+                    not re.fullmatch(r"[0-9a-f]{64}", recorded_sha) or recorded_sha != actual_sha):
+                findings.add("agy-version-drift")
 
     try:
         tools = tomllib.loads((home / ".config/mise/config.toml").read_text(encoding="utf-8"))["tools"]
