@@ -127,6 +127,25 @@ assert rules.count('decision = "forbidden"') == 0
 # Each requirements rule covers git and /usr/bin/git (or gh and /usr/bin/gh) at once.
 decisions = [rule["decision"] for rule in requirements["rules"]["prefix_rules"]]
 assert decisions.count("prompt") == 2 and decisions.count("forbidden") == 6, decisions
+# Read-deny: Codex runs with an admin permissions profile (not --sandbox, which cannot combine
+# with one) that keeps the write scope of its built-in base and denies the Claude Read list plus
+# credentials, private data and the excluded private repos. Only these profiles may be selected.
+assert requirements["default_permissions"] == "lane"
+assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True}
+assert {n: p["extends"] for n, p in requirements["permissions"].items()} == {"lane": ":workspace", "review": ":read-only"}
+claude_reads = {x[len("Read("):-1].removesuffix("/**") for x in claude["permissions"]["deny"]
+                if x.startswith("Read(~/")}
+extra_denies = {"~/.claude/.credentials.json", "~/.gemini", "~/project-data",
+                *(f"~/dev_workspace/{n}" for n in ("typo3-dkm", "typo3-dkm-plugin", "customer-harness", "photo-organizer")),
+                *(f"~/cortex/cortex-kb-{n}" for n in ("typo3-dkm", "customer-harness", "photo-organizer"))}
+assert {"~/.ssh", "~/.config/gh", "~/.codex/auth.json", "~/.npmrc"} <= claude_reads
+for name, profile in requirements["permissions"].items():
+    assert set(profile) == {"extends", "filesystem"}, name
+    assert profile["filesystem"] == dict.fromkeys(claude_reads | extra_denies, "deny"), name
+launch = (ROOT / "home/dot_local/bin/executable_task").read_text(encoding="utf-8")
+assert "--sandbox" not in launch
+assert launch.count('default_permissions="lane"') == 1 and launch.count('default_permissions=\\"review\\"') == 2
+assert launch.count('default_permissions="review"') == 1
 assert "PreToolUse" in claude["hooks"]
 assert not claude.get("mcpServers") and not claude.get("plugins")
 

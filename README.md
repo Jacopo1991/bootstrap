@@ -391,6 +391,26 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   with `~/.codex/rules/*.rules` and the most restrictive decision wins
   ([managed configuration](https://learn.chatgpt.com/docs/enterprise/managed-configuration),
   [hooks](https://learn.chatgpt.com/docs/hooks)).
+- Codex read-deny (T-50): `--sandbox` limits writes, not reads, and Codex refuses to combine
+  `sandbox_mode` with `default_permissions`. So `task` launches Codex with
+  `-c default_permissions="lane"` (build lanes) or `"review"` (reviewers, red team) and no
+  `--sandbox`. `system/codex-requirements.toml` defines both profiles (`lane` extends
+  `:workspace`, `review` extends `:read-only`, so each keeps its write scope), allows only those
+  two in `allowed_permission_profiles` and defaults to `lane`. Both deny reads of everything
+  in the Claude `Read(~/…)` deny list (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.gnupg`,
+  `~/.config/gh`, `~/.config/gcloud`, `~/.docker/config.json`, `~/.netrc`, `~/.npmrc`,
+  `~/.claude.json`, `~/.codex/auth.json`) plus `~/.claude/.credentials.json`, `~/.gemini`,
+  `~/project-data` and the private repos (`typo3-dkm`, `typo3-dkm-plugin`, `customer-harness`,
+  `photo-organizer` under `~/dev_workspace`, and their `cortex-kb-*` repos). The deny covers
+  commands the sandbox runs; the `codex` process reads `~/.codex/auth.json` itself. A private
+  project's own lane therefore cannot read its repo until that project gets its own profile.
+  `checks/agent-drift.py` reports `codex-deny-list-missing` when the installed requirements
+  lack these profiles. PM proof after install, one `codex sandbox -c 'default_permissions="review"' --
+  test -r <path>` per denied path (must fail; never print contents) and the controls
+  `/etc/hostname` and `~/.bashrc` (must succeed); repeat with `"lane"`; then run one Codex lane
+  and one Codex review normally. Also confirm `codex exec` with `-c default_permissions` starts
+  under the requirements (no "overrides cannot both be set" error) and that `~/.codex/config.toml`
+  `sandbox_mode` does not conflict.
 
 Both installers refuse to run unless the policy scripts, `/usr/bin/env`, `/usr/bin/python3`,
 `/usr/bin/git` and the root-owned `/usr/local/bin/gitleaks` (installed by `install.sh`), and

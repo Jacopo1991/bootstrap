@@ -3187,7 +3187,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(prompt.count('## INTENT.md\n'), 1)
         for value in ('INTENT.md', 'Pass test: ship the goal.', 'STATUS.md contents', 'Decision input', 'pass test', 'founder', 'direct: Direct title; milestone: m-1'):
             self.assertIn(value, prompt)
-        self.assertIn('--sandbox read-only', (self.kb / 'args-copy').read_text())
+        self.assertIn('default_permissions="review"', (self.kb / 'args-copy').read_text())
         self.assertEqual((self.kb / 'INTENT.md').read_bytes(), before)
         self.assertEqual(len(list((self.kb / 'history/realign').glob('realign-*.md'))), 1)
         stub.write_text('#!/usr/bin/env python3\nimport sys\nprint("partial reply")\nsys.exit(1)\n')
@@ -4761,7 +4761,7 @@ store.write_text(json.dumps(prs))
             self.assertEqual(call['brief'], wrapper.read_text() + '\n\n' + brief.read_text())
             self.assertIn(model, call['args'])
             if vendor == 'codex':
-                self.assertEqual(call['args'][:3], ['exec', '--sandbox', 'read-only'])
+                self.assertEqual(call['args'][:3], ['exec', '-c', 'default_permissions="review"'])
             else:
                 self.assertIn('dontAsk', call['args'])
         wrapper.unlink()
@@ -6350,7 +6350,7 @@ store.write_text(json.dumps(prs))
             with mock.patch.dict(os.environ, TASK_LANE_TEMP_ROOT=str(self.lane_root)):
                 self.assertEqual(TASK_MODULE.advisory_temporary_parent(wt), str(recorded))
             self.assertEqual(call["prompt"], 'Read the pinned task context in .work/context/ before working.\n\n' + prompt)
-            self.assertEqual(call["args"], ["exec", "--sandbox", "workspace-write", "--model", "gpt-6.1-sol",
+            self.assertEqual(call["args"], ["exec", "-c", 'default_permissions="lane"', "--model", "gpt-6.1-sol",
                                             "-c", "model_reasoning_effort=high", "--output-last-message", str(wt / ".work/final.md"), "-"])
             self.assertFalse(any(name in TASK_MODULE.GIT_OVERRIDE_ENV or
                                  name.startswith(("GIT_CONFIG", "TASK_RUN_")) for name in call["env_names"]))
@@ -7894,7 +7894,7 @@ store.write_text(json.dumps(prs))
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
-        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec --sandbox read-only --add-dir {self.kb} "
+        self.assertIn(f"GIT_OPTIONAL_LOCKS=0 codex exec -c 'default_permissions=\"review\"' --add-dir {self.kb} "
                       "-m gpt-6-luna -c model_reasoning_effort=high - <", out)
         self.assertIn(f"{prompt} > {reply}", out)
         self.assertIn(f"task review proj 5 --record {reply}", out)
@@ -7905,7 +7905,8 @@ store.write_text(json.dumps(prs))
     def test_direct_review_commands_do_not_add_kb_directory_without_backlog_file(self):
         self.raw_task("start", "proj", "direct-request", "--builder", "claude")
         out = self.raw_task("review", "proj", "direct-request")
-        self.assertIn("codex exec --sandbox read-only", out)
+        self.assertIn("codex exec -c 'default_permissions=\"review\"'", out)
+        self.assertNotIn("--sandbox", out)
         self.assertNotIn("--add-dir", out)
 
     def test_merge_gates_merge_result_without_changing_lane_and_is_idempotent(self):

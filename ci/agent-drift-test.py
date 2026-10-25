@@ -108,4 +108,15 @@ with tempfile.TemporaryDirectory() as temp:
         settings.write_text(json.dumps({"mcpServers": {"kb": server}}))
         assert drift.backlog_mcp_references(home), server
         assert not drift.shell_connector_references(home), server
+# The installed Codex requirements must carry the checked-in read-deny profiles.
+with tempfile.TemporaryDirectory() as temp:
+    installed = Path(temp) / "requirements.toml"
+    source = (ROOT / "system/codex-requirements.toml").read_text()
+    assert drift.codex_deny_list_missing(ROOT, installed)
+    installed.write_text(source)
+    assert not drift.codex_deny_list_missing(ROOT, installed)
+    for stripped in (source.split("\n[permissions.lane]")[0], source.replace('"~/project-data" = "deny"', '', 1),
+                     source.replace('default_permissions = "lane"', 'default_permissions = "review"')):
+        installed.write_text(stripped)
+        assert drift.codex_deny_list_missing(ROOT, installed)
 print("PASS: foreign npm, uv, and global CLI installs, stale OSV data and connector registrations are reported as drift")
