@@ -5469,6 +5469,44 @@ store.write_text(json.dumps(prs))
         self.wait_for_lane(wt)
         self.assertIn('(2/1 granted)', self.raw_task('lane', 'proj', '5', '--no-pace', '--extra-round', 'excess', code=1))
 
+    def test_round_cause_setup_rounds_are_recorded_and_not_counted(self):
+        self.stub_models()
+        says = self.home / 'lane-says'
+        stub = MODEL_STUB.replace("sys.exit(int(", f"sys.stderr.write(pathlib.Path({str(says)!r}).read_text())\nsys.exit(int(")
+        (self.home / 'bin/codex').write_text(stub)
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 1\nextra_rounds = 0\n')
+        (wt / '.work/prompt.md').write_text('round cause fixture\nNever work around a read-only file system.\n')
+        rounds = self.state() / 'rounds.json'
+        cases = (('Error: git push denied by policy hook (task-guard)\n', 'policy-denial', False),
+                 ('error: Failed to initialize cache at `/home/agent/.cache/uv`\n'
+                  '  Caused by: Read-only file system (os error 30)\n', 'missing-tool-or-cache', False),
+                 ('bash: line 1: just: command not found\n', 'missing-tool-or-cache', False),
+                 ('FAILED (failures=1)\nAssertionError: 2 != 3\n', 'code-or-test', True))
+        for number, (text, cause, counted) in enumerate(cases, 1):
+            with self.subTest(cause=cause, text=text):
+                says.write_text(text)
+                self.raw_task('lane', 'proj', '5', '--no-pace')
+                self.wait_for_lane(wt)
+                entry = json.loads(rounds.read_text())['rounds'][-1]
+                self.assertEqual((entry['round'], entry['cause'], entry['counted']), (number, cause, counted))
+        self.assertEqual(json.loads(rounds.read_text())['used'], 4)
+        self.assertIn('risk normal: maximum 1', self.raw_task('lane', 'proj', '5', '--no-pace', code=1))
+        ledger = self.home / '.local/state/task/usage/overrides.jsonl'
+        for bad in (('9', 'blind round'), ('4', ' '), ('1', 'already free')):
+            self.assertIn('setup-round' if bad[0] != '1' else 'already does not count',
+                          self.raw_task('lane', 'proj', '5', '--setup-round', *bad, code=1))
+        out = self.raw_task('lane', 'proj', '5', '--setup-round', '4', 'blind round: the hook hid the cache error')
+        self.assertIn('round 4 marked setup-caused', out)
+        entry = json.loads(rounds.read_text())['rounds'][3]
+        self.assertEqual((entry['counted'], entry['marked']), (False, 'blind round: the hook hid the cache error'))
+        row = json.loads(ledger.read_text().splitlines()[-1])
+        self.assertEqual((row['model'], row['tier'], row['override']),
+                         ('setup round', 'round 4', 'blind round: the hook hid the cache error'))
+        says.write_text('done\n')
+        self.raw_task('lane', 'proj', '5', '--no-pace')
+        self.assertEqual(self.wait_for_lane(wt)['usage_run']['round'], 5)
+
     def state(self, name="t5"):
         return self.home / ".local/state/task/proj" / name
 
@@ -10252,6 +10290,13 @@ if 'Verdict:' in prompt:
     judged = 'pass' if verdict == 'PASS' else 'fail'
     print(f"```review\\nVerdict: {verdict}\\nCommit: {head}\\n#1 {judged}: smoke.txt contains ok\\n```\\nBlocking: none\\nNotes: none")
     sys.exit(0)
+commands = [line[len('Run: '):] for line in prompt.splitlines() if line.startswith('Run: ')]
+if commands:  # the real-repository lane (T-62): run each command and stop
+    for command in commands:
+        subprocess.run(command, shell=True)
+    if '--output-last-message' in sys.argv:
+        pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
+    sys.exit(0)
 if 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' in prompt:
     checked = subprocess.run(['uv', 'run', '--no-project', '--with', 'colorama==0.4.6',
                               'python', 'smoke_check.py'], capture_output=True, text=True)
@@ -10296,6 +10341,8 @@ class SmokeTests(unittest.TestCase):
             (bin_dir / name).chmod(0o755)
         uv = bin_dir / 'uv'
         uv.write_text("#!/bin/sh\n[ \"$SMOKE_UV_FAIL\" = 1 ] && { echo 'error: uv cache is read-only' >&2; exit 1; }\n"
+                      "[ -n \"$UV_CACHE_DIR\" ] && { [ -e \"$UV_CACHE_DIR/.read-only\" ] || ! touch \"$UV_CACHE_DIR/.probe\"; } 2>/dev/null && { echo \"error: Failed to initialize cache at "
+                      "$UV_CACHE_DIR: Read-only file system (os error 30)\" >&2; exit 2; }\n"
                       "[ \"$1 $2\" = 'run --no-project' ] || exit 2\n"
                       "echo \"$PWD\" >> \"$HOME/uv-runs\"\nexit 0\n")
         uv.chmod(0o755)
@@ -10312,6 +10359,17 @@ class SmokeTests(unittest.TestCase):
         contract = self.home / '.agents/skills/slim-workflow/lane-contract.md'
         contract.parent.mkdir(parents=True)
         contract.write_text("# Fake lane contract\n")
+        for real in (self.home / 'dev_workspace/company', self.home / 'dev_workspace/bootstrap'):
+            self.real_repo(real)
+
+    def real_repo(self, path, justfile="check:\n    echo ok\n", files=()):
+        path.mkdir(parents=True)
+        (path / 'justfile').write_text(justfile)
+        for name, text in files:
+            (path / name).write_text(text)
+        for args in (('init', '-q', '-b', 'main'), ('add', '-A'), ('commit', '-qm', 'real fixture')):
+            subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-C', str(path), *args],
+                           check=True, capture_output=True)
 
     def smoke(self, *args, code=0, env=None):
         result = subprocess.run([sys.executable, str(self.home / 'bin/task-smoke'), *args], env=env or self.env,
@@ -10325,7 +10383,8 @@ class SmokeTests(unittest.TestCase):
     def scratch(self, run):
         return {'repo': self.home / 'dev_workspace' / f'task-smoke-{run}',
                 'kb': self.home / 'cortex' / f'cortex-kb-task-smoke-{run}',
-                'state': self.home / '.local/state/task' / f'task-smoke-{run}'}
+                'state': self.home / '.local/state/task' / f'task-smoke-{run}',
+                'real': self.home / 'dev_workspace' / f'task-smoke-{run}-real'}
 
     def smoke_module(self):
         loader = importlib.machinery.SourceFileLoader('task_smoke_web_test', str(SMOKE_HELPER))
@@ -10371,8 +10430,9 @@ class SmokeTests(unittest.TestCase):
         out = self.smoke()
         run = self.run_id(out)
         steps = ('start', 'setup', 'lane', 'commit', 'merge main', 'report', 'check', 'review', 'merge')
-        for step in steps:
+        for step in (*steps, 'real start', 'real lane', 'real company', 'real bootstrap'):
             self.assertEqual(len(re.findall(rf"(?m)^  PASS {step}$", out)), 2, (step, out))
+        self.assertNotIn('real cortex-core', out, 'cortex-core is checked only when it exists with a justfile')
         self.assertNotIn('FAIL', out)
         record = json.loads((self.home / '.local/state/task/smoke' / f'{run}.json').read_text())
         self.assertEqual(record['result'], 'PASS')
@@ -10383,6 +10443,65 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual({name: b['result'] for name, b in record['builders'].items()}, {'codex': 'PASS', 'claude': 'PASS'})
         for path in self.scratch(run).values():
             self.assertFalse(path.exists(), f"a passing run removes {path}")
+
+    def test_real_check_failing_only_in_the_lane_fails_smoke_on_pre_t60_profile(self):
+        """T-62: a lane whose uv cache is the shared read-only one (the profile before T-60) fails the smoke."""
+        helper = self.smoke_module()
+        helper.WORKSPACE, helper.CORTEX = self.home / 'dev_workspace', self.home / 'cortex'
+        uv_line = 'uv run --no-project --with colorama==0.4.6 python smoke_check.py'
+        cortex = self.home / 'cortex/cortex-core'
+        self.real_repo(cortex, f"check:\n    {uv_line}\n", [('smoke_check.py', 'print(1)\n')])
+        (self.home / 'dev_workspace/company/FAIL').write_text('broken on main\n')  # fails outside too
+        subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-C', str(self.home / 'dev_workspace/company'), 'add', 'FAIL'], check=True)
+        subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-C', str(self.home / 'dev_workspace/company'), 'commit', '-qm', 'break main'], check=True)
+        helper.REAL_REPOS = tuple((name, self.home / path.relative_to(helper.HOME), required)
+                                  for name, path, required in helper.REAL_REPOS)
+        repos = helper.real_repos()
+        self.assertEqual([name for name, _ in repos], ['company', 'bootstrap', 'cortex-core'])
+        found = {'repo': self.home / 'dev_workspace/task-smoke-x', 'real': self.home / 'dev_workspace/task-smoke-x-real'}
+        shared = self.home / 'shared-uv-cache'
+        shared.mkdir()
+        (shared / '.read-only').write_text('')  # root ignores the mode below; the stub honours either
+        shared.chmod(0o500)
+        self.addCleanup(shared.chmod, 0o700)
+        self.enterContext(mock.patch.dict(os.environ, PATH=self.env['PATH'], HOME=str(self.home)))
+        outside = helper.outside_checks('x', found, repos)
+        self.assertEqual({name: result['exit'] for name, result in outside.items()},
+                         {'company': 1, 'bootstrap': 0, 'cortex-core': 0})
+        calls = []
+
+        def fake_task(*args):  # the lane runs mocked: each Run: line under the pre-T-60 lane profile
+            calls.append(args)
+            wt = found['repo'] / '.worktrees/t3'
+            if args[0] == 'start':
+                (wt / '.work').mkdir(parents=True)
+            if args[0] == 'lane':
+                lane_env = dict(os.environ, UV_CACHE_DIR=str(shared))
+                for line in (wt / '.work/prompt.md').read_text().splitlines():
+                    if line.startswith('Run: '):
+                        subprocess.run(line[5:], shell=True, cwd=wt, env=lane_env, capture_output=True)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        helper.task = fake_task
+        lines = []
+        steps = helper.run_real_checks('x', found, 'codex', lines.append, repos, outside)
+        self.assertEqual([args[0] for args in calls], ['start', 'lane', 'wait'])
+        results = {step['step']: step['result'] for step in steps}
+        self.assertEqual(results, {'real start': 'PASS', 'real lane': 'PASS', 'real company': 'WARN',
+                                   'real bootstrap': 'PASS', 'real cortex-core': 'FAIL'})
+        self.assertIn('  FAIL real cortex-core: setup failure: just check fails in the codex lane but passes outside: '
+                      f'error: Failed to initialize cache at {shared}: Read-only file system (os error 30)', lines)
+        clone = found['repo'] / '.worktrees/t3/.work/real/cortex-core'
+        self.assertEqual(subprocess.run(['git', '-C', str(clone), 'branch', '--show-current'], capture_output=True,
+                                        text=True).stdout.strip(), 'task-smoke-x', 'checks run on a throwaway branch')
+        self.assertEqual(subprocess.run(['git', '-C', str(cortex), 'branch', '--list', 'task-smoke-x'], capture_output=True,
+                                        text=True).stdout.strip(), '', 'the real repository is untouched')
+
+    def test_missing_required_real_repository_fails_smoke(self):
+        shutil.rmtree(self.home / 'dev_workspace/company')
+        out = self.smoke('--builder', 'codex', code=1)
+        self.assertIn('FAIL real repositories:', out)
+        self.assertIn('company is not a repository', out)
 
     def test_review_fail_verdict_fails_at_review_step(self):
         out = self.smoke('--builder', 'codex', code=1, env=dict(self.env, SMOKE_REVIEW_VERDICT='FAIL'))
