@@ -5512,6 +5512,33 @@ store.write_text(json.dumps(prs))
         self.raw_task('lane', 'proj', '5', '--no-pace')
         self.assertEqual(self.wait_for_lane(wt)['usage_run']['round'], 5)
 
+    def test_round_cause_setup_round_refunds_its_extra_round_grant(self):
+        self.stub_models()
+        says = self.home / 'lane-says'
+        stub = MODEL_STUB.replace("sys.exit(int(", f"sys.stderr.write(pathlib.Path({str(says)!r}).read_text())\nsys.exit(int(")
+        (self.home / 'bin/codex').write_text(stub)
+        wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\nmax_rounds = 1\nextra_rounds = 2\n')
+        (wt / '.work/prompt.md').write_text('refund fixture\n')
+        rounds = self.state() / 'rounds.json'
+        ledger = self.home / '.local/state/task/usage/overrides.jsonl'
+        for flags, text, extra in (((), 'done\n', 0),
+                                   (('--extra-round', 'retry after hook'), 'Error: git push denied by policy hook\n', 0),
+                                   (('--extra-round', 'fix the test'), 'FAILED (failures=1)\n', 1)):
+            with self.subTest(flags=flags, text=text):
+                says.write_text(text)
+                self.raw_task('lane', 'proj', '5', '--no-pace', *flags)
+                self.wait_for_lane(wt)
+                self.assertEqual(json.loads(rounds.read_text())['extra'], extra)
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual([(row['model'], row['override']) for row in rows if 'extra rounds' in row['model']],
+                         [('extra rounds', 'retry after hook'), ('extra rounds refund', 'policy-denial'),
+                          ('extra rounds', 'fix the test')])
+        self.raw_task('lane', 'proj', '5', '--setup-round', '3', 'the test failed on a read-only cache')
+        self.assertEqual(json.loads(rounds.read_text())['extra'], 0)
+        self.assertEqual([json.loads(line)['model'] for line in ledger.read_text().splitlines()[-2:]],
+                         ['extra rounds refund', 'setup round'])
+
     def state(self, name="t5"):
         return self.home / ".local/state/task/proj" / name
 

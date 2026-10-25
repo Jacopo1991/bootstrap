@@ -1991,7 +1991,17 @@ def end_round(task, run, work, state, code):
     cause = round_cause(dict(run, state=state, exit_code=code), work)
     number = (run.get("usage_run") or {}).get("round") or rounds.get("used", 0)
     rounds.setdefault("rounds", []).append(dict(round=number, cause=cause, counted=cause not in SETUP_CAUSES, ended_at=utc_now()))
+    if cause in SETUP_CAUSES:
+        refund_grant(task, rounds, number, cause)
     atomic_json(path, rounds)
+
+
+def refund_grant(task, rounds, number, reason):
+    """A setup-caused round launched with --extra-round gives its grant back (ledgered next to the grant)."""
+    if number in rounds.get("grants", []):
+        rounds["grants"].remove(number)
+        rounds["extra"] = max(rounds.get("extra", 0) - 1, 0)
+        task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds refund", f"round {number}", reason)
 
 
 def setup_round(task, number, reason):
@@ -2013,6 +2023,7 @@ def setup_round(task, number, reason):
     if not entry.get("counted", True):
         raise Stop(f"round {number} already does not count ({entry.get('marked') or entry['cause']})")
     entry.update(counted=False, marked=reason)
+    refund_grant(task, rounds, number, reason)
     atomic_json(path, rounds)
     task_usage.record_override(HOME, task.repo.name, task.id, "setup round", f"round {number}", reason)
     print(f"round {number} marked setup-caused ({reason}); it does not count against the round limit")
@@ -2128,7 +2139,8 @@ def lane(args):
                 if os.environ.get('TASK_PLAN'): (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
                 atomic_json(lane_record, dict(unit=child.unit, state='skipped: hold', ended_at=utc_now()))
                 print('skipped: hold'); return 1
-            atomic_json(task_state(task) / "rounds.json", dict(rounds, used=used + 1, extra=extra))
+            grants = rounds.get("grants", []) + ([used + 1] if extra != rounds.get("extra", 0) else [])
+            atomic_json(task_state(task) / "rounds.json", dict(rounds, used=used + 1, extra=extra, grants=grants))
             if extra != rounds.get("extra", 0):
                 task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
             ledger_ramp_exempt(args, task, builder, model, tier, bool(decision and decision["ramp_exempt"]))
