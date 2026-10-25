@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import re
 from pathlib import Path
 import shutil
 import unittest
@@ -429,6 +430,15 @@ class CooldownTests(unittest.TestCase):
         self.assertIn(f"Refreshed Python lock {pins.PYTHON_LOCKS[0]} with uv --exclude-newer "
                       "2026-10-18T12:00:00Z.", notes)
         self.assertTrue(any(note.startswith(f"Retained Python lock {pins.PYTHON_LOCKS[1]}") for note in notes))
+
+    def test_monthly_workflow_stages_every_refreshed_python_lock(self) -> None:
+        workflow = (Path(pins.__file__).resolve().parents[1] / ".github/workflows/monthly-pin-bump.yml")
+        text = workflow.read_text(encoding="utf-8")
+        match = re.search(r"git add \\\n((?:\s+\S+(?: \\)?\n)+)", text)
+        self.assertIsNotNone(match, "monthly workflow has no explicit git add list")
+        staged = set(match.group(1).replace("\\", " ").split())
+        for relative in pins.PYTHON_LOCKS:
+            self.assertIn(relative, staged)
 
 
 if __name__ == "__main__":

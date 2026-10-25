@@ -1760,9 +1760,7 @@ to the newest stable version published more than 7 days ago, read from the
 packument's `time` field; the npm lock is regenerated with an explicit `--before`
 date; and the hashed pre-commit and inspect locks are recompiled with uv
 `--upgrade --exclude-newer` at the same cutoff. A younger release that was
-skipped is named in the summary. The GPU lock stays a manual update. The
-workflow's `git add` list does not yet include the two Python locks, so a CI run
-reports their refresh without committing it.
+skipped is named in the summary. The GPU lock stays a manual update.
 Every unresolved component stays at its previous pin and is listed in the
 workflow summary and pull request body. Claude Code's moving installer/version pairing is not resolved by this updater and
 requires manual review; signing-key rotations remain pinned for manual review.
