@@ -1715,7 +1715,8 @@ def check_task_from_args(args):
 
 
 def advisory_check_for(task: Task):
-    return not task_state_writable() or not task_state_writable(task)
+    # A lane (TASK_WORKTREE) never records a trusted check, whatever its state access (T-67).
+    return bool(os.environ.get("TASK_WORKTREE")) or not task_state_writable() or not task_state_writable(task)
 
 
 def require_pm(args):
@@ -2457,7 +2458,8 @@ def check_step_environment(run_id):
     """Keep local mock traffic off the sandbox proxy without changing proxy settings."""
     child_env = dict(agent_environment(), TASK_RUN_ID=run_id)
     child_env.update({key: value for key, value in os.environ.items()
-                      if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}})
+                      if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
+                      or key in {"UV_CACHE_DIR", "PIP_CACHE_DIR", "PRE_COMMIT_HOME", "npm_config_cache"}})
     for name in ("NO_PROXY", "no_proxy"):
         existing = child_env.get(name, "")
         child_env[name] = ",".join(part for part in (existing.rstrip(","), "localhost", "127.0.0.1", "::1") if part)
@@ -2733,6 +2735,22 @@ class UnitProcess:
 
     def stop(self):
         stop_unit(self.unit, self.env)
+        self.process.wait()
+
+
+class LocalProcess:
+    """An advisory check step run in-process: a lane sandbox refuses systemd-run (T-67). Same hold rule."""
+    def __init__(self, command, *, cwd, env, stdout, stderr):
+        self.unit, self.skipped = 'in-process', bool(hold_status())
+        self.process = None if self.skipped else subprocess.Popen(
+            command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+        self.pid = self.process.pid if self.process else 0
+
+    def wait(self, timeout=None):
+        return 77 if self.skipped else self.process.wait(timeout=timeout)
+
+    def stop(self):
+        with contextlib.suppress(ProcessLookupError): os.killpg(self.pid, signal.SIGKILL)
         self.process.wait()
 
 
@@ -3175,8 +3193,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
-                process = launch_unit('gate', main_repo(path), path.name, step, cwd=path,
-                                      env=child_env, stdout=out, stderr=out)
+                process = (LocalProcess(step, cwd=path, env=child_env, stdout=out, stderr=out) if advisory else
+                           launch_unit('gate', main_repo(path), path.name, step, cwd=path,
+                                       env=child_env, stdout=out, stderr=out))
                 if state:
                     set_child_group(state, process.pid, process.unit)
                 timed_out = False

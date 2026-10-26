@@ -818,7 +818,8 @@ and unsandboxed runner can write it and produce trusted evidence. Sandboxed
 Codex and Claude Code builders cannot: their checks remain advisory, and commands
 that mutate PM state refuse with “run this from the PM shell or a batch runner”.
 Always launch builders via `task lane`. Sessions that cannot write
-`~/.local/state/task` are advisory lanes.
+`~/.local/state/task` are advisory lanes, and so is any session with `TASK_WORKTREE`
+(set by `task lane`): a check inside a lane is never recorded as trusted (T-67).
 The hook permits PM task command routes; its other rules remain in force.
 `task lane` and plain `task review` are PM/runner-only too: lane dispatch starts
 a builder, and review preparation writes private routing and prompt records.
@@ -916,7 +917,9 @@ retries and fallbacks. Every builder, reviewer, gate step, runner and workspace-
 starts in a `systemd-run --user` unit. Each unit uses `ExecCondition=` with the installed `task hold --check`:
 it needs no holder and succeeds only when both markers are absent and inspectable.
 Skipped units are recorded as `skipped: hold`, with their unit name. A missing user manager
-fails closed; there is no process fallback. Gate-browser runs inside its existing gate unit,
+fails closed; there is no process fallback. The one exception is an advisory lane check: a lane
+sandbox refuses the user bus, so its gate steps run in-process after the same hold check (T-67);
+the trusted check keeps its unit. Gate-browser runs inside its existing gate unit,
 and a batch started by a runner runs inline in that runner's unit.
 `task merge` checks the hold once on entry in the PM's shell; its sync and publication
 continue in that process. A hold pulled after entry does not interrupt them.
@@ -968,7 +971,8 @@ task smoke                    # both builders (default); or --builder codex|clau
 It creates `~/dev_workspace/task-smoke-<run>` (one commit on `main`, no remote)
 and `~/cortex/cortex-kb-task-smoke-<run>`, then runs the normal path for each
 builder: `task start`, an unrelated commit on `main`, `task lane` on the cheapest
-model at low effort, the lane's commit, merge of `main` and report, `task check`,
+model at low effort, the lane's commit, merge of `main` and report, the lane's own
+`task check` (advisory and passing on the lane's head, T-67), the trusted `task check`,
 `task review --run` with the decision-32 reviewer, and
 `task merge`. It prints `PASS`, or `FAIL <step>: <first error line>` for each
 step, and stops that builder at its first failure. It writes
@@ -978,7 +982,9 @@ FAIL keeps it and prints the paths, and `task smoke --clean <run>` removes them.
 Each builder then runs a second lane on the scratch project that runs the real
 `just check` of `~/dev_workspace/company`, `~/dev_workspace/bootstrap` and
 `~/cortex/cortex-core` (when it has a justfile) on throwaway clones and a
-`task-smoke-<run>` branch; the same checks run outside any lane first. A check
+`task-smoke-<run>` branch; the same checks run outside any lane first. The lane runs
+only `task check`: the branch's check recipe runs each real check, so no agent is
+asked to run `just check`, which the policy hook denies in lanes (T-67). A check
 that fails in the lane but passes outside is a setup failure and fails the smoke
 (company decision-27); one that fails outside too is a `WARN`, not a setup failure.
 
