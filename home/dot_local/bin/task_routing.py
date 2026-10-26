@@ -121,6 +121,33 @@ def pick(home, vendor, tier, explicit, boosted):
     return values[tier] if vendor in active(home) else UNBOOSTED[vendor]
 
 
+def model_vendor(model):
+    return "codex" if model.startswith("gpt-") else "gemini" if model.startswith("gemini") else "claude"
+
+
+def same_vendor_ok(builder, risk):
+    """Company decision-32: a fresh read-only Codex session may review Codex-built normal-risk work."""
+    return builder == "codex" and risk == "normal"
+
+
+def review_chain(builder, risk, model, gemini=None):
+    """Decision-32 reviewers in order: each next one runs only when the one before is unavailable.
+
+    `model` is the risk policy's reviewer for this builder; `gemini` is the qualified agy model, or None.
+    High risk and planning never fall back to the author's vendor, and never default to Opus or Fable.
+    """
+    first = (model_vendor(model), model)
+    agy = [("gemini", gemini)] if gemini else []
+    if risk == "high":
+        chain = [first, *agy]
+    elif builder == "codex":
+        chain = [*agy, first, ("claude", "haiku")]
+    else:
+        chain = [first, ("claude", "haiku")]
+    return [route for index, route in enumerate(chain) if route not in chain[:index]
+            and (risk != "high" or route[0] != builder)]
+
+
 def lane_limits(home, slots):
     _, extra = policy(home)
     boosts = active(home)

@@ -13,6 +13,8 @@ from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 import os
+import shutil
+import subprocess
 import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
@@ -51,8 +53,9 @@ DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0
                 "home/dot_local/bin/executable_task-hold", "HOLD*", "**/HOLD*", "**/*sandbox*",
                 "home/dot_gitconfig.tmpl", "checks/boundary.sh", "system/vendor-block-hosts.sh", ".gitleaks.toml"]},
                 "low": {"max_rounds": 2, "extra_rounds": 1},
-                "normal": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1},
-                "high": {"codex": "haiku", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1,
+                # Company decision-32: reviewer per builder; Codex reviews Codex-built normal-risk work.
+                "normal": {"codex": "gpt-6.1-sol", "claude": "gpt-6-luna", "max_rounds": 3, "extra_rounds": 1},
+                "high": {"codex": "sonnet", "claude": "gpt-6.1-sol", "max_rounds": 3, "extra_rounds": 1,
                          "red_team_model": "gpt-6.1-sol", "red_team_model_claude": "sonnet"}}}
 
 
@@ -791,7 +794,7 @@ def _applied(vendor, item, pol, top):
                  f"new lanes only for {top or 'the top-priority repo with work'}",
         "under-used-near-reset": f"{reserve}; spend before the reset: "
                                  f"{item['boost_pause'] or 'boost on until it ends (stronger models on queued work)'}; "
-                                 f"deeper reviews ({DEEPER[vendor]}) only for high risk in boost for hard tasks or --final rounds; research backlog: "
+                                 f"deeper reviews ({DEEPER[vendor]}) only for high risk after a recorded miss (--miss, decision-32); research backlog: "
                                  f"{', '.join(pol['research_backlog']) or 'none named'}",
     }.get(item["verdict"], f"{reserve}; normal")
 
@@ -837,7 +840,7 @@ def report(home, now=None):
                          f"ceiling {found['ceiling']:g} %); {'past ramp: no new codex launches unless --ramp-exempt' if found['over'] else 'within ramp'}")
     if pol["codex_ramp"] and seen["codex"]["verdict"] == "unknown":
         lines.append("codex ramp: unknown without a current codex reading; not applied")
-    return lines + [warning for warning in reset_feed(home, now)[2:] if warning] + fallback_lines(pol, seen)
+    return lines + [warning for warning in reset_feed(home, now)[2:] if warning] + gemini_lines(home) + fallback_lines(pol, seen)
 
 
 def _states(vendor, item, pol):
@@ -921,3 +924,71 @@ def run_summary(home, days=1, now=None):
         total = sum(d for d in deltas if d is not None) if any(d is not None for d in deltas) else None
         lines.append(f"{vendor} last {days}d: runs {len({r.get('run_id', r['id']) for r in found})}, weekly usage delta {total}, outcomes {dict(Counter(r['outcome'] for r in found))}")
     return lines
+
+
+# Company decision-32: Gemini through `agy` as a reviewer. `agy --output-format json --print='/usage'` starts
+# no agent turn and spends no quota; its `response` is a TAB-separated table (group, limit, percent remaining,
+# reset). A reading `task` cannot parse is "unknown", and anything but a known-good reading keeps reviews on Codex.
+# agy has no telemetry control (no /config key, flag or documented setting), so the route stays closed until
+# the seat rules on using Gemini without one.
+def gemini_record(home):
+    return _json(_dir(home) / "gemini.json")
+
+
+def _agy(*args, timeout=30):
+    binary = shutil.which("agy")
+    if not binary:
+        return None, "agy not installed"
+    try:
+        done = subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, env=os.environ | {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"})
+        return (done.stdout, "") if done.returncode == 0 else (None, f"agy {args[-1]} exited {done.returncode}")
+    except (OSError, subprocess.SubprocessError):
+        return None, f"agy {args[-1]} did not run"
+
+
+def gemini_quota(text):
+    """(state, detail) from the /usage table: exhausted when any Gemini Models row has 0 % remaining."""
+    rows = []
+    for line in str(text or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 4 and fields[0].strip() == "Gemini Models" and fields[2].strip().endswith("%"):
+            try:
+                rows.append((fields[1].strip(), float(fields[2].strip()[:-1]), fields[3].strip()))
+            except ValueError:
+                return "unknown", f"unparseable row: {line.strip()}"
+    if not rows:
+        return "unknown", "no Gemini Models rows in agy /usage"
+    detail = "; ".join(f"{name} {left:g} % (resets {reset})" for name, left, reset in rows)
+    return ("exhausted" if any(left <= 0 for _, left, _ in rows) else "ok"), detail
+
+
+def gemini(home):
+    """Qualification record, quota ("ok", "exhausted", "unknown") and telemetry, which agy cannot turn off."""
+    record = gemini_record(home)
+    qualified = record.get("result") == "pass" and bool(record.get("model"))
+    out, reason = _agy("--output-format", "json", "--print=/usage")
+    try:
+        found = json.loads(out) if out is not None else None
+        quota, detail = gemini_quota(found.get("response")) if isinstance(found, dict) and found.get("status") == "SUCCESS" \
+            else ("unknown", reason or "agy /usage did not succeed")
+    except ValueError:
+        quota, detail = "unknown", "agy /usage gave no JSON"
+    version, _ = _agy("--version", timeout=10)
+    version = (version or "").split()[-1:] or ["(version unknown)"]
+    telemetry = f"no control in agy {version[0]} (seat decision pending)"
+    return {"qualified": qualified, "model": record.get("model") if qualified else None, "record": record,
+            "quota": quota, "quota_detail": detail, "telemetry": telemetry,
+            "available": False}  # fail-closed: no telemetry control to verify
+
+
+def gemini_lines(home):
+    state = gemini(home)
+    record = state["record"]
+    qualification = (f"qualified on the T-44 backtest ({record.get('time', '?')}, model {record['model']})" if state["qualified"]
+                     else f"not qualified: {record['result']} on the T-44 backtest ({record.get('time', '?')})" if record.get("result")
+                     else "not qualified: no T-44 backtest result recorded (task gemini --record)")
+    route = ("reviews use it first for Codex-built normal-risk work" if state["available"] else
+             "routing skips it; reviews go to Codex")
+    return [f"gemini (agy): quota {state['quota']} ({state['quota_detail']}); telemetry: {state['telemetry']}",
+            f"  {qualification}; {route}"]

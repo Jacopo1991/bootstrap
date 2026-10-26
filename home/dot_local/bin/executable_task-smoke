@@ -5,7 +5,7 @@ Creates ~/dev_workspace/task-smoke-<run> (one commit on main, no remote) and
 ~/cortex/cortex-kb-task-smoke-<run> (a signed plan and one task per builder). Per builder:
 task start, an unrelated commit on main, task lane (cheapest model, low effort), then the lane's
 commit, merge and report read back from Git, then task check, task review --run (routed to the
-cheapest reviewer of the other vendor) and task merge. Prints PASS, or FAIL <step>: <first error
+decision-32 reviewer) and task merge. Prints PASS, or FAIL <step>: <first error
 line>, per step. A FAIL keeps the scratch project for `task smoke --clean <run>`; a pass removes it.
 
 Then (T-62, company decision-27) each builder gets a second lane that runs the real `just check` of
@@ -229,11 +229,9 @@ def run_builder(run, found, builder, emit):
     wt = repo / ".worktrees" / f"t{ident[2:]}"
     steps = []
 
-    def done(step, error=None, result=None):
-        result = result or ("PASS" if error is None else "FAIL")
-        steps.append({"step": step, "result": result, "error": error or ""})
-        emit(f"  PASS {step}" if error is None else f"  SKIP hold: {step} unit skipped by the hold" if result == "SKIP"
-             else f"  FAIL {step}: {error}")
+    def done(step, error=None):
+        steps.append({"step": step, "result": "PASS" if error is None else "FAIL", "error": error or ""})
+        emit(f"  PASS {step}" if error is None else f"  FAIL {step}: {error}")
         return error is None
 
     error = reset_smoke(repo)
@@ -258,9 +256,6 @@ def run_builder(run, found, builder, emit):
     log = read(wt / ".work/lane.log")
     state, exit_code = lane_outcome(wt)
     error = None
-    if state == "skipped: hold":
-        done("lane", "hold", "SKIP")
-        return steps
     if lane.returncode != 0:
         error = command_error(lane)
     elif waited.returncode != 0:
@@ -449,15 +444,11 @@ def main(argv=None):
         for builder in names:
             emit(f"{builder} ({BUILDERS[builder][1]}, {BUILDERS[builder][0]}):")
             steps = run_builder(run, found, builder, emit)
-            if steps[-1]["result"] == "SKIP":
-                record["builders"][builder] = {"result": "SKIP hold", "steps": steps, "real": []}
-                continue
             passed = len(steps) == 9 and all(step["result"] == "PASS" for step in steps)
             real = run_real_checks(run, found, builder, emit, repos, outside) if repos is not None else []
             passed = passed and repos is not None and len(real) == 2 + len(repos) and all(step["result"] != "FAIL" for step in real)
             record["builders"][builder] = {"result": "PASS" if passed else "FAIL", "steps": steps, "real": real}
-        results = [b["result"] for b in record["builders"].values()]
-        record["result"] = "SKIP hold" if "SKIP hold" in results else "PASS" if all(r == "PASS" for r in results) else "FAIL"
+        record["result"] = "PASS" if all(b["result"] == "PASS" for b in record["builders"].values()) else "FAIL"
     except Exception as error:  # a crash is a failed run: keep its scratch project for inspection
         record["error"] = f"{type(error).__name__}: {error}"
         emit(f"  FAIL run: {record['error']}")
@@ -471,7 +462,7 @@ def main(argv=None):
             return 1
         emit(f"smoke {run}: PASS (scratch project removed; record {STATE / 'smoke' / (run + '.json')})")
         return 0
-    emit(f"smoke {run}: {record['result']} (record {STATE / 'smoke' / (run + '.json')})")
+    emit(f"smoke {run}: FAIL (record {STATE / 'smoke' / (run + '.json')})")
     for path in found.values():
         emit(f"kept {path}")
     emit(f"Remove with: task smoke --clean {run}")
