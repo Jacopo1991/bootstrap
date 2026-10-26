@@ -284,6 +284,58 @@ class TaskTool(unittest.TestCase):
                 finally:
                     marker.unlink()
 
+    def test_held_lane_and_review_units_record_skipped_hold_and_wait_returns(self):
+        self.stub_models()
+        self.stub_reviewers()
+        wt, _ = self.started()
+        work = wt / '.work'
+        (work / 'prompt.md').write_text('Build the task.')
+        for style in ('exec-condition', 'success'):
+            with self.subTest(style=style):
+                (self.home / 'skip-style').write_text(style)
+                marker = self.home / '.local/state/task/hold'
+                marker.write_text('unit admission hold')
+                try:
+                    self.assertIn('skipped: hold', self.raw_task('lane', 'proj', '5', code=1))
+                    lane = json.loads((work / 'lane.json').read_text())
+                    self.assertEqual(lane['state'], 'skipped: hold')
+                    self.assertTrue(lane['unit'])
+                    self.assertTrue(lane['ended_at'])
+                    started = time.monotonic()
+                    waited = self.raw_task('wait', 'proj', '5', '--max', '5', code=1)
+                    self.assertLess(time.monotonic() - started, 30)
+                    self.assertIn('skipped: hold', waited)
+                    self.assertEqual(len(waited.strip().splitlines()), 1)
+                    self.assertIn('skipped: hold', self.raw_task('review', 'proj', '5', '--run', '--no-check', 'hold fixture', code=1))
+                    review = json.loads((self.state() / 'review-run.json').read_text())
+                    self.assertEqual(review['state'], 'skipped: hold')
+                    self.assertTrue(review['unit'])
+                    self.assertRegex(review['ended_at'], r'^\d{4}-\d\d-\d\dT')
+                    self.assertEqual(review['ended_at'][-1], lane['ended_at'][-1])
+                    self.assertEqual(len(review['ended_at']), len(lane['ended_at']))
+                    marker.unlink()
+                    self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
+                    self.prepare_merge_evidence('5')
+                    brief = self.home / 'redteam-brief.md'
+                    brief.write_text('Attack the safety assumptions.\n')
+                    marker.write_text('unit admission hold')
+                    self.assertIn('skipped: hold', self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1))
+                    red = json.loads((self.state() / 'redteam-run.json').read_text())
+                    self.assertEqual((red['state'], red['result']), ('skipped: hold', 'skipped: hold'))
+                    self.assertTrue(red['unit'])
+                    self.assertEqual(len(red['ended_at']), len(lane['ended_at']))
+                finally:
+                    marker.unlink(missing_ok=True)
+
+    def test_finished_and_failed_units_are_not_recorded_as_skipped(self):
+        self.stub_models()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('Build the task.')
+        (self.home / 'skip-style').write_text('success')
+        self.raw_task('lane', 'proj', '5')
+        self.raw_task('wait', 'proj', '5', '--max', '5')
+        self.assertNotEqual(json.loads((wt / '.work/lane.json').read_text())['state'], 'skipped: hold')
+
     def test_units_unheld_run_and_pulling_hold_does_not_stop_running_unit(self):
         wt, _ = self.started()
         with mock.patch.dict(os.environ, self.env, clear=True):
@@ -10624,6 +10676,20 @@ class SmokeTests(unittest.TestCase):
         for value in ('any changing public fact', 'v999 https://github.com/astral-sh/uv/releases'):
             report.write_text('#1 met: smoke.txt contains ok\nWeb lookup: ' + value + '\n')
             self.assertIsNone(helper.report_error(wt, ''))
+
+    def test_held_lane_reports_skip_hold_not_timeout(self):
+        marker = self.home / '.local/state/task/hold'
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('unit admission hold')
+        for style in ('exec-condition', 'success'):
+            with self.subTest(style=style):
+                (self.home / 'skip-style').write_text(style)
+                out = self.smoke('--builder', 'claude', code=1)
+                self.assertIn('SKIP hold', out)
+                self.assertNotIn('still running', out)
+                self.assertNotRegex(out, r'(?m)^  FAIL')
+                self.assertRegex(out, r'smoke \S+: SKIP hold')
+                self.run_id(out)
 
     def test_missing_lookup_fails_at_report_step_for_each_builder(self):
         for builder in ('codex', 'claude'):
