@@ -1828,14 +1828,26 @@ def user_uv_cache():
     return base / "uv"
 
 
+UV_SEED_COPIED = ("simple-", "wheels-", "sdists-", "interpreter-", "git-")  # small registry metadata
+
+
 def seed_uv_cache(private):
-    """Copy (reflink when possible) the user's uv cache into a lane's private one, once, so a nested
-    `uv run --offline` resolves what the outer step did. The lane only ever writes its copy."""
+    """Let a nested `uv run --offline` in a lane resolve what the user's uv cache holds, without copying it:
+    the small metadata directories are copied, and each archive-v0 entry (the bulk, gigabytes) becomes a
+    symlink into the user's cache. New archives land in the lane's own directory. uv only reads existing
+    archive entries, and the lane never gets the user's cache as its UV_CACHE_DIR."""
     marker, source = private / ".seeded", user_uv_cache()
     if marker.exists() or not source.is_dir() or source.resolve() == private.resolve():
         return
-    if subprocess.run(["cp", "-a", "--reflink=auto", f"{source}/.", str(private)], capture_output=True).returncode == 0:
-        marker.touch()
+    for entry in source.iterdir():
+        if entry.name.startswith("archive-v") and entry.is_dir():
+            (private / entry.name).mkdir(exist_ok=True)
+            for archive in entry.iterdir():
+                with contextlib.suppress(FileExistsError):
+                    os.symlink(archive, private / entry.name / archive.name)
+        elif entry.name.startswith(UV_SEED_COPIED) and entry.is_dir():
+            subprocess.run(["cp", "-a", "--reflink=auto", str(entry), str(private)], capture_output=True)
+    marker.touch()
 
 
 def lane_environment(task, builder="codex"):

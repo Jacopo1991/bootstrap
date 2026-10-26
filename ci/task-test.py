@@ -7001,23 +7001,32 @@ store.write_text(json.dumps(prs))
         for name in expected:
             self.assertNotIn(name, claude)
 
-    def test_codex_lane_uv_cache_is_a_private_copy_of_the_user_cache(self):
+    def test_codex_lane_uv_cache_resolves_user_cache_entries_without_copying_it(self):
         wt, _ = self.started()
         task = TASK_MODULE.Task(self.repo, "5")
         user = self.home / "user-uv"
-        (user / "wheels").mkdir(parents=True)
-        (user / "wheels/colorama").write_text("resolved")
+        (user / "archive-v0/abc").mkdir(parents=True)
+        (user / "archive-v0/abc/big.whl").write_text("x" * 4096)
+        (user / "simple-v25").mkdir()
+        (user / "simple-v25/index").write_text("metadata")
+        (user / "builds-v0").mkdir()
+        (user / "builds-v0/scratch").write_text("not seeded")
         with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
-            codex = TASK_MODULE.lane_environment(task, "codex")
-            private = Path(codex["UV_CACHE_DIR"])
+            private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
             self.assertNotEqual(private, user)
-            self.assertEqual((private / "wheels/colorama").read_text(), "resolved")
-            (private / "wheels/colorama").write_text("lane change")
-            (user / "wheels/late").write_text("added after the lane started")
-            TASK_MODULE.lane_environment(task, "codex")  # seeded once: no overwrite, no late files
-        self.assertEqual((user / "wheels/colorama").read_text(), "resolved", "the user's cache is never written")
-        self.assertEqual((private / "wheels/colorama").read_text(), "lane change")
-        self.assertFalse((private / "wheels/late").exists())
+            self.assertEqual((private / "archive-v0/abc/big.whl").read_text(), "x" * 4096, "resolves through the seed")
+            self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
+            (private / "archive-v0/new").mkdir()  # a lane's own fetches stay in its cache
+            TASK_MODULE.lane_environment(task, "codex")  # seeded once
+        self.assertFalse((user / "archive-v0/new").exists())
+        self.assertFalse((private / "builds-v0").exists())
+        # Guard: the bulk is linked, never copied, and the metadata copy is independent of the user cache.
+        regular = [p for p in (private / "archive-v0").rglob("*") if p.is_file() and not p.is_symlink()
+                   and not any(parent.is_symlink() for parent in p.parents if parent != private)]
+        self.assertEqual(regular, [])
+        self.assertTrue((private / "archive-v0/abc").is_symlink())
+        (private / "simple-v25/index").write_text("lane change")
+        self.assertEqual((user / "simple-v25/index").read_text(), "metadata")
 
     def test_trusted_gate_nested_uv_uses_the_user_cache(self):
         wt, _ = self.started()
@@ -10630,12 +10639,13 @@ class SmokeTests(unittest.TestCase):
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
         (self.home / '.cache/uv').mkdir(parents=True)
-        (self.home / '.cache/uv/seeded').write_text('')  # what the outer step resolved (T-68)
+        (self.home / '.cache/uv/archive-v0/colorama').mkdir(parents=True)  # only in the user cache (T-68)
+        (self.home / '.cache/uv/archive-v0/colorama/seeded').write_text('')
         uv = bin_dir / 'uv'
         uv.write_text("#!/bin/sh\n[ \"$SMOKE_UV_FAIL\" = 1 ] && { echo 'error: uv cache is read-only' >&2; exit 1; }\n"
                       "[ -n \"$UV_CACHE_DIR\" ] && { [ -e \"$UV_CACHE_DIR/.read-only\" ] || ! touch \"$UV_CACHE_DIR/.probe\"; } 2>/dev/null && { echo \"error: Failed to initialize cache at "
                       "$UV_CACHE_DIR: Read-only file system (os error 30)\" >&2; exit 2; }\n"
-                      "case \" $* \" in *\" --offline \"*) cache=\"${UV_CACHE_DIR:-$HOME/.cache/uv}\"; [ -e \"$cache/seeded\" ] || { echo \"error: Because colorama was not found in the cache and you require colorama==0.4.6, "
+                      "case \" $* \" in *\" --offline \"*) cache=\"${UV_CACHE_DIR:-$HOME/.cache/uv}\"; [ -e \"$cache/archive-v0/colorama/seeded\" ] || { echo \"error: Because colorama was not found in the cache and you require colorama==0.4.6, "
                       "we can conclude that your requirements are unsatisfiable. Packages were unavailable because the network was disabled\" >&2; exit 1; }; exit 0 ;; esac\n"
                       "[ \"$1 $2\" = 'run --no-project' ] || exit 2\n"
                       "case \"$*\" in *smoke_nested.py) exec python3 smoke_nested.py ;; esac\n"
