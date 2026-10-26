@@ -49,6 +49,7 @@ HOLD_FIXTURE.parent.mkdir()
 def hold_fixture_source(source):
     assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
     source = source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
+    source = source.replace('Path("/etc/codex/requirements.toml")', f'Path({str(ROOT / "system/codex-requirements.toml")!r})')
     return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_', 'SMOKE_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL'}")
 fixture_bin = Path(audit_state.name) / 'bin'
 fixture_bin.mkdir()
@@ -4352,7 +4353,7 @@ store.write_text(json.dumps(prs))
         mode = victim.stat().st_mode
         shutil.rmtree(context)
         context.symlink_to(outside, target_is_directory=True)
-        task = SimpleNamespace(path=wt, kb=self.kb, file=None)
+        task = SimpleNamespace(path=wt, kb=self.kb, file=None, repo=self.repo, name='t5')
         self.enterContext(mock.patch.object(TASK_MODULE, 'HOME', self.home))
         TASK_MODULE.refresh_context(task)
         self.assertFalse(context.is_symlink())
@@ -4406,6 +4407,73 @@ store.write_text(json.dumps(prs))
         self.assertFalse((context / 'STATUS.md').exists())
         self.assertFalse((context / 'backlog/decisions' / decision.name).exists())
         self.assertIn("...", self.raw_task("review", "proj", "5"))
+
+    def test_context_carries_referenced_docs_and_pins(self):
+        (self.kb / 'docs').mkdir()
+        doc = self.kb / 'docs/doc-15 - design review.md'
+        doc.write_text('design review')
+        (self.kb / 'docs/doc-150 - other.md').write_text('other')
+        (self.kb / 'history/notes').mkdir(parents=True)
+        (self.kb / 'history/notes/past.md').write_text('past')
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nRead first: doc-15, qmd://cortex-kb-proj/history/notes/past.md.\n')
+        self.git(self.kb, 'add', '-A')
+        self.git(self.kb, 'commit', '-qm', 'docs')
+        self.task('plan', 'proj', '--sign')
+        wt, _ = self.started()
+        context = wt / '.work/context'
+        self.assertEqual((context / 'docs' / doc.name).read_text(), 'design review')
+        self.assertFalse((context / 'docs/doc-150 - other.md').exists())
+        self.assertEqual((context / 'history/notes/past.md').read_text(), 'past')
+        pinned = self.repo / 'design/spec.md'
+        pinned.parent.mkdir()
+        pinned.write_text('spec')
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', '--context', str(pinned))
+        self.wait_for_lane(wt)
+        self.assertEqual((context / 'proj/design/spec.md').read_text(), 'spec')
+        out = self.raw_task('lane', 'proj', '5')
+        self.wait_for_lane(wt)
+        self.assertNotIn('Context source removed', out)
+        self.assertEqual((context / 'proj/design/spec.md').read_text(), 'spec')
+        self.assertEqual((context / 'docs' / doc.name).read_text(), 'design review')
+        self.assertEqual(json.loads((self.state() / 'context.json').read_text())['pins'], [str(pinned.resolve())])
+
+    def test_context_unresolved_or_denied_reference_fails(self):
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        original = task_file.read_text()
+        task_file.write_text(original + '\nRead first: doc-99.\n')
+        self.git(self.kb, 'commit', '-qam', 'missing doc')
+        self.task('plan', 'proj', '--sign')
+        out = self.task('start', 'proj', 'T-5', code=1)
+        self.assertIn(str(self.kb / 'docs/doc-99*.md'), out)
+        self.assertFalse((self.repo / '.worktrees/t5').exists())
+        task_file.write_text(original)
+        self.git(self.kb, 'commit', '-qam', 'no reference')
+        self.task('plan', 'proj', '--sign')
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        private = self.home / 'project-data/proj/reference/notes.md'
+        private.parent.mkdir(parents=True)
+        private.write_text('private')
+        secret = self.repo / 'secrets.env'
+        secret.write_text('TOKEN=x')
+        outside = self.home / 'outside.md'
+        outside.write_text('outside')
+        for path, reason in ((private, 'denied'), (secret, 'denied'), (outside, 'outside')):
+            out = self.raw_task('lane', 'proj', '5', '--context', str(path), code=1)
+            self.assertIn(f'{path} is', out)
+            self.assertIn(reason, out)
+        self.assertFalse((self.state() / 'context.json').exists())
+        self.assertFalse(any(path.read_text() in {'private', 'TOKEN=x', 'outside'}
+                             for path in (wt / '.work/context').rglob('*') if path.is_file()))
+        task_file.write_text(original + '\nSee history/missing.md.\n')
+        out = self.raw_task('lane', 'proj', '5', code=1)
+        self.assertIn(f"not found: {self.kb / 'history/missing.md'}", out)
+        task_file.write_text(original + '\nSee qmd://proj-reference/notes.md.\n')
+        self.assertIn(f'{private} is a path lanes are denied', self.raw_task('lane', 'proj', '5', code=1))
 
     def test_reliability_special_files_archive_manifest_and_publication(self):
         import json
