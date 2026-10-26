@@ -11,7 +11,8 @@ line>, per step. A FAIL keeps the scratch project for `task smoke --clean <run>`
 Then (T-62, company decision-27) each builder gets a second lane that runs the real `just check` of
 company, bootstrap and cortex-core (when it has a justfile) on throwaway clones and branches; the same
 check also runs outside the lane. A check that fails in the lane but passes outside is a setup
-failure and fails the smoke.
+failure and fails the smoke. One command checks every repository (T-76), so one repository's failure
+never stops the others; a repository the lane recorded no result for is a WARN (not run), never a FAIL.
 """
 import argparse
 import json
@@ -35,20 +36,30 @@ REAL = {"codex": "T-3", "claude": "T-4"}
 # The active repositories; company and bootstrap are required, cortex-core only when it has a justfile.
 REAL_REPOS = (("company", WORKSPACE / "company", True), ("bootstrap", WORKSPACE / "bootstrap", True),
               ("cortex-core", CORTEX / "cortex-core", False))
+# One command checks every repository and records each result on its own (T-76): a failing repository
+# never stops the others, and the command itself always exits 0, so no lane stop rule can skip a repository.
 REAL_CHECK = """import json, subprocess, sys
 from pathlib import Path
-here, name = Path(__file__).resolve().parent, sys.argv[1]
-done = subprocess.run(["just", "check"], cwd=here / name, capture_output=True, text=True)
-(here / (name + ".json")).write_text(json.dumps({"exit": done.returncode, "output": (done.stdout + done.stderr)[-4000:]}))
-print(name + ": exit " + str(done.returncode))
+here = Path(__file__).resolve().parent
+names = (here / "repos.txt").read_text().split() if sys.argv[1:] == ["all"] else sys.argv[1:]
+for name in names:
+    print(name + ": running just check", flush=True)
+    try:
+        done = subprocess.run(["just", "check"], cwd=here / name, capture_output=True, text=True)
+        code, output = done.returncode, done.stdout + done.stderr
+    except OSError as error:
+        code, output = 127, str(error)
+    (here / (name + ".json")).write_text(json.dumps({"exit": code, "output": output[-4000:]}))
+    print(name + ": exit " + str(code), flush=True)
 """
 REAL_PROMPT = """# Real-repository check {ident} ({builder})
 
-This is an install smoke test. Run each command below from this worktree, one at a time, with the longest
-timeout your shell tool allows, then stop. Do not edit or commit anything, and do not retry or work around
-a failure: each command records its own result.
+This is an install smoke test. Run the one command below from this worktree, with the longest timeout your
+shell tool allows, wait for it to finish, then stop. It checks every repository in turn and records each
+result itself; a repository whose check fails does not stop the others, and that is expected. Do not edit or
+commit anything, and do not retry or work around a failure.
 
-{commands}
+Run: python3 .work/real/real_check.py all
 """
 RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 ERROR_LINE = re.compile(r"(?i)fatal|error|denied|read-only|refus")
@@ -132,11 +143,30 @@ def read(path):
     return path.read_text(errors="replace") if path.is_file() else ""
 
 
-def lane_error(text, default):
-    """The first error-like line of a log, else the default."""
+def bare(line):
+    """A line without its indent, list marker, quote mark or line number."""
+    return re.sub(r"^[\W\d_]+", "", line).strip()
+
+
+def prompt_lines(wt):
+    """The lines the lane was given (its prompt and pinned context, the lane contract among them)."""
+    work = wt / ".work"
+    sources = [work / "prompt.md", *sorted((work / "context").rglob("*"))]
+    return {bare(line) for source in sources for line in read(source).splitlines() if bare(line)}
+
+
+def quoted(line, given):
+    """A log line that repeats a prompt line (an agent echoing what it read) is not an error."""
+    line = bare(line)
+    return line in given or any(len(text) >= 20 and (text in line or (len(line) >= 20 and line in text)) for text in given)
+
+
+def lane_error(text, default, given=()):
+    """The first error-like line of a log that is not quoted from the prompt, else the default."""
     for line in text.splitlines():
-        if ERROR_LINE.search(line):
-            return line.strip()
+        line = line.strip()
+        if ERROR_LINE.search(line) and not quoted(line, given):
+            return line
     return default
 
 
@@ -187,7 +217,7 @@ def reset_smoke(repo):
 def commit_error(wt, base, log):
     if git(wt, "log", "-n1", "--format=%H", f"{base}..HEAD", "--", "smoke.txt").stdout.strip():
         return None
-    return lane_error(log, "smoke.txt is not committed on the lane branch")
+    return lane_error(log, "smoke.txt is not committed on the lane branch", prompt_lines(wt))
 
 
 def merge_error(wt, repo, log):
@@ -195,16 +225,23 @@ def merge_error(wt, repo, log):
     main = git(repo, "rev-parse", "main").stdout.strip()
     if len(parents) == 3 and git(wt, "merge-base", "--is-ancestor", main, "HEAD").returncode == 0:
         return None
-    return lane_error(log, "HEAD is not a merge of main")
+    return lane_error(log, "HEAD is not a merge of main", prompt_lines(wt))
 
 
-def report_error(wt, log):
+# Optional indent and one list marker (`-`, `*`, `1.`) before a report line's label (T-76).
+LIST_MARKER = r"^[^\S\r\n]*(?:(?:[-*]|\d+\.)[^\S\r\n]+)?"
+URL = re.compile(r"https?://\S+")
+
+
+def report_error(wt, log=""):
+    """The report step's own reason; never a log line, which may only quote the prompt."""
     text = read(wt / ".work/report.md")
-    if not re.search(r"(?m)^#1 met:", text) or "(fill in)" in text:
-        return lane_error(log, ".work/report.md is not filled in (no `#1 met:` line)")
-    if not re.search(r"(?m)^Web lookup:[^\S\r\n]*\S[^\r\n]*$", text):
-        return lane_error(log, ".work/report.md has no non-empty `Web lookup:` line")
-    return None
+    if not re.search(rf"(?m){LIST_MARKER}#1 met:", text) or "(fill in)" in text:
+        return ".work/report.md is not filled in (no `#1 met:` line)"
+    for fact in re.findall(rf"(?m){LIST_MARKER}Web lookup:([^\r\n]*)$", text):
+        if URL.search(fact) and URL.sub("", fact).strip(" \t:-()<>[]"):
+            return None
+    return ".work/report.md has no `Web lookup:` line with a fact and a source URL"
 
 
 def review_verdict(repo, name):
@@ -261,7 +298,7 @@ def run_builder(run, found, builder, emit):
     elif waited.returncode != 0:
         error = "the lane is still running after 20 minutes"
     elif state != "finished" or exit_code != 0:
-        error = lane_error(log, f"the lane ended {state}, exit {exit_code}")
+        error = lane_error(log, f"the lane ended {state}, exit {exit_code}", prompt_lines(wt))
     if not done("lane", error):
         return steps
     for step, error in (("commit", commit_error(wt, base, log)), ("merge main", merge_error(wt, repo, log)),
@@ -299,6 +336,7 @@ def clone_real(run, repos, target):
     """Throwaway clones on a task-smoke branch, plus the wrapper that records each check's exit."""
     target.mkdir(parents=True, exist_ok=True)
     (target / "real_check.py").write_text(REAL_CHECK)
+    (target / "repos.txt").write_text("".join(name + "\n" for name, _ in repos))
     for name, source in repos:
         for args in (("clone", "-q", "--no-hardlinks", str(source), str(target / name)),
                      ("-C", str(target / name), "checkout", "-q", "-b", f"task-smoke-{run}")):
@@ -317,8 +355,7 @@ def real_result(target, name):
 def outside_checks(run, found, repos):
     """The same checks outside any lane, in the PM's own environment."""
     clone_real(run, repos, found["real"])
-    for name, _ in repos:
-        subprocess.run([sys.executable, str(found["real"] / "real_check.py"), name], capture_output=True, text=True)
+    subprocess.run([sys.executable, str(found["real"] / "real_check.py"), "all"], capture_output=True, text=True)
     return {name: real_result(found["real"], name) for name, _ in repos}
 
 
@@ -344,18 +381,16 @@ def run_real_checks(run, found, builder, emit, repos, outside):
             error = str(stop)
     if not done("real start", error):
         return steps
-    commands = "\n".join(f"Run: python3 .work/real/real_check.py {name}" for name, _ in repos)
-    (wt / ".work/prompt.md").write_text(REAL_PROMPT.format(ident=ident, builder=builder, commands=commands))
+    (wt / ".work/prompt.md").write_text(REAL_PROMPT.format(ident=ident, builder=builder))
     lane = task("lane", repo.name, ident, "--builder", builder, "--model", model, "--effort", "low", "--timeout", "90")
     waited = task("wait", repo.name, ident, "--max", "100") if lane.returncode == 0 else lane
     error = command_error(lane) if lane.returncode else "the lane is still running after 100 minutes" if waited.returncode else None
     if not done("real lane", error):
         return steps
-    log = read(wt / ".work/lane.log")
     for name, _ in repos:
         inside, out = real_result(target, name), outside.get(name)
-        if inside is None:
-            done(f"real {name}", lane_error(log, "the lane did not record the check"))
+        if inside is None:  # no evidence either way: the lane never ran this repository's check
+            done(f"real {name}", "not run: the lane recorded no result for this repository", "WARN")
         elif inside.get("exit") == 0:
             done(f"real {name}")
         elif out and out.get("exit") == 0:

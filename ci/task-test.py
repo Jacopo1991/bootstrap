@@ -10842,9 +10842,59 @@ class SmokeTests(unittest.TestCase):
             with self.subTest(line=line):
                 report.write_text('#1 met: smoke.txt contains ok\n' + line + '\n')
                 self.assertIn('Web lookup:', helper.report_error(wt, ''))
-        for value in ('any changing public fact', 'v999 https://github.com/astral-sh/uv/releases'):
+        for value in ('any changing fact, https://example.org/source', 'v999 https://github.com/astral-sh/uv/releases'):
             report.write_text('#1 met: smoke.txt contains ok\nWeb lookup: ' + value + '\n')
             self.assertIsNone(helper.report_error(wt, ''))
+
+    def test_report_lines_accept_one_list_marker_and_still_need_fact_and_url(self):
+        """T-76: lanes write `- Web lookup: ...` and `- #1 met: ...`; the marker is fine, an empty or URL-less fact is not."""
+        helper = self.smoke_module()
+        wt = self.home / 'report-test'
+        (wt / '.work').mkdir(parents=True)
+        report = wt / '.work/report.md'
+        lookup = 'uv 0.9.5 is the latest release (https://github.com/astral-sh/uv/releases)'
+        for met, web in (('- #1 met: ok', f'- Web lookup: {lookup}'), ('* #1 met: ok', f'* Web lookup: {lookup}'),
+                         ('1. #1 met: ok', f'2. Web lookup: {lookup}'), ('  - #1 met: ok', f'   - Web lookup: {lookup}'),
+                         ('#1 met: ok', f'Web lookup: {lookup}')):
+            with self.subTest(met=met, web=web):
+                report.write_text(f'## Criteria\n\n{met}\n\n## Noticed, not done\n\n{web}\n')
+                self.assertIsNone(helper.report_error(wt, ''))
+        log = '- Never work around a guardrail or a refusal\nerror: unrelated'
+        for web in ('- Web lookup:', '- Web lookup:   ', '* Web lookup: latest uv is 0.9.5',
+                    '1. Web lookup: https://github.com/astral-sh/uv/releases', '- - Web lookup: ' + lookup,
+                    '-Web lookup: ' + lookup, 'Lookup: ' + lookup):
+            with self.subTest(web=web):
+                report.write_text(f'- #1 met: ok\n{web}\n')
+                self.assertEqual(helper.report_error(wt, log),
+                                 '.work/report.md has no `Web lookup:` line with a fact and a source URL')
+        for met in ('', '- - #1 met: ok', '#1: ok'):
+            with self.subTest(met=met):
+                report.write_text(f'{met}\n- Web lookup: {lookup}\n')
+                self.assertEqual(helper.report_error(wt, log), '.work/report.md is not filled in (no `#1 met:` line)')
+
+    def test_lane_error_never_returns_a_line_quoted_from_the_prompt_or_context(self):
+        """T-76: an agent echoing its prompt or the lane contract is not the step's failure reason."""
+        helper = self.smoke_module()
+        wt = self.home / 'lane-error-test'
+        (wt / '.work/context').mkdir(parents=True)
+        (wt / '.work/prompt.md').write_text(helper.PROMPT.format(ident='T-1', builder='codex'))
+        (wt / '.work/context/lane-contract.md').write_text(
+            '# Lane contract\n\n- Never work around a guardrail or a refusal; stop and report it.\n- A fatal error stops the lane.\n')
+        given = helper.prompt_lines(wt)
+        quoted = ('- Never work around a guardrail or a refusal; stop and report it.\n'
+                  '    12\t- Never work around a guardrail or a refusal; stop and report it.\n'
+                  '> Never work around a guardrail or a refusal\n'
+                  'Before editing, run uv run --no-project --with colorama==0.4.6 python smoke_check.py and stop if it fails.\n'
+                  '- A fatal error stops the lane.\n')
+        self.assertEqual(helper.lane_error(quoted, 'the default', given), 'the default')
+        self.assertEqual(helper.lane_error(quoted + 'fatal: not a git repository\n', 'the default', given),
+                         'fatal: not a git repository')
+        self.assertEqual(helper.lane_error('error: x\n', 'the default', given), 'error: x', 'a short real error is kept')
+
+    def test_bullet_report_lines_pass_the_report_step(self):
+        out = self.smoke('--builder', 'codex', code=0, env=dict(
+            self.env, SMOKE_WEB_LOOKUP='- Web lookup: uv v-test https://github.com/astral-sh/uv/releases'))
+        self.assertRegex(out, r'(?m)^  PASS report$')
 
     def test_missing_lookup_fails_at_report_step_for_each_builder(self):
         for builder in ('codex', 'claude'):
@@ -10924,6 +10974,70 @@ class SmokeTests(unittest.TestCase):
                                         text=True).stdout.strip(), 'task-smoke-x', 'checks run on a throwaway branch')
         self.assertEqual(subprocess.run(['git', '-C', str(cortex), 'branch', '--list', 'task-smoke-x'], capture_output=True,
                                         text=True).stdout.strip(), '', 'the real repository is untouched')
+
+    def real_lane(self, run_lane):
+        """run_real_checks for codex with a mocked `task`; run_lane(wt, log) plays the lane agent."""
+        helper = self.smoke_module()
+        helper.WORKSPACE, helper.CORTEX = self.home / 'dev_workspace', self.home / 'cortex'
+        self.real_repo(self.home / 'cortex/cortex-core')
+        company = self.home / 'dev_workspace/company'
+        (company / 'FAIL').write_text('broken on main\n')  # company main's own check fails
+        for args in (('add', 'FAIL'), ('commit', '-qm', 'break main')):
+            subprocess.run(['git', '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-C', str(company), *args],
+                           check=True)
+        helper.REAL_REPOS = tuple((name, self.home / path.relative_to(helper.HOME), required)
+                                  for name, path, required in helper.REAL_REPOS)
+        self.enterContext(mock.patch.dict(os.environ, PATH=self.env['PATH'], HOME=str(self.home)))
+        repos = helper.real_repos()
+        found = {'repo': self.home / 'dev_workspace/task-smoke-x', 'real': self.home / 'dev_workspace/task-smoke-x-real'}
+        outside = helper.outside_checks('x', found, repos)
+        self.assertEqual({name: result['exit'] for name, result in outside.items()},
+                         {'company': 1, 'bootstrap': 0, 'cortex-core': 0}, 'one command records every repository')
+        wt = found['repo'] / '.worktrees/t3'
+
+        def fake_task(*args):
+            if args[0] == 'start':
+                (wt / '.work/context').mkdir(parents=True)
+                (wt / '.work/context/lane-contract.md').write_text('- Never work around a guardrail or a refusal; stop.\n')
+            if args[0] == 'lane':
+                with (wt / '.work/lane.log').open('w') as log:
+                    log.write('- Never work around a guardrail or a refusal; stop.\n')
+                    run_lane(wt, log)
+            return subprocess.CompletedProcess(args, 0, '', '')
+
+        helper.task = fake_task
+        lines = []
+        steps = helper.run_real_checks('x', found, 'codex', lines.append, repos, outside)
+        return {step['step']: step['result'] for step in steps}, lines, wt
+
+    def test_one_repository_failing_does_not_stop_the_others(self):
+        """T-76: a lane that obeys its stop rule after the first non-zero exit still gets every repository checked."""
+        def obedient_lane(wt, log):
+            for line in (wt / '.work/prompt.md').read_text().splitlines():
+                if line.startswith('Run: '):
+                    done = subprocess.run(line[5:], shell=True, cwd=wt, capture_output=True, text=True)
+                    log.write(done.stdout + done.stderr)
+                    if done.returncode:
+                        return  # the stop rule: no further command after a failure
+        results, lines, wt = self.real_lane(obedient_lane)
+        prompt = (wt / '.work/prompt.md').read_text()
+        self.assertEqual([line for line in prompt.splitlines() if line.startswith('Run: ')],
+                         ['Run: python3 .work/real/real_check.py all'])
+        self.assertIn('does not stop the others', prompt)
+        self.assertEqual(results, {'real start': 'PASS', 'real lane': 'PASS', 'real company': 'WARN',
+                                   'real bootstrap': 'PASS', 'real cortex-core': 'PASS'}, lines)
+        self.assertIn('company: exit 1', (wt / '.work/lane.log').read_text())
+
+    def test_repository_the_lane_never_ran_is_not_run_warn_not_fail(self):
+        """T-76: no recorded result is a WARN (not run), and the reason is the smoke's own, never a log or prompt line."""
+        def idle_lane(wt, log):
+            log.write('error: I will not run anything\n')
+        results, lines, _ = self.real_lane(idle_lane)
+        self.assertEqual(results, {'real start': 'PASS', 'real lane': 'PASS', 'real company': 'WARN',
+                                   'real bootstrap': 'WARN', 'real cortex-core': 'WARN'}, lines)
+        for name in ('company', 'bootstrap', 'cortex-core'):
+            self.assertIn(f'  WARN real {name}: not run: the lane recorded no result for this repository', lines)
+        self.assertFalse(any('guardrail' in line or 'I will not' in line for line in lines), lines)
 
     def test_missing_required_real_repository_fails_smoke(self):
         shutil.rmtree(self.home / 'dev_workspace/company')
