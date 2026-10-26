@@ -1900,6 +1900,62 @@ def lane_contract_source():
                "or ~/.claude/skills/slim-workflow/lane-contract.md exists.")
 
 
+LANE_POLICY = Path("/etc/codex/requirements.toml")  # installed from system/codex-requirements.toml
+SECRET_NAME = re.compile(r"(?i)^(?:secrets\.env|\.env(?:\..*)?|.*\.(?:key|pem))$")
+
+
+def lane_denied():
+    try:
+        rules = tomllib.loads(LANE_POLICY.read_text())["permissions"]["lane"]["filesystem"]
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError) as error:
+        raise Stop(f"Cannot read the lane deny list in {LANE_POLICY} ({type(error).__name__}); no referenced doc was copied.")
+    return [(HOME / rule[2:] if rule.startswith("~/") else Path(rule)).resolve() for rule, mode in rules.items() if mode == "deny"]
+
+
+def context_file(path, roots, label):
+    """A file the lane may read: inside one of roots, not on the lane deny list, not secret-like (T-72)."""
+    resolved = path.resolve()
+    if any(resolved.is_relative_to(denied) for denied in lane_denied()) or SECRET_NAME.match(resolved.name) or ".git" in resolved.parts:
+        raise Stop(f"{label} {path} is a path lanes are denied; nothing was copied.")
+    root = next((root.resolve() for root in roots if resolved.is_relative_to(root.resolve())), None)
+    if root is None:
+        raise Stop(f"{label} {path} is outside {' and '.join(map(str, roots))}; refused.")
+    if not resolved.is_file():
+        raise Stop(f"{label} not found: {path}")
+    return resolved, root
+
+
+def context_pairs(task):
+    """The docs the task text references (doc-N, qmd://, history/) and the seat's --context pins."""
+    text = task.file.read_text() if task.file else ""
+    found = []
+    for number in dict.fromkeys(re.findall(r"(?i)\bdoc-(\d+)\b", text)):
+        docs = [doc for folder in ("docs", "backlog/docs") for doc in sorted((task.kb / folder).glob(f"doc-{number}*.md"))
+                if re.match(rf"doc-{number}(?!\d)", doc.name)]
+        found.append((docs[0] if docs else task.kb / f"docs/doc-{number}*.md", [task.kb], "Referenced doc"))
+    for collection, rest in re.findall(r"qmd://([A-Za-z0-9][\w.-]*)/([^\s)\]>\"'`]+)", text):
+        project = re.fullmatch(r"(.+)-reference", collection)
+        root = HOME / "project-data" / project[1] / "reference" if project else CORTEX / collection
+        found.append((root / rest.rstrip(".,;:"), [root], "Referenced doc"))
+    for rest in re.findall(r"(?<![\w/.-])history/([^\s)\]>\"'`*]+\.md)\b", text):
+        found.append((task.kb / "history" / rest, [task.kb], "Referenced doc"))
+    for pin in read_json_object(task_state(task) / "context.json").get("pins", []):
+        found.append((Path(pin), [task.repo, task.kb], "Pinned --context file"))
+    pairs = []
+    for path, roots, label in found:
+        resolved, root = context_file(path, roots, label)
+        pairs.append((resolved, resolved.relative_to(root) if root == task.kb.resolve() else root.name / resolved.relative_to(root)))
+    return pairs
+
+
+def pin_context(task, paths):
+    record = task_state(task) / "context.json"
+    pins = read_json_object(record).get("pins", [])
+    for given in paths:
+        pins.append(str(context_file(Path(given).expanduser().absolute(), [task.repo, task.kb], "--context file")[0]))
+    atomic_json(record, {"pins": list(dict.fromkeys(pins))})
+
+
 def refresh_context(task):
     destination = task.path / ".work/context"
     # Never traverse lane-controlled links, including dangling links and links
@@ -1922,7 +1978,7 @@ def refresh_context(task):
         for decision in (task.kb / "backlog/decisions").glob("*.md"):
             if decision.name in text or re.search(r"\b" + re.escape(decision.stem.split(" - ")[0]) + r"\b", text, re.I):
                 sources.append(decision)
-    pairs = [(source, source.relative_to(task.kb)) for source in sources if source.is_file()]
+    pairs = [(source, source.relative_to(task.kb)) for source in sources if source.is_file()] + context_pairs(task)
     pairs.append((lane_contract_source(), Path("lane-contract.md")))
     expected = {relative for _, relative in pairs}
     for target in destination.rglob("*"):
@@ -2080,6 +2136,8 @@ def lane(args):
     path = task.worktree()
     record = load_record(task)
     bind_plan(task, args)
+    if getattr(args, "context", None):  # in-process callers (tests) pass a namespace without it, like setup_round
+        pin_context(task, args.context)
     refresh_context(task)
     builder = args.builder or record["builder"]
     recorded = record.get("tier", "routine")
@@ -2845,6 +2903,7 @@ def start_locked(args, repo):
     check_plan(task, off_plan, refresh=args.refresh)
     if task.number is not None and task.file is None:
         raise Stop(f"No Backlog.md task {task.id} in {task.kb}.")
+    context_pairs(task)  # an unresolved or denied reference stops here, before any worktree exists
     task_text = task.file.read_text() if task.file else ""
     pinned = read_json_object(task_state(task) / "task.json").get("tier")
     if pinned and tier_guard(pinned, args.tier, args.override):
@@ -5321,6 +5380,8 @@ def main(argv=None):
             sub.add_argument("--extra-round", metavar="REASON")
             sub.add_argument("--setup-round", nargs=2, metavar=("ROUND", "REASON"),
                              help="mark an earlier round setup-caused so it does not count (ledgered); launches nothing")
+            sub.add_argument("--context", action="append", default=[], metavar="PATH",
+                             help="pin a file from the project's repositories into .work/context/, kept across syncs")
             sub.add_argument("--no-boost", action="store_true")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
