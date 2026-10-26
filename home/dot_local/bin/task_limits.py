@@ -10,7 +10,7 @@ CLI_LIMIT = {
     "claude": re.compile(r"(?:You've hit your (?:session limit|weekly limit|Opus limit|"
                          r"Sonnet limit|Fable limit|usage credit limit|limit|fast limit|"
                          r"monthly spend limit)|API Error: 429)"),
-    # agy 1.4.7 changelog: quota errors end a print run with an AGY_ERROR JSON line or the credits message.
+    # agy changelog (pinned release): quota errors end a print run with an AGY_ERROR JSON line or the credits message.
     "agy": re.compile(r"Your AI credits balance is too low to continue\.|"
                       r"AGY_ERROR: .*(?:RESOURCE_EXHAUSTED|\b429\b|[Qq]uota).*"),
 }
