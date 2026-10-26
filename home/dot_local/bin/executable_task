@@ -3603,6 +3603,45 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     return code
 
 
+DATA_DIFF_LIMIT = 20_000      # a data-file diff block larger than this becomes one line
+CODE_DIFF_NOTE_LIMIT = 150_000  # code diffs stay in full; above this the prompt says so
+DATA_SUFFIXES = (".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".lock", ".snap", ".map")
+DATA_NAMES = ("package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Cargo.lock", "go.sum")
+
+
+def slim_data_diffs(text):
+    """Keep code diffs whole; replace a large data-file diff with one line naming file, size and change."""
+    blocks, current = [], []
+    for line in text.splitlines(keepends=True):
+        if line.startswith(("diff --git ", "commit ")) and current:
+            blocks.append(current); current = []
+        current.append(line)
+    blocks.append(current)
+    blocks = [block for block in blocks if block]
+    out, code_chars = [], 0
+    for block in blocks:
+        body = "".join(block)
+        header = block[0]
+        match = re.match(r"diff --git a/(.+?) b/(.+)$", header.rstrip("\n"))
+        if match:
+            name = match[2]
+            is_data = (name.endswith(DATA_SUFFIXES) or Path(name).name in DATA_NAMES
+                       or "/fixtures/" in f"/{name}")
+            if is_data and len(body) > DATA_DIFF_LIMIT:
+                kind = ("added" if any(l.startswith("new file mode") for l in block[:6]) else
+                        "deleted" if any(l.startswith("deleted file mode") for l in block[:6]) else
+                        "renamed" if any(l.startswith("rename from") for l in block[:6]) else "modified")
+                out.append(f"[data diff omitted: {name}, {len(body):,} characters, {kind}; "
+                           f"read it with `git --no-optional-locks diff` if needed]\n")
+                continue
+            code_chars += len(body)
+        out.append(body)
+    if code_chars > CODE_DIFF_NOTE_LIMIT:
+        out.append(f"[note: code diffs above total {code_chars:,} characters and are included in full; "
+                   "this prompt may exceed a reviewer's input limit]\n")
+    return "".join(out)
+
+
 def review(args):
     if args.final and not args.run:
         raise Stop("--final requires --run")
@@ -3693,9 +3732,14 @@ def review_locked(args):
                                  r"(.*?)(?=^(?:#{1,6}\s+)?(?:\*\*)?Notes\b|\Z)", previous_text)
             prompt.extend(["Previous review Blocking list:", blocking[1].strip() if blocking else
                            "(old review has no Blocking section)"])
-            delta = run_git(path, "diff", "--no-ext-diff", "--no-textconv", previous['commit'], head, "--")
-            prompt.extend([f"Diff since previously reviewed head {previous['commit']}:",
-                           delta.stdout if delta.returncode == 0 else "(previous head unavailable)",
+            # Only this branch's own commits: what main already carries (merged in) is not re-sent.
+            main = default_branch(task.repo)
+            main_refs = [f"^{ref}" for ref in (main, f"origin/{main}") if ok(task.repo, "rev-parse", "--verify", "--quiet", ref)]
+            delta = run_git(path, "log", "-p", "--reverse", "--no-merges", "--no-ext-diff", "--no-textconv",
+                            "--format=commit %H", f"{previous['commit']}..{head}", *main_refs, "--")
+            prompt.extend([f"Diff since previously reviewed head {previous['commit']} (this branch's own commits; "
+                           "changes merged from main excluded):",
+                           slim_data_diffs(delta.stdout) if delta.returncode == 0 else "(previous head unavailable)",
                            "In a re-review, new non-defect findings on code unchanged since the previous "
                            "review are Notes only."])
         if request_text:
