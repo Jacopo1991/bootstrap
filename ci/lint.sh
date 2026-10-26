@@ -12,6 +12,9 @@ export PATH="$tmp/gate-bin:$PATH"
 bash ci/gate-tools.sh "$tmp"
 failed=0
 skipped=0
+suite_results="${TMPDIR:-/tmp}/gate-suites.tsv"
+: > "$suite_results"
+suite_timings=()
 lane_skippable_suite() {
   # Socket/browser suites may skip in lanes, never in a trusted gate.
   if [[ -n ${TASK_GATE_RUN_ID:-} ]]; then return 1; fi
@@ -21,18 +24,26 @@ lane_skippable_suite() {
   }
 }
 run() {
-  echo "RUN: $*" >&2
-  local status=0
+  local command="$*" started ended elapsed status=0 result
+  started=$(date +%s%N)
+  echo "RUN: $command" >&2
   "$@" || status=$?
   if (( status == 77 )) && lane_skippable_suite "$@"; then
-    echo "SKIP: suite $*" >&2
+    result=skipped
+    echo "SKIP: suite $command" >&2
     skipped=$((skipped + 1))
   elif (( status )); then
-    echo "FAIL: $* (exit $status)" >&2
+    result=failed
+    echo "FAIL: $command (exit $status)" >&2
     failed=$((failed + 1))
   else
-    echo "PASS: suite $*" >&2
+    result=passed
+    echo "PASS: suite $command" >&2
   fi
+  ended=$(date +%s%N)
+  elapsed=$((ended - started))
+  printf '%s\t%s\n' "$result" "$command" >> "$suite_results"
+  suite_timings+=("$elapsed"$'\t'"$command")
 }
 run bash ci/gate-tools.sh
 run python3 ci/gate-tools-test.py
@@ -95,5 +106,9 @@ run python3 ci/qmd-test.py "$(command -v chezmoi || true)"
 run gitleaks git --redact --no-banner .
 run bash ci/gitleaks-working-tree.sh gitleaks "$ROOT" "$tmp/working-tree-scan"
 
+echo "Suite timings (seconds, slowest first):" >&2
+while IFS=$'\t' read -r elapsed command; do
+  printf 'TIME: %s s  %s\n' "$(awk -v ns="$elapsed" 'BEGIN { printf "%.3f", ns / 1000000000 }')" "$command" >&2
+done < <(printf '%s\n' "${suite_timings[@]}" | sort -rn -k1,1)
 echo "Gate suites finished (failed=$failed, skipped=$skipped)"
 (( failed == 0 ))

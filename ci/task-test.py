@@ -107,6 +107,7 @@ case "$1 $2" in
     echo OK ;;
   "check ")
     [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
+    [ -f "$HOME/gate-suites.tsv" ] && cp "$HOME/gate-suites.tsv" "$TMPDIR/gate-suites.tsv"
     if [ -f smoke_check.py ]; then
       grep -Fq 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' justfile || exit 1
       uv run --no-project --with colorama==0.4.6 python smoke_check.py || exit $?
@@ -9759,6 +9760,69 @@ exit 1
         self.assertIn("PASS", self.task("check", "proj", "5"))
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "just check && just mcp-probe"])
+
+    def test_trusted_check_skips_verify_only_for_exact_passed_suite_command(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("passed\ttrue\n")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        step = evidence["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true"])
+        self.assertEqual(step["result"], "skipped: suite")
+        self.assertEqual(step["suite"], "true")
+        log = Path(evidence["log"]).read_text()
+        self.assertIn("SKIP: Verify command is covered by passed `just check` suite: true", log)
+
+    def test_trusted_check_runs_nonidentical_verify_command(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text().replace("Verify: `true`", "Verify: `true argument`"))
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("passed\ttrue\n")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        step = evidence["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true argument"])
+        self.assertEqual(step["result"], "finished")
+        self.assertNotIn("suite", step)
+
+    def test_trusted_check_runs_verify_when_matching_suite_failed(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("failed\ttrue\n")
+        self.task("check", "proj", "5")
+        step = json.loads((self.state() / "check.json").read_text())["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true"])
+        self.assertEqual(step["result"], "finished")
+        self.assertNotIn("suite", step)
+
+    def test_trusted_check_runs_verify_when_matching_suite_was_skipped(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("skipped\ttrue\n")
+        self.task("check", "proj", "5")
+        step = json.loads((self.state() / "check.json").read_text())["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true"])
+        self.assertEqual(step["result"], "finished")
+        self.assertNotIn("suite", step)
+
+    def test_advisory_check_still_runs_verify_covered_by_suite(self):
+        wt, _ = self.started()
+        (self.home / "gate-suites.tsv").write_text("passed\ttrue\n")
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", record={"verify": ["true"]}, advisory=True))
+        log = (wt / ".work/check.log").read_text()
+        self.assertNotIn("SKIP: Verify command", log)
+        self.assertIn("$ bash -c true", log)
+
+    def test_lint_summarizes_suite_seconds_slowest_first_and_lists_failures(self):
+        source = (ROOT / "ci/lint.sh").read_text()
+        self.assertIn('suite_timings+=("$elapsed"$\'\\t\'"$command")', source)
+        self.assertIn('sort -rn -k1,1', source)
+        self.assertIn('printf \'TIME: %s s  %s\\n\'', source)
+        self.assertIn('echo "FAIL: $command (exit $status)"', source)
+        self.assertIn('echo "Gate suites finished (failed=$failed, skipped=$skipped)"', source)
 
     def test_acceptance_3_review_requires_head_other_vendor_and_every_criterion(self):
         wt, _ = self.started()
