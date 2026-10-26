@@ -954,6 +954,42 @@ It runs from the task worktree, detaches and prints its pid. The final response 
 running, finished with its exit code, or interrupted. A live lane cannot be
 launched twice. Commit, check, report and other-vendor review still precede merge.
 
+### PM wake events
+
+`task` wakes the owning PM's Claude Code session on real events, so no PM polls on a timer (T-77).
+It sends events from the code paths that already know them: a lane ended (`lane T-12 finished
+(exit 0)`, or `timed_out`, `interrupted`, `cancelled`, `tampered`), a trusted check or merge gate
+failed (`check T-12: FAIL (trusted, abc1234)`), a review was recorded (`review T-12: PASS (abc1234)`),
+a merge published (`main now at abc1234 (T-12)`), the hold was pulled or released (sent to every
+mapped PM), `task smoke` finished (`smoke (both): PASS (exit 0)`), and an ask that needs the PM (`task
+note ... setup`, and a batch line that parks a task or stops the batch). Lines are short and carry
+no file contents. Jacopo's own `sudo agent-hold` sends nothing.
+
+The map is `~/.config/pm-wake/sessions`, one `pm=session_id` line per PM; chezmoi creates it once
+(comments only) and never overwrites it. A fresh PM session registers itself with
+`task pm-session <pm> <session_id>`: the id must be `session_` followed by letters and digits, and the
+map is replaced in one rename, keeping the other lines. Repositories route as follows: `company` (and
+`cortex-kb-company`) to the `company` PM; `bootstrap` and `cortex-core` to `workflow`; any other
+repository to the PM named after it (`cortex-kb-<name>` to `<name>`), only when the map lists it.
+An unmapped repository produces no event and no output.
+
+Each event is appended to a per-PM spool under `~/.local/state/task/pm-wake/`. If no flusher holds
+that PM's lock, `task` starts one as a transient `systemd-run --user` service (a detached process
+when there is no user manager) and returns at once. A transient service, not a child process,
+because the emitting command often runs inside a lane, check or runner unit whose processes systemd
+stops when that unit ends; a timer unit per event would collide on its name instead of batching. The
+flusher has no hold condition, so a pulled hold still gets its own event delivered. It waits about
+90 s, takes the whole spool and sends one message, then repeats until a window passes with nothing
+queued. The message is the label
+`[EVENT from AgentDev for the <pm> PM; information only, not Jacopo's approval]`
+and the events joined with `; `, sent with
+`claude -p <message> --cloud <session_id> --output-format json` (stdin empty, 60 s timeout); it
+counts as delivered only when the reply contains `"ok":true`. This is the only model call. A failed
+attempt is retried once; each attempt is one TSV line in `~/.local/state/task/pm-wake/sends.log`
+(time, PM, session, attempt, result, reason, event count, events). A batch still undelivered after
+its retry shows in `task status` as `pm-wake <pm>: N batch(es) undelivered after one retry` until a
+delivery to that PM succeeds.
+
 ### Installing a bootstrap change
 
 After every install of a guard, hook, sandbox profile, permission or `task`

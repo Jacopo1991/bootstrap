@@ -50,7 +50,7 @@ def hold_fixture_source(source):
     assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
     source = source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
     source = source.replace('Path("/etc/codex/requirements.toml")', f'Path({str(ROOT / "system/codex-requirements.toml")!r})')
-    return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_', 'SMOKE_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL'}")
+    return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_', 'SMOKE_', 'TASK_PM_WAKE_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL'}")
 fixture_bin = Path(audit_state.name) / 'bin'
 fixture_bin.mkdir()
 for sibling in TOOL.parent.iterdir():
@@ -10484,6 +10484,203 @@ Reviewer: claude strict-model
             self.assertIn(expected, out)
             self.assertIn(f"log: {log_path}", out)
             self.assertNotIn("check=", out)
+
+
+DELIVERY_STUB = """#!/usr/bin/env python3
+import json, os, pathlib, sys
+home = pathlib.Path(os.environ['HOME'])
+with (home / 'claude-calls.jsonl').open('a') as stream:
+    stream.write(json.dumps({'argv': sys.argv[1:], 'stdin': sys.stdin.read()}) + '\\n')
+fails = home / 'claude-fails'
+left = int(fails.read_text()) if fails.exists() else 0
+if left:
+    fails.write_text(str(left - 1))
+    print('{"ok":false,"error":"session not found"}')
+    sys.exit(1)
+print('{"ok":true,"session_id":"queued"}')
+"""
+
+
+class PmWakeTests(unittest.TestCase):
+    """T-77: `task` wakes the owning PM through a fake `claude` that records argv and stdin."""
+    setUp, git, task, raw_task, install_contract = (TaskTool.setUp, TaskTool.git, TaskTool.task,
+                                                    TaskTool.raw_task, TaskTool.install_contract)
+    started, state, stub_models, commit_in = TaskTool.started, TaskTool.state, TaskTool.stub_models, TaskTool.commit_in
+    prepare_merge_evidence, wait_for_lane = TaskTool.prepare_merge_evidence, TaskTool.wait_for_lane
+    LABEL = "[EVENT from AgentDev for the {} PM; information only, not Jacopo's approval] "
+
+    def wake(self, window='1', retry='0.2', sessions='proj=session_Proj01\nworkflow=session_Work02\n'):
+        self.env.update(TASK_PM_WAKE_WINDOW=window, TASK_PM_WAKE_RETRY=retry)
+        if sessions is not None:
+            path = self.home / '.config/pm-wake/sessions'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('# map\n' + sessions)
+        stub = self.home / 'bin/claude'
+        stub.write_text(DELIVERY_STUB)
+        stub.chmod(0o755)
+        self.addCleanup(self.drain)
+
+    def calls(self, count, timeout=20):
+        path = self.home / 'claude-calls.jsonl'
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+            if len(rows) >= count:
+                return rows
+            time.sleep(0.05)
+        self.fail(f'expected {count} deliveries, got {rows}')
+
+    def drain(self):
+        """Wait until every flusher let go of its lock, so the temporary home can be removed."""
+        deadline = time.monotonic() + 20
+        for lock in (self.home / '.local/state/task/pm-wake').glob('*.flush.lock'):
+            with lock.open('a') as stream:
+                while time.monotonic() < deadline:
+                    try:
+                        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.05)
+
+    def test_lane_review_and_merge_each_wake_the_mapped_pm_with_one_event(self):
+        """T-77 #1: lane finished, review recorded and merge, in a scratch repo, each one batched send."""
+        self.stub_models()
+        self.wake()
+        wt, _ = self.started()
+        (wt / '.work/prompt.md').write_text('Build the task.')
+        self.raw_task('lane', 'proj', '5')
+        self.wait_for_lane(wt)
+        lane, = self.calls(1)
+        self.assertEqual(lane, {'argv': ['-p', self.LABEL.format('proj') + 'lane T-5 finished (exit 0)',
+                                         '--cloud', 'session_Proj01', '--output-format', 'json'], 'stdin': ''})
+        self.commit_in(wt, 'b.txt')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'review.txt'
+        reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: b exists\n#2 pass: checks pass\n')
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'manual')
+        review = self.calls(2)[1]
+        self.assertEqual(review['argv'][1], self.LABEL.format('proj') + f'review T-5: PASS ({head[:7]})')
+        self.task('merge', 'proj', '5', '--keep')
+        merged = self.calls(3)[2]
+        main = self.git(self.repo, 'rev-parse', 'origin/main')
+        self.assertEqual(merged['argv'][1], self.LABEL.format('proj') + f'main now at {main[:7]} (T-5)')
+        time.sleep(1.5)
+        self.assertEqual(len(self.calls(3)), 3, 'one send per event, nothing repeated')
+        log = (self.home / '.local/state/task/pm-wake/sends.log').read_text().splitlines()
+        self.assertEqual([row.split('\t')[1:6] for row in log], [['proj', 'session_Proj01', '1', 'ok', 'ok']] * 3)
+
+    def test_events_in_one_window_are_one_labelled_message_and_hold_does_not_stop_it(self):
+        self.wake(window='2')
+        self.raw_task('hold', 'pull', 'drain for the test')
+        self.raw_task('note', 'proj', '5', 'setup', 'uv cache not writable')
+        self.raw_task('note', 'proj', '-', 'setup', 'second gap')
+        rows = sorted(self.calls(2), key=lambda row: row['argv'][3])
+        self.assertTrue((self.home / '.local/state/task/hold').exists(), 'delivered while the hold is pulled')
+        self.assertEqual([row['argv'] for row in rows], [
+            ['-p', self.LABEL.format('proj') + 'hold pulled by test-seat: drain for the test; '
+             'ask proj T-5: setup request #1; ask proj -: setup request #2',
+             '--cloud', 'session_Proj01', '--output-format', 'json'],
+            ['-p', self.LABEL.format('workflow') + 'hold pulled by test-seat: drain for the test',
+             '--cloud', 'session_Work02', '--output-format', 'json']])
+        self.raw_task('hold', 'release')
+        self.assertEqual(len(self.calls(4)), 4)
+
+    def test_trusted_check_failure_wakes_the_pm(self):
+        self.wake()
+        wt, _ = self.started()
+        self.commit_in(wt, 'FAIL')
+        self.raw_task('check', 'proj', '5', code=1)
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        self.assertEqual(self.calls(1)[0]['argv'][1], self.LABEL.format('proj') + f'check T-5: FAIL (trusted, {head[:7]})')
+
+    def test_unmapped_repo_sends_nothing_and_prints_nothing_extra(self):
+        """T-77 #2: no map line for the repository's PM means no event, no spool and no error output."""
+        for sessions in ('workflow=session_Work02\n', None):
+            with self.subTest(sessions=sessions):
+                self.wake(window='0.2', sessions=sessions)
+                out = self.raw_task('note', 'proj', '5', 'setup', 'a gap')
+                self.assertRegex(out, r'\ARecorded setup request #\d+ for proj\.\n\Z')
+                self.assertEqual(list((self.home / '.local/state/task/pm-wake').glob('*.spool')), [])
+        time.sleep(1)
+        self.assertFalse((self.home / 'claude-calls.jsonl').exists())
+
+    def test_failed_delivery_is_logged_retried_once_and_shown_in_status(self):
+        self.wake(window='0.3')
+        (self.home / 'claude-fails').write_text('99')
+        self.raw_task('note', 'proj', '5', 'setup', 'first')
+        self.assertEqual(len(self.calls(2)), 2)
+        self.drain()
+        log = self.home / '.local/state/task/pm-wake/sends.log'
+        rows = [row.split('\t') for row in log.read_text().splitlines()]
+        self.assertEqual([row[3:5] for row in rows], [['1', 'failed'], ['2', 'failed']])
+        self.assertEqual(rows[0][5], 'exit 1, no "ok":true')
+        self.assertEqual(rows[0][7], 'ask proj T-5: setup request #1')
+        self.assertIn('pm-wake proj: 1 batch(es) undelivered after one retry', self.raw_task('status'))
+        self.raw_task('note', 'proj', '5', 'setup', 'second')
+        self.calls(4)
+        self.drain()
+        self.assertIn('pm-wake proj: 2 batch(es) undelivered after one retry', self.raw_task('status'))
+        time.sleep(0.5)
+        self.assertEqual(len(self.calls(4)), 4, 'exactly one retry per batch')
+        (self.home / 'claude-fails').write_text('1')
+        self.raw_task('note', 'proj', '5', 'setup', 'third')
+        self.calls(6)
+        self.drain()
+        self.assertEqual([row.split('\t')[4] for row in log.read_text().splitlines()][-2:], ['failed', 'ok'])
+        self.assertNotIn('pm-wake', self.raw_task('status'))
+
+    def test_pm_session_validates_and_replaces_the_map_atomically(self):
+        path = self.home / '.config/pm-wake/sessions'
+        path.parent.mkdir(parents=True)
+        path.write_text('# keep this comment\ncompany=session_Comp01\nworkflow=session_Old\n')
+        for pm, session in (('workflow', 'session-abc'), ('workflow', 'abc123'), ('workflow', 'session_'),
+                            ('workflow', 'session_ab$c'), ('workflow', 'session_ab\ncompany=session_X'),
+                            ('Workflow', 'session_New1'), ('../x', 'session_New1'), ('', 'session_New1')):
+            with self.subTest(pm=pm, session=session):
+                self.assertIn('task pm-session:', self.raw_task('pm-session', pm, session, code=1))
+                self.assertEqual(path.read_text(), '# keep this comment\ncompany=session_Comp01\nworkflow=session_Old\n')
+        out = self.raw_task('pm-session', 'workflow', 'session_New9Ab')
+        self.assertIn('workflow PM events now go to session_New9Ab', out)
+        self.assertEqual(path.read_text(), '# keep this comment\ncompany=session_Comp01\nworkflow=session_New9Ab\n')
+        self.raw_task('pm-session', 'photohub', 'session_Ph1')
+        self.assertEqual(TASK_MODULE.task_wake.sessions(self.home),
+                         {'company': 'session_Comp01', 'workflow': 'session_New9Ab', 'photohub': 'session_Ph1'})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual([p.name for p in path.parent.iterdir() if p.name.startswith('.sessions-')], [])
+
+    def test_routing_and_flusher_launch_outside_the_hold(self):
+        wake = TASK_MODULE.task_wake
+        self.assertEqual([wake.pm_for(name) for name in ('company', 'cortex-kb-company', 'bootstrap', 'cortex-core',
+                                                         'photohub', 'cortex-kb-photohub')],
+                         ['company', 'company', 'workflow', 'workflow', 'photohub', 'photohub'])
+        with mock.patch.object(wake.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run, \
+                mock.patch.object(wake.subprocess, 'Popen') as popen:
+            wake.start_flusher(self.home, 'workflow')
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], ['systemd-run', '--user', '--collect', '--quiet'])
+        self.assertFalse(any('ExecCondition' in part for part in command), 'the hold never stops delivery')
+        self.assertEqual(command[command.index('--') + 1:][2:4], ['flush', 'workflow'])
+        popen.assert_not_called()
+
+    def test_batch_parked_or_stopped_line_is_an_ask(self):
+        loader = importlib.machinery.SourceFileLoader('task_batch_for_wake', str(ROOT / 'home/dot_local/bin/executable_task-batch'))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        batch = SimpleNamespace(done=self.home / 'runner.done', repo=self.repo, output=lambda text: None)
+        with mock.patch.object(module.task_wake, 'emit') as emit, mock.patch.dict(os.environ, HOME=str(self.home)):
+            for line in ('T-5: merged', 'T-5: parked: fix rounds exhausted; last blocking findings: x.py:3',
+                         'batch: stopped: two tasks parked in a row', 'batch: finished'):
+                module.Batch.append(batch, line)
+        self.assertEqual([call.args[1:] for call in emit.call_args_list],
+                         [('proj', 'ask batch proj: T-5: parked: fix rounds exhausted'),
+                          ('proj', 'ask batch proj: batch: stopped: two tasks parked in a row')])
+
+    def test_readme_documents_wake_events(self):
+        text = (ROOT / 'README.md').read_text()
+        for phrase in ('task pm-session <pm> <session_id>', '~/.config/pm-wake/sessions',
+                       "information only, not Jacopo's approval", 'sends.log'):
+            self.assertIn(phrase, text)
+        self.assertTrue((ROOT / 'home/dot_config/pm-wake/create_private_sessions').is_file())
 
 
 class WatcherTests(unittest.TestCase):

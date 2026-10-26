@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import task_usage, task_lock
+import task_usage, task_lock, task_wake
 from task_limits import bwrap_denial, cli_limit, lane_limit
 from task_routing import TIERS, guards, lane_limits, override_problem, same_vendor_ok
 
@@ -197,6 +197,8 @@ class Batch:
         self.done.parent.mkdir(parents=True, exist_ok=True)
         with self.done.open("a") as stream:
             stream.write(" ".join(line.split()) + "\n")
+        if re.search(r"\b(parked|stopped):", line):  # T-77: a parked task or stopped batch is an ask for the PM
+            task_wake.emit(Path.home(), self.repo.name, f"ask batch {self.repo.name}: " + line.split(";")[0])
         self.output(line)
 
     def call(self, command, *args, retry=False):

@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 import task_lock
+import task_wake
 from task_limits import bwrap_denial, cli_limit, lane_limit, round_cause, SETUP_CAUSES
 from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
 from task_routing import review_chain, same_vendor_ok
@@ -1824,6 +1825,16 @@ def finalize_lane_record(path, run, state, **fields):
         if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")):
             task_usage.run_log(HOME, run["usage_run"], "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
         atomic_json(path, run)
+        wake_lane(path.parent.parent, run)
+
+
+def wake_lane(worktree, run):
+    """T-77: the owning PM hears that a lane ended, with its outcome."""
+    try:
+        task, code = Task(main_repo(worktree), worktree.name), run.get("exit_code")
+        task_wake.emit(HOME, task.repo.name, f"lane {task.id} {run['state']}" + ("" if code is None else f" (exit {code})"))
+    except Exception:  # never disturbs the lane record it follows
+        pass
 
 
 def private_claude_lane(path, root):
@@ -3362,6 +3373,8 @@ def check(args):
             passed = run_check(path, base, record, task_state(task), advisory=False, variant=args.variant)
     else:
         passed = run_check(path, base, record, task_state(task), advisory=False, variant=args.variant)
+    if not advisory and read_json_object(task_state(task) / "check.json").get("result") == "failed":
+        task_wake.emit(HOME, repo.name, f"check {task.id}: FAIL (trusted, {sha(path, 'HEAD')[:7]})")
     return 0 if passed else 1
 
 
@@ -4006,6 +4019,7 @@ def review_locked(args):
     if not args.run:
         task_usage.run_log(HOME, (read_json_object(state / "review-routing.json").get("usage_run") or dict(id="manual-" + hashlib.sha256((str(state) + text).encode()).hexdigest(), repo=repo.name, task=task.id, kind="review", vendor=routed_reviewer[0], model=routed_reviewer[1], effort=None, tier="routine", round=None, start=None, ccusage_tokens=None)) | dict(plan=None), "finished")
     task_event(task, "review")
+    task_wake.emit(HOME, repo.name, f"review {task.id}: {meta['verdict']} ({head[:7]})")
     print(f"Recorded {meta['verdict']} review for {head[:7]}.")
     if args.run:
         print(f"Review recorded: {meta['verdict']}")
@@ -4268,6 +4282,7 @@ def merge(args):
                 print(f"reuse decision: running full gate because {reuse_reason}")
                 tree, gate_passed = gate_merge_result(task, repo, lane_head, base, record)
                 if not gate_passed:
+                    task_wake.emit(HOME, repo.name, f"merge gate {task.id}: FAIL (trusted, {lane_head[:7]})")
                     if not args.override:
                         raise Stop("Gate check failed on the would-be merge result; nothing was published.")
                     try:
@@ -4357,6 +4372,7 @@ def merge(args):
         task_usage.record_override(HOME, repo.name, task.id, None, record.get("tier", "routine"),
                                    args.no_redteam, kind="no_redteam", risk=risk, commit=lane_head)
     task_usage.run_outcome(HOME, repo.name, task.id, "merged")
+    task_wake.emit(HOME, repo.name, f"{default} now at {commit[:7]} ({task.id})")
     try:
         review = json.loads((archive / "review.json").read_text())
     except (OSError, json.JSONDecodeError):
@@ -4825,6 +4841,7 @@ def note(args):
                      "task": task.id if task else "-", "text": args.text}
             out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
         print(f"Recorded setup request #{request_id} for {repo.name}.")
+        task_wake.emit(HOME, repo.name, f"ask {repo.name} {entry['task']}: setup request #{request_id}")
         return 0
 
     if task is None:
@@ -4923,6 +4940,8 @@ def status(args):
     print(f"Gate slots: {gate_slots()}")
     print(f"Batch lane limits: {lane_limits(HOME, gate_slots())}; total bounded by gate slots")
     print(task_usage.override_summary(HOME))
+    for line in task_wake.status_lines(HOME):
+        print(line)
     for row in gate_holders():
         print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
     repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
@@ -5343,7 +5362,10 @@ def hold(args):
     if args.action == 'pull':
         if not args.reason: raise Stop('task hold pull requires a reason')
         atomic_json(path, dict(mode='drain', who=holder, why=args.reason, when=utc_now()))
-    elif args.action == 'release': path.unlink(missing_ok=True)
+        task_wake.emit(HOME, '', f'hold pulled by {holder}: {args.reason}', everyone=True)
+    elif args.action == 'release':
+        path.unlink(missing_ok=True)
+        task_wake.emit(HOME, '', f'hold released by {holder}', everyone=True)
     print(hold_status() or 'no hold')
 
 
@@ -5354,7 +5376,19 @@ def smoke(args):
         print("task smoke: task-smoke is not on PATH; run chezmoi apply first.", file=sys.stderr)
         return 1
     flags = ["--clean", args.clean] if args.clean else ["--builder", args.builder]
-    return subprocess.run([helper, *flags], env=dict(os.environ, TASK_SMOKE_TOOL=str(Path(__file__).resolve()))).returncode
+    code = subprocess.run([helper, *flags], env=dict(os.environ, TASK_SMOKE_TOOL=str(Path(__file__).resolve()))).returncode
+    if not args.clean:
+        task_wake.emit(HOME, "bootstrap", f"smoke ({args.builder}): {'PASS' if code == 0 else 'FAIL'} (exit {code})")
+    return code
+
+
+def pm_session(args):
+    """`task pm-session <pm> <session_id>`: a fresh PM session registers where its wake events go."""
+    try:
+        path = task_wake.set_session(HOME, args.pm, args.session)
+    except ValueError as error:
+        raise Stop(str(error)) from None
+    print(f"{args.pm} PM events now go to {args.session} ({path}).")
 
 
 def main(argv=None):
@@ -5468,6 +5502,9 @@ def main(argv=None):
     sub = commands.add_parser("smoke", help="the lane path on a scratch project, per builder (install gate)")
     sub.add_argument("--builder", choices=("codex", "claude", "both"), default="both")
     sub.add_argument("--clean", metavar="RUN_ID", help="remove a kept smoke run's scratch project")
+    sub = commands.add_parser("pm-session", help="register the PM session that receives this PM's wake events")
+    sub.add_argument("pm")
+    sub.add_argument("session")
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
     sub = commands.add_parser("gemini", help="Gemini (agy) review route: state, backtest command, T-44 result")
@@ -5504,7 +5541,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start"} or task_lock.requires_pm(args) or args.command == "gemini" and args.record or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start", "pm-session"} or task_lock.requires_pm(args) or args.command == "gemini" and args.record or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -5572,7 +5609,7 @@ def main(argv=None):
                           "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
                           "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage, "gemini": gemini,
                           "plan-budget": lambda a: print(plan_budget(a.id, clear=a.clear)) if not a.clear else plan_budget(a.id, clear=a.clear),
-                          "hold": hold,
+                          "hold": hold, "pm-session": pm_session,
                           "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo)}[args.command](args) or 0
         finally:
             if lock:
