@@ -2558,6 +2558,28 @@ class TaskTool(unittest.TestCase):
         self.assertIn(f'env keys: unavailable (Cannot read {config}.)', output)
         self.assertRegex(output, r'z-good:\n  project lock: [^\n]+\n  env keys: PRODUCT_DIR')
 
+    @unittest.skipIf(os.geteuid() == 0, 'root reads a mode-000 directory')
+    def test_status_and_repair_skip_a_repo_the_lane_cannot_read(self):
+        # A lane sandbox masks a denied repo as a mode-000 directory (T-79).
+        good = self.home / 'dev_workspace/z-good'
+        good.mkdir()
+        self.git(good, 'init', '-q', '-b', 'main')
+        self.commit_in(good, 'README.md', 'readable\n')  # repair needs a main branch
+        denied = self.home / 'dev_workspace/a-denied'
+        denied.mkdir()
+        self.git(denied, 'init', '-q', '-b', 'main')
+        (denied / 'do-not-display.txt').write_text('private\n')
+        make_read_only(self, denied, 0o000)
+        output = self.raw_task('status')
+        self.assertIn('a-denied: skipped (not readable here)\n', output)
+        self.assertEqual(output.count('a-denied'), 1)
+        self.assertNotIn('do-not-display', output)
+        self.assertIn('proj:\n', output)
+        self.assertIn('z-good:\n', output)
+        output = self.raw_task('repair')
+        self.assertIn('a-denied: skipped (not readable here)\n', output)
+        self.assertEqual(output.count('a-denied'), 1)
+
     def test_configured_environment_rejects_reserved_names(self):
         names = TASK_MODULE.GIT_OVERRIDE_ENV | {'GIT_OVERRIDE_ENV', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
                                               'TASK_RUN_ID', 'TASK_RUN_ANY', 'TMPDIR', 'TASK_GATE_SLOT',

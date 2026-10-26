@@ -431,6 +431,15 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   (T-56); the change counts as installed only when it passes. Also confirm `codex exec` with
   `-c default_permissions` starts under the requirements (no "overrides cannot both be set" error)
   and that `~/.codex/config.toml` `sandbox_mode` does not conflict.
+  Run Codex with `-C` under `~/dev_workspace` or `~/cortex`; `codex exec -s read-only -C $HOME`
+  fails with `bwrap: Can't create ...`. In read-only mode Codex's Linux sandbox starts from
+  `--ro-bind / /` and then mounts its masks on top: an empty tmpfs or file over every deny path
+  above, and root-scoped protections for `.git`, `.codex` and `.agents` in the `-C` project root.
+  bwrap cannot create a missing mount target inside that read-only bind, and with `-C $HOME`
+  the project root is the home directory that holds the deny paths and Codex's own `~/.codex`.
+  Under an approved root none of those targets are needed. `task` never passes `-C` (lanes run
+  from the task worktree, reviews and realigns from the worktree or knowledge repo). Cause read
+  from Codex's `linux-sandbox/src/bwrap.rs`, not reproduced in a cloud container (T-79).
 
 Both installers refuse to run unless the policy scripts, `/usr/bin/env`, `/usr/bin/python3`,
 `/usr/bin/git` and the root-owned `/usr/local/bin/gitleaks` (installed by `install.sh`), and
@@ -580,7 +589,8 @@ for that vendor. Total concurrency is capped by the largest current vendor
 limit and the slots in `~/.config/task/gate.toml` (default 3).
 Dependencies wait for their predecessor to merge; parked predecessors skip
 their dependants. Expiry reduces new dispatches without interrupting live work.
-`task status` shows the effective vendor limits and gate slots.
+`task status` shows the effective vendor limits and gate slots. It names a repo the current
+sandbox cannot read (`<name>: skipped (not readable here)`) and walks on; `task repair` does the same.
 
 #### Risk and checks
 

@@ -321,6 +321,25 @@ def resolve_repo(name):
     return main_repo(path)
 
 
+def workspace_repos():
+    """The workspace repos this process can read. A lane sandbox masks a denied repo as an
+    unreadable directory, so name it once and walk on, never touching its contents (T-79)."""
+    repos = []
+    for path in sorted(WORKSPACE.iterdir()):
+        try:
+            git_dir = (path / ".git").stat()
+            os.listdir(path)
+            if stat.S_ISDIR(git_dir.st_mode):
+                os.listdir(path / ".git")
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError:
+            print(f"{path.name}: skipped (not readable here)")
+            continue
+        repos.append(path)
+    return repos
+
+
 def has_origin(repo):
     return ok(repo, "remote", "get-url", "origin")
 
@@ -4848,7 +4867,7 @@ def status(args):
     print(task_usage.override_summary(HOME))
     for row in gate_holders():
         print(f"gate {row[0]}: {holder_display(row, include_slot=False)}")
-    repos = [resolve_repo(args.repo)] if args.repo else sorted(p for p in WORKSPACE.iterdir() if (p / ".git").exists())
+    repos = [resolve_repo(args.repo)] if args.repo else workspace_repos()
     setup_path = HOME / ".local/state/task/setup-requests.jsonl"
     setup_warnings = []
     setup_events = read_setup_events(setup_path, setup_warnings)
@@ -5179,8 +5198,7 @@ def repair_published(task, base):
 
 
 def repair(args):
-    repos = [resolve_repo(args.repo)] if args.repo else sorted(
-        p for p in WORKSPACE.iterdir() if (p / ".git").exists())
+    repos = [resolve_repo(args.repo)] if args.repo else workspace_repos()
     for repo in repos:
         prune_stale_gate_worktrees(repo)
         try:
