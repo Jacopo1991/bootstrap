@@ -10548,26 +10548,77 @@ class PmWakeTests(unittest.TestCase):
         self.wake()
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('Build the task.')
-        self.raw_task('lane', 'proj', '5')
-        self.wait_for_lane(wt)
-        lane, = self.calls(1)
-        self.assertEqual(lane, {'argv': ['-p', self.LABEL.format('proj') + 'lane T-5 finished (exit 0)',
-                                         '--cloud', 'session_Proj01', '--output-format', 'json'], 'stdin': ''})
+        root = self.home / '.local/state/task/pm-wake'
+        lane_task = SimpleNamespace(repo=SimpleNamespace(name='proj'), id='T-5')
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE, 'main_repo', return_value=self.repo), \
+                mock.patch.object(TASK_MODULE, 'Task', return_value=lane_task):
+            TASK_MODULE.wake_lane(wt, {'state': 'finished', 'exit_code': 0})
+        self.assertFalse((self.home / 'claude-calls.jsonl').exists())
+        self.assertEqual((root / 'proj.digest').read_text().splitlines()[0].split(' ', 1)[1],
+                         'lane T-5 finished (exit 0)')
         self.commit_in(wt, 'b.txt')
         head = self.git(wt, 'rev-parse', 'HEAD')
         reply = self.home / 'review.txt'
         reply.write_text(f'Verdict: PASS\nCommit: {head}\n#1 pass: b exists\n#2 pass: checks pass\n')
         self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'manual')
-        review = self.calls(2)[1]
-        self.assertEqual(review['argv'][1], self.LABEL.format('proj') + f'review T-5: PASS ({head[:7]})')
+        self.assertFalse((self.home / 'claude-calls.jsonl').exists())
+        self.assertEqual((root / 'proj.digest').read_text().splitlines()[1].split(' ', 1)[1],
+                         f'review T-5: PASS ({head[:7]})')
         self.task('merge', 'proj', '5', '--keep')
-        merged = self.calls(3)[2]
         main = self.git(self.repo, 'rev-parse', 'origin/main')
-        self.assertEqual(merged['argv'][1], self.LABEL.format('proj') + f'main now at {main[:7]} (T-5)')
-        time.sleep(1.5)
-        self.assertEqual(len(self.calls(3)), 3, 'one send per event, nothing repeated')
-        log = (self.home / '.local/state/task/pm-wake/sends.log').read_text().splitlines()
-        self.assertEqual([row.split('\t')[1:6] for row in log], [['proj', 'session_Proj01', '1', 'ok', 'ok']] * 3)
+        self.assertFalse((self.home / 'claude-calls.jsonl').exists())
+        self.assertEqual((root / 'proj.digest').read_text().splitlines()[2].split(' ', 1)[1],
+                         f'main now at {main[:7]} (T-5)')
+        self.assertEqual((root / 'proj.digest.count').read_text(), '3')
+
+    def test_digest_count_is_added_to_next_wake_and_printed_by_command(self):
+        self.wake()
+        wake = TASK_MODULE.task_wake
+        wake.emit(self.home, 'proj', 'lane T-5 finished (exit 0)', event_class='DIGEST')
+        wake.emit(self.home, 'proj', 'review T-5: PASS (abcdef0)', event_class='DIGEST')
+        out = self.raw_task('note', 'proj', '5', 'setup', 'need help')
+        self.assertIn('Recorded setup request #1', out)
+        rows = self.calls(1)
+        self.assertEqual(rows[0]['argv'][1], self.LABEL.format('proj') +
+                         'ask proj T-5: setup request #1 (+2 digest events since the last wake)')
+        self.assertEqual((self.home / '.local/state/task/pm-wake/proj.digest.count').read_text(), '0')
+        out = self.raw_task('pm-wake-digest', 'proj')
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn('lane T-5 finished (exit 0)', lines[0])
+        self.assertIn('review T-5: PASS (abcdef0)', lines[1])
+        self.assertEqual(lines[2], '0 digest event(s)')
+
+    def test_lane_and_smoke_outcomes_choose_wake_or_digest(self):
+        self.wake()
+        task = SimpleNamespace(repo=SimpleNamespace(name='proj'), id='T-5')
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE, 'main_repo', return_value=self.repo), \
+                mock.patch.object(TASK_MODULE, 'Task', return_value=task):
+            TASK_MODULE.wake_lane(self.repo, {'state': 'failed', 'exit_code': 1})
+        self.assertIn('lane T-5 failed (exit 1)', self.calls(1)[0]['argv'][1])
+
+        helper = self.home / 'task-smoke'
+        helper.write_text('#!/bin/sh\nexit 0\n')
+        helper.chmod(0o755)
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE.shutil, 'which', return_value=str(helper)), \
+                mock.patch.object(TASK_MODULE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            TASK_MODULE.smoke(SimpleNamespace(clean=None, builder='codex'))
+        self.assertEqual(len(self.calls(1)), 1)
+        self.assertIn('smoke (codex): PASS (exit 0)',
+                      (self.home / '.local/state/task/pm-wake/workflow.digest').read_text())
+
+        with mock.patch.dict(os.environ, self.env), \
+                mock.patch.object(TASK_MODULE, 'HOME', self.home), \
+                mock.patch.object(TASK_MODULE.shutil, 'which', return_value=str(helper)), \
+                mock.patch.object(TASK_MODULE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)):
+            TASK_MODULE.smoke(SimpleNamespace(clean=None, builder='codex'))
+        self.assertIn('smoke (codex): FAIL (exit 1)', self.calls(2)[1]['argv'][1])
 
     def test_events_in_one_window_are_one_labelled_message_and_hold_does_not_stop_it(self):
         self.wake(window='2')
@@ -10592,6 +10643,27 @@ class PmWakeTests(unittest.TestCase):
         self.raw_task('check', 'proj', '5', code=1)
         head = self.git(wt, 'rev-parse', 'HEAD')
         self.assertEqual(self.calls(1)[0]['argv'][1], self.LABEL.format('proj') + f'check T-5: FAIL (trusted, {head[:7]})')
+
+    def test_review_failure_wakes_the_pm(self):
+        self.wake()
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = self.home / 'review.txt'
+        reply.write_text(f'Verdict: FAIL\nCommit: {head}\n#1 fail: missing behavior\n#2 fail: check fails\n')
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'manual')
+        self.assertEqual(self.calls(1)[0]['argv'][1], self.LABEL.format('proj') +
+                         f'review T-5: FAIL ({head[:7]})')
+
+    def test_merge_gate_failure_wakes_the_pm(self):
+        self.wake(window='0.2')
+        wt, _ = self.started()
+        self.commit_in(wt, 'FAIL')
+        self.prepare_merge_evidence('5')
+        (self.state() / 'check.json').unlink()
+        out = self.raw_task('merge', 'proj', '5', '--override', 'approved failing-gate exception')
+        self.assertIn('Merged', out)
+        self.assertIn('merge gate T-5: FAIL (trusted,', self.calls(1)[0]['argv'][1])
 
     def test_unmapped_repo_sends_nothing_and_prints_nothing_extra(self):
         """T-77 #2: no map line for the repository's PM means no event, no spool and no error output."""
