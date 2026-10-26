@@ -4,14 +4,16 @@
 Creates ~/dev_workspace/task-smoke-<run> (one commit on main, no remote) and
 ~/cortex/cortex-kb-task-smoke-<run> (a signed plan and one task per builder). Per builder:
 task start, an unrelated commit on main, task lane (cheapest model, low effort), then the lane's
-commit, merge and report read back from Git, then task check, task review --run (routed to the
-cheapest reviewer of the other vendor) and task merge. Prints PASS, or FAIL <step>: <first error
+commit, merge and report read back from Git, the lane's own `task check` (T-67: advisory, passed, on the
+lane's head), then the trusted task check, task review --run (routed to the decision-32 reviewer)
+and task merge. Prints PASS, or FAIL <step>: <first error
 line>, per step. A FAIL keeps the scratch project for `task smoke --clean <run>`; a pass removes it.
 
 Then (T-62, company decision-27) each builder gets a second lane that runs the real `just check` of
 company, bootstrap and cortex-core (when it has a justfile) on throwaway clones and branches; the same
-check also runs outside the lane. A check that fails in the lane but passes outside is a setup
-failure and fails the smoke.
+check also runs outside the lane. The lane runs only `task check` (T-67): the branch's check recipe runs
+each real check, so no agent is asked to run `just check`, which the policy hook denies in lanes. A
+check that fails in the lane but passes outside is a setup failure and fails the smoke.
 """
 import argparse
 import json
@@ -44,11 +46,11 @@ print(name + ": exit " + str(done.returncode))
 """
 REAL_PROMPT = """# Real-repository check {ident} ({builder})
 
-This is an install smoke test. Run each command below from this worktree, one at a time, with the longest
-timeout your shell tool allows, then stop. Do not edit or commit anything, and do not retry or work around
-a failure: each command records its own result.
+This is an install smoke test. Run `task check` once from this worktree, with the longest timeout your
+shell tool allows, then stop. Its gate runs the real check of {names} on throwaway clones and records each
+result. Do not edit or commit anything, and do not retry or work around a failure.
 
-{commands}
+Run: task check
 """
 NESTED_SOURCE = """import subprocess, sys
 done = subprocess.run(["uv", "run", "--offline", "--quiet", "--no-project", "--with", "colorama==0.4.6",
@@ -57,7 +59,7 @@ sys.stderr.write(done.stderr)
 sys.exit(done.returncode)
 """
 RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
-ERROR_LINE = re.compile(r"(?i)fatal|error|denied|read-only|refus")
+ERROR_LINE = re.compile(r"(?i)fatal|error|denied|read-only|refus|not permitted|unavailable")
 GIT = ["git", "-c", "user.name=task-smoke", "-c", "user.email=task-smoke@example.invalid", "-c", "commit.gpgsign=false"]
 PROMPT = """# Lane smoke {ident} ({builder})
 
@@ -71,8 +73,9 @@ uv run --no-project --with colorama==0.4.6 python smoke_nested.py (it calls uv r
 4. Fill `.work/report.md`: What changed, How I verified, Criteria (`#1 met: smoke.txt contains ok`), Not done, Noticed, not done and Check.
 5. Look up the latest astral-sh/uv release tag at https://github.com/astral-sh/uv/releases with your web tool.
    Add a non-empty line to `.work/report.md`: `Web lookup: <fact and source URL>`.
+6. As your last step, run `task check` from this worktree once and leave its result as it is.
 
-Do not run `task check`, do not push and do not merge.
+Do not push and do not merge.
 """
 TASK = """---
 id: {ident}
@@ -97,7 +100,7 @@ smoke.txt only.
 
 ## Verification and tools
 
-Verify: `test -s smoke.txt`
+Verify: `{verify}`
 """
 
 
@@ -162,7 +165,8 @@ def build_scratch(run, found):
     (repo / "smoke_check.py").write_text("import colorama\nprint(colorama.__version__)\n")
     # T-68: a nested offline uv call must find what the outer step resolved.
     (repo / "smoke_nested.py").write_text(NESTED_SOURCE)
-    (repo / ".task.toml").write_text(f'knowledge = "cortex-kb-{name}"\n')
+    # The real-repository checks run inside the gate (T-67): give them the real lane's 90 minutes.
+    (repo / ".task.toml").write_text(f'knowledge = "cortex-kb-{name}"\ncheck_timeout = 5400\n')
     (repo / "README.md").write_text("Scratch project for task smoke; `task smoke --clean` removes it.\n")
     commit(repo, "scratch project")
     (kb / "backlog/tasks").mkdir(parents=True)
@@ -172,9 +176,10 @@ def build_scratch(run, found):
     if git(kb, "init", "-q", "-b", "main").returncode:
         raise Stop(f"git init failed in {kb}")
     for builder, (_, ident) in BUILDERS.items():
-        (kb / f"backlog/tasks/t-{ident[2:]} - Smoke {builder}.md").write_text(TASK.format(ident=ident, builder=builder))
+        (kb / f"backlog/tasks/t-{ident[2:]} - Smoke {builder}.md").write_text(
+            TASK.format(ident=ident, builder=builder, verify="test -s smoke.txt"))
         (kb / f"backlog/tasks/t-{REAL[builder][2:]} - Real checks {builder}.md").write_text(
-            TASK.format(ident=REAL[builder], builder=builder + " real checks"))
+            TASK.format(ident=REAL[builder], builder=builder + " real checks", verify="test -s justfile"))
     commit(kb, "smoke knowledge")
     signed = task("plan", name, "--sign")
     if signed.returncode:
@@ -217,6 +222,18 @@ def report_error(wt, log):
     return None
 
 
+def lane_check_error(wt, log):
+    """The lane's own `task check` (T-67): advisory, never trusted, passed on the lane's head."""
+    try:
+        checked = json.loads(read(wt / ".work/check.json") or "{}")
+    except ValueError:
+        checked = {}
+    head = git(wt, "rev-parse", "HEAD").stdout.strip()
+    if (checked.get("result"), checked.get("advisory"), checked.get("trusted"), checked.get("sha")) == ("passed", True, False, head):
+        return None
+    return lane_error(read(wt / ".work/check.log") + "\n" + log, "the lane recorded no passing advisory `task check` on its head")
+
+
 def review_verdict(repo, name):
     """The verdict `task review --run` recorded for the task; it exits 0 on FAIL too."""
     try:
@@ -239,11 +256,9 @@ def run_builder(run, found, builder, emit):
     wt = repo / ".worktrees" / f"t{ident[2:]}"
     steps = []
 
-    def done(step, error=None, result=None):
-        result = result or ("PASS" if error is None else "FAIL")
-        steps.append({"step": step, "result": result, "error": error or ""})
-        emit(f"  PASS {step}" if error is None else f"  SKIP hold: {step} unit skipped by the hold" if result == "SKIP"
-             else f"  FAIL {step}: {error}")
+    def done(step, error=None):
+        steps.append({"step": step, "result": "PASS" if error is None else "FAIL", "error": error or ""})
+        emit(f"  PASS {step}" if error is None else f"  FAIL {step}: {error}")
         return error is None
 
     error = reset_smoke(repo)
@@ -268,9 +283,6 @@ def run_builder(run, found, builder, emit):
     log = read(wt / ".work/lane.log")
     state, exit_code = lane_outcome(wt)
     error = None
-    if state == "skipped: hold":
-        done("lane", "hold", "SKIP")
-        return steps
     if lane.returncode != 0:
         error = command_error(lane)
     elif waited.returncode != 0:
@@ -280,7 +292,7 @@ def run_builder(run, found, builder, emit):
     if not done("lane", error):
         return steps
     for step, error in (("commit", commit_error(wt, base, log)), ("merge main", merge_error(wt, repo, log)),
-                        ("report", report_error(wt, log))):
+                        ("report", report_error(wt, log)), ("lane check", lane_check_error(wt, log))):
         if not done(step, error):
             return steps
     check = task("check", repo.name, ident)
@@ -355,12 +367,16 @@ def run_real_checks(run, found, builder, emit, repos, outside):
     if error is None:
         try:
             clone_real(run, repos, target)
+            # The lane runs only `task check`; this branch's check recipe runs each real check (T-67).
+            (wt / "justfile").write_text("check:\n" + "".join(
+                f"    python3 .work/real/real_check.py {name}\n" for name, _ in repos))
+            commit(wt, "smoke: check the real repositories")
         except (Stop, OSError) as stop:
             error = str(stop)
     if not done("real start", error):
         return steps
-    commands = "\n".join(f"Run: python3 .work/real/real_check.py {name}" for name, _ in repos)
-    (wt / ".work/prompt.md").write_text(REAL_PROMPT.format(ident=ident, builder=builder, commands=commands))
+    names = ", ".join(name for name, _ in repos)
+    (wt / ".work/prompt.md").write_text(REAL_PROMPT.format(ident=ident, builder=builder, names=names))
     lane = task("lane", repo.name, ident, "--builder", builder, "--model", model, "--effort", "low", "--timeout", "90")
     waited = task("wait", repo.name, ident, "--max", "100") if lane.returncode == 0 else lane
     error = command_error(lane) if lane.returncode else "the lane is still running after 100 minutes" if waited.returncode else None
@@ -459,15 +475,11 @@ def main(argv=None):
         for builder in names:
             emit(f"{builder} ({BUILDERS[builder][1]}, {BUILDERS[builder][0]}):")
             steps = run_builder(run, found, builder, emit)
-            if steps[-1]["result"] == "SKIP":
-                record["builders"][builder] = {"result": "SKIP hold", "steps": steps, "real": []}
-                continue
-            passed = len(steps) == 9 and all(step["result"] == "PASS" for step in steps)
+            passed = len(steps) == 10 and all(step["result"] == "PASS" for step in steps)
             real = run_real_checks(run, found, builder, emit, repos, outside) if repos is not None else []
             passed = passed and repos is not None and len(real) == 2 + len(repos) and all(step["result"] != "FAIL" for step in real)
             record["builders"][builder] = {"result": "PASS" if passed else "FAIL", "steps": steps, "real": real}
-        results = [b["result"] for b in record["builders"].values()]
-        record["result"] = "SKIP hold" if "SKIP hold" in results else "PASS" if all(r == "PASS" for r in results) else "FAIL"
+        record["result"] = "PASS" if all(b["result"] == "PASS" for b in record["builders"].values()) else "FAIL"
     except Exception as error:  # a crash is a failed run: keep its scratch project for inspection
         record["error"] = f"{type(error).__name__}: {error}"
         emit(f"  FAIL run: {record['error']}")
@@ -481,7 +493,7 @@ def main(argv=None):
             return 1
         emit(f"smoke {run}: PASS (scratch project removed; record {STATE / 'smoke' / (run + '.json')})")
         return 0
-    emit(f"smoke {run}: {record['result']} (record {STATE / 'smoke' / (run + '.json')})")
+    emit(f"smoke {run}: FAIL (record {STATE / 'smoke' / (run + '.json')})")
     for path in found.values():
         emit(f"kept {path}")
     emit(f"Remove with: task smoke --clean {run}")

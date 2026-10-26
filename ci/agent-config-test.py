@@ -154,7 +154,14 @@ assert "uv run --no-project --with colorama==0.4.6 python smoke_nested.py" in sm
 assert "seed_uv_cache" in launch and "user_uv_cache" in launch
 readme = (ROOT / "README.md").read_text(encoding="utf-8")
 assert "private uv, pip, pre-commit and npm caches" in readme
-assert "--sandbox" not in launch
+# Codex launches use permission profiles, never Codex's --sandbox flag; only agy's own --sandbox (its
+# terminal sandbox, decision-32 Gemini review route) may appear, and only inside agy_command.
+launch_lines = launch.splitlines()
+for index, line in enumerate(launch_lines):
+    if "--sandbox" in line:
+        owner = next(text for text in reversed(launch_lines[:index + 1]) if text.startswith("def "))
+        assert owner.startswith("def agy_command("), (index + 1, line)
+assert '"agy --mode plan --sandbox ' in launch
 assert launch.count('default_permissions="lane"') == 1 and launch.count('default_permissions=\\"review\\"') == 2
 assert launch.count('default_permissions="review"') == 1
 assert "PreToolUse" in claude["hooks"]

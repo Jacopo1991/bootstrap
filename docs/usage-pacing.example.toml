@@ -50,16 +50,17 @@ high_paths = { "*" = ["policy/**", "skills/**/SKILL.md", "skills/**/references/*
 max_rounds = 2
 extra_rounds = 1
 
-# Reviewer model keyed by builder vendor; the reviewer uses the other vendor.
+# Reviewer model keyed by builder vendor (company decision-32): a fresh Codex session reviews Codex-built
+# normal-risk work; high risk uses another vendor than the author, never Opus by default.
 [review.normal]
-codex = "haiku"
+codex = "gpt-6.1-sol"
 claude = "gpt-6-luna"
 max_rounds = 3
 extra_rounds = 1
 
 [review.high]
-codex = "haiku"
-claude = "gpt-6-luna"
+codex = "sonnet"
+claude = "gpt-6.1-sol"
 max_rounds = 3
 extra_rounds = 1
 red_team_model = "gpt-6.1-sol"
