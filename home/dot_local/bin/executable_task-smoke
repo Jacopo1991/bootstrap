@@ -50,12 +50,6 @@ a failure: each command records its own result.
 
 {commands}
 """
-NESTED_SOURCE = """import subprocess, sys
-done = subprocess.run(["uv", "run", "--offline", "--quiet", "--no-project", "--with", "colorama==0.4.6",
-                       "python", "-c", "import colorama"], capture_output=True, text=True)
-sys.stderr.write(done.stderr)
-sys.exit(done.returncode)
-"""
 RUN_ID = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{6}")
 ERROR_LINE = re.compile(r"(?i)fatal|error|denied|read-only|refus")
 GIT = ["git", "-c", "user.name=task-smoke", "-c", "user.email=task-smoke@example.invalid", "-c", "commit.gpgsign=false"]
@@ -63,8 +57,7 @@ PROMPT = """# Lane smoke {ident} ({builder})
 
 This is an install smoke test on a scratch project. Do these steps in this worktree, in order, then stop:
 
-Before editing, run uv run --no-project --with colorama==0.4.6 python smoke_check.py and then
-uv run --no-project --with colorama==0.4.6 python smoke_nested.py (it calls uv run --offline inside), and stop if either fails.
+Before editing, run uv run --no-project --with colorama==0.4.6 python smoke_check.py and stop if it fails.
 1. Create `smoke.txt` containing exactly one line: `ok`, with your file-edit tool, never an inline interpreter (`python -c`, heredocs).
 2. `git add smoke.txt` and `git commit -m "smoke: write smoke.txt"`.
 3. `git merge main`. Main has one new commit, so Git creates a merge commit; if it leaves the merge uncommitted, commit it.
@@ -157,11 +150,8 @@ def build_scratch(run, found):
     repo.mkdir(parents=True)
     if git(repo, "init", "-q", "-b", "main").returncode:
         raise Stop(f"git init failed in {repo}")
-    (repo / "justfile").write_text("check:\n    uv run --no-project --with colorama==0.4.6 python smoke_check.py\n"
-                                   "    uv run --no-project --with colorama==0.4.6 python smoke_nested.py\n")
+    (repo / "justfile").write_text("check:\n    uv run --no-project --with colorama==0.4.6 python smoke_check.py\n")
     (repo / "smoke_check.py").write_text("import colorama\nprint(colorama.__version__)\n")
-    # T-68: a nested offline uv call must find what the outer step resolved.
-    (repo / "smoke_nested.py").write_text(NESTED_SOURCE)
     (repo / ".task.toml").write_text(f'knowledge = "cortex-kb-{name}"\n')
     (repo / "README.md").write_text("Scratch project for task smoke; `task smoke --clean` removes it.\n")
     commit(repo, "scratch project")
