@@ -150,6 +150,8 @@ assert 'temporary / directory' in launch
 smoke = (ROOT / "home/dot_local/bin/executable_task-smoke").read_text(encoding="utf-8")
 uv_step = "uv run --no-project --with colorama==0.4.6 python smoke_check.py"
 assert uv_step in smoke and "import colorama" in smoke
+assert "uv run --no-project --with colorama==0.4.6 python smoke_nested.py" in smoke and '"--offline"' in smoke
+assert "seed_uv_cache" in launch and "user_uv_cache" in launch
 readme = (ROOT / "README.md").read_text(encoding="utf-8")
 assert "private uv, pip, pre-commit and npm caches" in readme
 assert "--sandbox" not in launch
