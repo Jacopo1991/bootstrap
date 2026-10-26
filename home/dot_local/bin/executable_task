@@ -2913,8 +2913,10 @@ def start_locked(args, repo):
         if candidate.is_symlink() and not candidate.exists():
             print(f"warning: environment link {candidate} does not resolve.")
     for name in args.seed: seed_source(repo, name)
-    for name in args.base:
-        if (len(name) > 100 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*", name)
+    carried = previous.get("bases") if isinstance(previous.get("bases"), list) else []
+    declared = list(dict.fromkeys(carried + args.base))  # a refresh keeps earlier declarations
+    for name in declared:
+        if (not isinstance(name, str) or len(name) > 100 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*", name)
                 or ".." in name or name.endswith(".") or any(part.endswith(".lock") for part in name.split("/"))
                 or name in {"HEAD", "main", default_branch(repo)}):
             raise Stop(f"--base {name!r} must be a plain local branch name other than the default branch.")
@@ -2984,6 +2986,7 @@ def start_locked(args, repo):
                   "verify": verify, "no_verify": args.no_verify or "", "off_plan": off_plan or "",
                   "milestone": frontmatter_value(task_text, "milestone"),
                   "seeds": list(dict.fromkeys(previous_seeds + args.seed)),
+                  **({"bases": declared} if declared else {}),
                   **({"plan": os.environ["TASK_PLAN"]} if os.environ.get("TASK_PLAN") else {})}
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
@@ -3007,7 +3010,7 @@ def start_locked(args, repo):
         record["bases"] = bases
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
-    for name in args.base:
+    for name in record.get("bases", []):
         if not is_ancestor(task.path, f"refs/heads/{name}", "HEAD"):
             merged = run_git(task.path, "merge", "--no-edit", f"refs/heads/{name}")
             if merged.returncode:

@@ -9040,6 +9040,11 @@ store.write_text(json.dumps(prs))
         self.assertEqual((wt / "t33.txt").read_text(), "scorer v2\n")
         self.assertNotIn("Merged base", self.task("start", "proj", "T-5"))
         self.assertEqual(json.loads((self.state() / "task.json").read_text())["bases"], ["t33-scorer"])
+        # A refresh without --base keeps the declaration (the hook below reads the rebuilt record).
+        self.task("start", "proj", "T-5", "--refresh")
+        refreshed = json.loads((self.state() / "task.json").read_text())
+        self.assertEqual(refreshed["bases"], ["t33-scorer"])
+        self.assertEqual(refreshed["revision"], TASK_MODULE.record_revision(refreshed))
         # The lane hook reads that private record: the declared base merges, others are refused.
         spec = importlib.util.spec_from_file_location("agent_policy_t70", ROOT / "system/agent-policy/pre_tool_use.py")
         policy = importlib.util.module_from_spec(spec)
@@ -9068,6 +9073,25 @@ store.write_text(json.dumps(prs))
                           self.task("start", "proj", "T-5", "--base", "other", cwd=wt, code=1))
             self.assertEqual((self.state() / "task.json").read_text(), before)
         self.assertIsNotNone(judge("Bash", {"command": "git merge --no-edit other"}))
+
+    def test_start_base_refresh_adds_and_revalidates_carried_declarations(self):
+        self.git(self.repo, "remote", "remove", "origin")
+        self.base_branch("t33-scorer")
+        self.base_branch("other", "other.txt")
+        self.task("start", "proj", "T-5", "--base", "t33-scorer")
+        self.assertIn("Merged base other", self.task("start", "proj", "T-5", "--refresh", "--base", "other"))
+        record_path = self.state() / "task.json"
+        self.assertEqual(json.loads(record_path.read_text())["bases"], ["t33-scorer", "other"])
+        # Carried names pass the same validation as --base: a bad or vanished one stops the refresh.
+        for bad, message in (("--strategy=ours", "must be a plain local branch name"),
+                             ("refs/heads/other", "no local branch of that name"),
+                             ("gone", "no local branch of that name")):
+            record = json.loads(record_path.read_text())
+            record["bases"] = ["t33-scorer", bad]
+            record["revision"] = TASK_MODULE.record_revision(record)
+            record_path.write_text(json.dumps(record))
+            self.assertIn(message, self.task("start", "proj", "T-5", "--refresh", code=1), bad)
+            self.assertEqual(json.loads(record_path.read_text())["bases"], ["t33-scorer", bad])
 
     def test_start_base_refuses_bad_names_and_reports_conflicts(self):
         self.git(self.repo, "remote", "remove", "origin")
