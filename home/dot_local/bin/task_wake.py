@@ -86,7 +86,8 @@ def flusher_alive(home, pm):
 
 def start_flusher(home, pm):
     """A transient user service leaves the emitting unit's cgroup and has no hold condition; without
-    a user manager (a plain shell, the tests) a detached process does the same job."""
+    a user manager (a plain shell, the tests) a detached process does the same job;
+    there is then no emitting unit whose cgroup it could need to leave."""
     window = os.environ.get("TASK_PM_WAKE_WINDOW", str(WINDOW))
     retry = os.environ.get("TASK_PM_WAKE_RETRY", str(RETRY))
     command = [sys.executable, str(Path(__file__).resolve()), "flush", pm, window, retry]
