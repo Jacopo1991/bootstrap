@@ -8850,6 +8850,75 @@ store.write_text(json.dumps(prs))
         self.assertEqual(self.git(self.repo, "show", "main:b.txt"), "x")
         self.assertEqual(self.git(self.repo, "branch", "--show-current"), "someone-else", "checkout untouched")
 
+    def base_branch(self, name, file="t33.txt", text="scorer\n"):
+        self.git(self.repo, "switch", "-q", "-c", name)
+        self.commit_in(self.repo, file, text)
+        self.git(self.repo, "switch", "-q", "main")
+
+    def test_start_base_merges_declared_branch_and_lane_hook_allows_only_it(self):
+        self.git(self.repo, "remote", "remove", "origin")
+        self.base_branch("t33-scorer")
+        self.base_branch("other", "other.txt")
+        out = self.task("start", "proj", "T-5", "--base", "t33-scorer")
+        wt = self.repo / ".worktrees/t5"
+        self.assertIn("Merged base t33-scorer into t5-add-the-b-file.", out)
+        self.assertEqual((wt / "t33.txt").read_text(), "scorer\n")
+        self.assertFalse((wt / "other.txt").exists())
+        record = json.loads((self.state() / "task.json").read_text())
+        self.assertEqual(record["bases"], ["t33-scorer"])
+        self.assertEqual(record["revision"], TASK_MODULE.record_revision(record))
+        # Resuming keeps the declaration; a new commit on the base is merged again.
+        self.git(self.repo, "switch", "-q", "t33-scorer")
+        self.commit_in(self.repo, "t33.txt", "scorer v2\n")
+        self.git(self.repo, "switch", "-q", "main")
+        self.assertIn("Merged base t33-scorer", self.task("start", "proj", "T-5", "--base", "t33-scorer"))
+        self.assertEqual((wt / "t33.txt").read_text(), "scorer v2\n")
+        self.assertNotIn("Merged base", self.task("start", "proj", "T-5"))
+        self.assertEqual(json.loads((self.state() / "task.json").read_text())["bases"], ["t33-scorer"])
+        # The lane hook reads that private record: the declared base merges, others are refused.
+        spec = importlib.util.spec_from_file_location("agent_policy_t70", ROOT / "system/agent-policy/pre_tool_use.py")
+        policy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(policy)
+        def judge(tool, data):
+            event = {"tool_name": tool, "tool_input": data, "cwd": str(wt)}
+            with mock.patch.object(policy.Path, "home", return_value=self.home), \
+                    mock.patch.dict(os.environ, {"TASK_WORKTREE": str(wt.resolve())}):
+                return policy.evaluate(event, (self.repo.parent,))
+        self.assertIsNone(judge("Bash", {"command": "git merge --no-edit t33-scorer"}))
+        self.assertEqual(judge("Bash", {"command": "git merge --no-edit other"}),
+                         "In a repository without a remote, only git merge [--no-edit] main is allowed.")
+        for command in ("git merge --no-edit refs/heads/t33-scorer", "git merge --no-edit t33-scorer~1",
+                        "git merge --squash t33-scorer"):
+            self.assertIsNotNone(judge("Bash", {"command": command}), command)
+        # ...and the lane cannot add a base to that record itself.
+        record_path = str(self.state() / "task.json")
+        self.assertIsNotNone(judge("Write", {"file_path": record_path, "content": "{}"}))
+        self.assertIsNotNone(judge("Edit", {"file_path": record_path, "old_string": "t33-scorer",
+                                            "new_string": "other"}))
+        self.assertIsNotNone(judge("Bash", {"command": f"sed -i s/t33-scorer/other/ {record_path}"}))
+        if os.geteuid():  # root ignores the read-only mount's permission bits
+            before = (self.state() / "task.json").read_text()
+            self.sandbox_state()  # a lane sees private task state read-only, so task start refuses
+            self.assertIn("Private task state is not writable",
+                          self.task("start", "proj", "T-5", "--base", "other", cwd=wt, code=1))
+            self.assertEqual((self.state() / "task.json").read_text(), before)
+        self.assertIsNotNone(judge("Bash", {"command": "git merge --no-edit other"}))
+
+    def test_start_base_refuses_bad_names_and_reports_conflicts(self):
+        self.git(self.repo, "remote", "remove", "origin")
+        self.base_branch("t33-scorer", "a.txt", "base side\n")
+        for name in ("-x", "--strategy=ours", "t33-scorer:main", "../t33-scorer", "/tmp/t33-scorer",
+                     "refs/heads/t33-scorer", "a..b", "t33-scorer~1", "main", "HEAD", "x.lock", "missing"):
+            out = self.task("start", "proj", "T-5", f"--base={name}", code=1)
+            self.assertIn("--base", out, name)
+            self.assertFalse((self.repo / ".worktrees/t5").exists(), name)
+        self.commit_in(self.repo, "a.txt", "main side\n")
+        out = self.task("start", "proj", "T-5", "--base", "t33-scorer", code=1)
+        wt = self.repo / ".worktrees/t5"
+        self.assertIn("Merging base t33-scorer into t5-add-the-b-file failed; it was aborted", out)
+        self.assertEqual(self.git(wt, "status", "--porcelain"), "")
+        self.assertEqual((wt / "a.txt").read_text(), "main side\n")
+
     def test_conflict_is_reported_not_forced(self):
         wt, _ = self.started()
         self.commit_in(wt, "a.txt", "lane\n")

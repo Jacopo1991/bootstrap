@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -653,9 +654,41 @@ def _merge_options_configured(target: Path, current: str) -> bool:
     return options.returncode != 1
 
 
+TASK_BASE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*")
+
+
+def task_base_name(value: object) -> bool:
+    """A declared base is a short plain branch name: no options, refspecs, paths or revisions."""
+    return (isinstance(value, str) and len(value) <= 100 and bool(TASK_BASE_NAME.fullmatch(value))
+            and plain_branch_name(value) and value not in {"HEAD", LOCAL_DEFAULT_BRANCH})
+
+
+def declared_bases(target: Path, current: str) -> list[str]:
+    """Bases the PM declared with `task start --base`, read only from the pinned task record in
+    private task state (lanes cannot write it) and only for the branch that record pins."""
+    try:
+        common = Path(_read_git(target, "rev-parse", "--path-format=absolute",
+                                "--git-common-dir")).resolve()
+        top = Path(_read_git(target, "rev-parse", "--show-toplevel")).resolve()
+        if common.name != ".git" or top.parent != common.parent / ".worktrees":
+            return []
+        path = Path.home() / ".local/state/task" / common.parent.name / top.name / "task.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        body = {key: value for key, value in record.items() if key != "revision"}
+        revision = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        return []
+    bases = record.get("bases")
+    if (record.get("revision") != revision or record.get("branch") != current[len("refs/heads/"):]
+            or not isinstance(bases, list)):
+        return []
+    return [name for name in bases if task_base_name(name)]
+
+
 def local_only_merge(arguments: list[str], target: Path, current: str) -> str | None:
     """Repositories with no remote at all (local-only projects): a task branch may merge the
-    local main branch, nothing else. Its commits were scanned when they were committed."""
+    local main branch, or a base its task record declares, nothing else. Its commits were
+    scanned when they were committed."""
     if not current.startswith("refs/heads/"):
         return "Cannot identify the current branch safely."
     local_main = policy_subprocess(
@@ -671,14 +704,15 @@ def local_only_merge(arguments: list[str], target: Path, current: str) -> str | 
             return "This local-only repository uses master; rename the default branch to main."
     if current == "refs/heads/" + LOCAL_DEFAULT_BRANCH:
         return "Merging into the default branch is blocked; update only a task branch."
-    if arguments not in ([LOCAL_DEFAULT_BRANCH], ["--no-edit", LOCAL_DEFAULT_BRANCH]):
+    name = arguments[-1] if arguments[:-1] in ([], ["--no-edit"]) and arguments else None
+    if name != LOCAL_DEFAULT_BRANCH and (
+            not task_base_name(name) or name not in declared_bases(target, current)):
         return ("In a repository without a remote, only git merge [--no-edit] "
                 + LOCAL_DEFAULT_BRANCH + " is allowed.")
-    source = "refs/heads/" + LOCAL_DEFAULT_BRANCH
+    source = "refs/heads/" + name
     _read_git(target, "rev-parse", "--verify", source + "^{commit}")
-    if _read_git(target, "rev-parse", "--symbolic-full-name", "--verify",
-                 LOCAL_DEFAULT_BRANCH) != source:
-        return "The merge source must resolve uniquely to the local " + LOCAL_DEFAULT_BRANCH + " branch."
+    if _read_git(target, "rev-parse", "--symbolic-full-name", "--verify", name) != source:
+        return "The merge source must resolve uniquely to the local " + name + " branch."
     if _merge_options_configured(target, current):
         return "Configured merge options or unreadable configuration are blocked."
     return None

@@ -2,6 +2,8 @@
 """Hosted synthetic metadata tests; no remote connection or PR merge."""
 import importlib.util
 import atexit
+import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -268,3 +270,86 @@ with tempfile.TemporaryDirectory() as temporary:
     reason = policy.evaluate(event, (base / "dev_workspace", base / "cortex"))
     assert reason and "rename the default branch to main" in reason, reason
 print("PASS: local-only repositories merge only the local main into a task branch; master gets rename guidance")
+
+# T-70: a task record (private task state, written by `task start --base`) may declare local
+# base branches; the lane may then merge exactly those, and cannot declare one itself.
+with tempfile.TemporaryDirectory() as temporary:
+    base = Path(temporary)
+    home = base / "home"
+    code = base / "dev_workspace"
+    roots = (code, base / "cortex")
+    repo = code / "proj"
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q", "--initial-branch=main")
+    git(repo, "config", "user.name", "CI")
+    git(repo, "config", "user.email", "ci@example.invalid")
+    (repo / "safe.txt").write_text("safe synthetic content\n", encoding="utf-8")
+    git(repo, "add", ".")
+    git(repo, "commit", "-q", "-m", "base")
+    for name in ("t33-scorer", "other", "team/feature"):
+        git(repo, "branch", name)
+    worktree = repo / ".worktrees" / "t5"
+    git(repo, "worktree", "add", "-q", "-b", "t5-build", str(worktree))
+    state = home / ".local/state/task/proj/t5/task.json"
+    def declare(bases, branch="t5-build", damage=False):
+        record = {"id": "T-5", "branch": branch, "bases": bases}
+        body = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        record["revision"] = "0" * 64 if damage else hashlib.sha256(body).hexdigest()
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps(record), encoding="utf-8")
+    lane_env = {"TASK_WORKTREE": str(worktree.resolve())}
+    def judge(command, tool="Bash", data=None):
+        event = {"tool_name": tool, "tool_input": data or {"command": command}, "cwd": str(worktree)}
+        with patch.object(policy.Path, "home", return_value=home), patch.dict(os.environ, lane_env):
+            return policy.evaluate(event, roots)
+    refusal = "In a repository without a remote, only git merge [--no-edit] main is allowed."
+    # No declaration: today's behaviour and message.
+    assert judge("git merge --no-edit main") is None
+    assert judge("git merge --no-edit t33-scorer") == refusal, judge("git merge --no-edit t33-scorer")
+    declare(["t33-scorer", "team/feature"])
+    for command in ("git merge --no-edit t33-scorer", "git merge t33-scorer",
+                    "git merge --no-edit team/feature", "git merge --no-edit main",
+                    "git merge-tree --write-tree HEAD t33-scorer"):
+        assert judge(command) is None, command + ": " + str(judge(command))
+    # Undeclared branches and every non-plain spelling of a declared one stay refused.
+    for tail in ("other", "--no-edit other", "refs/heads/t33-scorer", "t33-scorer~1",
+                 "t33-scorer^", "t33-scorer:main", "./t33-scorer", "--squash t33-scorer",
+                 "-s ours t33-scorer", "t33-scorer --no-edit", "t33-scorer other",
+                 "--no-edit t33-scorer main"):
+        assert judge("git merge " + tail), tail
+    # Malformed declarations are ignored, never interpreted.
+    for bad in ("--strategy=ours", "x:y", "../t33-scorer", "/tmp/repo", "a..b", "HEAD", "x.lock"):
+        declare([bad, "t33-scorer"])
+        assert judge("git merge --no-edit " + bad), bad
+        assert judge("git merge --no-edit t33-scorer") is None, bad
+    # A record for another branch, a damaged record or a non-list declares nothing.
+    declare(["t33-scorer"], branch="t6-other")
+    assert judge("git merge --no-edit t33-scorer") == refusal
+    declare(["t33-scorer"], damage=True)
+    assert judge("git merge --no-edit t33-scorer") == refusal
+    declare("t33-scorer")
+    assert judge("git merge --no-edit t33-scorer") == refusal
+    # A tag shadowing the declared branch is refused rather than guessed.
+    declare(["t33-scorer"])
+    git(repo, "tag", "t33-scorer")
+    assert judge("git merge --no-edit t33-scorer")
+    git(repo, "tag", "-d", "t33-scorer")
+    # The lane cannot write the declaration: not with the edit tools, not through the shell,
+    # and lane-writable places (.work, git config) do not count as a declaration.
+    for tool in ("Write", "Edit"):
+        assert judge("", tool, {"file_path": str(state), "content": "{}"}), tool
+    for command in ("printf x > " + str(state), "cp /dev/null " + str(state),
+                    "python3 -c pass " + str(state), "rm " + str(state),
+                    "git config branch.t5-build.base other"):
+        assert judge(command), command
+    state.unlink()
+    (worktree / ".work").mkdir()
+    (worktree / ".work/task.json").write_text(json.dumps({"branch": "t5-build", "bases": ["other"]}))
+    assert judge("git merge --no-edit other") == refusal
+    # A plain repository checkout (not a task worktree) never reads a declaration.
+    declare(["other"])
+    git(repo, "switch", "-q", "-c", "t5-build-copy")
+    event = {"tool_name": "Bash", "tool_input": {"command": "git merge --no-edit other"}, "cwd": str(repo)}
+    with patch.object(policy.Path, "home", return_value=home):
+        assert policy.evaluate(event, roots) == refusal
+print("PASS: lanes merge only bases their private task record declares; lanes cannot declare one")

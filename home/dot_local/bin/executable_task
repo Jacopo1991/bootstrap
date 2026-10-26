@@ -2873,6 +2873,13 @@ def start_locked(args, repo):
         if candidate.is_symlink() and not candidate.exists():
             print(f"warning: environment link {candidate} does not resolve.")
     for name in args.seed: seed_source(repo, name)
+    for name in args.base:
+        if (len(name) > 100 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)*", name)
+                or ".." in name or name.endswith(".") or any(part.endswith(".lock") for part in name.split("/"))
+                or name in {"HEAD", "main", default_branch(repo)}):
+            raise Stop(f"--base {name!r} must be a plain local branch name other than the default branch.")
+        if not ok(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{name}^{{commit}}"):
+            raise Stop(f"--base {name}: no local branch of that name.")
     task_tier(task_text, args.tier)
     if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], dict(repo=repo.name, task=task.id, kind="start", vendor=args.builder), reserve=None); bind_plan(task, args, save=True)
     if task.path.exists():
@@ -2955,6 +2962,18 @@ def start_locked(args, repo):
         record["seeds"] = seeds
         record["revision"] = record_revision(record)
         atomic_json(record_path, record)
+    bases = list(dict.fromkeys(record.get("bases", []) + args.base))
+    if bases != record.get("bases", []):
+        record["bases"] = bases
+        record["revision"] = record_revision(record)
+        atomic_json(record_path, record)
+    for name in args.base:
+        if not is_ancestor(task.path, f"refs/heads/{name}", "HEAD"):
+            merged = run_git(task.path, "merge", "--no-edit", f"refs/heads/{name}")
+            if merged.returncode:
+                run_git(task.path, "merge", "--abort")
+                raise Stop(f"Merging base {name} into {branch} failed; it was aborted: {merged.stderr.strip()}")
+            print(f"Merged base {name} into {branch}.")
     if args.no_verify:
         print(f"exception: verification omitted: {args.no_verify}")
     if "Verification and tools" in task_text:
@@ -5227,6 +5246,8 @@ def main(argv=None):
             sub.add_argument("--builder", choices=("codex", "claude"), required=True)
             sub.add_argument("--refresh", action="store_true")
             sub.add_argument("--seed", action="append", default=[], metavar="NAME")
+            sub.add_argument("--base", action="append", default=[], metavar="BRANCH",
+                             help="local branch this task builds on: merged at start, and the lane may merge it")
             sub.add_argument("--no-verify", metavar="REASON")
             sub.add_argument("--off-plan", metavar="REASON")
         if name == "lane":

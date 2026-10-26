@@ -810,6 +810,11 @@ task worktree, including an existing worktree. Resumed runner lines naming a see
 apply it through the same start path. Identical targets are left alone; a differing
 file or directory stops with a conflict message and preserves lane work.
 
+`task start --base <branch>` declares a local branch the task builds on: it must be a
+plain existing local branch name, is recorded in the task record and merged into the task
+branch at start (a conflict aborts the merge and stops). In a repository without a remote,
+the lane may then run `git merge --no-edit <branch>` for that declared branch only.
+
 Before reporting, builders run advisory `task check` from the worktree on the final
 commit and paste its final PASS/FAIL line, including the log path, under `## Check`
 in `.work/report.md`. `review --run` requires a passing check for that head and
@@ -1943,7 +1948,9 @@ the hook never contacts a remote to discover it.
 Local-only repositories (no remote configured at all) have their own exception:
 `git merge [--no-edit] main` on an attached task branch, where `main` must resolve
 uniquely to the local branch (a tag of that name blocks it) and no branch merge options
-may be configured. Adding any remote switches the repository back to the rules above.
+may be configured. A task branch may also merge, in the same form, a local base branch its
+pinned task record declares (`task start --base <branch>`); the hook reads that record from
+private task state, which lanes cannot write. Adding any remote switches the repository back to the rules above.
 A read-only preview, `git merge-tree --write-tree [--name-only] HEAD <source>`, is
 allowed wherever the same `<source>` may be merged.
 Cross-repository reads use `git --no-pager --no-optional-locks -C <repo>`
