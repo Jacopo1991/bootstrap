@@ -1076,7 +1076,8 @@ def redteam(args):
                                   env={**agent_environment(), 'GIT_OPTIONAL_LOCKS': '0'}, stdin=source,
                                   stdout=output_stream if vendor == 'claude' else None)
             code = process.wait()
-        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code))
+        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code,
+                                                       **(dict(state='skipped: hold', ended_at=utc_now()) if process.skipped else {})))
         if process.skipped: raise Stop('skipped: hold')
         if code or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
             raise Stop("risk high: red-team failed or head changed; no output recorded")
@@ -3552,7 +3553,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         try:
             code = process.wait()
             if process.skipped:
-                atomic_json(run_file, dict(run, unit=process.unit, state='skipped: hold'))
+                atomic_json(run_file, dict(run, unit=process.unit, state='skipped: hold', ended_at=utc_now()))
                 if usage_run: (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
                 raise Stop('skipped: hold')
             print(reply_file.with_name('review-unit.log').read_text(), end='', file=sys.stderr)

@@ -310,8 +310,22 @@ class TaskTool(unittest.TestCase):
                     review = json.loads((self.state() / 'review-run.json').read_text())
                     self.assertEqual(review['state'], 'skipped: hold')
                     self.assertTrue(review['unit'])
-                finally:
+                    self.assertRegex(review['ended_at'], r'^\d{4}-\d\d-\d\dT')
+                    self.assertEqual(review['ended_at'][-1], lane['ended_at'][-1])
+                    self.assertEqual(len(review['ended_at']), len(lane['ended_at']))
                     marker.unlink()
+                    self.raw_task('risk', 'proj', '5', 'high', '--reason', 'safety')
+                    self.prepare_merge_evidence('5')
+                    brief = self.home / 'redteam-brief.md'
+                    brief.write_text('Attack the safety assumptions.\n')
+                    marker.write_text('unit admission hold')
+                    self.assertIn('skipped: hold', self.raw_task('redteam', 'proj', '5', '--brief', str(brief), code=1))
+                    red = json.loads((self.state() / 'redteam-run.json').read_text())
+                    self.assertEqual((red['state'], red['result']), ('skipped: hold', 'skipped: hold'))
+                    self.assertTrue(red['unit'])
+                    self.assertEqual(len(red['ended_at']), len(lane['ended_at']))
+                finally:
+                    marker.unlink(missing_ok=True)
 
     def test_finished_and_failed_units_are_not_recorded_as_skipped(self):
         self.stub_models()
