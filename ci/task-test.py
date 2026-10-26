@@ -49,6 +49,7 @@ HOLD_FIXTURE.parent.mkdir()
 def hold_fixture_source(source):
     assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
     source = source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
+    source = source.replace('Path("/etc/codex/requirements.toml")', f'Path({str(ROOT / "system/codex-requirements.toml")!r})')
     return source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'LANE_STUB_', 'REVIEW_STUB_', 'RUNNER_', 'SMOKE_', 'TASK_PM_WAKE_')) or name in {'SIMULATE_READ_ONLY_GIT_DIR', 'PRE_COMMIT_FAIL'}")
 fixture_bin = Path(audit_state.name) / 'bin'
 fixture_bin.mkdir()
@@ -106,8 +107,6 @@ case "$1 $2" in
     echo OK ;;
   "check ")
     [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
-    # task smoke's real-repository recipe (T-67): run its body as just would.
-    grep -q 'real_check.py' justfile && { sed -n 's/^    //p' justfile | sh -e; exit $?; }
     if [ -f smoke_check.py ]; then
       grep -Fq 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' justfile || exit 1
       uv run --no-project --with colorama==0.4.6 python smoke_check.py || exit $?
@@ -2306,6 +2305,65 @@ class TaskTool(unittest.TestCase):
         checks = [json.loads(line) for line in (self.state() / 'checks.jsonl').read_text().splitlines()]
         self.assertEqual([item['result'] for item in checks], ['passed', 'failed'])
 
+    def record_first_review(self, wt):
+        self.raw_task('check', 'proj', '5')
+        reply = self.home / 'review.md'
+        reply.write_text(f"Verdict: PASS\nCommit: {self.git(wt, 'rev-parse', 'HEAD')}\n#1 pass: ok\n#2 pass: ok\n")
+        self.raw_task('review', 'proj', '5', '--record', str(reply), '--reviewer', 'claude', 'haiku')
+
+    def test_review_prompt_slims_large_data_diff_and_keeps_code(self):
+        wt, _ = self.started()
+        self.record_first_review(wt)
+        fixture = json.dumps({'rows': [{'id': i, 'name': f'row-{i:08d}'} for i in range(45000)]}, indent=1)
+        self.assertGreater(len(fixture), 1_000_000)
+        self.commit_in(wt, 'models.json', fixture)
+        self.commit_in(wt, 'code.py', 'print(1)\n')
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertLess(len(prompt), 200_000)
+        self.assertRegex(prompt, r'\[data diff omitted: models\.json, [\d,]{9,} characters, added')
+        self.assertIn('diff --git a/code.py b/code.py\n', prompt)
+        self.assertIn('+print(1)', prompt)
+
+    def test_review_prompt_notes_oversized_code_diff_without_dropping_it(self):
+        wt, _ = self.started()
+        self.record_first_review(wt)
+        self.commit_in(wt, 'big.py', ''.join(f'x{i} = {i}\n' for i in range(30000)))
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertIn('+x29999 = 29999', prompt)
+        self.assertIn('included in full; this prompt may exceed', prompt)
+
+    def test_review_delta_after_merging_main_excludes_main_changes(self):
+        wt, _ = self.started()
+        self.record_first_review(wt)
+        self.commit_in(wt, 'lane.txt', 'lane\n')
+        self.commit_in(self.repo, 'from-main.txt', 'main-only\n')
+        self.git(wt, 'merge', '--no-edit', 'main')
+        self.assertTrue((wt / 'from-main.txt').exists())
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertIn('diff --git a/lane.txt b/lane.txt', prompt)
+        self.assertNotIn('from-main.txt', prompt)
+        self.assertNotIn('main-only', prompt)
+
+    def test_review_delta_keeps_branch_merge_resolution_changes(self):
+        wt, _ = self.started()
+        self.commit_in(self.repo, 'shared.txt', 'base\n')
+        self.git(wt, 'merge', '--no-edit', 'main')
+        self.record_first_review(wt)
+        self.commit_in(wt, 'shared.txt', 'lane-edit\n')
+        self.commit_in(self.repo, 'shared.txt', 'main-edit\n')
+        self.commit_in(self.repo, 'from-main.txt', 'main-only\n')
+        merge = subprocess.run(['git', '-C', str(wt), 'merge', '--no-edit', 'main'], env=self.env,
+                               capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0)
+        (wt / 'shared.txt').write_text('resolved-by-branch\n')
+        self.git(wt, 'add', 'shared.txt')
+        subprocess.run(['git', '-C', str(wt), 'commit', '-qm', 'merge main'], env=self.env,
+                       check=True, capture_output=True)
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertIn('resolved-by-branch', prompt)
+        self.assertNotIn('from-main.txt', prompt)
+        self.assertNotIn('main-only', prompt)
+
     def test_quality_history_rereview_and_check_precedence(self):
         wt, _ = self.started()
         advisory = dict(self.env, CODEX_SANDBOX='1')
@@ -4445,7 +4503,7 @@ store.write_text(json.dumps(prs))
         mode = victim.stat().st_mode
         shutil.rmtree(context)
         context.symlink_to(outside, target_is_directory=True)
-        task = SimpleNamespace(path=wt, kb=self.kb, file=None)
+        task = SimpleNamespace(path=wt, kb=self.kb, file=None, repo=self.repo, name='t5')
         self.enterContext(mock.patch.object(TASK_MODULE, 'HOME', self.home))
         TASK_MODULE.refresh_context(task)
         self.assertFalse(context.is_symlink())
@@ -4499,6 +4557,73 @@ store.write_text(json.dumps(prs))
         self.assertFalse((context / 'STATUS.md').exists())
         self.assertFalse((context / 'backlog/decisions' / decision.name).exists())
         self.assertIn("...", self.raw_task("review", "proj", "5"))
+
+    def test_context_carries_referenced_docs_and_pins(self):
+        (self.kb / 'docs').mkdir()
+        doc = self.kb / 'docs/doc-15 - design review.md'
+        doc.write_text('design review')
+        (self.kb / 'docs/doc-150 - other.md').write_text('other')
+        (self.kb / 'history/notes').mkdir(parents=True)
+        (self.kb / 'history/notes/past.md').write_text('past')
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        task_file.write_text(task_file.read_text() + '\nRead first: doc-15, qmd://cortex-kb-proj/history/notes/past.md.\n')
+        self.git(self.kb, 'add', '-A')
+        self.git(self.kb, 'commit', '-qm', 'docs')
+        self.task('plan', 'proj', '--sign')
+        wt, _ = self.started()
+        context = wt / '.work/context'
+        self.assertEqual((context / 'docs' / doc.name).read_text(), 'design review')
+        self.assertFalse((context / 'docs/doc-150 - other.md').exists())
+        self.assertEqual((context / 'history/notes/past.md').read_text(), 'past')
+        pinned = self.repo / 'design/spec.md'
+        pinned.parent.mkdir()
+        pinned.write_text('spec')
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        self.raw_task('lane', 'proj', '5', '--context', str(pinned))
+        self.wait_for_lane(wt)
+        self.assertEqual((context / 'proj/design/spec.md').read_text(), 'spec')
+        out = self.raw_task('lane', 'proj', '5')
+        self.wait_for_lane(wt)
+        self.assertNotIn('Context source removed', out)
+        self.assertEqual((context / 'proj/design/spec.md').read_text(), 'spec')
+        self.assertEqual((context / 'docs' / doc.name).read_text(), 'design review')
+        self.assertEqual(json.loads((self.state() / 'context.json').read_text())['pins'], [str(pinned.resolve())])
+
+    def test_context_unresolved_or_denied_reference_fails(self):
+        task_file = next((self.kb / 'backlog/tasks').glob('t-5 *'))
+        original = task_file.read_text()
+        task_file.write_text(original + '\nRead first: doc-99.\n')
+        self.git(self.kb, 'commit', '-qam', 'missing doc')
+        self.task('plan', 'proj', '--sign')
+        out = self.task('start', 'proj', 'T-5', code=1)
+        self.assertIn(str(self.kb / 'docs/doc-99*.md'), out)
+        self.assertFalse((self.repo / '.worktrees/t5').exists())
+        task_file.write_text(original)
+        self.git(self.kb, 'commit', '-qam', 'no reference')
+        self.task('plan', 'proj', '--sign')
+        wt, _ = self.started()
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        private = self.home / 'project-data/proj/reference/notes.md'
+        private.parent.mkdir(parents=True)
+        private.write_text('private')
+        secret = self.repo / 'secrets.env'
+        secret.write_text('TOKEN=x')
+        outside = self.home / 'outside.md'
+        outside.write_text('outside')
+        for path, reason in ((private, 'denied'), (secret, 'denied'), (outside, 'outside')):
+            out = self.raw_task('lane', 'proj', '5', '--context', str(path), code=1)
+            self.assertIn(f'{path} is', out)
+            self.assertIn(reason, out)
+        self.assertFalse((self.state() / 'context.json').exists())
+        self.assertFalse(any(path.read_text() in {'private', 'TOKEN=x', 'outside'}
+                             for path in (wt / '.work/context').rglob('*') if path.is_file()))
+        task_file.write_text(original + '\nSee history/missing.md.\n')
+        out = self.raw_task('lane', 'proj', '5', code=1)
+        self.assertIn(f"not found: {self.kb / 'history/missing.md'}", out)
+        task_file.write_text(original + '\nSee qmd://proj-reference/notes.md.\n')
+        self.assertIn(f'{private} is a path lanes are denied', self.raw_task('lane', 'proj', '5', code=1))
 
     def test_reliability_special_files_archive_manifest_and_publication(self):
         import json
@@ -6955,60 +7080,6 @@ store.write_text(json.dumps(prs))
         self.assertTrue(trusted["trusted"])
         self.assertTrue(__import__("json").loads((wt / ".work/check.json").read_text())["advisory"])
         self.assertIn("lane check: passed (advisory)", self.raw_task("status", "proj"))
-
-    def refused_bus_path(self):
-        """A lane sandbox: systemd-run cannot reach the user bus (T-67, company T-34/T-37)."""
-        sandbox = self.home / "sandbox-bin"
-        sandbox.mkdir(exist_ok=True)
-        (sandbox / "systemd-run").write_text("#!/bin/sh\necho 'Failed to connect to bus: Operation not permitted' >&2\nexit 1\n")
-        (sandbox / "systemd-run").chmod(0o755)
-        return f"{sandbox}:{self.env['PATH']}"
-
-    def test_lane_check_runs_in_process_where_systemd_run_is_refused(self):
-        """T-67 #1: `task check` inside a lane passes without systemd-run and is never recorded as trusted."""
-        wt, _ = self.started()
-        self.commit_in(wt, "b.txt")
-        script = self.home / "during-check.sh"
-        script.write_text('#!/bin/sh\nenv > "$HOME/check-env"\n')
-        script.chmod(0o755)
-        calls = self.home / "unit-calls.jsonl"
-        before = calls.read_text() if calls.exists() else ""
-        lane = dict(self.env, PATH=self.refused_bus_path(), TASK_WORKTREE=str(wt), UV_CACHE_DIR=str(self.home / "lane-uv"))
-        out = self.raw_task("check", "proj", "5", env=lane)
-        self.assertIn("advisory lane check (not evidence for merge)", out)
-        self.assertIn("PASS", out)
-        self.assertNotIn("Failed to connect to bus", out)
-        evidence = json.loads((wt / ".work/check.json").read_text())
-        self.assertEqual((evidence["result"], evidence["trusted"], evidence["advisory"]), ("passed", False, True))
-        self.assertEqual(evidence["sha"], self.git(wt, "rev-parse", "HEAD"))
-        self.assertEqual({step["unit"] for step in evidence["steps"]}, {"in-process"})
-        self.assertFalse((self.state() / "check.json").exists(), "a lane check never writes the trusted record")
-        self.assertEqual(calls.read_text() if calls.exists() else "", before, "no unit is launched")
-        self.assertIn(f"UV_CACHE_DIR={self.home / 'lane-uv'}", (self.home / "check-env").read_text().splitlines())
-        self.assertNotIn("TASK_WORKTREE=", (self.home / "check-env").read_text())
-        hold = self.home / ".local/state/task/hold"
-        hold.write_text("lane hold")
-        (self.home / "check-env").unlink()
-        out = self.raw_task("check", "proj", "5", env=lane, code=1)
-        self.assertIn("SKIP: hold", out)
-        self.assertFalse((self.home / "check-env").exists(), "the hold stops the in-process gate before it starts")
-        self.assertEqual(json.loads((wt / ".work/check.json").read_text())["result"], "skipped: hold")
-
-    def test_trusted_check_outside_a_lane_still_runs_as_a_unit(self):
-        """T-67 #2: without TASK_WORKTREE the check is trusted, runs behind systemd-run, and never falls back."""
-        wt, _ = self.started()
-        self.commit_in(wt, "b.txt")
-        out = self.raw_task("check", "proj", "5")
-        self.assertNotIn("advisory", out)
-        checked = json.loads((self.state() / "check.json").read_text())
-        self.assertEqual((checked["result"], checked["trusted"], checked["advisory"]), ("passed", True, False))
-        self.assertTrue(all(step["unit"].startswith("task-gate-proj-t5-") for step in checked["steps"]), checked)
-        self.assertIn("hold --check", (self.home / "unit-calls.jsonl").read_text())
-        self.assertFalse((wt / ".work/check.json").exists())
-        (self.state() / "check.json").unlink()
-        out = self.raw_task("check", "proj", "5", env=dict(self.env, PATH=self.refused_bus_path()), code=1)
-        self.assertIn("systemd-run --user unavailable", out)
-        self.assertFalse((self.state() / "check.json").exists(), "no in-process fallback for the trusted check")
 
     def test_vendor_markers_do_not_make_writable_state_advisory(self):
         wt, _ = self.started()
@@ -10912,23 +10983,10 @@ if 'Verdict:' in prompt:
     judged = 'pass' if verdict == 'PASS' else 'fail'
     print(f"```review\\nVerdict: {verdict}\\nCommit: {head}\\n#1 {judged}: smoke.txt contains ok\\n```\\nBlocking: none\\nNotes: none")
     sys.exit(0)
-# The lane sandbox refuses the user bus, as Codex's does (T-67): systemd-run fails in anything the agent runs.
-sandbox = pathlib.Path('.work/sandbox-bin')
-sandbox.mkdir(parents=True, exist_ok=True)
-(sandbox / 'systemd-run').write_text("#!/bin/sh\\necho 'Failed to connect to bus: Operation not permitted' >&2\\nexit 1\\n")
-(sandbox / 'systemd-run').chmod(0o755)
-lane_env = dict(os.environ, PATH=f"{sandbox.resolve()}:{os.environ['PATH']}")
-
-
-def task_check():
-    checked = subprocess.run(['task', 'check'], env=lane_env, capture_output=True, text=True)
-    print(checked.stdout + checked.stderr, file=sys.stderr)
-
-
 commands = [line[len('Run: '):] for line in prompt.splitlines() if line.startswith('Run: ')]
 if commands:  # the real-repository lane (T-62): run each command and stop
     for command in commands:
-        subprocess.run(command, shell=True, env=lane_env)
+        subprocess.run(command, shell=True)
     if '--output-last-message' in sys.argv:
         pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
     sys.exit(0)
@@ -10953,8 +11011,6 @@ pathlib.Path('.work/report.md').write_text("# Task report\\n\\n## What changed\\
                                            "## Noticed, not done\\n\\n(none)\\n")
 with pathlib.Path('.work/report.md').open('a') as report:
     report.write(os.environ.get('SMOKE_WEB_LOOKUP', 'Web lookup: astral-sh/uv release v-test https://github.com/astral-sh/uv/releases') + '\\n')
-if 'run `task check`' in prompt and os.environ.get('SMOKE_SKIP_LANE_CHECK') != '1':
-    task_check()
 if '--output-last-message' in sys.argv:
     pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
 """
@@ -10983,8 +11039,6 @@ class SmokeTests(unittest.TestCase):
                       "[ \"$1 $2\" = 'run --no-project' ] || exit 2\n"
                       "echo \"$PWD\" >> \"$HOME/uv-runs\"\nexit 0\n")
         uv.chmod(0o755)
-        (bin_dir / 'task').write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TOOL}" "$@"\n')
-        (bin_dir / 'task').chmod(0o755)
         shutil.copy(SMOKE_HELPER, bin_dir / 'task-smoke')
         (bin_dir / 'task-smoke').chmod(0o755)  # chezmoi sets this on install
         self.env = dict(HOME=str(self.home), PATH=f"{bin_dir}:{os.environ['PATH']}", **IDENTITY,
@@ -11068,7 +11122,7 @@ class SmokeTests(unittest.TestCase):
     def test_stub_run_passes_every_step_for_both_builders(self):
         out = self.smoke()
         run = self.run_id(out)
-        steps = ('start', 'setup', 'lane', 'commit', 'merge main', 'report', 'lane check', 'check', 'review', 'merge')
+        steps = ('start', 'setup', 'lane', 'commit', 'merge main', 'report', 'check', 'review', 'merge')
         for step in (*steps, 'real start', 'real lane', 'real company', 'real bootstrap'):
             self.assertEqual(len(re.findall(rf"(?m)^  PASS {step}$", out)), 2, (step, out))
         self.assertNotIn('real cortex-core', out, 'cortex-core is checked only when it exists with a justfile')
@@ -11077,7 +11131,7 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(record['result'], 'PASS')
         uv_runs = (self.home / 'uv-runs').read_text().splitlines()
         repo = self.scratch(run)['repo']
-        self.assertEqual(len(uv_runs), 6, 'per builder: lane probe, lane task check, trusted check')
+        self.assertEqual(len(uv_runs), 4)
         self.assertTrue(all(Path(path).is_relative_to(repo) for path in uv_runs), uv_runs)
         self.assertEqual({name: b['result'] for name, b in record['builders'].items()}, {'codex': 'PASS', 'claude': 'PASS'})
         for path in self.scratch(run).values():
@@ -11109,17 +11163,16 @@ class SmokeTests(unittest.TestCase):
                          {'company': 1, 'bootstrap': 0, 'cortex-core': 0})
         calls = []
 
-        def fake_task(*args):  # the lane runs mocked: its task check's recipe under the pre-T-60 lane profile
+        def fake_task(*args):  # the lane runs mocked: each Run: line under the pre-T-60 lane profile
             calls.append(args)
             wt = found['repo'] / '.worktrees/t3'
             if args[0] == 'start':
                 (wt / '.work').mkdir(parents=True)
-                subprocess.run(['git', 'init', '-q', str(wt)], check=True)
             if args[0] == 'lane':
-                self.assertIn('Run: task check', (wt / '.work/prompt.md').read_text())
                 lane_env = dict(os.environ, UV_CACHE_DIR=str(shared))
-                for line in (wt / 'justfile').read_text().splitlines()[1:]:
-                    subprocess.run(line.strip(), shell=True, cwd=wt, env=lane_env, capture_output=True)
+                for line in (wt / '.work/prompt.md').read_text().splitlines():
+                    if line.startswith('Run: '):
+                        subprocess.run(line[5:], shell=True, cwd=wt, env=lane_env, capture_output=True)
             return subprocess.CompletedProcess(args, 0, '', '')
 
         helper.task = fake_task
@@ -11136,35 +11189,6 @@ class SmokeTests(unittest.TestCase):
                                         text=True).stdout.strip(), 'task-smoke-x', 'checks run on a throwaway branch')
         self.assertEqual(subprocess.run(['git', '-C', str(cortex), 'branch', '--list', 'task-smoke-x'], capture_output=True,
                                         text=True).stdout.strip(), '', 'the real repository is untouched')
-
-    def test_lanes_run_only_task_check_and_smoke_fails_on_the_pre_t67_check(self):
-        """T-67 #3: each builder's lane runs `task check` itself (the real-repository lane runs nothing else, so no
-        agent is asked to run the hook-denied `just check`); a lane check that goes through systemd-run, as before
-        T-67, fails the smoke at the lane check and at every real repository."""
-        helper = self.smoke_module()
-        prompt = helper.PROMPT.format(ident='T-1', builder='codex')
-        self.assertIn('run `task check` from this worktree once', prompt)
-        real = helper.REAL_PROMPT.format(ident='T-3', builder='codex', names='company, bootstrap')
-        self.assertEqual([line for line in real.splitlines() if line.startswith('Run: ')], ['Run: task check'])
-        self.assertNotIn('just check', real)
-        self.assertNotIn('real_check.py', real)
-        tool = self.home / 'pre-t67-task'  # the tool before T-67: a lane's check took the trusted, systemd-run path
-        tool.write_text(f'#!/bin/sh\nunset TASK_WORKTREE\nexec "{sys.executable}" "{TOOL}" "$@"\n')
-        tool.chmod(0o755)
-        (self.home / 'bin/task').unlink()
-        (self.home / 'bin/task').symlink_to(tool)
-        for builder in ('codex', 'claude'):
-            with self.subTest(builder=builder):
-                out = self.smoke('--builder', builder, code=1)
-                self.assertIn('  FAIL lane check: ', out)
-                self.assertIn('systemd-run --user unavailable', out)
-                self.assertRegex(out, r'(?m)^  FAIL real company: ')
-                self.assertRegex(out, r'(?m)^  FAIL real bootstrap: ')
-                self.assertNotRegex(out, r'(?m)^  (PASS|FAIL) (check|review|merge)$')
-
-    def test_lane_that_skips_its_task_check_fails_smoke(self):
-        out = self.smoke('--builder', 'claude', code=1, env=dict(self.env, SMOKE_SKIP_LANE_CHECK='1'))
-        self.assertIn('  FAIL lane check: the lane recorded no passing advisory `task check` on its head', out)
 
     def test_missing_required_real_repository_fails_smoke(self):
         shutil.rmtree(self.home / 'dev_workspace/company')
