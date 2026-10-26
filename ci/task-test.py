@@ -1083,6 +1083,7 @@ class TaskTool(unittest.TestCase):
         self.assertIn('plan chain:', self.raw_task('status', 'proj'))
 
     def test_plan_budget_cli_start_lane_and_review_share_the_log(self):
+        self.legacy_reviewers()
         self.budget_fixture(points=2)
         self.raw_task('start', 'proj', '5', '--builder', 'codex', '--plan', 'chain')
         wt = self.repo / '.worktrees/t5'
@@ -1292,6 +1293,7 @@ class TaskTool(unittest.TestCase):
         self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
     def test_plan_budget_lane_and_review_keys_follow_commits(self):
+        self.legacy_reviewers()
         wt, _ = self.started()
         self.budget_fixture(points=2)
         self.stub_models()
@@ -1360,6 +1362,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(len({(r['vendor'], r['commit']) for r in rows}), 2, 'rounds do not change draw keys')
 
     def test_plan_budget_reviewer_fallback_shares_reviewed_commit_draw(self):
+        # Decision-32: Codex gpt-6.1-sol reviews first; Claude Haiku is the fallback.
         wt, _ = self.started()
         self.budget_fixture(points=1)
         self.stub_reviewers()
@@ -1371,14 +1374,14 @@ class TaskTool(unittest.TestCase):
                                REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.",
                                REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply, REVIEW_STUB_EXIT='0'))
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '2')
-        self.assertEqual(json.loads((self.state() / 'review.json').read_text())['reviewer'], 'codex')
+        self.assertEqual(json.loads((self.state() / 'review.json').read_text())['reviewer'], 'claude')
         rows = self.run_rows()
         self.assertEqual([(r['kind'], r['commit'], r['vendor'], r['outcome']) for r in rows],
-                         [('review', head, 'claude', 'failed'), ('review', head, 'codex', 'finished')])
+                         [('review', head, 'codex', 'failed'), ('review', head, 'claude', 'finished')])
         self.assertNotEqual(rows[0]['id'], rows[1]['id'])
         self.assertEqual(rows[1]['replaces'], rows[0]['id'])
-        self.assertIn('claude used 0 left 1', self.raw_task('plan-budget', 'chain'))
-        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('codex used 0 left 1', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('claude used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
     def test_plan_budget_same_commit_failures_are_separate_attempts_and_trip_breaker(self):
         wt, _ = self.started()
@@ -1439,16 +1442,17 @@ class TaskTool(unittest.TestCase):
         self.assertIn('claude used 1 left 0; codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
     def test_plan_budget_fallback_refused_for_zero_points_keeps_primary_charge(self):
+        # Decision-32: Codex gpt-6.1-sol reviews first; Claude Haiku is the fallback.
         wt, _ = self.started()
         plan = self.budget_fixture(points=1)
-        plan.write_text(plan.read_text().replace('codex = 1', 'codex = 0'))
+        plan.write_text(plan.read_text().replace('claude = 1', 'claude = 0'))
         self.stub_reviewers()
         self.raw_task('check', 'proj', '5')
-        self.assertIn('codex points exhausted', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1,
-                      env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit", REVIEW_STUB_FIRST_EXIT='2')))
+        self.assertIn('claude points exhausted', self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain', code=1,
+                      env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.", REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit", REVIEW_STUB_FIRST_EXIT='2')))
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
-        self.assertEqual([(r['vendor'], r['outcome']) for r in self.run_rows()], [('claude', 'failed')])
-        self.assertIn('claude used 1 left 0; codex used 0 left 0', self.raw_task('plan-budget', 'chain'))
+        self.assertEqual([(r['vendor'], r['outcome']) for r in self.run_rows()], [('codex', 'failed')])
+        self.assertIn('claude used 0 left 0; codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
     def test_plan_budget_start_binding_inherits_and_rejects_cli_and_environment_conflicts(self):
         self.budget_fixture(points=10)
@@ -1486,6 +1490,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(json.loads((self.state() / 'task.json').read_text())['plan'], 'chain')
 
     def test_plan_budget_fallback_refused_at_spawn_preserves_primary_charge(self):
+        # Decision-32: Codex gpt-6.1-sol reviews first; Claude Haiku is the fallback.
         wt, _ = self.started()
         self.stub_reviewers()
         self.raw_task('check', 'proj', '5')
@@ -1503,7 +1508,7 @@ class TaskTool(unittest.TestCase):
                     'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
                     'review disabled': "\n".join([
                         "for number in range(2):",
-                        "    row = api['task_usage'].run_log(api['HOME'], plan='chain', repo='proj', task='seed-' + str(number), kind='review', vendor='codex', commit=str(number))",
+                        "    row = api['task_usage'].run_log(api['HOME'], plan='chain', repo='proj', task='seed-' + str(number), kind='review', vendor='claude', commit=str(number))",
                         "    api['task_usage'].run_log(api['HOME'], row, 'failed')",
                     ]),
                 }[rule]
@@ -1518,27 +1523,27 @@ class TaskTool(unittest.TestCase):
                     def delayed(path, data):
                         global changed
                         original(path, data)
-                        if path.name == 'review-run.json' and data.get('usage_run', {{}}).get('vendor') == 'codex' and not changed:
+                        if path.name == 'review-run.json' and data.get('usage_run', {{}}).get('vendor') == 'claude' and not changed:
                             changed = True
                 ''') + textwrap.indent(mutation, '        ') + '\n' +
                     "with mock.patch.dict(api['review'].__globals__, atomic_json=delayed):\n" +
                     "    sys.exit(api['main'](['review', 'proj', '5', '--run', '--plan', 'chain']))\n")
                 result = subprocess.run([sys.executable, str(probe)], cwd=self.home,
-                                        env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                                        env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.", REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
                                                  REVIEW_STUB_FIRST_EXIT='2'), capture_output=True, text=True)
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(rule, result.stderr)
                 self.assertEqual((wt / '.work/reviewer-count').read_text(), '1', 'fallback never ran')
                 rows = self.run_rows()
-                self.assertEqual((rows[0]['vendor'], rows[0]['outcome']), ('claude', 'failed'))
+                self.assertEqual((rows[0]['vendor'], rows[0]['outcome']), ('codex', 'failed'))
                 reservations = list(log.parent.glob('pending-runs/*.json'))
                 self.assertEqual(len(reservations), 1)
                 fallback = json.loads(reservations[0].read_text())
                 self.assertEqual(fallback['replaces'], rows[0]['id'])
                 self.assertFalse(fallback.get('invoked', False))
-                self.assertIn('claude used 1 left 9', self.raw_task('plan-budget', 'chain'))
-                codex_used = 3 if rule == 'review disabled' else 1  # two concurrent seed keys
-                self.assertIn(f'codex used {codex_used} left {10 - codex_used}', self.raw_task('plan-budget', 'chain'))
+                self.assertIn('codex used 1 left 9', self.raw_task('plan-budget', 'chain'))
+                claude_used = 3 if rule == 'review disabled' else 1  # two concurrent seed keys
+                self.assertIn(f'claude used {claude_used} left {10 - claude_used}', self.raw_task('plan-budget', 'chain'))
                 if rule != 'review disabled':
                     self.budget_fixture(points=10)  # restore expiry/scope in this fixture
                 self.raw_task('plan-budget', 'chain', '--clear', 'review')
@@ -1546,16 +1551,16 @@ class TaskTool(unittest.TestCase):
                 head = self.git(wt, 'rev-parse', 'HEAD')
                 reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: exists\n#2 pass: checked\n'
                 self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
-                              env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                              env=dict(self.env, REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.", REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
                                        REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
                 attempts = [r for r in self.run_rows() if r.get('task') == 'T-5']
                 self.assertEqual([(r['vendor'], r['outcome']) for r in attempts],
-                                 [('claude', 'failed'), ('claude', 'failed'), ('codex', 'finished')])
+                                 [('codex', 'failed'), ('codex', 'failed'), ('claude', 'finished')])
                 self.assertEqual(attempts[-1]['id'], fallback['id'], 'reuse the refused reservation')
                 self.assertNotEqual(attempts[0]['id'], attempts[1]['id'])
                 self.assertEqual(set(attempts[-1]['superseded']), {r['id'] for r in attempts[:-1]})
-                self.assertIn('claude used 0 left 10', self.raw_task('plan-budget', 'chain'))
-                self.assertIn(f'codex used {codex_used} left {10 - codex_used}', self.raw_task('plan-budget', 'chain'))
+                self.assertIn('codex used 0 left 10', self.raw_task('plan-budget', 'chain'))
+                self.assertIn(f'claude used {claude_used} left {10 - claude_used}', self.raw_task('plan-budget', 'chain'))
                 self.assertEqual(list(log.parent.glob('pending-runs/*.json')), [])
 
     def test_plan_budget_lane_rechecks_expiry_scope_and_breaker_at_model_spawn(self):
@@ -1662,6 +1667,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(len(self.run_rows()), 1)
 
     def test_plan_budget_review_child_keeps_execution_lock_after_parent_is_killed(self):
+        # Decision-32: Codex gpt-6.1-sol reviews first; Claude Haiku is the fallback.
         wt, _ = self.started()
         self.budget_fixture(points=10)
         self.stub_reviewers()
@@ -1674,7 +1680,7 @@ class TaskTool(unittest.TestCase):
                     (wt / '.work' / name).unlink(missing_ok=True)
                 env = dict(self.env, REVIEW_STUB_REPLY=reply, REVIEW_STUB_DELAY='30')
                 if fallback:
-                    env.update(REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
+                    env.update(REVIEW_STUB_STDERR="ERROR: You've hit your usage limit.", REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
                                REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_FIRST_DELAY='0')
                 parent = subprocess.Popen([sys.executable, str(TOOL), 'review', 'proj', '5', '--run', '--plan', 'chain'],
                                           env=env, cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -1983,6 +1989,7 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(list(pending[0].parent.glob('*.json')), [])
 
     def test_run_log_lane_review_merge_and_retry(self):
+        self.legacy_reviewers()
         self.budget_fixture('plan-42', points=10)
         wt, _ = self.started()
         self.stub_models()
@@ -3898,6 +3905,7 @@ sys.exit(7)
             self.raw_task('cancel', 'proj', 'runner-b1')
 
     def test_runner_passes_lock_holder_to_children(self):
+        self.legacy_reviewers()
         wt, _ = self.started()
         (wt / '.work/prompt.md').write_text('Build the b file.')
         self.stub_models()
@@ -3962,6 +3970,7 @@ sys.exit(7)
         self.raw_task('start', 'proj', 'docs', '--builder', 'codex', env=dict(self.env, TASK_HOLDER='other'))
 
     def test_runner_real_batch_handoff_survives_wrapper_death(self):
+        self.legacy_reviewers()
         wt, _ = self.started()
         self.commit_in(wt, 'b.txt')
         self.prepare_merge_evidence('5')
@@ -4132,7 +4141,8 @@ sys.exit(7)
         out = self.raw_task('merge', 'proj', '5', '--override', 'approved emergency')
         waived = json.loads((self.state() / 'exception.json').read_text())['waived']
         self.assertEqual({item['step'] for item in waived}, {
-            'risk normal: recorded PASS review for lane head with every criterion pass by the other vendor',
+            'risk normal: recorded PASS review for lane head with every criterion pass by the other vendor'
+            ' (or a fresh Codex session, decision-32)',
             'filled .work/report.md'})
         for item in waived:
             self.assertIn(item['step'] + ' waived: approved emergency', out)
@@ -5179,6 +5189,10 @@ store.write_text(json.dumps(prs))
         wt = self.repo / ".worktrees/t5"
         self.assertTrue(wt.is_dir(), out)
         return wt, out
+
+    def legacy_reviewers(self):
+        """Pre-decision-32 reviewers (Claude Haiku on Codex builds) for tests of review mechanics, not routing."""
+        self.risk_policy_fixture('[review.normal]\ncodex = "haiku"\n[review.high]\ncodex = "haiku"\nclaude = "gpt-6-luna"\n')
 
     def risk_policy_fixture(self, text):
         path = self.home / 'cortex/cortex-kb-company/policy/usage-pacing.toml'
@@ -7578,7 +7592,7 @@ store.write_text(json.dumps(prs))
         self.assertIn("pace warning: codex reset feed down or unparseable; no spend-down, the codex ramp applies", out)
         self.assertIn("past ramp", out)
 
-    def test_pace_review_holds_exhausted_reviewer_and_final_goes_deeper_when_under_used(self):
+    def test_pace_review_holds_exhausted_reviewer_and_only_a_recorded_miss_goes_deeper(self):
         self.stub_reviewers()
         wt, _ = self.started()
         self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise high review pacing')
@@ -7591,13 +7605,17 @@ store.write_text(json.dumps(prs))
         self.readings(claude=(40, 30), five=10)
         reply = f"```review\nVerdict: PASS\nCommit: {head}\n#1 pass: ok\n#2 pass: ok\n```\n"
         self.raw_task("review", "proj", "5", "--run", env=dict(self.env, REVIEW_STUB_REPLY=reply))
-        self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "haiku")
+        self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "sonnet")
         self.raw_task("review", "proj", "5", "--run", "--final", env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "sonnet")  # decision-32
+        self.raw_task("review", "proj", "5", "--run", "--miss", "sonnet missed a defect",
+                      env=dict(self.env, REVIEW_STUB_REPLY=reply))
         call = json.loads((wt / ".work/reviewer-call.json").read_text())
         self.assertEqual(call["args"][call["args"].index("--model") + 1], "opus")
         self.assertEqual(json.loads((self.state() / "review.json").read_text())["model"], "opus")
 
     def test_review_run_records_claude_stream_events_and_plain_reply(self):
+        self.legacy_reviewers()
         self.stub_reviewers()
         self.raw_task("start", "proj", "5", "--builder", "codex")
         wt = self.repo / ".worktrees/t5"
@@ -7678,6 +7696,7 @@ store.write_text(json.dumps(prs))
                     self.assertEqual(logs[-1]['outcome'], 'interrupted')
 
     def test_reviewer_signals_stop_live_group_before_releasing_claim(self):
+        self.legacy_reviewers()
         self.stub_reviewers()
         wt, _ = self.started()
         self.commit_in(wt, 'b.txt')
@@ -8613,6 +8632,7 @@ store.write_text(json.dumps(prs))
                          dict(vendor='claude', model='haiku', fallback_from=['codex', 'gpt-6-luna']))
 
     def test_review_run_cleans_inherited_environment_before_hook_and_diff(self):
+        self.legacy_reviewers()
         import json
         self.stub_reviewers()
         for builder in ("codex", "claude"):
@@ -8692,6 +8712,7 @@ store.write_text(json.dumps(prs))
         self.assertFalse(self.state().exists())
 
     def test_record_uses_routed_identity_despite_openai_gpt6_reply_line(self):
+        self.legacy_reviewers()
         wt, _ = self.started()
         self.raw_task("review", "proj", "5")
         head = self.git(wt, "rev-parse", "HEAD")
@@ -8724,11 +8745,15 @@ store.write_text(json.dumps(prs))
         self.raw_task("review", "proj", "5", "--record", str(review), "--reviewer", "claude", "manual")
         meta = __import__("json").loads((self.state() / "review.json").read_text())
         self.assertEqual((meta["reviewer"], meta["model"]), ("claude", "manual"))
+        # Decision-32: a Codex review of Codex-built normal-risk work records; high risk still refuses it.
+        self.raw_task("review", "proj", "5", "--record", str(review), "--reviewer", "codex", "manual")
+        self.raw_task("risk", "proj", "5", "high", "--reason", "vendor rule fixture")
         out = self.raw_task("review", "proj", "5", "--record", str(review),
                             "--reviewer", "codex", "manual", code=1)
         self.assertIn("reviewer vendor must differ from builder", out)
 
     def test_builder_vendor_in_reply_line_warns_but_routed_identity_is_recorded(self):
+        self.legacy_reviewers()
         wt, _ = self.started()
         self.raw_task("review", "proj", "5")
         head = self.git(wt, "rev-parse", "HEAD")
@@ -8741,6 +8766,7 @@ store.write_text(json.dumps(prs))
         self.assertEqual((meta["reviewer"], meta["model"]), ("claude", "haiku"))
 
     def test_review_includes_direct_request_text(self):
+        self.legacy_reviewers()
         self.task("start", "proj", "direct-request", "--builder", "codex")
         request = self.home / "request.md"
         request.write_text("Preserve the user's uncommitted files and explain the behavior change.")
@@ -9592,6 +9618,7 @@ exit 1
 
     def test_acceptance_3_review_requires_head_other_vendor_and_every_criterion(self):
         wt, _ = self.started()
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'high risk keeps the other-vendor rule (decision-32)')
         head = self.git(wt, "rev-parse", "HEAD")
         cases = [
             f"Verdict: PASS\nCommit: {head}\nReviewer: claude test\n#1 pass: evidence\n",
