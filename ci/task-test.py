@@ -1042,31 +1042,39 @@ class TaskTool(unittest.TestCase):
             with self.assertRaisesRegex(api.Stop, 'expired'):
                 api.budget_run(**fields)
 
-    def test_plan_budget_breaker_classes_are_consecutive_latched_and_clearable(self):
-        self.budget_fixture(points=20)
+    def test_plan_budget_breaker_counts_any_real_failure_class_and_is_clearable(self):
+        self.budget_fixture(points=40)
         with self.budget_environment() as api:
-            def end(kind, outcome, reason):
+            def end(kind, outcome, reason=''):
                 row = api.budget_run(repo='proj', task='docs', kind=kind, vendor='codex', commit=str(len(self.run_rows())))
-                api.task_usage.run_log(self.home, row, outcome, reason=reason)
-            end('lane', 'failed', 'same text')
-            end('lane', 'interrupted', 'same text')
+                api.task_usage.run_log(self.home, row, outcome, final=outcome == 'stopped', reason=reason)
+            def tripped():
+                self.assertIn("disabled ['lane proj/docs']", api.plan_budget('chain'))
+                self.raw_task('plan-budget', 'chain', '--clear', 'lane')
+                self.assertEqual(self.run_rows()[-1]['outcome'], 'cleared')
+                self.assertIn('disabled []', api.plan_budget('chain'))
+            end('lane', 'failed')
+            end('review', 'failed', 'another kind never joins the lane streak')
             self.assertIn('disabled []', api.plan_budget('chain'))
-            end('review', 'failed', 'unrelated kind')
-            end('lane', 'interrupted', 'different text')
+            end('lane', 'interrupted', 'different class, same streak')
             with self.assertRaisesRegex(api.Stop, 'lane disabled'):
-                end('lane', 'finished', '')
+                end('lane', 'finished')
             self.assertIn("disabled ['lane proj/docs']", self.raw_task('plan-budget', 'chain'))
-            before = len(self.run_rows())
-            self.raw_task('plan-budget', 'chain', '--clear', 'lane')
-            self.assertEqual(len(self.run_rows()), before + 1)
-            self.assertEqual(self.run_rows()[-1]['outcome'], 'cleared')
-            self.assertIn('disabled []', self.raw_task('plan-budget', 'chain'))
-            end('lane', 'failed', 'one')
-            end('lane', 'finished', 'success resets consecutive failures')
-            end('lane', 'failed', 'two')
+            tripped()
+            for between in (('vendor-unavailable', 'Selected model is at capacity'), ('stopped', 'cancelled'),
+                            ('interrupted', 'timed_out')):
+                with self.subTest(between=between[0]):
+                    end('lane', 'failed')
+                    end('lane', *between)
+                    self.assertIn('disabled []', api.plan_budget('chain'), f'{between[0]} never counts')
+                    end('lane', 'failed')
+                    tripped()  # ... and never resets the streak
+            end('lane', 'failed')
+            end('lane', 'finished', 'success resets the streak')
+            end('lane', 'failed')
             self.assertIn('disabled []', api.plan_budget('chain'))
-            end('lane', 'failed', 'three')
-            self.assertIn("disabled ['lane proj/docs']", api.plan_budget('chain'))
+            end('lane', 'failed')
+            tripped()
 
     def test_plan_budget_read_only_missing_malformed_and_status(self):
         state = self.home / '.local/state/task'
@@ -1395,7 +1403,7 @@ class TaskTool(unittest.TestCase):
         with self.budget_environment() as api:
             def end(task, outcome):
                 row = api.budget_run(repo='proj', task=task, kind='lane', vendor='codex', commit=str(len(self.run_rows())))
-                api.task_usage.run_log(self.home, row, outcome)
+                api.task_usage.run_log(self.home, row, outcome, final=outcome == 'stopped')
             end('T-35', 'stopped')
             end('T-36', 'failed')
             end('T-36', 'vendor-unavailable')

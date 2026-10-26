@@ -581,6 +581,12 @@ def plan_time(value):
         return None
 
 
+# T-71: outcomes that mean the run broke. A lane or review stopped by --timeout logs `interrupted` with reason
+# `timed_out` (a time cap); vendor-unavailable and stopped are separate outcomes.
+REAL_FAILURES = {"failed", "interrupted"}
+TIME_CAPS = {"timed_out"}
+
+
 def plan_budget(ident, fields=None, clear=None, reserve=True):
     try:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", ident): raise ValueError("invalid id")
@@ -605,15 +611,17 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
             replaced = {ident for r in rows if r.get("invoked") for ident in [r.get("replaces"), *r.get("superseded", [])]}
             charged = [r for r in rows if r["id"] not in replaced]
             used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in charged if r.get("vendor") == v and r.get("type") != "outcome"}) for v in task_usage.VENDORS}
-            # T-71: two same-class failures in a row on one task disable that task's kind; vendor-unavailable and stopped never count.
-            last, disabled = {}, set()
+            # T-71: two real failures in a row on one task, of any class, disable that task's kind; a finish resets the streak.
+            # Everything else (vendor-unavailable, a PM stop, a time cap, outcome notes) neither counts nor resets.
+            streak, disabled = {}, set()
             for row in rows:
                 kind, outcome = row.get("kind"), row.get("outcome")
                 key = (kind, row.get("repo"), row.get("task"))
-                if outcome == "cleared": disabled = {d for d in disabled if d[0] != kind}; last = {k: v for k, v in last.items() if k[0] != kind}
-                elif outcome in {"finished", "failed", "interrupted"}:
-                    if outcome in {"failed", "interrupted"} and last.get(key) == outcome: disabled.add(key)
-                    last[key] = outcome
+                if outcome == "cleared": disabled = {d for d in disabled if d[0] != kind}; streak = {k: v for k, v in streak.items() if k[0] != kind}
+                elif outcome == "finished": streak[key] = 0
+                elif outcome in REAL_FAILURES and row.get("reason") not in TIME_CAPS:
+                    streak[key] = streak.get(key, 0) + 1
+                    if streak[key] >= 2: disabled.add(key)
             if clear:
                 stream.write(json.dumps(dict(id=secrets.token_hex(12), plan=ident, kind=clear, outcome="cleared", start=utc_now(), type="control")) + "\n"); return
             if fields:
