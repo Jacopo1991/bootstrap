@@ -878,11 +878,12 @@ def weekly_lines(home, now=None):
     return run_summary(home, 7, now) + [override_summary(home, now)]
 
 
-# T-71: `vendor-unavailable` and `stopped` end a run but are never the lane's own failure.
-TERMINAL = {"finished", "failed", "interrupted", "vendor-unavailable", "stopped"}
+# T-71: `vendor-unavailable` ends a run but is never the lane's own failure. A seat-stopped lane ends with
+# `stopped` through final=True; a batch's own `stopped: <reason>` stays an outcome note on the run.
+TERMINAL = {"finished", "failed", "interrupted", "vendor-unavailable"}
 
 
-def run_log(home, run=None, outcome=None, **fields):
+def run_log(home, run=None, outcome=None, final=False, **fields):
     now = datetime.now(timezone.utc)
     root = _dir(home).parent
     reading = readings(home, now).get((run or fields).get("vendor"))
@@ -892,7 +893,7 @@ def run_log(home, run=None, outcome=None, **fields):
                    effort="high", tier="routine", round=1 + sum(r.get("repo") == fields.get("repo") and r.get("task") == fields.get("task") and r.get("kind") == fields.get("kind") and r.get("outcome") in TERMINAL for r in map(json.loads, _text(root / "runs.jsonl").splitlines())), ccusage_tokens=None, before=reading) | fields
         _write(root / "pending-runs" / (run["id"] + ".json"), run)
         return run
-    terminal = outcome in TERMINAL
+    terminal = final or outcome in TERMINAL
     after = reading if terminal else run.get("after")
     before = run.get("before") or {}
     delta = {k: after[k] - before[k] if after and before.get(k) is not None and after.get(k) is not None and before.get(reset) == after.get(reset) else None
@@ -901,7 +902,7 @@ def run_log(home, run=None, outcome=None, **fields):
     with (root / "runs.jsonl").open("a+") as stream:
         fcntl.flock(stream, fcntl.LOCK_EX)
         stream.seek(0)
-        if not any(r.get("run_id", r["id"]) == run["id"] and (r["outcome"] in TERMINAL if terminal else r["outcome"] == outcome) for r in map(json.loads, stream)):
+        if not any(r.get("run_id", r["id"]) == run["id"] and (r["outcome"] in TERMINAL or r.get("type") == "run" if terminal else r["outcome"] == outcome) for r in map(json.loads, stream)):
             stream.write(json.dumps(row) + "\n")
             stream.flush()
         if terminal:

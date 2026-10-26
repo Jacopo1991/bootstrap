@@ -1826,7 +1826,7 @@ def finalize_lane_record(path, run, state, **fields):
         usage_run = run.get("usage_run")
         if usage_run and usage_run.get("plan"): usage_run.update(read_json_object(HOME / ".local/state/task/pending-runs" / (usage_run["id"] + ".json")))
         if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")):
-            task_usage.run_log(HOME, run["usage_run"], "stopped" if stopped else state if state == "vendor-unavailable" else "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
+            task_usage.run_log(HOME, run["usage_run"], final=True, outcome="stopped" if stopped else state if state == "vendor-unavailable" else "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
         atomic_json(path, run)
 
 
