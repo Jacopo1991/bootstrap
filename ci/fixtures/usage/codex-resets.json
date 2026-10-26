@@ -1,0 +1,16 @@
+{"generated_at": "2026-10-20T19:30:00Z",
+ "stats": {"total": 4},
+ "events": [
+  {"announced_at": "2026-10-20T08:00:00Z", "target_date": "2026-10-21T17:00:00Z", "completed_at": null,
+   "event_status": "confirmed", "reset_type": "standard", "timing_kind": "announced",
+   "text": "Lands tomorrow before 10am PST", "tweet_url": "https://x.com/example/status/2"},
+  {"announced_at": "2026-10-12T08:00:00Z", "target_date": "2026-10-13T17:00:00Z", "completed_at": "2026-10-13T16:40:00Z",
+   "event_status": "scheduled_completed", "reset_type": "standard", "timing_kind": "announced",
+   "text": "Reset is live", "tweet_url": "https://x.com/example/status/1"},
+  {"announced_at": "2026-10-20T12:00:00Z", "target_date": "2026-10-20T23:00:00Z", "completed_at": null,
+   "event_status": "confirmed", "reset_type": "standard", "timing_kind": "teaser",
+   "text": "Something nice soon", "tweet_url": "https://x.com/example/status/3"},
+  {"announced_at": "2026-10-20T12:00:00Z", "target_date": "2026-10-22T00:00:00Z", "completed_at": null,
+   "event_status": "confirmed", "reset_type": "banked", "timing_kind": "interval_prediction",
+   "text": "Every ~4 days", "tweet_url": null}
+ ]}

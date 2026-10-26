@@ -60,7 +60,7 @@ def main():
     state = home / '.local/state/task'
     state.mkdir(parents=True, exist_ok=True)
     with (state / 'watch.lock').open('w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.flock(lock, fcntl.LOCK_EX); usage.refresh_resets(home, now)  # decision-24 Codex reset feed, at most hourly
         found = findings(home, now)
         snapshot = state / 'watch-state.json'
         old = json.loads(snapshot.read_text()) if snapshot.exists() else {}

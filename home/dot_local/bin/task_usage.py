@@ -3,9 +3,12 @@
 Readings are the vendors' own numbers: the newest Codex rollout `rate_limits` and the newest
 Claude `rate_limit_event` that a recorded lane or review left behind. Nothing here calls a model.
 """
+import email.utils
 import json
 import fnmatch
 import fcntl
+import http.client
+import urllib.request
 from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -14,6 +17,7 @@ import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 VENDORS = ("claude", "codex")
@@ -27,6 +31,12 @@ FIVE_OUT, FIVE_WARN = "5h-exhausted", "5h-warning"
 FIVE_BAND = 15  # points below the 5-hour limit where only one lane or review may run
 STALE = timedelta(minutes=45)
 _ASSESSMENTS = ContextVar("usage_assessments", default=None)
+# Decision-24: public Codex reset feed (primary JSON, RSS fallback), polled hourly by task-watch.
+RESET_FEEDS = ("https://codexresets.com/api/resets", "https://aiidelist.com/codex-reset.xml")
+RESET_POLL, RESET_FRESH = timedelta(hours=1), timedelta(hours=3)
+RESET_FIELDS = ("announced_at", "target_date", "completed_at", "event_status", "reset_type", "timing_kind", "text", "tweet_url")
+NOT_ANNOUNCED = ("teas", "predict", "interval", "estimat", "rumo")  # teasers and interval predictions change nothing
+SPEND_DOWN = "decision-24 spend-down"
 DEFAULTS = {"reserve": {"claude": 25, "codex": 10}, "spare_resets": {"claude": 0, "codex": 1},
             "priority": ["madplanner-v2", "household-signal-harness", "product-harness", "cortex-kb-company"],
             "under_use_percent": 60, "under_use_hours": 36, "ahead_margin": 10, "research_backlog": [],
@@ -413,7 +423,7 @@ def ramp(reading, pol, now):
 def ramp_hold(item, kind, exempt=""):
     """Refusal text for a new Codex launch past its ramp, or "" (exempt work may launch above it)."""
     found = item.get("ramp")
-    if not found or not found["over"] or exempt:
+    if not found or not found["over"] or exempt or item.get("spend_down"):
         return ""
     return (f"codex past its daily ramp: weekly used {item['weekly']:.0f} % > allowance {found['allowance']:g} % "
             f"(day {found['day']}, {found['per_day']:g} %/day, ceiling {found['ceiling']:g} %); no new {kind}s on codex "
@@ -445,6 +455,106 @@ def assess(reading, pol, now, ran=False):
     else:
         verdict = "ahead" if used > elapsed + margin else "under" if used < elapsed - margin else "on"
     return dict(result, verdict=verdict, left=left, elapsed=elapsed)
+
+
+def _feed_time(value):
+    """Aware datetime from an ISO stamp (a bare date is its UTC midnight) or an RSS date; None otherwise."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        when = _stamp(value.strip())
+    except ValueError:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError, IndexError):
+            return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _fetch(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "task-watch (decision-24 reset feed)"})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return response.read(1 << 20)
+
+
+def _parse_resets(raw, rss):
+    """Events of the primary JSON feed, or the RSS fallback's landed resets; raises on anything unparseable."""
+    if rss:
+        events = []
+        for item in ElementTree.fromstring(raw).iter("item"):
+            landed = _feed_time(item.findtext("pubDate"))
+            if not landed:
+                raise ValueError("RSS item without a date")
+            events.append({"key": item.findtext("guid") or item.findtext("link") or landed.isoformat(),
+                           "completed_at": landed.isoformat(), "event_status": "completed",
+                           "reset_type": item.findtext("category") or "", "text": item.findtext("title") or ""})
+        return events
+    events = json.loads(raw)["events"]
+    if not isinstance(events, list) or not all(isinstance(event, dict) for event in events):
+        raise ValueError("events is not a list of objects")
+    return [dict({key: event.get(key) for key in RESET_FIELDS},
+                 key=event.get("tweet_url") or f"{event.get('announced_at')}|{event.get('target_date')}") for event in events]
+
+
+def refresh_resets(home, now, urls=None, fetch=None):
+    """Poll the reset feed at most hourly (fallback on error) and keep its events in watcher state; never a model.
+
+    TASK_RESET_FEEDS="<json url> <rss url>" replaces the sources; empty turns polling off. Never raises on a source.
+    """
+    urls = (os.environ["TASK_RESET_FEEDS"].split() if "TASK_RESET_FEEDS" in os.environ else RESET_FEEDS) if urls is None else urls
+    path = _dir(home).parent / "codex-resets.json"
+    state = _json(path)
+    checked = _feed_time(state.get("checked_at"))
+    if not urls or checked and now - checked < RESET_POLL:
+        return state
+    events, source, errors = None, "", []
+    for url, rss in zip(urls, (False, True)):
+        try:
+            events, source = _parse_resets((fetch or _fetch)(url), rss), url
+            break
+        except (OSError, ValueError, KeyError, TypeError, ElementTree.ParseError, http.client.HTTPException) as error:
+            # down, refused or unparseable: try the fallback, else fail closed
+            errors.append(f"{url}: {type(error).__name__}")
+    known = state.get("events") if isinstance(state.get("events"), dict) else {}
+    for event in events or []:
+        known[str(event.pop("key"))] = event
+    state = {"checked_at": now.isoformat(), "ok": events is not None, "source": source,
+             "error": "; ".join(errors), "events": dict(list(known.items())[-200:])}
+    try:
+        _write(path, state)
+    except OSError as error:
+        print(f"task-watch: codex reset feed state not written ({error.strerror}); task usage warns", file=sys.stderr)
+    return state
+
+
+def reset_feed(home, now):
+    """Spend-down target (an announced reset ahead), newest landed reset and a feed warning, from watcher state."""
+    state = _json(_dir(home).parent / "codex-resets.json")
+    checked = _feed_time(state.get("checked_at"))
+    warning = ("" if state.get("ok") is True and checked and now - checked <= RESET_FRESH else
+               "pace warning: codex reset feed " + ("has no reading yet" if not state else "down or unparseable"
+               if state.get("ok") is not True else f"not checked since {checked:%Y-%m-%d %H:%M} UTC" if checked
+               else "unparseable") + "; no spend-down, the codex ramp applies")
+    landed, ahead = None, []
+    for event in (state.get("events") or {}).values() if isinstance(state.get("events"), dict) else ():
+        if not isinstance(event, dict) or any(word in f"{event.get('timing_kind')} {event.get('event_status')}".lower()
+                                              for word in NOT_ANNOUNCED):
+            continue
+        target, done = _feed_time(event.get("target_date")), _feed_time(event.get("completed_at"))
+        done = done or (target if target and target <= now else None)
+        if done and done <= now:
+            landed = max(landed or done, done)
+        elif target and target > now and _feed_time(event.get("announced_at")):
+            ahead.append((target, _feed_time(event.get("announced_at"))))
+    targets = [target for target, announced in ahead if not landed or landed < announced]
+    return (None if warning else min(targets, default=None)), landed, warning
+
+
+def _landed(reading, landed):
+    """T-54's early-reset rule for a reset the feed saw land after the reading: the window restarts at day 1."""
+    if not landed or reading["reason"] or reading["at"] >= landed or landed <= reading["resets_at"] - WEEK:
+        return reading
+    return dict(reading, weekly=0.0, resets_at=landed + WEEK, five_hour=None, five_resets=None, landed=landed)
 
 
 def _top(home, pol):
@@ -538,11 +648,13 @@ def assessments(home, now):
         pol = json.loads(json.dumps(DEFAULTS))
         notes.append(f"pace warning: {error}; built-in defaults used")
     seen = {}
+    spend, landed, _ = reset_feed(home, now)
     for vendor, item in readings(home, now).items():
+        item = _landed(item, landed) if vendor == "codex" else item
         since = item.get("at")
         last = _json(_dir(home) / f"{vendor}-last-start.json").get("at", "")
         ran = bool(since) and (running(home, vendor) > 0 or last > since.isoformat())
-        seen[vendor] = found = assess(item, pol, now, ran)
+        seen[vendor] = found = dict(assess(item, pol, now, ran), spend_down=spend if vendor == "codex" else None)
         if found["stale"]:
             notes.append(f"pace warning: {vendor} usage reading is {(now - since) / timedelta(minutes=1):.0f} min old "
                          "while its lanes ran; treated as the 5-hour warning band (one lane or review at a time)")
@@ -580,7 +692,7 @@ def gate(home, kind, vendor, tier, repo, key, now=None, exempt=""):
     """
     now = now or datetime.now(timezone.utc)
     pol, seen, notes = assessments(home, now)
-    out = {"vendor": vendor, "hold": "", "cheaper": False, "spend": "", "notes": notes, "ramp_exempt": ""}
+    out = {"vendor": vendor, "hold": "", "cheaper": False, "spend": "", "notes": notes, "ramp_exempt": "", "spend_down": ""}
     other = "codex" if vendor == "claude" else "claude"
     found = seen[vendor]
     if found["verdict"] == "unknown":
@@ -607,7 +719,10 @@ def gate(home, kind, vendor, tier, repo, key, now=None, exempt=""):
                        f"{running(home, out['vendor'])} lane or review running; one at a time")
     if not out["hold"]:
         out["hold"] = ramp_hold(found, kind, exempt)
-        if exempt and found.get("ramp") and found["ramp"]["over"]:
+        if found.get("spend_down") and found.get("ramp") and found["ramp"]["over"]:
+            out["spend_down"] = found["spend_down"].isoformat()
+            notes.append(f"pace: codex in {SPEND_DOWN} until {_when(found['spend_down'])}; ramp and ceiling lifted (ledgered)")
+        elif exempt and found.get("ramp") and found["ramp"]["over"]:
             out["ramp_exempt"] = exempt
             notes.append(f"pace: codex past its daily ramp ({found['weekly']:.0f} % > {found['ramp']['allowance']:g} %); "
                          f"launch allowed as ramp-exempt {exempt} work (ledgered)")
@@ -625,6 +740,11 @@ def gate(home, kind, vendor, tier, repo, key, now=None, exempt=""):
         note(home, seen[vendor], now, f"{repo}/{key}")
         log(home, f"held {kind} {repo}/{key}: {out['hold']}", now)
     return out
+
+
+def spend_down(home, vendor, now=None):
+    """Decision-24: the announced reset's target while Codex is in spend-down, else None; never for Claude."""
+    return assessments(home, now or datetime.now(timezone.utc))[1]["codex"]["spend_down"] if vendor == "codex" else None
 
 
 def ramp_gate(home, kind, vendor, repo, key, exempt="", now=None):
@@ -708,19 +828,22 @@ def report(home, now=None):
                   f"  reading {item['at']:%Y-%m-%d %H:%M} UTC, {age:.0f} min old; week elapsed {item['elapsed']:.0f} %",
                   f"  pace: {item['verdict']}",
                   f"  policy: {_applied(vendor, item, pol, _top(home, pol))}"]
-        if item["ramp"]:
+        if item["spend_down"]:
+            lines.append(f"  spend-down until {_when(item['spend_down'])}: announced reset ahead ({SPEND_DOWN}); ramp and "
+                         "ceiling lifted for codex launches, every codex model and effort allowed (ledgered)")
+        elif item["ramp"]:
             found = item["ramp"]
             lines.append(f"  ramp: day {found['day']}, allowance {found['allowance']:g} % ({found['per_day']:g} %/day, "
                          f"ceiling {found['ceiling']:g} %); {'past ramp: no new codex launches unless --ramp-exempt' if found['over'] else 'within ramp'}")
     if pol["codex_ramp"] and seen["codex"]["verdict"] == "unknown":
         lines.append("codex ramp: unknown without a current codex reading; not applied")
-    return lines + fallback_lines(pol, seen)
+    return lines + [warning for warning in reset_feed(home, now)[2:] if warning] + fallback_lines(pol, seen)
 
 
 def _states(vendor, item, pol):
     """Why a vendor is not normal for new work: past ramp, braked, near its 5-hour window, blocked."""
     found = []
-    if item.get("ramp") and item["ramp"]["over"]:
+    if item.get("ramp") and item["ramp"]["over"] and not item.get("spend_down"):
         found.append(f"past ramp (day {item['ramp']['day']}, {item['ramp']['allowance']:g} %)")
     if item["verdict"] == EXHAUSTED or _ahead(item):
         found.append("braked (" + ("automated share used up" if item["verdict"] == EXHAUSTED else "ahead of pace") + ")")

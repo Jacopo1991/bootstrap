@@ -749,6 +749,15 @@ the allowance and the ceiling with `--ramp-exempt hold|service|security|money` o
 High risk alone is not an exemption. Claude has no ramp. **Decision-22 (Claude 3-point brake)** stays
 outside `task` for now; the PM applies it by hand.
 
+**Decision-24 (Codex spend-down before an announced reset):** `task-watch` polls
+`codexresets.com/api/resets` at most hourly (RSS fallback `aiidelist.com/codex-reset.xml`, no model) into
+`~/.local/state/task/codex-resets.json`. While an announced reset is ahead, `task usage` shows Codex
+`spend-down until <target>`: the ramp and ceiling are lifted for Codex launches and the model guard allows
+every Codex model and effort, each such launch ledgered as `decision-24 spend-down`. It ends at the target
+or when the reset lands; a landed reset restarts the ramp at day 1. Teasers and interval predictions change
+nothing; a feed that is down, unparseable or more than 3 hours old means no spend-down and one warning
+line. Claude is never affected.
+
 After the vendor readings `task usage` prints a `fallback:` block with one line per vendor that is past
 its Codex ramp, braked (automated share used up, or ahead of pace), near or out of its 5-hour window
 (the warning band, including a missing or stale reading) or blocked by an open foundation defect,

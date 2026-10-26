@@ -196,12 +196,12 @@ class Usage(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
-    def codex_week(self, used, started, five=None):
+    def codex_week(self, used, started, five=None, at=NOW - timedelta(minutes=5)):
         """A Codex reading `started` into its weekly window (the window starts at resets_at - 7 days)."""
         limits = {"primary": {"used_percent": used, "window_minutes": 10080, "resets_at": epoch(NOW + usage.WEEK - started)}}
         if five is not None:
             limits["secondary"] = {"used_percent": five, "window_minutes": 300, "resets_at": epoch(NOW + FIVE_LEFT)}
-        self.codex(json.dumps({"timestamp": (NOW - timedelta(minutes=5)).isoformat(), "payload": {"rate_limits": limits}}) + "\n")
+        self.codex(json.dumps({"timestamp": at.isoformat(), "payload": {"rate_limits": limits}}) + "\n")
 
     RAMP = "codex_ramp = { per_day = 20, ceiling = 80 }\n"
 
@@ -793,6 +793,145 @@ class Usage(unittest.TestCase):
         state = json.loads((self.home / ".local/state/task/usage/claude.json").read_text())
         self.assertEqual(state["seven_day"]["utilization"], 0.85)
         self.assertEqual(state["five_hour"]["resetsAt"], 1792161600)
+
+class ResetFeed(unittest.TestCase):
+    """Decision-24 spend-down from the Codex reset feed: fixtures and a mocked fetch only, never the network."""
+    setUp, claude, codex, codex_week, write_policy, verdict, RAMP = (
+        Usage.setUp, Usage.claude, Usage.codex, Usage.codex_week, Usage.write_policy, Usage.verdict, Usage.RAMP)
+
+    def feed(self, primary=None, rss=None, now=NOW, events=None):
+        """Run one watcher poll; each source is fixture bytes or an exception the mocked fetch raises."""
+        if events is not None:
+            primary = json.dumps({"events": events, "stats": {}, "generated_at": now.isoformat()}).encode()
+        sources = {"primary": (FIXTURES / "codex-resets.json").read_bytes() if primary is None else primary,
+                   "rss": (FIXTURES / "codex-reset.xml").read_bytes() if rss is None else rss}
+        calls = []
+
+        def fetch(url):
+            calls.append(url)
+            if isinstance(sources[url], Exception):
+                raise sources[url]
+            return sources[url]
+        state = usage.refresh_resets(self.home, now, ("primary", "rss"), fetch)
+        return state, calls
+
+    def lines(self, now=NOW):
+        return usage.report(self.home, now)
+
+    def test_feed_is_polled_hourly_and_stored_in_watcher_state(self):
+        state, calls = self.feed()
+        self.assertEqual((calls, state["ok"], state["source"], len(state["events"])), (["primary"], True, "primary", 4))
+        path = self.home / ".local/state/task/codex-resets.json"
+        self.assertEqual(json.loads(path.read_text())["events"], state["events"])
+        self.assertEqual(self.feed(now=NOW + timedelta(minutes=59))[1], [])  # at most hourly
+        self.assertEqual(self.feed(now=NOW + timedelta(hours=1))[1], ["primary"])
+        with mock.patch.object(usage.urllib.request, "urlopen", side_effect=AssertionError("network")):
+            self.assertEqual(usage.refresh_resets(self.home, NOW, ()), json.loads(path.read_text()))  # feed off: no fetch
+
+    def test_1_announced_reset_ahead_is_codex_spend_down_lifting_ramp_and_ceiling(self):
+        self.write_policy(self.RAMP)
+        self.claude(50, 84)
+        self.codex_week(95, timedelta(hours=2))  # past the day-1 allowance and the 80 % ceiling
+        self.assertIn("codex past its daily ramp", usage.gate(self.home, "lane", "codex", "routine", "proj", "t1", NOW)["hold"])
+        self.feed()
+        target = datetime(2026, 10, 21, 17, tzinfo=timezone.utc)
+        self.assertEqual(self.verdict("codex")["spend_down"], target)
+        self.assertEqual(usage.spend_down(self.home, "codex", NOW), target)
+        decision = usage.gate(self.home, "lane", "codex", "routine", "proj", "t1", NOW)
+        self.assertEqual((decision["hold"], decision["ramp_exempt"]), ("", ""))
+        self.assertTrue(any(usage.SPEND_DOWN in note for note in decision["notes"]))
+        self.assertEqual(usage.ramp_gate(self.home, "red-team", "codex", "proj", "t1", "", NOW), ("", ""))
+        text = "\n".join(self.lines())
+        self.assertIn("  spend-down until 2026-10-21 17:00 UTC / 2026-10-21 19:00 Europe/Copenhagen: announced reset ahead "
+                      "(decision-24 spend-down); ramp and ceiling lifted for codex launches", text)
+        self.assertNotIn("past ramp", text)
+        self.assertNotIn("codex reset feed", text)
+        from task_routing import RoutingParseError, guard
+        self.assertTrue(guard("routine", "gpt-6-astra", "", usage.SPEND_DOWN))  # the guard allows it; the caller ledgers
+        with self.assertRaises(RoutingParseError):
+            guard("routine", "gpt-6-astra", "")
+
+    def test_1_teasers_and_interval_predictions_change_nothing(self):
+        self.write_policy(self.RAMP)
+        self.codex_week(95, timedelta(hours=2))
+        events = json.loads((FIXTURES / "codex-resets.json").read_text())["events"][2:]
+        self.feed(events=events)
+        self.assertIsNone(self.verdict("codex")["spend_down"])
+        self.assertTrue(self.verdict("codex")["ramp"]["over"])
+        self.assertIn("past ramp", "\n".join(self.lines()))
+
+    def test_2_completed_or_passed_target_ends_spend_down_and_restarts_the_ramp_at_day_one(self):
+        self.write_policy(self.RAMP)
+        events = json.loads((FIXTURES / "codex-resets.json").read_text())["events"]
+        for name, completed, now in (("completed", "2026-10-20T19:00:00Z", NOW),
+                                     ("target passed", None, datetime(2026, 10, 21, 18, tzinfo=timezone.utc))):
+            with self.subTest(name):
+                self.home = Path(self.enterContext(tempfile.TemporaryDirectory(prefix="usage-test-")))
+                self.write_policy(self.RAMP)
+                self.codex_week(70, timedelta(days=4), at=datetime(2026, 10, 20, 18, tzinfo=timezone.utc))  # day 5, before the reset
+                self.feed(events=[dict(events[0], completed_at=completed)] + events[1:], now=now)
+                found = usage.assessments(self.home, now)[1]["codex"]
+                self.assertIsNone(found["spend_down"])
+                self.assertEqual((found["ramp"]["day"], found["ramp"]["allowance"], found["ramp"]["over"], found["weekly"]),
+                                 (1, 20, False, 0.0))
+                self.assertIn("  ramp: day 1, allowance 20 % (20 %/day, ceiling 80 %); within ramp", self.lines(now))
+                self.assertFalse(any("spend-down until" in line for line in self.lines(now)))
+
+    def test_2_a_landed_reset_after_the_announcement_ends_spend_down(self):
+        self.write_policy(self.RAMP)
+        self.codex_week(95, timedelta(hours=2))
+        events = json.loads((FIXTURES / "codex-resets.json").read_text())["events"]
+        self.feed(events=events + [{"announced_at": None, "target_date": None, "completed_at": "2026-10-20T19:30:00Z",
+                                    "event_status": "confirmed", "tweet_url": "https://x.com/example/status/4"}])
+        self.assertIsNone(self.verdict("codex")["spend_down"])
+        self.assertTrue(self.verdict("codex")["ramp"]["over"])  # the reading at 19:55 is already after the reset
+
+    def test_3_primary_failing_uses_the_rss_fallback(self):
+        self.write_policy(self.RAMP)
+        self.codex_week(70, timedelta(days=4), at=datetime(2026, 10, 20, 18, tzinfo=timezone.utc))
+        for primary in (OSError("connection refused"), b"<html>not json</html>", b'{"events": "nope"}'):
+            with self.subTest(primary=primary):
+                (self.home / ".local/state/task/codex-resets.json").unlink(missing_ok=True)
+                state, calls = self.feed(primary=primary)
+                self.assertEqual((calls, state["ok"], state["source"]), (["primary", "rss"], True, "rss"))
+                self.assertEqual(sorted(state["events"]), ["reset-2026-10-13", "reset-2026-10-20"])
+                found = self.verdict("codex")
+                self.assertIsNone(found["spend_down"])  # the RSS feed has only landed resets
+                self.assertEqual(found["ramp"]["day"], 1)  # its 19:00 reset landed after the 18:00 reading
+                self.assertFalse(any("codex reset feed" in line for line in self.lines()))
+
+    def test_3_both_failing_means_no_spend_down_and_one_warning_line(self):
+        self.write_policy(self.RAMP)
+        self.claude(50, 84)
+        self.codex_week(95, timedelta(hours=2))
+        self.feed()  # an announced reset is stored, then the feed goes down
+        later = NOW + timedelta(hours=1)
+        state, calls = self.feed(primary=OSError("down"), rss=b"<rss><channel><item><title>x</title></item>", now=later)
+        self.assertEqual((calls, state["ok"]), (["primary", "rss"], False))
+        found = usage.assessments(self.home, later)[1]["codex"]
+        self.assertIsNone(found["spend_down"])
+        self.assertTrue(found["ramp"]["over"])
+        self.assertIn("codex past its daily ramp", usage.gate(self.home, "lane", "codex", "routine", "proj", "t1", later)["hold"])
+        warnings = [line for line in self.lines(later) if "codex reset feed" in line]
+        self.assertEqual(warnings, ["pace warning: codex reset feed down or unparseable; no spend-down, the codex ramp applies"])
+        stale = '{"ok": true, "checked_at": "2026-10-20T15:00:00+00:00", "events": {}}'
+        for state_text, expected in (("{broken", "has no reading yet"), (stale, "not checked since 2026-10-20 15:00 UTC")):
+            (self.home / ".local/state/task/codex-resets.json").write_text(state_text)
+            self.assertEqual([line for line in self.lines(later) if "codex reset feed" in line],
+                             [f"pace warning: codex reset feed {expected}; no spend-down, the codex ramp applies"])
+
+    def test_4_claude_is_unaffected_in_every_case(self):
+        self.write_policy(self.RAMP)
+        self.claude(80, 84)  # exhausted: Claude stays held in every feed state
+        before = usage.gate(self.home, "lane", "claude", "hard", "proj", "t1", NOW)["hold"]
+        for primary in (None, OSError("down")):
+            with self.subTest(primary=primary):
+                (self.home / ".local/state/task/codex-resets.json").unlink(missing_ok=True)
+                self.feed(primary=primary, rss=OSError("down"))
+                self.assertIsNone(self.verdict("claude")["spend_down"])
+                self.assertIsNone(usage.spend_down(self.home, "claude", NOW))
+                self.assertEqual(usage.gate(self.home, "lane", "claude", "hard", "proj", "t1", NOW)["hold"], before)
+                self.assertFalse(any("spend-down" in line for line in self.lines() if line.startswith("claude")))
 
 
 if __name__ == "__main__":

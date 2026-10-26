@@ -68,13 +68,14 @@ def active(home, paused=None):
     return result
 
 
-def guard(tier, model, override=""):
-    """Refuse a top model outside its tier unless Jacopo's override text is given; True when it was needed."""
+def guard(tier, model, override="", allow=""):
+    """Refuse a top model outside its tier unless Jacopo's override text (or `allow`, decision-24's Codex
+    spend-down) is given; True when it was needed."""
     if problem := override_problem(override):
         raise RoutingParseError(problem)
     if TOP_ONLY.get(model, tier) == tier:
         return False
-    if not (override or "").strip():
+    if not (override or "").strip() and not allow:
         raise RoutingParseError(
             f"{model} is for Tier: {TOP_ONLY[model]} tasks only (this one is {tier}); use gpt-6-luna "
             f"by default or gpt-6.1-sol for hard (Claude: sonnet, opus). Only --override \"{OVERRIDE_FORMAT}\" "
@@ -92,16 +93,16 @@ def tier_guard(recorded, tier, override=""):
     return True
 
 
-def route(home, vendor, tier, explicit=None, boosted=True, override="", recorded=None):
+def route(home, vendor, tier, explicit=None, boosted=True, override="", recorded=None, allow=""):
     """Pick the model for `tier`; the guard needs both it and the task's recorded tier to allow the model."""
     model = pick(home, vendor, tier, explicit, boosted)
-    guards(tier, recorded, model, override)
+    guards(tier, recorded, model, override, allow)
     return model
 
 
-def guards(tier, recorded, model, override=""):
+def guards(tier, recorded, model, override="", allow=""):
     """guard() for the lane's tier and the task's recorded tier: a --tier flag cannot raise eligibility."""
-    return any([guard(each, model, override) for each in dict.fromkeys((recorded or tier, tier))])
+    return any([guard(each, model, override, allow) for each in dict.fromkeys((recorded or tier, tier))])
 
 
 def pick(home, vendor, tier, explicit, boosted):

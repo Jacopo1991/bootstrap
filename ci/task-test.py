@@ -7402,6 +7402,66 @@ store.write_text(json.dumps(prs))
         self.assertIn("fallback:\n  claude blocked by a foundation defect (hook defect T-70): builds -> wait; reviews of Codex work -> wait\n"
                       "  codex past ramp (day 1, 20 %): builds -> wait; reviews of Claude work -> wait", out)
 
+    def reset_feed(self, **event):
+        """Watcher state holding one feed event (decision-24); times are relative to now."""
+        now = datetime.now(timezone.utc)
+        event = dict(announced_at=(now - timedelta(hours=8)).isoformat(), event_status="confirmed", timing_kind="announced",
+                     **{key: value if value is None else (now + value).isoformat() for key, value in event.items()})
+        path = self.home / ".local/state/task/codex-resets.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"checked_at": now.isoformat(), "ok": True, "source": "fixture", "events": {"e": event}}))
+
+    def spend_ledger(self):
+        path = self.home / ".local/state/task/usage/overrides.jsonl"
+        return [row for row in map(json.loads, path.read_text().splitlines()) if row.get("kind") == "spend_down"] if path.exists() else []
+
+    def test_spend_down_codex_lane_past_ramp_and_ceiling_with_any_model_starts_and_is_ledgered(self):
+        self.ramp_policy()
+        self.readings(codex=(95, 167))  # day 1: allowance 20 %, ceiling 80 %
+        self.reset_feed(target_date=timedelta(hours=20), completed_at=None)
+        self.assertIn("  spend-down until ", self.raw_task("usage"))
+        wt, out = self.pace_lane("--model", "gpt-6-astra", builder="codex")  # a design-only model on a routine task
+        self.assertNotIn("held back", out)
+        self.assertIn("override recorded: decision-24 spend-down on codex until", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "gpt-6-astra")
+        rows = self.spend_ledger()
+        self.assertEqual([(r["override"], r["vendor"], r["model"], r["past_ramp"], r["model_guard"]) for r in rows],
+                         [("decision-24 spend-down", "codex", "gpt-6-astra", True, True)])
+        self.assertIn("spend_down on routine", self.raw_task("status", "proj"))
+
+    def test_spend_down_ends_when_the_reset_landed_or_its_target_passed(self):
+        self.ramp_policy()
+        self.readings(codex=(30, 167))  # read after the reset: day 1, past the 20 % allowance
+        for event in (dict(target_date=timedelta(hours=20), completed_at=timedelta(hours=-2)),
+                      dict(target_date=timedelta(hours=-2), completed_at=None)):
+            with self.subTest(event=event):
+                self.reset_feed(**event)
+                out = self.raw_task("usage")
+                self.assertNotIn("spend-down until", out)
+                self.assertIn("  ramp: day 1, allowance 20 % (20 %/day, ceiling 80 %); past ramp", out)
+        wt, out = self.pace_lane(builder="codex", code=4)
+        self.assertIn("held back by usage pacing: codex past its daily ramp", out)
+        self.assertEqual(self.spend_ledger(), [])
+
+    def test_spend_down_feed_down_fails_closed_with_one_warning_and_claude_is_unaffected(self):
+        self.ramp_policy("ahead_margin = 90\n")
+        self.readings(claude=(50, 167), codex=(30, 167))
+        self.reset_feed(target_date=timedelta(hours=20), completed_at=None)
+        out = self.raw_task("usage")
+        self.assertFalse(any(line.startswith("claude") and "spend-down" in line for line in out.splitlines()))
+        wt, out = self.pace_lane("--model", "fable", code=1)  # Claude's guard still refuses a hard-only model
+        self.assertIn("fable is for Tier: hard tasks only", out)
+        out = self.raw_task("lane", "proj", "5")
+        self.assertNotIn("spend-down", out)
+        self.assertEqual(self.wait_for_lane(wt)["model"], "sonnet")
+        self.assertEqual(self.spend_ledger(), [])
+        state = self.home / ".local/state/task/codex-resets.json"
+        state.write_text(json.dumps(dict(json.loads(state.read_text()), ok=False)))
+        out = self.raw_task("usage")
+        self.assertEqual(out.count("codex reset feed"), 1)
+        self.assertIn("pace warning: codex reset feed down or unparseable; no spend-down, the codex ramp applies", out)
+        self.assertIn("past ramp", out)
+
     def test_pace_review_holds_exhausted_reviewer_and_final_goes_deeper_when_under_used(self):
         self.stub_reviewers()
         wt, _ = self.started()
@@ -10087,6 +10147,7 @@ class WatcherTests(unittest.TestCase):
         self.readings = mock.patch.object(self.watch.usage, 'readings', return_value={})
         self.readings.start()
         self.addCleanup(self.readings.stop)
+        self.enterContext(mock.patch.dict(os.environ, TASK_RESET_FEEDS=''))  # no network in tests
 
     def write(self, name, text):
         path = self.home / name
@@ -10194,7 +10255,7 @@ class WatcherTests(unittest.TestCase):
                               'print(json.loads((home / "unit-properties.json").read_text())[sys.argv[-1]])\n')
         systemctl.chmod(0o755)
         env = dict(HOME=str(self.home), PATH=f'{systemctl.parent}:/usr/bin:/bin',
-                   PYTHONDONTWRITEBYTECODE='1')
+                   PYTHONDONTWRITEBYTECODE='1', TASK_RESET_FEEDS='')
         cases = [
             ({'SubState': 'running'}, 'activating', None),
             ({'SubState': 'running'}, 'inactive', None),
@@ -10233,7 +10294,7 @@ class WatcherTests(unittest.TestCase):
         ping = self.write('.local/bin/job-ping', '#!/bin/sh\nexit 0\n')
         ping.chmod(0o755)
         env = dict(HOME=str(self.home), PATH=f'{systemctl.parent}:/usr/bin:/bin',
-                   PYTHONDONTWRITEBYTECODE='1', TASK_HOLDER='watcher-test')
+                   PYTHONDONTWRITEBYTECODE='1', TASK_HOLDER='watcher-test', TASK_RESET_FEEDS='')
         state = self.home / '.local/state/task'
         first_seen = None
         for props, reason in [({'UnitFileState': 'disabled'}, 'disabled'),
@@ -10296,7 +10357,7 @@ class WatcherTests(unittest.TestCase):
         ping.chmod(0o755)
         ask = self.write('cortex/cortex-kb-company/backlog/tasks/ask.md',
                          '---\nstatus: To Do\nlabels: [ask]\ndue_date: 2000-01-01\n---\n')
-        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1', 'TASK_RESET_FEEDS': ''}
         result = subprocess.run([sys.executable, installed / 'task-watch'], cwd=self.home,
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -10368,11 +10429,38 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual([row['status'] for row in rows], ['open', 'closed', 'open'])
         self.assertTrue(all(row['class'] == 'seat-report' and 'source' in row and 'last_seen' in row for row in rows))
 
+    def test_codex_reset_feed_polled_hourly_with_fallback_and_never_fails_the_watch(self):
+        fixtures = ROOT / 'ci/fixtures/usage'
+        calls, sources = [], {'http://primary.test/api': (fixtures / 'codex-resets.json').read_bytes(),
+                              'http://rss.test/feed.xml': (fixtures / 'codex-reset.xml').read_bytes()}
+        def fetch(url):
+            calls.append(url)
+            if isinstance(sources[url], Exception): raise sources[url]
+            return sources[url]
+        state = self.home / '.local/state/task/codex-resets.json'
+        os.environ['TASK_RESET_FEEDS'] = 'http://primary.test/api http://rss.test/feed.xml'
+        with mock.patch.object(Path, 'home', return_value=self.home), mock.patch.object(sys, 'argv', ['task-watch']), \
+                mock.patch.object(self.watch.usage, '_fetch', fetch):
+            self.watch.main()
+            self.watch.main()  # within the hour: no second poll
+            self.assertEqual(calls, ['http://primary.test/api'])
+            self.assertEqual(len(json.loads(state.read_text())['events']), 4)
+            state.write_text(json.dumps(dict(json.loads(state.read_text()), checked_at='2000-01-01T00:00:00+00:00')))
+            sources['http://primary.test/api'] = OSError('down')
+            self.watch.main()
+            self.assertEqual(json.loads(state.read_text())['source'], 'http://rss.test/feed.xml')
+            self.assertEqual(len(json.loads(state.read_text())['events']), 6)
+            state.write_text(json.dumps(dict(json.loads(state.read_text()), checked_at='2000-01-01T00:00:00+00:00')))
+            sources['http://rss.test/feed.xml'] = OSError('down')
+            self.watch.main()  # both down: the watch still runs, the state says so
+            self.assertFalse(json.loads(state.read_text())['ok'])
+        self.assertEqual(len(calls), 5)
+
     def test_cli_ping_success_failure_and_write_boundary(self):
         ping = self.write('.local/bin/job-ping', '#!/bin/sh\nprintf "%s %s\\n" "$1" "$2" >> "$HOME/pings"\n')
         ping.chmod(0o755)
         before = {str(p.relative_to(self.home)) for p in self.home.rglob('*') if p.is_file()}
-        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'}
+        env = {'HOME': str(self.home), 'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1', 'TASK_RESET_FEEDS': ''}
         tool = TOOL.with_name('executable_task-watch')
         for expected in (0, 1):
             if expected: self.write('.config/task/watch-reports.json', '{broken')

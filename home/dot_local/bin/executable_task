@@ -547,6 +547,16 @@ def ledger_ramp_exempt(args, task, vendor, model, tier, past_ramp):
         print(f"override recorded: ramp-exempt {args.ramp_exempt} on {vendor}{' past its daily ramp' if past_ramp else ''}")
 
 
+def ledger_spend_down(task, vendor, model, tier, guarded=False):
+    """Record a Codex launch that decision-24's spend-down let past the ramp or the model guard."""
+    item = task_usage.assessments(HOME, datetime.now(timezone.utc))[1]["codex"]
+    past_ramp = bool(item["ramp"] and item["ramp"]["over"])
+    if vendor == "codex" and item["spend_down"] and (past_ramp or guarded):
+        task_usage.record_override(HOME, task.repo.name, task.id, model, tier, task_usage.SPEND_DOWN, kind="spend_down",
+                                   vendor=vendor, until=item["spend_down"].isoformat(), past_ramp=past_ramp, model_guard=guarded)
+        print(f"override recorded: {task_usage.SPEND_DOWN} on codex until {item['spend_down']:%Y-%m-%d %H:%M} UTC")
+
+
 def plan_time(value):
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -1051,6 +1061,7 @@ def redteam(args):
             brief = wrapper.read_text(encoding="utf-8") + "\n\n" + brief
         model = policy["red_team_model_claude" if vendor == "claude" else "red_team_model"]
         ledger_ramp_exempt(args, task, vendor, model, record.get("tier", "routine"), bool(exempted))
+        ledger_spend_down(task, vendor, model, record.get("tier", "routine"))
         binary = shutil.which(vendor)
         if not binary:
             raise Stop(f"risk high: {vendor} is not available on PATH")
@@ -2043,7 +2054,8 @@ def lane(args):
     recorded = record.get("tier", "routine")
     tier = args.tier or recorded
     explicit = args.model
-    guards(tier, recorded, explicit, args.override)
+    spend = task_usage.SPEND_DOWN if task_usage.spend_down(HOME, builder) else ""
+    guards(tier, recorded, explicit, args.override, spend)
     tier_changed = tier_guard(recorded, args.tier, args.override)
     decision = None if args._worker else pace_check(args, "lane", builder, tier, task)
     if decision:
@@ -2055,7 +2067,8 @@ def lane(args):
             if explicit and explicit != task_usage.CHEAPER[builder]:
                 print(f"pace: {builder} ahead of pace; routine lane uses {task_usage.CHEAPER[builder]}, not {explicit} (--no-pace keeps it)")
             explicit = task_usage.CHEAPER[builder]
-    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker, args.override, recorded)
+    spend = task_usage.SPEND_DOWN if task_usage.spend_down(HOME, builder) else ""
+    model = route(HOME, builder, tier, explicit, not args.no_boost and not args._worker, args.override, recorded, spend)
     cli_model = resolve_model(builder, model)
     until = active_boosts().get(builder)
     if until and not args.no_boost and not args._worker:
@@ -2113,11 +2126,13 @@ def lane(args):
             print(f"route: {tier} -> {builder} {model}")
             if boost_notice:
                 print(boost_notice)
-            if os.environ.get("TASK_PLAN"): guards(tier, recorded, model, args.override); usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", commit=sha(path, "HEAD"), vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1)
+            if os.environ.get("TASK_PLAN"): guards(tier, recorded, model, args.override, spend); usage_run = budget_run(repo=task.repo.name, task=task.id, kind="lane", commit=sha(path, "HEAD"), vendor=builder, model=model, tier=tier, effort=args.effort, round=used + 1)
             if tier_changed:
                 task_usage.record_override(HOME, task.repo.name, task.id, "tier change", f"{recorded} to {tier}", args.override)
                 print(f"override recorded: tier {recorded} to {tier} ({args.override})")
-            if guards(tier, recorded, model, args.override):
+            needed = guards(tier, recorded, model, args.override, spend)
+            guarded = needed and not args.override
+            if needed and args.override:
                 task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
@@ -2144,6 +2159,7 @@ def lane(args):
             if extra != rounds.get("extra", 0):
                 task_usage.record_override(HOME, task.repo.name, task.id, "extra rounds", risk, args.extra_round)
             ledger_ramp_exempt(args, task, builder, model, tier, bool(decision and decision["ramp_exempt"]))
+            ledger_spend_down(task, builder, model, tier, guarded)
             task_usage.claim(HOME, builder, "lane", child.pid)
             atomic_json(lane_record, {"state": "running", "pid": child.pid, "unit": child.unit,
                                       "process_start": task_usage.process_start(child.pid),
@@ -3637,6 +3653,7 @@ def review_locked(args):
             if risk == "high" and reviewer_route[0] in active_boosts() and (record.get("tier") == "hard" or args.final):
                 reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
             ledger_ramp_exempt(args, task, reviewer_route[0], reviewer_route[1], "routine", bool(decision and decision["ramp_exempt"]))
+            ledger_spend_down(task, reviewer_route[0], reviewer_route[1], "routine")
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
                   f"Task: {task.file or '(no Backlog task file)'}", f"Worktree: {path}",
                   f"Outcome: {outcome}", f"Scope: {scope}"]

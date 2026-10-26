@@ -12,7 +12,7 @@ import tempfile
 import unittest
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from policy_test_env import isolate_policy_environment
 from hold_fixture import install_checker
@@ -91,12 +91,26 @@ elif cmd == 'lane':
     prompt = (work / 'prompt.md').read_text()
     sys.path.insert(0, os.environ['TASK_TEST_ROUTING_DIR'])
     from task_routing import route
+    from task_routing import guards
+    from task_usage import SPEND_DOWN, spend_down
     vendor = options[options.index('--builder') + 1]
     tier = options[options.index('--tier') + 1] if '--tier' in options else 'routine'
     explicit = options[options.index('--model') + 1] if '--model' in options else None
     override = options[options.index('--override') + 1] if '--override' in options else ''
     recorded = json.loads((state / 'task.json').read_text()).get('tier', 'routine')
-    routed_model = route(home, vendor, tier, explicit, override=override, recorded=recorded)
+    allow = SPEND_DOWN if spend_down(home, vendor) else ''
+    routed_model = route(home, vendor, tier, explicit, override=override, recorded=recorded, allow=allow)
+    # Ledger through production: run the real `task lane` line that calls ledger_spend_down, in the real module.
+    import importlib.machinery, importlib.util, inspect, types
+    loader = importlib.machinery.SourceFileLoader('task_cli', os.path.join(os.environ['TASK_TEST_ROUTING_DIR'], 'executable_task'))
+    cli = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(cli)
+    guarded = guards(tier, recorded, routed_model, override, allow) and not override
+    for line in inspect.getsource(cli.lane).splitlines():
+        if line.strip().startswith('ledger_spend_down('):
+            # the helper reads only task.repo.name and task.id; stub idents need not pass Task's name rules
+            exec(line.strip(), vars(cli), dict(task=types.SimpleNamespace(repo=repo, id=ident), builder=vendor,
+                                               model=routed_model, tier=tier, guarded=guarded))
     with (home / 'prompts.jsonl').open('a') as out:
         out.write(json.dumps(dict(path=str(work / 'prompt.md'), prompt=prompt, args=options,
                                  routed_model=routed_model)) + '\n')
@@ -675,6 +689,39 @@ class BatchTest(unittest.TestCase):
                                  r'(design|hard) tasks only .*gpt-6-luna.*gpt-6.1-sol')
                 self.assertFalse((self.home / 'calls.jsonl').exists() and self.calls('lane'))
                 (self.repo / '.work/runner-test.done').unlink()
+
+    def test_codex_spend_down_lets_an_out_of_tier_codex_model_pass_preflight_and_ledgers_it(self):
+        now = datetime.now(timezone.utc)
+        rollout = self.home / '.codex/sessions/2026/10/25/rollout-fixture.jsonl'
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(json.dumps({'timestamp': now.isoformat(), 'payload': {'rate_limits': {'primary': {
+            'used_percent': 30, 'window_minutes': 10080, 'resets_at': int(now.timestamp()) + 100 * 3600}}}}) + '\n')
+        feed = self.home / '.local/state/task/codex-resets.json'
+        feed.parent.mkdir(parents=True, exist_ok=True)
+        ledger = self.home / '.local/state/task/usage/overrides.jsonl'
+        def rows():
+            return [json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+        for number, (vendor, model, target) in enumerate((('codex', 'gpt-6-astra', 20), ('codex', 'gpt-6-astra', None),
+                                                          ('claude', 'fable', 20))):
+            with self.subTest(vendor=vendor, spend_down=bool(target)):
+                event = dict(announced_at=now.isoformat(), target_date=(now + timedelta(hours=target or -1)).isoformat(),
+                             completed_at=None, event_status='confirmed', timing_kind='announced')
+                feed.write_text(json.dumps({'checked_at': now.isoformat(), 'ok': True, 'events': {'e': event}}))
+                ident = f'sd{number}'
+                self.source.write_text(f'1. {ident}: builder {vendor}, model {model}\nTime box: 60 min\n')
+                self.scenario({})
+                before = len(rows())
+                result = self.run_batch()
+                lanes = [c for c in self.calls('lane') if c[2] == ident] if (self.home / 'calls.jsonl').exists() else []
+                if vendor == 'codex' and target:
+                    self.assertNotIn('parked', result)
+                    self.assertEqual(lanes[0][lanes[0].index('--model') + 1], model)
+                    self.assertEqual([(r['kind'], r['override'], r['vendor'], r['model'], r['task'])
+                                      for r in rows()[before:]], [('spend_down', 'decision-24 spend-down', 'codex', model, ident)])
+                else:  # outside spend-down, and Claude at any time: still refused, nothing ledgered
+                    self.assertRegex(result, rf'{ident}: parked: {model} is for Tier: (design|hard) tasks only')
+                    self.assertEqual((lanes, rows()[before:]), ([], []))
+                (self.repo / '.work/runner-test.done').unlink(missing_ok=True)
 
     def test_top_model_on_its_own_tier_runs_and_never_returns_in_fix_rounds(self):
         for builder, model, tier, final in (('codex', 'gpt-6-astra', 'design', 'opus'),
