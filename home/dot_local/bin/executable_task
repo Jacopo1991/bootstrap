@@ -29,6 +29,7 @@ import task_usage
 import task_lock
 from task_limits import bwrap_denial, cli_limit, lane_limit, round_cause, SETUP_CAUSES
 from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
+from task_routing import review_chain, same_vendor_ok
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
 JACOPO_HOLD = Path("/etc/agent-hold")
@@ -511,13 +512,28 @@ def boost_line():
     paused = {}
     boosts = active(HOME, paused)
     lines = (["boost: " + ", ".join(f"{vendor} until {until}" for vendor, until in sorted(boosts.items()))
-              + " (tier routing + batch capacity; deeper hard/final reviews)"] if boosts else [])
+              + " (tier routing + batch capacity)"] if boosts else [])
     return "\n".join(lines + list(paused.values()))
 
 
 def usage(args):
     lines = task_usage.weekly_lines(HOME) if args.weekly_line else task_usage.report(HOME)
     print("\n".join(lines))
+    return 0
+
+
+def gemini(args):
+    """Decision-32 Gemini review route: state, the agy command for one backtest prompt, the T-44 result."""
+    if args.record:
+        if not args.model or not args.evidence or not args.evidence.strip():
+            raise Stop("--record needs --model <agy model slug> and --evidence \"<T-44 backtest result>\"")
+        atomic_json(HOME / ".local/state/task/usage/gemini.json", dict(
+            result=args.record, model=args.model, evidence=args.evidence.strip(), time=utc_now()))
+        task_usage.log(HOME, f"gemini T-44 backtest recorded: {args.record} with {args.model}")
+    if args.command_for:
+        print(agy_command(args.model or "<model>", prompt_file=Path(args.command_for).resolve()) + " < /dev/null")
+        return 0
+    print("\n".join(task_usage.gemini_lines(HOME)))
     return 0
 
 
@@ -1076,8 +1092,7 @@ def redteam(args):
                                   env={**agent_environment(), 'GIT_OPTIONAL_LOCKS': '0'}, stdin=source,
                                   stdout=output_stream if vendor == 'claude' else None)
             code = process.wait()
-        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code,
-                                                       **(dict(state='skipped: hold', ended_at=utc_now()) if process.skipped else {})))
+        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code))
         if process.skipped: raise Stop('skipped: hold')
         if code or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
             raise Stop("risk high: red-team failed or head changed; no output recorded")
@@ -1095,7 +1110,22 @@ def redteam(args):
 
 
 def deeper_review(model):
-    return model in {*task_usage.DEEPER.values(), *TOP_ONLY} or any(name in model.lower() for name in ("opus", "fable"))
+    """Opus and the top-only models; gpt-6.1-sol is a routine reviewer under company decision-32."""
+    return model in TOP_ONLY or any(name in model.lower() for name in ("opus", "fable"))
+
+
+AGY_PROMPT = "--print=@review-prompt"  # run_reviewer puts the prompt file's text here, as one argv element
+
+
+def agy_command(model, add_dir="", prompt_file=None):
+    """The Gemini review route: plan mode (no edits), terminal sandbox on, slash commands off. agy takes the
+    prompt as --print's value; with `prompt_file` the command reads it in a shell, for the PM's backtest."""
+    return (f"agy --mode plan --sandbox --output-format text --model {shlex.quote(model)} "
+            f"--disable-slash-commands {add_dir}{agy_prompt(prompt_file) if prompt_file else AGY_PROMPT}")
+
+
+def agy_prompt(prompt_file):
+    return f'--print="$(cat {shlex.quote(str(prompt_file))})"'
 
 
 def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=False):
@@ -1685,7 +1715,8 @@ def check_task_from_args(args):
 
 
 def advisory_check_for(task: Task):
-    return not task_state_writable() or not task_state_writable(task)
+    # A lane (TASK_WORKTREE) never records a trusted check, whatever its state access (T-67).
+    return bool(os.environ.get("TASK_WORKTREE")) or not task_state_writable() or not task_state_writable(task)
 
 
 def require_pm(args):
@@ -2427,7 +2458,8 @@ def check_step_environment(run_id):
     """Keep local mock traffic off the sandbox proxy without changing proxy settings."""
     child_env = dict(agent_environment(), TASK_RUN_ID=run_id)
     child_env.update({key: value for key, value in os.environ.items()
-                      if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}})
+                      if key.lower() in {"http_proxy", "https_proxy", "all_proxy", "no_proxy"}
+                      or key in {"UV_CACHE_DIR", "PIP_CACHE_DIR", "PRE_COMMIT_HOME", "npm_config_cache"}})
     for name in ("NO_PROXY", "no_proxy"):
         existing = child_env.get(name, "")
         child_env[name] = ",".join(part for part in (existing.rstrip(","), "localhost", "127.0.0.1", "::1") if part)
@@ -2674,14 +2706,6 @@ def stop_unit(unit, env=None):
             raise Stop(f'Cannot stop {unit}; kept the running record.')
 
 
-def unit_skipped(service, exited):
-    """The ExecCondition (hold check) refused the unit. systemd reports that as Result=exec-condition,
-    or as Result=success with no main process ever started once systemd-run has exited."""
-    if service.get('Result') == 'exec-condition': return True
-    return (exited and service.get('Result') == 'success' and service.get('ActiveState') == 'inactive'
-            and service.get('MainPID') in (None, '', '0') and service.get('ExecMainStartTimestamp') == '')
-
-
 class UnitProcess:
     """Wait on systemd-run, but identify and stop the service's actual process."""
     def __init__(self, process, unit, env):
@@ -2691,7 +2715,7 @@ class UnitProcess:
         while time.monotonic() < deadline:
             code = process.poll()
             service = runner_service(unit, env)
-            self.skipped = unit_skipped(service, code is not None)
+            self.skipped = service.get('Result') == 'exec-condition'
             self.pid = int(service.get('MainPID') or 0)
             if self.pid or self.skipped: return
             if code is not None and service.get('Result') == 'success': return
@@ -2703,7 +2727,7 @@ class UnitProcess:
 
     def wait(self, timeout=None):
         code = self.process.wait(timeout=timeout)
-        self.skipped = self.skipped or unit_skipped(runner_service(self.unit, self.env), True)
+        self.skipped = self.skipped or runner_service(self.unit, self.env).get('Result') == 'exec-condition'
         return 77 if self.skipped else code
 
     def poll(self):
@@ -2711,6 +2735,22 @@ class UnitProcess:
 
     def stop(self):
         stop_unit(self.unit, self.env)
+        self.process.wait()
+
+
+class LocalProcess:
+    """An advisory check step run in-process: a lane sandbox refuses systemd-run (T-67). Same hold rule."""
+    def __init__(self, command, *, cwd, env, stdout, stderr):
+        self.unit, self.skipped = 'in-process', bool(hold_status())
+        self.process = None if self.skipped else subprocess.Popen(
+            command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+        self.pid = self.process.pid if self.process else 0
+
+    def wait(self, timeout=None):
+        return 77 if self.skipped else self.process.wait(timeout=timeout)
+
+    def stop(self):
+        with contextlib.suppress(ProcessLookupError): os.killpg(self.pid, signal.SIGKILL)
         self.process.wait()
 
 
@@ -3172,8 +3212,9 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                     child_env.update(gate_environment or {})
                 if advisory and step[0] == "pre-commit":
                     child_env, private_index_directory = advisory_pre_commit_environment(path, child_env)
-                process = launch_unit('gate', main_repo(path), path.name, step, cwd=path,
-                                      env=child_env, stdout=out, stderr=out)
+                process = (LocalProcess(step, cwd=path, env=child_env, stdout=out, stderr=out) if advisory else
+                           launch_unit('gate', main_repo(path), path.name, step, cwd=path,
+                                       env=child_env, stdout=out, stderr=out))
                 if state:
                     set_child_group(state, process.pid, process.unit)
                 timed_out = False
@@ -3548,6 +3589,11 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
     env = agent_environment()
     argv = shlex.split(command)
+    if AGY_PROMPT in argv:
+        text = prompt_file.read_text()
+        if len(text.encode()) > 120_000:  # one argv element may not exceed 128 KiB
+            raise Stop("Review prompt too long for agy's --print argument; no review recorded.")
+        argv[argv.index(AGY_PROMPT)] = "--print=" + text
     if argv[0] == "GIT_OPTIONAL_LOCKS=0":
         env["GIT_OPTIONAL_LOCKS"] = "0"
         argv.pop(0)
@@ -3572,7 +3618,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         try:
             code = process.wait()
             if process.skipped:
-                atomic_json(run_file, dict(run, unit=process.unit, state='skipped: hold', ended_at=utc_now()))
+                atomic_json(run_file, dict(run, unit=process.unit, state='skipped: hold'))
                 if usage_run: (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
                 raise Stop('skipped: hold')
             print(reply_file.with_name('review-unit.log').read_text(), end='', file=sys.stderr)
@@ -3590,7 +3636,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
-            process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply, stderr=errors,
+            process = subprocess.Popen(argv, cwd=path, env=env, stdin=subprocess.DEVNULL if AGY_PROMPT in shlex.split(command) else prompt, stdout=reply, stderr=errors,
                                        start_new_session=True, pass_fds=(*task_lock.descriptors(), *([lock_fd] if lock_fd is not None else [])))
             run.update(unit=unit, pid=os.getpid(), process_start=task_usage.process_start(os.getpid()))
             if not usage_run: usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
@@ -3671,15 +3717,27 @@ def review_locked(args):
     outcome = markdown_section(task_text, "Outcome") or record.get("title") or f"Direct request for branch {task.id}"
     scope = markdown_section(task_text, "Scope") or task.id
     if not args.record:
-        reviewer_route = ("claude" if record["builder"] == "codex" else "codex", review_policy[record["builder"]])
+        if args.miss is not None and (risk != "high" or not args.miss.strip()):
+            raise Stop("--miss needs high risk and the recorded miss of a cheaper reviewer")
+        gemini = None
+        if (risk == "high" or record["builder"] == "codex") and task_usage.gemini_record(HOME).get("result") == "pass":
+            found = task_usage.gemini(HOME)
+            gemini = found["model"] if found["available"] else None
+            if not gemini:
+                print(f"gemini reviewer skipped: quota {found['quota']}, telemetry {found['telemetry']}; routing to the next reviewer.")
+        chain = review_chain(record["builder"], risk, review_policy[record["builder"]], gemini)
+        if not chain:
+            raise Stop(f"risk {risk}: the review policy names the builder's own vendor; high risk needs another vendor")
+        if args.miss:  # decision-32: Opus only after a cheaper reviewer's recorded miss (ledgered)
+            chain.insert(0, (chain[0][0], task_usage.DEEPER[chain[0][0]] if chain[0][0] in task_usage.DEEPER else chain[0][1]))
+            task_usage.record_override(HOME, repo.name, task.id, chain[0][1], "routine", args.miss, kind="review_miss", vendor=chain[0][0])
+        reviewer_route = chain[0]
         if risk != "high" and deeper_review(reviewer_route[1]):
             raise Stop(f"risk {risk}: policy must select a cheap reviewer; deeper review requires high")
         if args.run:
-            decision = pace_check(args, "review", reviewer_route[0], "routine", task)
+            decision = None if reviewer_route[0] == "gemini" else pace_check(args, "review", reviewer_route[0], "routine", task)
             if decision and decision["hold"]:
                 return 4
-            if risk == "high" and reviewer_route[0] in active_boosts() and (record.get("tier") == "hard" or args.final):
-                reviewer_route = (reviewer_route[0], task_usage.DEEPER[reviewer_route[0]])
             ledger_ramp_exempt(args, task, reviewer_route[0], reviewer_route[1], "routine", bool(decision and decision["ramp_exempt"]))
             ledger_spend_down(task, reviewer_route[0], reviewer_route[1], "routine")
         prompt = ["You are the REVIEWER of another agent's work. Do not edit, run builds or tests, or commit. Read the diff and report, then give the verdict block.",
@@ -3756,6 +3814,8 @@ def review_locked(args):
         reply_file.unlink(missing_ok=True)
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         def reviewer_command(vendor, model):
+            if vendor == "gemini":
+                return agy_command(model, add_dir)
             if vendor == "claude":
                 events = "--output-format stream-json --verbose " if args.run else ""
                 return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
@@ -3766,28 +3826,31 @@ def review_locked(args):
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
-            print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
+            print(f"  {command.replace(AGY_PROMPT, agy_prompt(prompt_file))} < "
+                  f"{shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
             return 0
         task_lock.work(HOME, repo, head)
         used_fallback = False
         for attempt in range(2):
-            try:
-                run_reviewer(command, path, prompt_file, reply_file, lock_fd=args.review_lock_fd)
-            except UsageLimit:
-                if used_fallback:
-                    raise
-                previous_route = reviewer_route
-                reviewer_route = (("codex", "gpt-6-luna") if reviewer_route[0] == "claude"
-                                  else ("claude", "haiku"))
-                print(f"{previous_route[0]} reviewer hit a usage limit; retrying once with "
-                      f"{reviewer_route[0]} {reviewer_route[1]}.")
+            while True:
+                try:
+                    run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if used_fallback and os.environ.get("TASK_PLAN") else None, lock_fd=args.review_lock_fd)
+                    break
+                except Stop as error:
+                    # The next decision-32 reviewer on a usage limit; any agy failure also moves on, so reviews never stop on Gemini.
+                    limited = isinstance(error, UsageLimit)
+                    if len(chain) < 2 or not (limited or reviewer_route[0] == "gemini" and str(error) != "skipped: hold"):
+                        raise
+                previous_route, reviewer_route = reviewer_route, chain[1]
+                chain = chain[1:]
+                print(f"{previous_route[0]} reviewer {'hit a usage limit' if limited else 'failed'}; "
+                      f"retrying once with {reviewer_route[0]} {reviewer_route[1]}.")
                 used_fallback = True
                 atomic_json(state / "review-routing.json", {
                     "vendor": reviewer_route[0], "model": reviewer_route[1],
                     "fallback_from": list(previous_route)})
                 command = reviewer_command(*reviewer_route)
-                run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if os.environ.get("TASK_PLAN") else None, lock_fd=args.review_lock_fd)
             head = sha(path, "HEAD")
             try:
                 verdict, commit, _, _ = parse_review_reply(
@@ -3825,14 +3888,14 @@ def review_locked(args):
         routed_reviewer = tuple(args.reviewer) if args.reviewer else None
         if not routed_reviewer:
             problems.append("no stored reviewer routing; provide --reviewer <vendor> <model>")
-        elif routed_reviewer[0].lower() not in {"claude", "codex"} or not routed_reviewer[1].strip():
-            problems.append("--reviewer must be <claude|codex> <model>")
+        elif routed_reviewer[0].lower() not in {"claude", "codex", "gemini"} or not routed_reviewer[1].strip():
+            problems.append("--reviewer must be <claude|codex|gemini> <model>")
         elif routed_reviewer[1] in TOP_ONLY:
             problems.append(f"reviews never use {routed_reviewer[1]}; no override applies")
         else:
             routed_reviewer = (routed_reviewer[0].lower(), routed_reviewer[1])
     if (routed_reviewer and routed_reviewer[0].lower() == record["builder"]
-            and not (args.run and used_fallback)):
+            and not (args.run and used_fallback) and not same_vendor_ok(record["builder"], risk)):
         problems.append("reviewer vendor must differ from builder")
     if routed_reviewer and risk != "high" and deeper_review(routed_reviewer[1]):
         problems.append(f"risk {risk}: deeper review is allowed only for high tasks")
@@ -3901,8 +3964,9 @@ def merge_gate(task, path, head):
     if (review.get("verdict") != "PASS" or reviewed_head != head
             or review.get("record_revision") != record["revision"]
             or any(v != "pass" for v in review.get("judgments", {}).values())
-            or review.get("reviewer") == record["builder"]):
-        missing.append(f"risk {risk}: recorded PASS review for lane head with every criterion pass by the other vendor")
+            or review.get("reviewer") == record["builder"] and not same_vendor_ok(record["builder"], risk)):
+        missing.append(f"risk {risk}: recorded PASS review for lane head with every criterion pass by the other vendor"
+                       + (" (or a fresh Codex session, decision-32)" if same_vendor_ok(record["builder"], risk) else ""))
     if risk == "normal" and deeper_review(review.get("model", "")):
         missing.append("risk normal: a cheap review is required; deeper review is allowed only for high tasks")
     report = path / ".work/report.md"
@@ -5157,9 +5221,6 @@ def wait_task(args):
             runs.append(run)
             limit = lane_limit(run, task.path / ".work") if file.name == "lane.json" else ""
             labels.append(f"lane: ended by usage limit ({limit})" if limit else run.get("state", "unknown"))
-        if any(r.get("state") == "skipped: hold" for r in runs):
-            print("; ".join(labels) + " (unit not started; release the hold with `task hold release`)")
-            return 1
         if not any(r.get("state") in {"running", "foreground", "starting"} for r in runs):
             print("; ".join(labels) or "not started")
             return 0
@@ -5280,6 +5341,8 @@ def main(argv=None):
                               help="run the routed reviewer, print its reply, and record the verdict")
             mode.add_argument("--record", metavar="FILE")
             sub.add_argument("--final", action="store_true", help="mark this run as the task's final review round")
+            sub.add_argument("--miss", metavar="TEXT", help="high risk: a cheaper reviewer's recorded miss; routes the "
+                             "reviewer vendor's deeper model (Opus for Claude) and ledgers it (decision-32)")
             sub.add_argument("--request", metavar="FILE")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--no-check", metavar="REASON", help="record an override of the passing-check prerequisite")
@@ -5291,7 +5354,7 @@ def main(argv=None):
             sub.add_argument("--reason", metavar="TEXT")
         if name == "redteam":
             sub.add_argument("--brief", required=True, metavar="FILE")
-    sub = commands.add_parser("boost", help="temporary tier routing, extra batch capacity and deeper hard/final reviews")
+    sub = commands.add_parser("boost", help="temporary tier routing and extra batch capacity")
     sub.add_argument("action", nargs="?", choices=("off",))
     sub.add_argument("--claude-until")
     sub.add_argument("--codex-until")
@@ -5323,6 +5386,11 @@ def main(argv=None):
     sub.add_argument("--clean", metavar="RUN_ID", help="remove a kept smoke run's scratch project")
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
+    sub = commands.add_parser("gemini", help="Gemini (agy) review route: state, backtest command, T-44 result")
+    sub.add_argument("--record", choices=("pass", "fail"), help="record the T-44 backtest result (pass qualifies the route)")
+    sub.add_argument("--model", metavar="SLUG", help="the agy model the backtest ran")
+    sub.add_argument("--evidence", metavar="TEXT", help="the backtest result: defects found of 4, must-fix on controls")
+    sub.add_argument("--command-for", metavar="PROMPT_FILE", help="print the read-only agy review command for one prompt")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
@@ -5352,7 +5420,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start"} or task_lock.requires_pm(args) or args.command == "gemini" and args.record or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -5418,7 +5486,7 @@ def main(argv=None):
                 result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                           "review": review, "risk": risk, "redteam": redteam, "cancel": cancel, "note": note, "status": status,
                           "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                          "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
+                          "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage, "gemini": gemini,
                           "plan-budget": lambda a: print(plan_budget(a.id, clear=a.clear)) if not a.clear else plan_budget(a.id, clear=a.clear),
                           "hold": hold,
                           "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo)}[args.command](args) or 0
