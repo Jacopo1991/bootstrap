@@ -42,7 +42,8 @@ class PolicyFile(unittest.TestCase):
         self.assertEqual(litellm.source, "https://docs.litellm.ai/blog/security-incident-oct-21-2026")
         raw = tomllib.loads(POLICY.read_text())
         self.assertEqual(set(raw["packages"]["litellm"]), {"max_version", "images", "reason", "source", "added", "allowed_names"})
-        self.assertEqual(set(litellm.allowed_names), {'langchain-litellm'})
+        self.assertEqual(set(litellm.allowed_names),
+                         {'litellm_master_key', 'litellm_local_model_cost_map', 'litellm_config.yaml'})
 
     def test_another_package_is_one_table(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -209,7 +210,7 @@ class Manifests(unittest.TestCase):
         for name in ('uv.lock', 'poetry.lock'):
             self.allowed(name, '[[package]]\nname="numpy"\nsource={git="https://example.invalid/repo"}\n')
         self.allowed('Pipfile.lock', '{"default":{"numpy":{"git":"https://example.invalid/repo"}}}')
-        for image in ('numpy:latest', 'other/langchain-litellm:latest', '${IMAGE}', 'numpy:${TAG}'):
+        for image in ('numpy:latest', '${IMAGE}', 'numpy:${TAG}'):
             self.allowed('Dockerfile', 'FROM ' + image + '\n')
             self.allowed('compose.yaml', 'services: {app: {image: "' + image + '"}}\n')
 
@@ -310,9 +311,8 @@ class Manifests(unittest.TestCase):
                      'dependencies=["litellm==1.106.2"]}]\n')
 
     def test_absolute_workspace_exclusion_without_capped_names_is_ignored(self):
-        # A lane's own absolute path can contain the capped name (litellm-allow).
-        # Keep this fixture uncapped, as its regression specifically requires.
-        text = '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["/fixture/packages/excluded"]\n'
+        # An in-repo absolute path; the temporary root never contains the capped name.
+        text = '[tool.uv.workspace]\nmembers=["packages/*"]\nexclude=["' + str(self.repo / 'packages/excluded') + '"]\n'
         self.write('pyproject.toml', text)
         self.write('packages/member/pyproject.toml', '[project]\nname="member"\ndependencies=["numpy"]\n')
         subprocess.run(['git', '-C', str(self.repo), 'add', '.'], check=True)
@@ -338,7 +338,7 @@ class Manifests(unittest.TestCase):
                     self.refused(name, prefix + '\n# ' + mention + '\n',
                                  f'{name}:{3 if prefix else 2}:')
             # Invalid format syntax and uncapped joined names are never parsed.
-            self.allowed(name, prefix + '[[{ not valid syntax: langchain-litellm\n')
+            self.allowed(name, prefix + '[[{ not valid syntax: LITELLM_MASTER_KEY\n')
             self.refused(name, prefix + 'litellm[proxy]:v1.106.2\n', 'exact pin (==) or upper bound (<=)')
 
     def test_allowlist_forms_in_every_non_lock_format(self):
@@ -352,15 +352,17 @@ class Manifests(unittest.TestCase):
                          'ghcr.io/berriai/litellm:v1.106.2-stable',
                          'berriai/litellm:litellm_stable_release_branch-v1.106.2-stable',
                          './litellm-1.106.2-py3-none-any.whl', 'litellm-1.104.0.tar.gz',
-                         'langchain-litellm', 'LANGCHAIN-LITELLM>=9'):
+                         'LITELLM_MASTER_KEY', 'litellm_local_model_cost_map=1',
+                         './litellm_config.yaml'):
                 with self.subTest(name=name, form=form):
                     self.allowed(name, prefix + form + '\n')
             for unknown in ('litellm.git', 'git+https://github.com/BerriAI/litellm.git',
                             'litellm', 'litellm>=1.100', 'litellm<=1.107',
                             'unknown-litellm', 'LITELLM', '# LiteLLM', 'litellm_proxy',
                             'unknown-litellm==1.104.0', 'xlitellm:v1.104.0',
-                            'other_litellm-1.104.0.tar.gz', 'langchain-litellm-unknown',
-                            'langchain-litellm.git', 'xlangchain-litellm',
+                            'other_litellm-1.104.0.tar.gz', 'LITELLM_MASTER_KEY_FILE',
+                            'litellm_config.yaml.git', 'xlitellm_master_key',
+                            'langchain-litellm', 'LANGCHAIN-LITELLM>=9',
                             'litellm = {version = "==1.106.2", git = "repo"}',
                             'litellm-1.104.0.tar.gz"suffix',
                             'litellm = {version = "==1.106.2"}"suffix'):
@@ -369,7 +371,7 @@ class Manifests(unittest.TestCase):
 
     def test_each_occurrence_is_checked_and_reports_its_line_and_case(self):
         code, output = self.run_check(self.write('requirements.txt',
-            'langchain-litellm litellm==1.106.2\n# LiteLLM\nlitellm.git LITELLM_PROXY\n'))
+            'LITELLM_MASTER_KEY litellm==1.106.2\n# LiteLLM\nlitellm.git LITELLM_PROXY\n'))
         self.assertEqual(code, 1, output)
         self.assertIn("requirements.txt:2:", output)
         self.assertIn("occurrence 'LiteLLM'", output)
@@ -515,8 +517,7 @@ class Manifests(unittest.TestCase):
                                 self.allowed(name, text)
                             else:
                                 self.refused(name, text, f'{name}:1:')
-        self.allowed('requirements.txt', 'langchain-litellm\n')
-        for other in ('litellm-proxy', 'other_litellm-1.107.0.tar.gz'):
+        for other in ('litellm-proxy', 'other_litellm-1.107.0.tar.gz', 'langchain-litellm'):
             self.refused('requirements.txt', other + '\n')
         self.refused('requirements.txt', './litellm-1.107.0-unknown.whl\n',
                      'distribution filename cannot be evaluated safely')
@@ -659,8 +660,9 @@ class Manifests(unittest.TestCase):
         self.assertIn('above the cap', checker.findings[0])
 
     def test_dockerfile_discovery_uses_filename_patterns(self):
-        for name in ('docs/dockerfile-notes.md', 'dockerfile-custom', 'odd-containerfile',
-                     'custom.Dockerfile.build', 'Containerfile', 'anything.yaml', 'weird-compose.yaml'):
+        for name in ('docs/dockerfile-notes.md', 'odd-containerfile', 'dev-requirements.md',
+                     'custom.Dockerfile.build', 'anything.yaml', 'weird-compose.yaml',
+                     'config/settings.yaml', 'docs/values.md', 'Pipfile.txt'):
             code, output = self.run_check(self.write(name, 'FROM berriai/litellm:latest\n'))
             self.assertEqual(code, 0, (name, output))
             self.assertIn('0 manifest(s)', output)
@@ -690,8 +692,8 @@ class Manifests(unittest.TestCase):
 
     def test_container_substrings_fail_closed(self):
         for name in ('Dockerfile', 'compose.yaml'):
-            self.allowed(name, 'langchain-litellm\n')
-            for text in ('litellm-extra', 'other_litellm',
+            self.allowed(name, 'LITELLM_MASTER_KEY: x\n')
+            for text in ('litellm-extra', 'other_litellm', 'langchain-litellm',
                          'litellm.py', 'xlitellm', 'litellmx', 'LITELLM_IMAGE'):
                 with self.subTest(name=name, text=text):
                     self.refused(name, text + '\n')
@@ -766,6 +768,91 @@ class Manifests(unittest.TestCase):
         # Once it is a script, all of its text is subject to the same rule.
         self.refused('script.py', '# /// script\n# dependencies=[]\n# ///\n# litellm\n',
                      'script.py:4:')
+
+    def test_encoded_names_are_caught_in_the_folded_copy(self):
+        for name in ('requirements.txt', 'pyproject.toml', 'Dockerfile', 'compose.yaml'):
+            for encoded in ('lite\\\nllm==1.107.0', 'lite\\\r\nllm', 'lit\\u0065llm==1.107.0',
+                            '"l\\u0069tellm"', 'l\\U00000069tellm>=1', "lit''ellm==1.107.0",
+                            '"li""tellm"', "lit'e'llm", 'lite%6Clm==1.107.0',
+                            'https://example.invalid/lite%6clm-1.107.0.tar.gz',
+                            './litellm-1.106.2%2Bcustom-py3-none-any.whl'):
+                with self.subTest(name=name, encoded=encoded):
+                    self.refused(name, 'RUN pip install ' + encoded + '\n', 'folded copy')
+            for compliant in ('lite\\\nllm==1.106.2', 'lit\\u0065llm==1.106.2', "lit''ellm==1.106.2",
+                              '"li""tellm==1.104.0"', 'https://example.invalid/lite%6Clm-1.106.2.tar.gz',
+                              "RUN echo '' && pip install \\\n    'litellm==1.106.2' requests",
+                              "# don't cache: litellm==1.106.2 %20"):
+                with self.subTest(name=name, compliant=compliant):
+                    self.allowed(name, compliant + '\n')
+        # A finding in both copies is reported once.
+        code, output = self.run_check(self.write('requirements.txt', 'litellm>=1\nx%20y\n'))
+        self.assertEqual(code, 1, output)
+        self.assertIn('1 finding(s)', output)
+
+    def test_named_manifest_discovery(self):
+        for name in ('dev-requirements.txt', 'test_constraints.txt', 'Dockerfile-dev', 'dockerfile-custom',
+                     'Containerfile', 'Containerfile.prod', 'Containerfile-dev', 'api.containerfile',
+                     'Pipfile', 'uv.toml', 'k8s/proxy.yaml', 'deploy/kubernetes/app/svc.yml',
+                     'charts/proxy/templates/deployment.yaml', 'helm/values.yaml', 'values.yaml',
+                     'values-prod.yml', 'Chart.yaml', 'kustomization.yaml', 'deployment.yaml',
+                     'ops/statefulset-proxy.yml', 'cronjob.yaml'):
+            with self.subTest(name=name):
+                self.allowed(name, 'litellm==1.106.2\n')
+                self.refused(name, 'litellm==1.107.0\n', 'above the cap', f'{name}:1:')
+        self.refused('Pipfile', '[packages]\nlitellm = "*"\n', 'exact pin (==) or upper bound (<=)')
+        self.allowed('Pipfile', '[packages]\nlitellm = "==1.106.2"\n[dev-packages]\npytest = "*"\n')
+        self.refused('uv.toml', 'constraint-dependencies = ["litellm<1.108"]\n')
+        self.allowed('uv.toml', 'constraint-dependencies = ["litellm<=1.106.2"]\n')
+
+    def test_kubernetes_and_helm_images(self):
+        pod = 'spec:\n  containers:\n    - name: proxy\n      image: {}\n'
+        self.allowed('k8s/pod.yaml', pod.format(IMAGE + ':v1.106.2-stable'))
+        self.refused('k8s/pod.yaml', pod.format(IMAGE + ':main-stable'), 'is refused')
+        values = 'image:\n  repository: {}\n  tag: {}\n'
+        self.allowed('values.yaml', values.format(IMAGE, 'v1.106.2'))
+        self.allowed('values.yaml', values.format('"berriai/litellm"', '"v1.104.0-stable"'))
+        self.refused('values.yaml', values.format(IMAGE, 'main-stable'), 'is refused')
+        self.refused('values.yaml', values.format(IMAGE, 'v1.107.0'), 'above the cap')
+        self.refused('values.yaml', 'image:\n  repository: ' + IMAGE + '\n', 'exact pin (==) or upper bound (<=)')
+        self.refused('values.yaml', 'image:\n  repository: ' + IMAGE + '\n  pullPolicy: Always\n  tag: v1.106.2\n')
+
+    def test_pipfile_lock_custom_categories(self):
+        self.refused('Pipfile.lock', '{"_meta":{}, "default":{}, "tools":{"litellm":{"version":"==1.107.0"}}}',
+                     'above the cap')
+        self.refused('Pipfile.lock', '{"docs":{"litellm":{"version":"==1.106.2","git":"x"}}}', 'non-registry')
+        self.allowed('Pipfile.lock', '{"_meta":{"litellm":"1.107.0"}, "tools":{"litellm":{"version":"==1.106.2"}}}')
+        self.refused('Pipfile.lock', '{"tools":["litellm"]}', 'cannot evaluate manifest')
+
+    def test_image_prefix_cannot_hide_another_occurrence(self):
+        for text in ('litellm.git/litellm:v1.106.2', 'host/litellm/litellm:v1.106.2',
+                     'litellm-mirror.invalid/berriai/litellm:v1.106.2',
+                     'example.invalid/a/b/c/d/litellm:v1.106.2'):
+            for name in ('Dockerfile', 'compose.yaml'):
+                with self.subTest(name=name, text=text):
+                    self.refused(name, 'FROM ' + text + '\n', 'occurrence')
+        for text in ('localhost:5000/berriai/litellm:v1.106.2', 'private.invalid/team/sub/litellm:v1.106.2',
+                     'docker.io/berriai/litellm:v1.104.0'):
+            self.allowed('Dockerfile', 'FROM ' + text + '\n')
+
+    def test_compliant_project_mentions_pass(self):
+        # The fixed bare mentions of the projects that use litellm (T-51 #6).
+        compose = ('services:\n  litellm:\n    image: ' + IMAGE + ':v1.106.2-stable\n'
+                   '    command: ["--config", "/app/litellm_config.yaml"]\n'
+                   '    volumes:\n      - ./litellm_config.yaml:/app/litellm_config.yaml:ro\n'
+                   '    environment:\n      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}\n'
+                   '      LITELLM_LOCAL_MODEL_COST_MAP: "True"\n'
+                   '  app:\n    environment:\n      OPENAI_BASE_URL: http://litellm:4000/v1\n')
+        for name in ('compose.yaml', 'docker-compose.yml', 'k8s/proxy.yaml'):
+            self.allowed(name, compose)
+        self.allowed('Dockerfile', 'FROM python:3.12\nCOPY litellm_config.yaml /app/\n'
+                     'ENV LITELLM_LOCAL_MODEL_COST_MAP=True\nRUN pip install litellm[proxy]==1.104.2\n')
+        self.allowed('pyproject.toml', '[project]\ndependencies = ["litellm==1.104.0"]\n')
+        # Only those exact names: neighbours and other list items still fail.
+        for text in ('services:\n  litellm: {image: x}\n', 'depends_on:\n  - litellm\n',
+                     'command: [pip, install, litellm]\n', 'image: ${LITELLM_IMAGE}\n',
+                     'url: http://litellm.evil.invalid/x\n'):
+            with self.subTest(text=text):
+                self.refused('compose.yaml', text, 'occurrence')
 
     def test_policy_schema_and_production_override_removal(self):
         original = tomllib.loads(POLICY.read_text())['packages']['litellm']
