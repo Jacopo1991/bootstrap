@@ -564,48 +564,60 @@ class Usage(unittest.TestCase):
 
     AGY = """#!/usr/bin/env python3
 import os, sys
-assert sys.argv[1:4] == ["--print", "--output-format", "json"], sys.argv
-print(os.environ.get("AGY_STUB_" + sys.argv[4].strip("/").upper(), ""))
+if sys.argv[1:] == ["--version"]:
+    print("agy 0.0.0-stub")
+    sys.exit(0)
+assert sys.argv[1:] == ["--output-format", "json", "--print=/usage"], sys.argv  # agy takes the prompt as --print's value
+print(os.environ.get("AGY_STUB_USAGE", ""))
 sys.exit(int(os.environ.get("AGY_STUB_EXIT", "0")))
 """
-    QUOTA = '{"quotas": [{"window": "5-hour", "remainingPercent": %s}, {"window": "weekly", "usedPercent": 30}]}'
-    CONFIG = '{"settings": [{"name": "Enable Telemetry", "value": "%s"}, {"name": "Theme", "value": "dark"}]}'
+    # The shape the real pinned agy returned on the PM's machine (2026-10-26): a TAB table in `response`.
+    ROWS = ("Gemini Models\tWeekly Limit Remaining\t{weekly}%\t2026-11-02T08:19:35Z\n"
+            "Gemini Models\tFive Hour Limit Remaining\t{five}%\t2026-10-26T13:19:35Z\n"
+            "Claude and GPT models\tWeekly Limit Remaining\t{other}%\t2026-11-02T08:19:35Z\n"
+            "Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-02T08:19:35Z\n")
 
-    def gemini(self, quota="60", telemetry="off", **env):
+    def usage_json(self, weekly="100", five="100", other="100", status="SUCCESS"):
+        return json.dumps({"conversation_id": "", "status": status,
+                           "response": self.ROWS.format(weekly=weekly, five=five, other=other),
+                           "num_turns": 0, "command": {"name": "usage"}})
+
+    def gemini(self, usage_text=None, **env):
         stub = self.home / "bin/agy"
         stub.parent.mkdir(exist_ok=True)
         stub.write_text(self.AGY.replace("/usr/bin/env python3", sys.executable))
         stub.chmod(0o755)
-        values = dict(PATH=str(stub.parent), AGY_STUB_USAGE=self.QUOTA % quota if quota else "not json",
-                      AGY_STUB_CONFIG=self.CONFIG % telemetry, **env)
+        values = dict(PATH=str(stub.parent), AGY_STUB_USAGE=self.usage_json() if usage_text is None else usage_text, **env)
         with mock.patch.dict(os.environ, values):
             return usage.gemini(self.home), "\n".join(usage.report(self.home, NOW))
 
-    def test_gemini_quota_telemetry_and_qualification_from_stubbed_agy(self):
+    def test_gemini_quota_table_and_fail_closed_telemetry_from_stubbed_agy(self):
         with mock.patch.dict(os.environ, PATH=str(self.home / "none")):
             state = usage.gemini(self.home)
         self.assertEqual((state["quota"], state["quota_detail"], state["available"]), ("unknown", "agy not installed", False))
         state, text = self.gemini()
-        self.assertEqual((state["quota"], state["telemetry"], state["qualified"], state["available"]), ("ok", "off", False, False))
-        self.assertIn("gemini (agy): quota ok (5-hour 60 % left; weekly 70 % left); telemetry off", text)
+        self.assertEqual((state["quota"], state["qualified"], state["available"]), ("ok", False, False))
+        self.assertIn("gemini (agy): quota ok (Weekly Limit Remaining 100 % (resets 2026-11-02T08:19:35Z); "
+                      "Five Hour Limit Remaining 100 % (resets 2026-10-26T13:19:35Z)); "
+                      "telemetry: no control in agy 0.0.0-stub (seat decision pending)", text)
         self.assertIn("not qualified: no T-44 backtest result recorded (task gemini --record); routing skips it", text)
         record = self.home / ".local/state/task/usage/gemini.json"
         record.parent.mkdir(parents=True, exist_ok=True)
-        record.write_text(json.dumps(dict(result="fail", model="gemini-x", evidence="2 of 4", time="t")))
-        self.assertFalse(self.gemini()[0]["available"])
         record.write_text(json.dumps(dict(result="pass", model="gemini-x", evidence="4 of 4, controls clean", time="t")))
-        state, text = self.gemini()
-        self.assertEqual((state["available"], state["model"]), (True, "gemini-x"))
-        self.assertIn("qualified on the T-44 backtest (t, model gemini-x); reviews use it first", text)
-        for case, (quota, telemetry, env, expected) in {
-                "weekly lockout": ("0", "off", {}, ("exhausted", "off")),
-                "unreadable quota": ("", "off", {}, ("unknown", "off")),
-                "agy fails": ("60", "off", {"AGY_STUB_EXIT": "3"}, ("unknown", "unknown")),
-                "telemetry on": ("60", "on", {}, ("ok", "on")),
-                "telemetry unreadable": ("60", "maybe", {}, ("ok", "unknown"))}.items():
+        state, text = self.gemini()  # even a recorded pass stays closed: agy has no telemetry control
+        self.assertEqual((state["qualified"], state["quota"], state["available"]), (True, "ok", False))
+        self.assertIn("routing skips it; reviews go to Codex", text)
+        for case, (usage_text, env, expected) in {
+                "weekly lockout": (self.usage_json(weekly="0"), {}, "exhausted"),
+                "5-hour sprint used": (self.usage_json(five="0"), {}, "exhausted"),
+                "only Claude and GPT used up": (self.usage_json(other="0"), {}, "ok"),
+                "not json": ("not json", {}, "unknown"),
+                "no Gemini rows": (json.dumps({"status": "SUCCESS", "response": "Claude and GPT models\tWeekly\t5%\tx\n"}), {}, "unknown"),
+                "agy status error": (self.usage_json(status="ERROR"), {}, "unknown"),
+                "agy fails": (self.usage_json(), {"AGY_STUB_EXIT": "3"}, "unknown")}.items():
             with self.subTest(case):
-                state, text = self.gemini(quota, telemetry, **env)
-                self.assertEqual((state["quota"], state["telemetry"], state["available"]), (*expected, False))
+                state, text = self.gemini(usage_text, **env)
+                self.assertEqual((state["quota"], state["available"]), (expected, False))
                 self.assertIn("routing skips it; reviews go to Codex", text)
 
     def test_report_lines_and_times(self):

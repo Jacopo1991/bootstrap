@@ -922,63 +922,60 @@ def run_summary(home, days=1, now=None):
     return lines
 
 
-# Company decision-32: Gemini through `agy` as a reviewer. Print-mode `/usage` and `/config` start no
-# agent turn and spend no quota. Their JSON layout is not documented: an unrecognized reading is
-# "unknown", and anything but a known-good reading keeps reviews on Codex.
+# Company decision-32: Gemini through `agy` as a reviewer. `agy --output-format json --print='/usage'` starts
+# no agent turn and spends no quota; its `response` is a TAB-separated table (group, limit, percent remaining,
+# reset). A reading `task` cannot parse is "unknown", and anything but a known-good reading keeps reviews on Codex.
+# agy has no telemetry control (no /config key, flag or documented setting), so the route stays closed until
+# the seat rules on using Gemini without one.
 def gemini_record(home):
     return _json(_dir(home) / "gemini.json")
 
 
-def _leaves(node, label=""):
-    if isinstance(node, dict):
-        name = next((node[k] for k in ("name", "label", "title", "window", "model") if isinstance(node.get(k), str)), "")
-        for key, value in node.items():
-            yield from _leaves(value, f"{label} {name}".strip()) if isinstance(value, (dict, list)) else \
-                [(f"{label} {name}".strip(), str(key).lower().replace("_", "").replace("-", ""), value)]
-    elif isinstance(node, list):
-        for item in node:
-            yield from _leaves(item, label)
-
-
-def _agy(command, timeout=30):
+def _agy(*args, timeout=30):
     binary = shutil.which("agy")
     if not binary:
         return None, "agy not installed"
     try:
-        done = subprocess.run([binary, "--print", "--output-format", "json", command], capture_output=True,
-                              text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                              env=os.environ | {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"})
-        return (json.loads(done.stdout), "") if done.returncode == 0 else (None, f"agy {command} exited {done.returncode}")
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None, f"agy {command} gave no JSON reading"
+        done = subprocess.run([binary, *args], capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, env=os.environ | {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"})
+        return (done.stdout, "") if done.returncode == 0 else (None, f"agy {args[-1]} exited {done.returncode}")
+    except (OSError, subprocess.SubprocessError):
+        return None, f"agy {args[-1]} did not run"
 
 
-def gemini(home, quota_only=False):
-    """Qualification record, quota ("ok", "exhausted", "unknown") and telemetry ("off", "on", "unknown")."""
+def gemini_quota(text):
+    """(state, detail) from the /usage table: exhausted when any Gemini Models row has 0 % remaining."""
+    rows = []
+    for line in str(text or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 4 and fields[0].strip() == "Gemini Models" and fields[2].strip().endswith("%"):
+            try:
+                rows.append((fields[1].strip(), float(fields[2].strip()[:-1]), fields[3].strip()))
+            except ValueError:
+                return "unknown", f"unparseable row: {line.strip()}"
+    if not rows:
+        return "unknown", "no Gemini Models rows in agy /usage"
+    detail = "; ".join(f"{name} {left:g} % (resets {reset})" for name, left, reset in rows)
+    return ("exhausted" if any(left <= 0 for _, left, _ in rows) else "ok"), detail
+
+
+def gemini(home):
+    """Qualification record, quota ("ok", "exhausted", "unknown") and telemetry, which agy cannot turn off."""
     record = gemini_record(home)
     qualified = record.get("result") == "pass" and bool(record.get("model"))
-    found, reason = _agy("/usage")
-    windows = []
-    for label, key, value in _leaves(found) if found is not None else ():
-        if type(value) in (int, float) and not isinstance(value, bool):
-            left = (value if key in {"remainingpercent", "remainingpercentage", "percentremaining"} else
-                    value * 100 if key in {"remainingfraction", "remaining"} and value <= 1 else
-                    100 - value if key in {"usedpercent", "usedpercentage", "percentused"} else None)
-            if left is not None:
-                windows.append((label or "quota", max(left, 0)))
-    quota = "unknown" if not windows else "exhausted" if any(left <= 0 for _, left in windows) else "ok"
-    detail = "; ".join(f"{label} {left:.0f} % left" for label, left in windows) or reason or "no quota windows in agy /usage"
-    state = {"qualified": qualified, "model": record.get("model") if qualified else None, "record": record,
-             "quota": quota, "quota_detail": detail, "telemetry": "unknown"}
-    if not quota_only:
-        found, _ = _agy("/config")
-        values = {str(value).strip().lower() for label, key, value in _leaves(found) if found is not None
-                  and "telemetry" in f"{label} {key}".lower() and not isinstance(value, (dict, list))}
-        values -= {"enable telemetry", "telemetry", "enabletelemetry"}
-        state["telemetry"] = ("on" if values & {"true", "on", "enabled", "1"} else
-                              "off" if values and values <= {"false", "off", "disabled", "off (disabled)", "0"} else "unknown")
-    state["available"] = qualified and quota == "ok" and state["telemetry"] == "off"
-    return state
+    out, reason = _agy("--output-format", "json", "--print=/usage")
+    try:
+        found = json.loads(out) if out is not None else None
+        quota, detail = gemini_quota(found.get("response")) if isinstance(found, dict) and found.get("status") == "SUCCESS" \
+            else ("unknown", reason or "agy /usage did not succeed")
+    except ValueError:
+        quota, detail = "unknown", "agy /usage gave no JSON"
+    version, _ = _agy("--version", timeout=10)
+    version = (version or "").split()[-1:] or ["(version unknown)"]
+    telemetry = f"no control in agy {version[0]} (seat decision pending)"
+    return {"qualified": qualified, "model": record.get("model") if qualified else None, "record": record,
+            "quota": quota, "quota_detail": detail, "telemetry": telemetry,
+            "available": False}  # fail-closed: no telemetry control to verify
 
 
 def gemini_lines(home):
@@ -989,5 +986,5 @@ def gemini_lines(home):
                      else "not qualified: no T-44 backtest result recorded (task gemini --record)")
     route = ("reviews use it first for Codex-built normal-risk work" if state["available"] else
              "routing skips it; reviews go to Codex")
-    return [f"gemini (agy): quota {state['quota']} ({state['quota_detail']}); telemetry {state['telemetry']}",
+    return [f"gemini (agy): quota {state['quota']} ({state['quota_detail']}); telemetry: {state['telemetry']}",
             f"  {qualification}; {route}"]

@@ -625,13 +625,18 @@ company policy file that still names `codex = "haiku"` overrides them.
 `task merge` accepts a recorded PASS by Codex on a Codex-built normal-risk task; high risk still
 needs the other vendor, and `--override` stays recorded in the task's `exception.json`.
 
-Gemini runs as `agy --print --mode plan --sandbox --output-format text --model <slug>`, pointed at
-the review prompt file. Routing reads `agy --print --output-format json /usage` and `/config` (no agent
-turn, no quota) and uses Gemini only when all three hold: the T-44 backtest result recorded as a pass,
-a quota reading with no exhausted window, and `Enable Telemetry` read as off. Otherwise, and when an
-agy run fails or hits its quota, the review moves to Codex; reviews never stop on Gemini. `task usage`
-shows the Gemini quota and route state. The JSON layout of those two readings is not documented; a
-reading `task` cannot parse counts as unknown, which routes to Codex.
+Gemini runs as `agy --mode plan --sandbox --output-format text --model <slug> --disable-slash-commands
+--print=<prompt>`: agy takes the prompt as `--print`'s value, so `task` reads the prompt file and passes
+it as one argument (nothing on stdin; a prompt over 120 kB moves the review to Codex). Routing reads the
+quota with `agy --output-format json --print='/usage'` (no agent turn, no quota): its `response` is a
+TAB-separated table of group, limit, percent remaining and reset time, and a `Gemini Models` row at 0 %
+is exhausted; a reading `task` cannot parse is unknown. Either routes to Codex, as does an agy run that
+fails or hits its quota; reviews never stop on Gemini. `task usage` shows the Gemini quota and route.
+
+**The route is closed.** The pinned agy release has no telemetry control: no `/config` key, no flag, no documented
+setting. Routing needs a verified control, so `task usage` reports `telemetry: no control in agy
+<version> (seat decision pending)` and routing skips Gemini even with a recorded backtest pass. Whether
+Gemini may review without a telemetry control is a decision for the seat.
 
 Qualifying Gemini (PM, after the T-61 install and the login in [docs/agy-probe.md](docs/agy-probe.md)):
 for each head of T-44's blind backtest set, print the read-only command for that head's prompt with

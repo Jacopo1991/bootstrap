@@ -531,7 +531,7 @@ def gemini(args):
             result=args.record, model=args.model, evidence=args.evidence.strip(), time=utc_now()))
         task_usage.log(HOME, f"gemini T-44 backtest recorded: {args.record} with {args.model}")
     if args.command_for:
-        print(agy_command(args.model or "<model>", Path(args.command_for).resolve()) + " < /dev/null")
+        print(agy_command(args.model or "<model>", prompt_file=Path(args.command_for).resolve()) + " < /dev/null")
         return 0
     print("\n".join(task_usage.gemini_lines(HOME)))
     return 0
@@ -1114,13 +1114,18 @@ def deeper_review(model):
     return model in TOP_ONLY or any(name in model.lower() for name in ("opus", "fable"))
 
 
-def agy_command(model, prompt_file, add_dir=""):
-    """The Gemini review route: agy print mode, plan mode (no edits), terminal sandbox on. Telemetry is the
-    account's `Enable Telemetry` setting, which task_usage.gemini() must read as off before routing here."""
-    ask = (f"Read the review prompt in {prompt_file} and follow it exactly. You are a read-only reviewer: "
-           "do not edit files or run any command that changes them; reply with the review only.")
-    return (f"agy --print --mode plan --sandbox --output-format text --model {shlex.quote(model)} "
-            f"--add-dir {shlex.quote(str(prompt_file.parent))} {add_dir}{shlex.quote(ask)}")
+AGY_PROMPT = "--print=@review-prompt"  # run_reviewer puts the prompt file's text here, as one argv element
+
+
+def agy_command(model, add_dir="", prompt_file=None):
+    """The Gemini review route: plan mode (no edits), terminal sandbox on, slash commands off. agy takes the
+    prompt as --print's value; with `prompt_file` the command reads it in a shell, for the PM's backtest."""
+    return (f"agy --mode plan --sandbox --output-format text --model {shlex.quote(model)} "
+            f"--disable-slash-commands {add_dir}{agy_prompt(prompt_file) if prompt_file else AGY_PROMPT}")
+
+
+def agy_prompt(prompt_file):
+    return f'--print="$(cat {shlex.quote(str(prompt_file))})"'
 
 
 def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=False):
@@ -3546,6 +3551,11 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
     env = agent_environment()
     argv = shlex.split(command)
+    if AGY_PROMPT in argv:
+        text = prompt_file.read_text()
+        if len(text.encode()) > 120_000:  # one argv element may not exceed 128 KiB
+            raise Stop("Review prompt too long for agy's --print argument; no review recorded.")
+        argv[argv.index(AGY_PROMPT)] = "--print=" + text
     if argv[0] == "GIT_OPTIONAL_LOCKS=0":
         env["GIT_OPTIONAL_LOCKS"] = "0"
         argv.pop(0)
@@ -3588,7 +3598,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
-            process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply, stderr=errors,
+            process = subprocess.Popen(argv, cwd=path, env=env, stdin=subprocess.DEVNULL if AGY_PROMPT in shlex.split(command) else prompt, stdout=reply, stderr=errors,
                                        start_new_session=True, pass_fds=(*task_lock.descriptors(), *([lock_fd] if lock_fd is not None else [])))
             run.update(unit=unit, pid=os.getpid(), process_start=task_usage.process_start(os.getpid()))
             if not usage_run: usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
@@ -3767,7 +3777,7 @@ def review_locked(args):
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         def reviewer_command(vendor, model):
             if vendor == "gemini":
-                return agy_command(model, prompt_file, add_dir)
+                return agy_command(model, add_dir)
             if vendor == "claude":
                 events = "--output-format stream-json --verbose " if args.run else ""
                 return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
@@ -3778,7 +3788,8 @@ def review_locked(args):
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
-            print(f"  {command} < {shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
+            print(f"  {command.replace(AGY_PROMPT, agy_prompt(prompt_file))} < "
+                  f"{shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
             return 0
         task_lock.work(HOME, repo, head)

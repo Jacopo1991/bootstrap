@@ -159,7 +159,7 @@ for index, line in enumerate(launch_lines):
     if "--sandbox" in line:
         owner = next(text for text in reversed(launch_lines[:index + 1]) if text.startswith("def "))
         assert owner.startswith("def agy_command("), (index + 1, line)
-assert '"agy --print --mode plan --sandbox ' in launch
+assert '"agy --mode plan --sandbox ' in launch
 assert launch.count('default_permissions="lane"') == 1 and launch.count('default_permissions=\\"review\\"') == 2
 assert launch.count('default_permissions="review"') == 1
 assert "PreToolUse" in claude["hooks"]
