@@ -564,12 +564,11 @@ text is refused. Each use is appended to
 these models, override or not.
 `--no-boost` disables boosted tier
 routing, while Codex hard remains gpt-6.1-sol.
-The launch notice explains the decision. For high-risk tasks in boost, hard-tier reviews and rounds explicitly
-marked with `task review <repo> <id> --run --final` use Claude opus or Codex gpt-6.1-sol.
-Other reviews keep their usual cheap models; no round is inferred to be final.
-Usage limits retry once on the other reviewer vendor and record its actual
-identity. If that fallback uses the builder's vendor, the batch stops for an
-independent review; the merge gate still requires the other vendor.
+The launch notice explains the decision. Reviews follow company decision-32 (below); boost and
+`--final` no longer pick a deeper reviewer.
+A usage limit moves the review to the next reviewer in that order and records its actual
+identity. If that fallback uses the builder's vendor where decision-32 does not accept it, the
+batch stops for an independent review and the merge gate refuses it.
 
 The shared routing constant is in `home/dot_local/bin/task_routing.py`.
 Optional `~/.config/task/routing.json` overrides defaults and hard/design models,
@@ -603,10 +602,49 @@ and close ticks the pinned criteria without review evidence. The batch runner sk
 low-tier review and runs a red-team after a high-tier review, before merge.
 
 Normal reviews stay cheap even in boost or with `review --run --final`. Manual
-Opus, Fable and other deeper reviews are refused outside high risk. High keeps the
-existing boost routing: hard builder tier or explicit `--final` selects the deeper
-reviewer while that vendor is boosted. Default cheap reviewers are Haiku for
-Codex-built work and gpt-6-luna for Claude-built work.
+Opus, Fable and other deeper reviews are refused outside high risk.
+
+#### Review routing (company decision-32)
+
+Claude allowance goes to building, not reviewing. `task review --run` picks, in order:
+
+| Builder, risk | Reviewers, each used only when the ones before are unavailable |
+| --- | --- |
+| Codex, normal | Gemini via `agy` (once qualified), Codex gpt-6.1-sol in a fresh read-only session, Claude Haiku |
+| Claude, normal | Codex gpt-6-luna (unchanged), Claude Haiku |
+| Claude, high | Codex gpt-6.1-sol at high effort, Gemini (once qualified) |
+| Codex, high | Claude Sonnet, Gemini (once qualified) |
+
+Planning work (policy, skills, INTENT and decision records) is forced to high risk by
+`review.high_paths`, so it takes the high rows: never the author's vendor, never Opus by default.
+`task review ... --run --miss "<the cheaper reviewer's recorded miss>"` (high risk only) runs the
+reviewer vendor's deeper model (Opus for Claude) and ledgers it as `review_miss`. The models come
+from `[review.normal]` and `[review.high]` in the usage policy, whose defaults are the table's; a
+company policy file that still names `codex = "haiku"` overrides them.
+
+`task merge` accepts a recorded PASS by Codex on a Codex-built normal-risk task; high risk still
+needs the other vendor, and `--override` stays recorded in the task's `exception.json`.
+
+Gemini runs as `agy --mode plan --sandbox --output-format text --model <slug> --disable-slash-commands
+--print=<prompt>`: agy takes the prompt as `--print`'s value, so `task` reads the prompt file and passes
+it as one argument (nothing on stdin; a prompt over 120 kB moves the review to Codex). Routing reads the
+quota with `agy --output-format json --print='/usage'` (no agent turn, no quota): its `response` is a
+TAB-separated table of group, limit, percent remaining and reset time, and a `Gemini Models` row at 0 %
+is exhausted; a reading `task` cannot parse is unknown. Either routes to Codex, as does an agy run that
+fails or hits its quota; reviews never stop on Gemini. `task usage` shows the Gemini quota and route.
+
+**The route is closed.** The pinned agy release has no telemetry control: no `/config` key, no flag, no documented
+setting. Routing needs a verified control, so `task usage` reports `telemetry: no control in agy
+<version> (seat decision pending)` and routing skips Gemini even with a recorded backtest pass. Whether
+Gemini may review without a telemetry control is a decision for the seat.
+
+Qualifying Gemini (PM, after the T-61 install and the login in [docs/agy-probe.md](docs/agy-probe.md)):
+for each head of T-44's blind backtest set, print the read-only command for that head's prompt with
+`task gemini --model <slug> --command-for <prompt file>`, run it from the head's checkout in the PM's
+unsandboxed shell, and judge the replies against the sealed `set.md` (pass: the known defect on at
+least 3 of 4, no must-fix on either control). Then record it:
+`task gemini --record pass|fail --model <slug> --evidence "<n of 4, controls>"`. Until a pass is
+recorded, routing skips Gemini. `task gemini` alone shows the state.
 
 At check, review and merge, changed paths in `main...HEAD` matching `review.high_paths`
 force high risk; attempting to lower it names the matching path and refuses.
@@ -789,9 +827,8 @@ Use `task review <repo> <id> --run [--request <file>]` from the PM shell or an
 approved batch runner to prepare the prompt, run the routed reviewer, save its
 reply and record the verdict in one command. This keeps private task-state file
 access inside `task`; the runner does not need shell redirections into that state.
-Codex-built work routes to Claude Haiku with high effort and read-only tools;
-Claude-built work routes to GPT-6 luna with high reasoning effort and the read-only
-sandbox. The command prints the full reviewer reply under a clear header, then
+The reviewer follows the decision-32 table above; Claude reviewers run with high effort and
+read-only tools, Codex reviewers with high reasoning effort and the read-only sandbox. The command prints the full reviewer reply under a clear header, then
 ends with the recorded verdict. Reviewer identity comes from stored routing,
 just as with `--record`.
 `TASK_REVIEW_TIMEOUT` sets the timeout in seconds (default 900). A timeout, empty
@@ -932,7 +969,7 @@ It creates `~/dev_workspace/task-smoke-<run>` (one commit on `main`, no remote)
 and `~/cortex/cortex-kb-task-smoke-<run>`, then runs the normal path for each
 builder: `task start`, an unrelated commit on `main`, `task lane` on the cheapest
 model at low effort, the lane's commit, merge of `main` and report, `task check`,
-`task review --run` with the cheapest reviewer of the other vendor, and
+`task review --run` with the decision-32 reviewer, and
 `task merge`. It prints `PASS`, or `FAIL <step>: <first error line>` for each
 step, and stops that builder at its first failure. It writes
 `~/.local/state/task/smoke/<run>.json`. A pass removes the scratch project; a
@@ -946,7 +983,7 @@ that fails in the lane but passes outside is a setup failure and fails the smoke
 (company decision-27); one that fails outside too is a `WARN`, not a setup failure.
 
 A smoke costs four cheap lanes (two each on Codex `gpt-6-luna` and Claude `haiku`) and two cheap
-reviews (Claude `haiku` on the Codex build, Codex `gpt-6-luna` on the Claude
+reviews (Codex `gpt-6.1-sol` on the Codex build under decision-32, Codex `gpt-6-luna` on the Claude
 build).
 
 ### Cortex knowledge search (qmd)

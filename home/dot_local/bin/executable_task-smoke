@@ -5,7 +5,7 @@ Creates ~/dev_workspace/task-smoke-<run> (one commit on main, no remote) and
 ~/cortex/cortex-kb-task-smoke-<run> (a signed plan and one task per builder). Per builder:
 task start, an unrelated commit on main, task lane (cheapest model, low effort), then the lane's
 commit, merge and report read back from Git, then task check, task review --run (routed to the
-cheapest reviewer of the other vendor) and task merge. Prints PASS, or FAIL <step>: <first error
+decision-32 reviewer) and task merge. Prints PASS, or FAIL <step>: <first error
 line>, per step. A FAIL keeps the scratch project for `task smoke --clean <run>`; a pass removes it.
 
 Then (T-62, company decision-27) each builder gets a second lane that runs the real `just check` of
