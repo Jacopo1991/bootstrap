@@ -193,12 +193,13 @@ print(entry.get('output', 'OK'))
 
 class BatchTest(unittest.TestCase):
     def test_same_builder_reviewer_fallback_stops_before_merge_or_fixes(self):
-        self.source.write_text('1. one: builder codex, tier hard\n')
+        # Decision-32 accepts Codex on Codex-built normal-risk work, so the stop is shown on a Claude build.
+        self.source.write_text('1. one: builder claude, tier hard\n')
         self.scenario({})
         original = batch_module.Batch.reviewer_outcome
         def fallback(worker, state):
             (state / 'review-routing.json').write_text(json.dumps(
-                dict(vendor='codex', model='gpt-6-luna', fallback_from=['claude', 'haiku'])))
+                dict(vendor='claude', model='haiku', fallback_from=['codex', 'gpt-6-luna'])))
             return original(worker, state)
         runner = batch_module.Batch(self.repo, self.source)
         with mock.patch.dict(os.environ, self.env, clear=True), \
