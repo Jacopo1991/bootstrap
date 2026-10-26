@@ -3613,7 +3613,7 @@ def slim_data_diffs(text):
     """Keep code diffs whole; replace a large data-file diff with one line naming file, size and change."""
     blocks, current = [], []
     for line in text.splitlines(keepends=True):
-        if line.startswith(("diff --git ", "commit ")) and current:
+        if line.startswith(("diff --git ", "diff --cc ", "commit ")) and current:
             blocks.append(current); current = []
         current.append(line)
     blocks.append(current)
@@ -3622,9 +3622,9 @@ def slim_data_diffs(text):
     for block in blocks:
         body = "".join(block)
         header = block[0]
-        match = re.match(r"diff --git a/(.+?) b/(.+)$", header.rstrip("\n"))
+        match = re.match(r"diff --git a/.+? b/(.+)$|diff --cc (.+)$", header.rstrip("\n"))
         if match:
-            name = match[2]
+            name = match[1] or match[2]
             is_data = (name.endswith(DATA_SUFFIXES) or Path(name).name in DATA_NAMES
                        or "/fixtures/" in f"/{name}")
             if is_data and len(body) > DATA_DIFF_LIMIT:
@@ -3732,10 +3732,11 @@ def review_locked(args):
                                  r"(.*?)(?=^(?:#{1,6}\s+)?(?:\*\*)?Notes\b|\Z)", previous_text)
             prompt.extend(["Previous review Blocking list:", blocking[1].strip() if blocking else
                            "(old review has no Blocking section)"])
-            # Only this branch's own commits: what main already carries (merged in) is not re-sent.
+            # Only this branch's own commits: what main already carries (merged in) is not re-sent;
+            # --cc keeps a merge commit's resolution changes and drops its clean main side.
             main = default_branch(task.repo)
             main_refs = [f"^{ref}" for ref in (main, f"origin/{main}") if ok(task.repo, "rev-parse", "--verify", "--quiet", ref)]
-            delta = run_git(path, "log", "-p", "--reverse", "--no-merges", "--no-ext-diff", "--no-textconv",
+            delta = run_git(path, "log", "-p", "--cc", "--reverse", "--no-ext-diff", "--no-textconv",
                             "--format=commit %H", f"{previous['commit']}..{head}", *main_refs, "--")
             prompt.extend([f"Diff since previously reviewed head {previous['commit']} (this branch's own commits; "
                            "changes merged from main excluded):",

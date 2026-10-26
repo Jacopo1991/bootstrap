@@ -2388,6 +2388,26 @@ class TaskTool(unittest.TestCase):
         self.assertNotIn('from-main.txt', prompt)
         self.assertNotIn('main-only', prompt)
 
+    def test_review_delta_keeps_branch_merge_resolution_changes(self):
+        wt, _ = self.started()
+        self.commit_in(self.repo, 'shared.txt', 'base\n')
+        self.git(wt, 'merge', '--no-edit', 'main')
+        self.record_first_review(wt)
+        self.commit_in(wt, 'shared.txt', 'lane-edit\n')
+        self.commit_in(self.repo, 'shared.txt', 'main-edit\n')
+        self.commit_in(self.repo, 'from-main.txt', 'main-only\n')
+        merge = subprocess.run(['git', '-C', str(wt), 'merge', '--no-edit', 'main'], env=self.env,
+                               capture_output=True, text=True)
+        self.assertNotEqual(merge.returncode, 0)
+        (wt / 'shared.txt').write_text('resolved-by-branch\n')
+        self.git(wt, 'add', 'shared.txt')
+        subprocess.run(['git', '-C', str(wt), 'commit', '-qm', 'merge main'], env=self.env,
+                       check=True, capture_output=True)
+        prompt = self.raw_task('review', 'proj', '5')
+        self.assertIn('resolved-by-branch', prompt)
+        self.assertNotIn('from-main.txt', prompt)
+        self.assertNotIn('main-only', prompt)
+
     def test_quality_history_rereview_and_check_precedence(self):
         wt, _ = self.started()
         advisory = dict(self.env, CODEX_SANDBOX='1')
