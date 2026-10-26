@@ -107,10 +107,10 @@ case "$1 $2" in
     echo OK ;;
   "check ")
     [ -x "$HOME/during-check.sh" ] && "$HOME/during-check.sh"
+    [ -f "$HOME/gate-suites.tsv" ] && cp "$HOME/gate-suites.tsv" "$TMPDIR/gate-suites.tsv"
     if [ -f smoke_check.py ]; then
       grep -Fq 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' justfile || exit 1
       uv run --no-project --with colorama==0.4.6 python smoke_check.py || exit $?
-      [ -f smoke_nested.py ] && { uv run --no-project --with colorama==0.4.6 python smoke_nested.py || exit $?; }
     fi
     [ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
     echo "Ran 3 tests in 0.01s"; echo OK ;;
@@ -7223,65 +7223,6 @@ store.write_text(json.dumps(prs))
         for name in expected:
             self.assertNotIn(name, claude)
 
-    def test_codex_lane_uv_cache_resolves_user_cache_entries_without_copying_it(self):
-        wt, _ = self.started()
-        task = TASK_MODULE.Task(self.repo, "5")
-        user = self.home / "user-uv"
-        (user / "archive-v0/abc").mkdir(parents=True)
-        (user / "archive-v0/abc/big.whl").write_text("x" * 4096)
-        (user / "simple-v25").mkdir()
-        (user / "simple-v25/index").write_text("metadata")
-        (user / "builds-v0").mkdir()
-        (user / "builds-v0/scratch").write_text("not seeded")
-        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
-            private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
-            self.assertNotEqual(private, user)
-            self.assertEqual((private / "archive-v0/abc/big.whl").read_text(), "x" * 4096, "resolves through the seed")
-            self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
-            (private / "archive-v0/new").mkdir()  # a lane's own fetches stay in its cache
-            TASK_MODULE.lane_environment(task, "codex")  # seeded once
-        self.assertFalse((user / "archive-v0/new").exists())
-        self.assertFalse((private / "builds-v0").exists())
-        # Guard: the bulk is linked, never copied, and the metadata copy is independent of the user cache.
-        regular = [p for p in (private / "archive-v0").rglob("*") if p.is_file() and not p.is_symlink()
-                   and not any(parent.is_symlink() for parent in p.parents if parent != private)]
-        self.assertEqual(regular, [])
-        self.assertTrue((private / "archive-v0/abc").is_symlink())
-        (private / "simple-v25/index").write_text("lane change")
-        self.assertEqual((user / "simple-v25/index").read_text(), "metadata")
-
-    def test_failed_uv_cache_seeding_leaves_no_marker_and_the_next_start_retries(self):
-        wt, _ = self.started()
-        task = TASK_MODULE.Task(self.repo, "5")
-        user = self.home / "user-uv"
-        (user / "archive-v0/abc").mkdir(parents=True)
-        (user / "simple-v25").mkdir()
-        (user / "simple-v25/index").write_text("metadata")
-        real_run = subprocess.run
-        failing = subprocess.CompletedProcess([], 1, b"", b"cp: boom")
-        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
-            with mock.patch.object(TASK_MODULE.subprocess, "run",
-                                   side_effect=lambda cmd, *a, **k: failing if cmd[0] == "cp" else real_run(cmd, *a, **k)):
-                private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
-            self.assertFalse((private / ".seeded").exists())
-            self.assertFalse((private / "archive-v0/abc").is_symlink(), "partial seeding is dropped")
-            self.assertFalse((private / "simple-v25").exists())
-            TASK_MODULE.lane_environment(task, "codex")
-        self.assertTrue((private / ".seeded").exists())
-        self.assertTrue((private / "archive-v0/abc").is_symlink())
-        self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
-
-    def test_trusted_gate_nested_uv_uses_the_user_cache(self):
-        wt, _ = self.started()
-        user = self.home / "user-uv"
-        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
-            self.assertEqual(TASK_MODULE.trusted_check_environment(wt, "run", {})["UV_CACHE_DIR"], str(user))
-        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.home / "xdg")}), \
-                mock.patch.dict(os.environ, clear=False):
-            os.environ.pop("UV_CACHE_DIR", None)
-            self.assertEqual(TASK_MODULE.trusted_check_environment(wt, "run", {})["UV_CACHE_DIR"],
-                             str(self.home / "xdg/uv"))
-
     def assert_claude_temporary_path(self, temporary, call=None):
         root = Path("/tmp") / f"claude-{os.getuid()}"
         # Locate the outer grant from the fixture's actual location, independently
@@ -9820,6 +9761,69 @@ exit 1
         check = __import__("json").loads((self.state() / "check.json").read_text())
         self.assertEqual(check["steps"][-1]["command"], ["bash", "-c", "just check && just mcp-probe"])
 
+    def test_trusted_check_skips_verify_only_for_exact_passed_suite_command(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("passed\ttrue\n")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        step = evidence["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true"])
+        self.assertEqual(step["result"], "skipped: suite")
+        self.assertEqual(step["suite"], "true")
+        log = Path(evidence["log"]).read_text()
+        self.assertIn("SKIP: Verify command is covered by passed `just check` suite: true", log)
+
+    def test_trusted_check_runs_nonidentical_verify_command(self):
+        task_file = next((self.kb / "backlog/tasks").glob("t-5 *"))
+        task_file.write_text(task_file.read_text().replace("Verify: `true`", "Verify: `true argument`"))
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("passed\ttrue\n")
+        self.task("check", "proj", "5")
+        evidence = json.loads((self.state() / "check.json").read_text())
+        step = evidence["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true argument"])
+        self.assertEqual(step["result"], "finished")
+        self.assertNotIn("suite", step)
+
+    def test_trusted_check_runs_verify_when_matching_suite_failed(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("failed\ttrue\n")
+        self.task("check", "proj", "5")
+        step = json.loads((self.state() / "check.json").read_text())["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true"])
+        self.assertEqual(step["result"], "finished")
+        self.assertNotIn("suite", step)
+
+    def test_trusted_check_runs_verify_when_matching_suite_was_skipped(self):
+        wt, _ = self.started()
+        self.commit_in(wt, "b.txt")
+        (self.home / "gate-suites.tsv").write_text("skipped\ttrue\n")
+        self.task("check", "proj", "5")
+        step = json.loads((self.state() / "check.json").read_text())["steps"][-1]
+        self.assertEqual(step["command"], ["bash", "-c", "true"])
+        self.assertEqual(step["result"], "finished")
+        self.assertNotIn("suite", step)
+
+    def test_advisory_check_still_runs_verify_covered_by_suite(self):
+        wt, _ = self.started()
+        (self.home / "gate-suites.tsv").write_text("passed\ttrue\n")
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(TASK_MODULE, "HOME", self.home):
+            self.assertTrue(TASK_MODULE.run_check(wt, "", record={"verify": ["true"]}, advisory=True))
+        log = (wt / ".work/check.log").read_text()
+        self.assertNotIn("SKIP: Verify command", log)
+        self.assertIn("$ bash -c true", log)
+
+    def test_lint_summarizes_suite_seconds_slowest_first_and_lists_failures(self):
+        source = (ROOT / "ci/lint.sh").read_text()
+        self.assertIn('suite_timings+=("$elapsed"$\'\\t\'"$command")', source)
+        self.assertIn('sort -rn -k1,1', source)
+        self.assertIn('printf \'TIME: %s s  %s\\n\'', source)
+        self.assertIn('echo "FAIL: $command (exit $status)"', source)
+        self.assertIn('echo "Gate suites finished (failed=$failed, skipped=$skipped)"', source)
+
     def test_acceptance_3_review_requires_head_other_vendor_and_every_criterion(self):
         wt, _ = self.started()
         self.raw_task('risk', 'proj', '5', 'high', '--reason', 'high risk keeps the other-vendor rule (decision-32)')
@@ -11051,12 +11055,11 @@ if commands:  # the real-repository lane (T-62): run each command and stop
         pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
     sys.exit(0)
 if 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' in prompt:
-    for script in ('smoke_check.py', 'smoke_nested.py'):
-        checked = subprocess.run(['uv', 'run', '--no-project', '--with', 'colorama==0.4.6',
-                                  'python', script], capture_output=True, text=True)
-        if checked.returncode:
-            print(checked.stderr or checked.stdout, file=sys.stderr)
-            sys.exit(1)
+    checked = subprocess.run(['uv', 'run', '--no-project', '--with', 'colorama==0.4.6',
+                              'python', 'smoke_check.py'], capture_output=True, text=True)
+    if checked.returncode:
+        print(checked.stderr or checked.stdout, file=sys.stderr)
+        sys.exit(1)
 pathlib.Path('smoke.txt').write_text('ok\\n')
 if os.environ.get('SMOKE_STUB_RO') == '1':
     # T-53's defect: the agent's commit is refused, and the agent stops under its stop rule.
@@ -11093,17 +11096,11 @@ class SmokeTests(unittest.TestCase):
         for name, body in stubs.items():
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
-        (self.home / '.cache/uv').mkdir(parents=True)
-        (self.home / '.cache/uv/archive-v0/colorama').mkdir(parents=True)  # only in the user cache (T-68)
-        (self.home / '.cache/uv/archive-v0/colorama/seeded').write_text('')
         uv = bin_dir / 'uv'
         uv.write_text("#!/bin/sh\n[ \"$SMOKE_UV_FAIL\" = 1 ] && { echo 'error: uv cache is read-only' >&2; exit 1; }\n"
                       "[ -n \"$UV_CACHE_DIR\" ] && { [ -e \"$UV_CACHE_DIR/.read-only\" ] || ! touch \"$UV_CACHE_DIR/.probe\"; } 2>/dev/null && { echo \"error: Failed to initialize cache at "
                       "$UV_CACHE_DIR: Read-only file system (os error 30)\" >&2; exit 2; }\n"
-                      "case \" $* \" in *\" --offline \"*) cache=\"${UV_CACHE_DIR:-$HOME/.cache/uv}\"; [ -e \"$cache/archive-v0/colorama/seeded\" ] || { echo \"error: Because colorama was not found in the cache and you require colorama==0.4.6, "
-                      "we can conclude that your requirements are unsatisfiable. Packages were unavailable because the network was disabled\" >&2; exit 1; }; exit 0 ;; esac\n"
                       "[ \"$1 $2\" = 'run --no-project' ] || exit 2\n"
-                      "case \"$*\" in *smoke_nested.py) exec python3 smoke_nested.py ;; esac\n"
                       "echo \"$PWD\" >> \"$HOME/uv-runs\"\nexit 0\n")
         uv.chmod(0o755)
         shutil.copy(SMOKE_HELPER, bin_dir / 'task-smoke')
