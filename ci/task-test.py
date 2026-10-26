@@ -9111,6 +9111,49 @@ store.write_text(json.dumps(prs))
         self.assertEqual(self.git(wt, "status", "--porcelain"), "")
         self.assertEqual((wt / "a.txt").read_text(), "main side\n")
 
+    def test_start_base_never_aborts_a_merge_already_in_progress(self):
+        self.git(self.repo, "remote", "remove", "origin")
+        self.base_branch("t33-scorer")
+        self.base_branch("side", "a.txt", "side\n")
+        self.task("start", "proj", "T-5", "--base", "t33-scorer")
+        wt = self.repo / ".worktrees/t5"
+        self.commit_in(wt, "a.txt", "lane\n")
+        conflict = subprocess.run(["git", "-C", str(wt), "merge", "--no-edit", "side"],
+                                  env=self.env, capture_output=True, text=True, check=False)
+        self.assertNotEqual(conflict.returncode, 0, conflict.stdout)
+        (wt / "a.txt").write_text("resolved\n")
+        self.git(wt, "add", "a.txt")
+        merge_head = self.git(wt, "rev-parse", "MERGE_HEAD")
+        self.git(self.repo, "switch", "-q", "t33-scorer")
+        self.commit_in(self.repo, "t33.txt", "scorer v2\n")
+        self.git(self.repo, "switch", "-q", "main")
+        out = self.task("start", "proj", "T-5", "--refresh", code=1)
+        self.assertIn("A merge is already in progress", out)
+        self.assertEqual(self.git(wt, "rev-parse", "MERGE_HEAD"), merge_head)
+        self.assertEqual((wt / "a.txt").read_text(), "resolved\n")
+        self.assertEqual(self.git(wt, "diff", "--cached", "--name-only"), "a.txt")
+        self.assertEqual((wt / "t33.txt").read_text(), "scorer\n")
+        # Once the lane commits its resolution, the next start merges the moved base.
+        self.git(wt, "commit", "-q", "--no-edit")
+        self.assertIn("Merged base t33-scorer", self.task("start", "proj", "T-5"))
+        self.assertEqual((wt / "t33.txt").read_text(), "scorer v2\n")
+        self.assertEqual((wt / "a.txt").read_text(), "resolved\n")
+
+    def test_start_base_aborts_only_its_own_merge(self):
+        self.git(self.repo, "remote", "remove", "origin")
+        self.base_branch("t33-scorer")
+        self.task("start", "proj", "T-5", "--base", "t33-scorer")
+        wt = self.repo / ".worktrees/t5"
+        self.commit_in(wt, "t33.txt", "lane edit\n")
+        (wt / "t33.txt").write_text("uncommitted\n")  # git refuses before starting any merge
+        self.git(self.repo, "switch", "-q", "t33-scorer")
+        self.commit_in(self.repo, "t33.txt", "scorer v2\n")
+        self.git(self.repo, "switch", "-q", "main")
+        out = self.task("start", "proj", "T-5", code=1)
+        self.assertIn("Merging base t33-scorer into t5-add-the-b-file failed:", out)
+        self.assertNotIn("it was aborted", out)
+        self.assertEqual((wt / "t33.txt").read_text(), "uncommitted\n")
+
     def test_conflict_is_reported_not_forced(self):
         wt, _ = self.started()
         self.commit_in(wt, "a.txt", "lane\n")

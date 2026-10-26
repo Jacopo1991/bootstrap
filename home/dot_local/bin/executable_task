@@ -2994,10 +2994,16 @@ def start_locked(args, repo):
         atomic_json(record_path, record)
     for name in record.get("bases", []):
         if not is_ancestor(task.path, f"refs/heads/{name}", "HEAD"):
+            if ok(task.path, "rev-parse", "--quiet", "--verify", "MERGE_HEAD"):
+                raise Stop(f"A merge is already in progress in {task.path}; finish or abort it before "
+                           f"`task start` merges base {name}. Nothing was changed.")
             merged = run_git(task.path, "merge", "--no-edit", f"refs/heads/{name}")
             if merged.returncode:
-                run_git(task.path, "merge", "--abort")
-                raise Stop(f"Merging base {name} into {branch} failed; it was aborted: {merged.stderr.strip()}")
+                started = ok(task.path, "rev-parse", "--quiet", "--verify", "MERGE_HEAD")
+                if started:  # only the merge this invocation began, never earlier work
+                    run_git(task.path, "merge", "--abort")
+                raise Stop(f"Merging base {name} into {branch} failed{'; it was aborted' if started else ''}: "
+                           f"{merged.stderr.strip()}")
             print(f"Merged base {name} into {branch}.")
     if args.no_verify:
         print(f"exception: verification omitted: {args.no_verify}")
