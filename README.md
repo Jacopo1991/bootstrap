@@ -1402,9 +1402,11 @@ The rule rests on resolver constraints plus the offline repository gate:
   build dependency resolution is not probed.
 
 - **Gate:** every standard pre-commit config runs `package-cap-check` over tracked
-  requirements/constraints (`.txt`/`.in`, including files under `requirements/`
-  and `constraints/` directories), all `*.in` files, pyproject, uv/Poetry/Pipenv/PDM locks,
-  Dockerfiles, compose YAML, setup metadata and PEP 723 scripts. Bootstrap uses
+  requirements/constraints (`.txt`/`.in`, including `dev-requirements.txt` and files
+  under `requirements/` and `constraints/` directories), all `*.in` files, pyproject,
+  `Pipfile`, `uv.toml`, uv/Poetry/Pipenv/PDM locks (every Pipenv category),
+  Dockerfiles and Containerfiles, compose YAML, Kubernetes and Helm YAML, setup
+  metadata and PEP 723 scripts. Bootstrap uses
   `python3 ci/package-cap-check.py` with its checkout's policy before installation.
   Lock files are always parsed, even without capped names; a malformed lock fails
   closed. Capped entries must resolve at or below the cap and use registry sources;
@@ -1414,18 +1416,31 @@ The rule rests on resolver constraints plus the offline repository gate:
   (`litellm==1.106.2`, `litellm[proxy] <= 1.104.0`, quoted or unquoted), Poetry
   assignments (`litellm = "==1.106.2"`, `litellm = {version = "<=1.104.0"}`,
   optionally with extras), image tags (`litellm:v1.106.2`, optionally `-stable`
-  and an approved digest), wheel/sdist filenames whose complete version is at
-  or below the cap, and explicitly allowed other package names.
+  and an approved digest, after a registry and at most three path segments that
+  do not themselves contain the name), Helm `repository:` with `tag:` on the next
+  line, wheel/sdist filenames whose complete version is at or below the cap, a
+  compose service key alone on its line (`litellm:`), a URL host (`http://litellm:4000`)
+  and explicitly allowed fixed names.
+  Each file is also scanned as a folded copy, with backslash line continuations,
+  `\uXXXX`/`\UXXXXXXXX`/`\xXX` escapes, percent-encoding and quotes inside a word
+  (`lit''ellm`, `"li""tellm"`) removed; variables such as `${A}llm` stay out of
+  reach of any text check.
   Unknown forms fail closed: bare names, `litellm.git`, `litellm_proxy`, unknown
   joined names, and ranges without an allowed upper bound fail even with an
   allowed lock pin. Rewrite refused declarations as plain pins.
-  Container discovery uses `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`,
-  `compose*.y*ml` or `docker-compose*.y*ml`, anywhere in the repository.
+  Container discovery uses `Dockerfile`, `Dockerfile.*`, `Dockerfile-*`, `*.Dockerfile`,
+  the same `Containerfile` names, `compose*.y*ml` or `docker-compose*.y*ml`,
+  anywhere in the repository. Kubernetes and Helm discovery uses `Chart.yaml`,
+  `values*.yaml`, `kustomization.yaml`, workload names (`deployment*.yaml`,
+  `statefulset*`, `daemonset*`, `pod*`, `job*`, `cronjob*`, `replicaset*`) and any
+  YAML under a `k8s`, `kube`, `kubernetes`, `helm` or `charts` directory.
   A version must end the word; quote or escape concatenation after a safe version
   prefix is refused.
-  The policy's `allowed_names` currently exempts only `langchain-litellm`, a
-  separate distribution. An exemption matches that complete name; extending
-  it into an unknown name such as `langchain-litellm-unknown` still fails.
+  The policy's `allowed_names` exempts only fixed names that reference no package:
+  `LITELLM_MASTER_KEY`, `LITELLM_LOCAL_MODEL_COST_MAP` and `litellm_config.yaml`.
+  `langchain-litellm` is not exempt: it depends on litellm, so its bare name
+  would let an unpinned litellm in. An exemption matches that complete name;
+  extending it into an unknown name such as `LITELLM_MASTER_KEY_FILE` still fails.
   Comments and heredocs count; manifest/shell/YAML syntax, variables, requirement
   includes and `dockerfile:` references are not interpreted. Non-lock files without a
   capped-name substring are never parsed further. Violations report the file,
@@ -1435,7 +1450,7 @@ The rule rests on resolver constraints plus the offline repository gate:
 
 `pipx`, Poetry, images and existing uv projects without workspace constraints
 have only the gate guard for the scanned file formats listed above. Files such
-as conda's `environment.yml`, `Pipfile` and `Containerfile` are outside discovery.
+as conda's `environment.yml` and unnamed config YAML are outside discovery.
 The gate checks tracked declarations/locks at commit time; it does not block ad hoc installs. The agent hook keeps its ordinary
 command rules, including allowing `uv sync`.
 
@@ -1443,7 +1458,7 @@ To add a package, add `[packages.<pypi-name>]` with required keys `max_version`,
 `reason` and `source` (HTTPS). Optional keys are `images`, `added` and
 `approved_digests` and `allowed_names`. To allow another package name containing
 the capped name, add it to that package's `allowed_names` map with a nonempty
-reason, for example `allowed_names = { langchain-litellm = "Separate LangChain integration distribution" }`.
+reason, for example `litellm_salt_key = "Environment variable name; names no package"`.
 Keep this list small; unknown names remain refused. `images` records known vendor
 repositories; the text rule also checks other registries.
 Reinstall bootstrap to regenerate constraints; the PM handles

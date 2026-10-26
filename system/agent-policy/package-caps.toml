@@ -20,4 +20,10 @@ images = ["ghcr.io/berriai/litellm", "berriai/litellm"]
 reason = "litellm 1.107.0 on PyPI and the v1.107.0, latest, main-latest and main-stable image tags were compromised on 2026-10-21 (credential-stealing malware with a remote code loader); 1.106.2 and earlier are safe"
 source = "https://docs.litellm.ai/blog/security-incident-oct-21-2026"
 added = 2026-10-23
-allowed_names = { langchain-litellm = "Separate LangChain integration package; not the capped litellm distribution" }
+# Fixed names that are not installable references to litellm. Each needs a reason.
+# langchain-litellm is not listed: it depends on litellm, so allowing its bare name
+# would let an unpinned litellm in through its own dependency.
+[packages.litellm.allowed_names]
+litellm_master_key = "Environment variable name for the proxy admin key; names no package or image"
+litellm_local_model_cost_map = "Environment variable name for the offline cost map switch; names no package or image"
+"litellm_config.yaml" = "Proxy configuration file name; names no package or image"

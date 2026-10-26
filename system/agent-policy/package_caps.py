@@ -13,6 +13,7 @@ import sys
 import subprocess
 import os
 import tomllib
+import urllib.parse
 
 try:
     from packaging.utils import parse_sdist_filename, parse_wheel_filename
@@ -25,7 +26,13 @@ except ModuleNotFoundError:
     from packaging.utils import parse_sdist_filename, parse_wheel_filename
     from packaging.version import InvalidVersion, Version
 
-REQUIREMENTS = re.compile(r'^(?:requirements|constraints).*\.(?:txt|in)$', re.I)
+REQUIREMENTS = re.compile(r'^(?:[\w.-]*[-_.])?(?:requirements|constraints).*\.(?:txt|in)$', re.I)
+# Named container, Pipenv, uv, Kubernetes and Helm files; never every config file.
+CONTAINERS = re.compile(r'(?:docker|container)file(?:-[^.]+|\..*)?|.*\.(?:docker|container)file|'
+                        r'(?:docker-)?compose.*\.y.*ml|pipfile|uv\.toml', re.I)
+KUBERNETES = re.compile(r'(?:chart|kustomization|(?:values|deployment|statefulset|daemonset|pod|'
+                        r'job|cronjob|replicaset)s?(?:[-_.].*)?)\.ya?ml', re.I)
+KUBERNETES_DIRS = {'k8s', 'kube', 'kubernetes', 'helm', 'charts'}
 SKIP_DIRS = {'.git', '.work', '.venv', 'venv', 'node_modules', '__pycache__', '.worktrees'}
 DEFAULT_POLICY = Path('/usr/local/lib/agent-policy/package-caps.toml')
 
@@ -88,7 +95,7 @@ class Cap:
                 self.name not in other or normalize(other) == self.name or
                 not isinstance(reason, str) or not reason.strip()
                 for other, reason in names.items()):
-            raise ValueError(f'{name}: allowed_names must map other package names to reasons')
+            raise ValueError(f'{name}: allowed_names must map other names to reasons')
         self.allowed_names = names
         self.reason, self.source = table['reason'], table['source']
 
@@ -151,8 +158,9 @@ class Checker:
         if path.name.lower() == 'pipfile.lock':
             data = json.loads(text)
             entries = ((name, entry if isinstance(entry, dict) else {})
-                       for section in ('default', 'develop')
-                       for name, entry in data.get(section, {}).items())
+                       # Custom Pipenv categories are further top-level sections.
+                       for section, packages in data.items() if section != '_meta'
+                       for name, entry in packages.items())
         else:
             data = tomllib.loads(text)
             entries = ((entry.get('name'), entry)
@@ -180,12 +188,35 @@ class Checker:
                 self.error(path, self.line_of(text, name),
                            f'{cap.name} has a non-registry or unrecognized lock source; registry resolution required')
 
+    @staticmethod
+    def folded(text: str) -> str:
+        """The text with the encodings installers and shells decode removed."""
+        text = re.sub(r'\\\r?\n', '', text)  # line continuations
+        text = re.sub(r'\\(?:u([0-9a-fA-F]{4})|U([0-9a-fA-F]{8})|x([0-9a-fA-F]{2}))',
+                      lambda m: chr(int(m[1] or m[2] or m[3], 16)), text)
+        text = urllib.parse.unquote(text)
+        # Quotes inside a word concatenate in shells: lit''ellm, "li""tellm", lit'e'llm.
+        return re.sub(r'(?<=[A-Za-z0-9_.-])["\']+(?=[A-Za-z0-9_.-])', '', text)
+
     def pinned_text(self, path: Path, text: str) -> None:
         """Every capped-name substring must belong to a complete allowed form.
 
-        All non-lock formats, including comments, use the same literal rule.
-        No manifest/shell/YAML parsing, expansion or referenced-file resolution.
+        All non-lock formats, including comments, use the same literal rule, on
+        the text and on its folded copy. No manifest/shell/YAML parsing,
+        expansion or referenced-file resolution.
         """
+        findings = self.text_findings(text)
+        folded = self.folded(text)
+        if folded != text:
+            known = {reason for _, reason in findings}
+            findings += [(line, reason + ' (folded copy: continuations, escapes, '
+                          'percent-encoding and in-word quotes removed)')
+                         for line, reason in self.text_findings(folded) if reason not in known]
+        for line, reason in findings:
+            self.error(path, line, reason)
+
+    def text_findings(self, text: str) -> list[tuple[int, str]]:
+        findings = []
         for cap in self.caps.values():
             name = re.escape(cap.name)
             value = r'''[^\s"'`,;\[\]{}()<>|&\\]+'''
@@ -193,6 +224,7 @@ class Checker:
             extras = r'(?:\[[A-Za-z0-9_,. -]+\])?'
             # Boundaries constrain allowed forms; they never filter occurrences.
             requirement = r'(?<![A-Za-z0-9_./:@$+-])' + name + extras
+            segment = r'(?:(?!' + name + r')[A-Za-z0-9_.-])+'
             forms = [
                 ('version', requirement + operator + '(' + value + ')'),
                 ('version', requirement + r'''["']?[ \t]*=[ \t]*["']''' +
@@ -200,8 +232,14 @@ class Checker:
                 ('table', requirement + r'''["']?[ \t]*=[ \t]*\{[ \t]*version[ \t]*=[ \t]*["']''' +
                  operator + '(' + value + ')' + r'''["'][ \t]*''' +
                  r'''(?:,[ \t]*extras[ \t]*=[ \t]*\[[A-Za-z0-9_,. "'-]*\][ \t]*)?\}'''),
-                ('image', r'(?<![A-Za-z0-9_./:+@-])(?:[A-Za-z0-9_.:-]+/)*' +
-                 name + ':(' + value + ')'),
+                # An optional registry host:port and up to three path segments,
+                # none containing another capped-name occurrence.
+                ('image', r'(?<![A-Za-z0-9_./:+@-])(?:' + segment + r'(?::[0-9]{1,5})?/)?(?:' +
+                 segment + '/){0,3}' + name + ':(' + value + ')'),
+                # Helm values: repository: <image>, then tag: on the next line.
+                ('image', r'(?<![A-Za-z0-9_.-])repository:[ \t]*["\']?(?:' + segment +
+                 r'(?::[0-9]{1,5})?/)?(?:' + segment + '/){0,3}' + name +
+                 r'''["']?[ \t]*\r?\n[ \t]*tag:[ \t]*["']?(''' + value + ')'),
                 ('distribution', r'(?<![A-Za-z0-9_.-])(' + name +
                  r'''-[0-9][^\s"'`,;\[\]{}()<>|&\\/?#]+)'''),
             ]
@@ -227,6 +265,11 @@ class Checker:
                     if not re.match(r'''["'\])}]*(?:\s|$|[,;<>|&])''', text[candidate.end():]):
                         reason = 'version token does not end the word; quote/escape concatenation refused'
                     spans.append((candidate.start(), candidate.end(), reason))
+            # A compose service key alone on its line, and a URL host:port.
+            for candidate in re.finditer(r'(?m)^[ \t]*' + name + r'[ \t]*:[ \t]*(?:#.*)?$|'
+                                         r'(?<=://)' + name + r'''(?::[0-9]{1,5})?(?=[/\s"']|$)''',
+                                         text, re.I | re.ASCII):
+                spans.append((candidate.start(), candidate.end(), None))
             for other in cap.allowed_names:
                 for candidate in re.finditer(r'(?<![A-Za-z0-9_.-])' + re.escape(other) +
                                              r'(?![A-Za-z0-9_.-])', text, re.I | re.ASCII):
@@ -239,7 +282,8 @@ class Checker:
                     continue
                 reason = containing[0] if containing else cap.version_reason(None)
                 line = text.count('\n', 0, occurrence.start()) + 1
-                self.error(path, line, f'{reason}; occurrence {occurrence[0]!r}')
+                findings.append((line, f'{reason}; occurrence {occurrence[0]!r}'))
+        return findings
 
     def check(self, path: Path) -> bool:
         name = path.name.lower()
@@ -250,7 +294,9 @@ class Checker:
                   path.suffix.lower() == '.txt' and any(
                       part.lower() in {'requirements', 'constraints'} for part in path.parent.parts) or
                   name in {'pyproject.toml', 'setup.cfg', 'setup.py'} or
-                  re.fullmatch(r'dockerfile(?:\..*)?|.*\.dockerfile|(?:docker-)?compose.*\.y.*ml', name)):
+                  CONTAINERS.fullmatch(name) or KUBERNETES.fullmatch(name) or
+                  path.suffix.lower() in {'.yaml', '.yml'} and any(
+                      part.lower() in KUBERNETES_DIRS for part in path.parent.parts)):
                 self.pinned_text(path, path.read_text(encoding='utf-8'))
             elif path.suffix == '.py':
                 text = path.read_text(encoding='utf-8')
