@@ -1092,7 +1092,8 @@ def redteam(args):
                                   env={**agent_environment(), 'GIT_OPTIONAL_LOCKS': '0'}, stdin=source,
                                   stdout=output_stream if vendor == 'claude' else None)
             code = process.wait()
-        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code))
+        atomic_json(state / 'redteam-run.json', dict(unit=process.unit, result='skipped: hold' if process.skipped else 'finished', exit_code=code,
+                                                       **(dict(state='skipped: hold', ended_at=utc_now()) if process.skipped else {})))
         if process.skipped: raise Stop('skipped: hold')
         if code or not temporary.is_file() or not temporary.read_text(encoding="utf-8").strip() or sha(path, "HEAD") != head:
             raise Stop("risk high: red-team failed or head changed; no output recorded")
@@ -2704,6 +2705,14 @@ def stop_unit(unit, env=None):
             raise Stop(f'Cannot stop {unit}; kept the running record.')
 
 
+def unit_skipped(service, exited):
+    """The ExecCondition (hold check) refused the unit. systemd reports that as Result=exec-condition,
+    or as Result=success with no main process ever started once systemd-run has exited."""
+    if service.get('Result') == 'exec-condition': return True
+    return (exited and service.get('Result') == 'success' and service.get('ActiveState') == 'inactive'
+            and service.get('MainPID') in (None, '', '0') and service.get('ExecMainStartTimestamp') == '')
+
+
 class UnitProcess:
     """Wait on systemd-run, but identify and stop the service's actual process."""
     def __init__(self, process, unit, env):
@@ -2713,7 +2722,7 @@ class UnitProcess:
         while time.monotonic() < deadline:
             code = process.poll()
             service = runner_service(unit, env)
-            self.skipped = service.get('Result') == 'exec-condition'
+            self.skipped = unit_skipped(service, code is not None)
             self.pid = int(service.get('MainPID') or 0)
             if self.pid or self.skipped: return
             if code is not None and service.get('Result') == 'success': return
@@ -2725,7 +2734,7 @@ class UnitProcess:
 
     def wait(self, timeout=None):
         code = self.process.wait(timeout=timeout)
-        self.skipped = self.skipped or runner_service(self.unit, self.env).get('Result') == 'exec-condition'
+        self.skipped = self.skipped or unit_skipped(runner_service(self.unit, self.env), True)
         return 77 if self.skipped else code
 
     def poll(self):
@@ -3580,7 +3589,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         try:
             code = process.wait()
             if process.skipped:
-                atomic_json(run_file, dict(run, unit=process.unit, state='skipped: hold'))
+                atomic_json(run_file, dict(run, unit=process.unit, state='skipped: hold', ended_at=utc_now()))
                 if usage_run: (HOME / '.local/state/task/pending-runs' / (usage_run['id'] + '.json')).unlink(missing_ok=True)
                 raise Stop('skipped: hold')
             print(reply_file.with_name('review-unit.log').read_text(), end='', file=sys.stderr)
@@ -5183,6 +5192,9 @@ def wait_task(args):
             runs.append(run)
             limit = lane_limit(run, task.path / ".work") if file.name == "lane.json" else ""
             labels.append(f"lane: ended by usage limit ({limit})" if limit else run.get("state", "unknown"))
+        if any(r.get("state") == "skipped: hold" for r in runs):
+            print("; ".join(labels) + " (unit not started; release the hold with `task hold release`)")
+            return 1
         if not any(r.get("state") in {"running", "foreground", "starting"} for r in runs):
             print("; ".join(labels) or "not started")
             return 0
