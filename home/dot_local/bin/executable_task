@@ -3262,6 +3262,7 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
     configured_env = configured_environment(path)
     run_id = os.environ.get("TASK_RUN_ID") or secrets.token_hex(16)
     results = []
+    passed_suites = {}
     with log.open("w") as out:
         steps = [["just", "check"]]
         if record:
@@ -3271,6 +3272,14 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
         for step in steps:
             out.write(f"$ {' '.join(step)}\n")
             out.flush()
+            verify_text = step[2] if step[:2] == ["bash", "-c"] else None
+            covering_suite = passed_suites.get(verify_text)
+            if covering_suite is not None:
+                out.write(f"SKIP: Verify command is covered by passed `just check` suite: {covering_suite}\n")
+                out.write("exit 0\n")
+                results.append({"command": step, "result": "skipped: suite", "suite": covering_suite,
+                                "exit": 0, "duration": 0})
+                continue
             configured, timeout, durations = step_timeout(path, step)
             timeout_details = {"configured_timeout": configured, "effective_timeout": timeout,
                                "history_durations": durations, "history_duration_order": "oldest_to_newest"}
@@ -3321,6 +3330,15 @@ def run_check_steps(path, base, record=None, state=None, evidence_name="check.js
                         atomic_json(run_path, read_json_object(run_path) | dict(state='skipped: hold', ended_at=utc_now()))
                 passed = False
                 break
+            if step == ["just", "check"] and not advisory and gate_environment is not None:
+                suite_results = Path(gate_environment["TMPDIR"]) / "gate-suites.tsv"
+                try:
+                    for line in suite_results.read_text().splitlines():
+                        result, separator, command = line.partition("\t")
+                        if separator and result == "passed":
+                            passed_suites.setdefault(command, command)
+                except FileNotFoundError:
+                    pass
     evidence = {"sha": sha(path, "HEAD"), "base_sha": base or "",
                 "record_revision": record.get("revision") if record else "",
                 "result": "skipped: hold" if process.skipped else "passed" if passed else "failed", "steps": results,
