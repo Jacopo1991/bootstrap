@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage, task_lock
 from task_limits import bwrap_denial, cli_limit, lane_limit
-from task_routing import TIERS, guards, lane_limits, override_problem
+from task_routing import TIERS, guards, lane_limits, override_problem, same_vendor_ok
 
 
 TASK_LINE = re.compile(
@@ -282,8 +282,10 @@ class Batch:
         if denied:
             raise Stop(f"reviewer: {denied}")
         routing = data(state / "review-routing.json")
-        builder = data(state / "task.json").get("builder")
-        if routing.get("fallback_from") and routing.get("vendor") == builder:
+        task_record = data(state / "task.json")
+        builder = task_record.get("builder")
+        if (routing.get("fallback_from") and routing.get("vendor") == builder
+                and not same_vendor_ok(builder, task_record.get("risk") or "normal")):  # the merge gate rechecks forced high risk
             raise Stop("reviewer fallback used the builder vendor; independent review required before merge")
 
     def task(self, task):
