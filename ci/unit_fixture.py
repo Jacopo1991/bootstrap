@@ -26,7 +26,10 @@ condition = next(arg.split('=', 1)[1] for arg in args if arg.startswith('ExecCon
 if (home / 'pull-before-service').exists():
     (home / '.local/state/task/hold').write_text('service admission hold')
 if subprocess.run(shlex.split(condition), env=env).returncode:
-    (root / unit).write_text(json.dumps(dict(MainPID='0', ActiveState='inactive', Result='exec-condition')))
+    # skip-style: systemd may report a skipped ExecCondition as Result=success with no main process started
+    style = (home / 'skip-style').read_text().strip() if (home / 'skip-style').exists() else 'exec-condition'
+    (root / unit).write_text(json.dumps(dict(MainPID='0', ActiveState='inactive', ExecMainStartTimestamp='',
+                                             Result='exec-condition' if style == 'exec-condition' else 'success')))
     sys.exit(0)
 if os.environ.get('SERVICE_EXIT'):
     sys.exit(int(os.environ['SERVICE_EXIT']))
