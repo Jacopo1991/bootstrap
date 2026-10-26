@@ -2137,7 +2137,7 @@ def lane(args):
     path = task.worktree()
     record = load_record(task)
     bind_plan(task, args)
-    if args.context:
+    if getattr(args, "context", None):  # in-process callers (tests) pass a namespace without it, like setup_round
         pin_context(task, args.context)
     refresh_context(task)
     builder = args.builder or record["builder"]
