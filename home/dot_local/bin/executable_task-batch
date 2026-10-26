@@ -255,6 +255,7 @@ class Batch:
     def lane_outcome(self, work):
         record = data(work / "lane.json")
         if record.get("state") == "tampered": raise Stop("lane tampered with Git metadata; the PM inspects it before any further Git runs")
+        if record.get("state") == "vendor-unavailable": raise Stop(f"lane vendor-unavailable after a retry and {record.get('model')} fallback; relaunch later")
         try:
             started = datetime.fromisoformat(record["started_at"]).timestamp()
         except (KeyError, ValueError, TypeError):

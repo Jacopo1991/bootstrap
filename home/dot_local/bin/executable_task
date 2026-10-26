@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 import task_lock
-from task_limits import bwrap_denial, cli_limit, lane_limit, round_cause, SETUP_CAUSES
+from task_limits import bwrap_denial, cli_limit, lane_limit, round_cause, vendor_unavailable, FALLBACK, VENDOR_BACKOFF, SETUP_CAUSES
 from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
 
 HOME = Path(os.environ.get("HOME", "/home/agent"))
@@ -589,26 +589,28 @@ def plan_budget(ident, fields=None, clear=None, reserve=True):
             replaced = {ident for r in rows if r.get("invoked") for ident in [r.get("replaces"), *r.get("superseded", [])]}
             charged = [r for r in rows if r["id"] not in replaced]
             used = {v: len({(r.get("repo"), r.get("task"), r.get("kind"), r.get("commit")) for r in charged if r.get("vendor") == v and r.get("type") != "outcome"}) for v in task_usage.VENDORS}
+            # T-71: two same-class failures in a row on one task disable that task's kind; vendor-unavailable and stopped never count.
             last, disabled = {}, set()
             for row in rows:
                 kind, outcome = row.get("kind"), row.get("outcome")
-                if outcome == "cleared": disabled.discard(kind); last.pop(kind, None)
+                key = (kind, row.get("repo"), row.get("task"))
+                if outcome == "cleared": disabled = {d for d in disabled if d[0] != kind}; last = {k: v for k, v in last.items() if k[0] != kind}
                 elif outcome in {"finished", "failed", "interrupted"}:
-                    if outcome in {"failed", "interrupted"} and last.get(kind) == outcome: disabled.add(kind)
-                    last[kind] = outcome
+                    if outcome in {"failed", "interrupted"} and last.get(key) == outcome: disabled.add(key)
+                    last[key] = outcome
             if clear:
                 stream.write(json.dumps(dict(id=secrets.token_hex(12), plan=ident, kind=clear, outcome="cleared", start=utc_now(), type="control")) + "\n"); return
             if fields:
                 if datetime.now(timezone.utc) >= expiry: raise Stop(f"Plan {ident}: expired")
                 allowed = plan["allowed"].get(fields["repo"], [])
                 if "*" not in allowed and any(t.lower() not in [a.lower() for a in allowed] for t in fields.get("tasks", [fields["task"]])): raise Stop(f"Plan {ident}: outside allowed work")
-                if fields["kind"] in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required")
+                if (fields["kind"], fields["repo"], fields["task"]) in disabled: raise Stop(f"Plan {ident}: {fields['kind']} disabled; clear required ({fields['repo']}/{fields['task']} failed twice in a row)")
                 prior = next((r for r in reversed(charged) if all(r.get(k) == fields.get(k) for k in ("repo", "task", "kind", "commit", "vendor")) and r.get("type") != "outcome"), None)
                 if (not prior or reserve is False) and used.get(fields["vendor"], float("inf")) >= plan["points"].get(fields["vendor"], 0): raise Stop(f"Plan {ident}: {fields['vendor']} points exhausted")
                 if isinstance(reserve, dict): reserve["invoked"] = True; atomic_json(root / "pending-runs" / (reserve["id"] + ".json"), reserve); return reserve
                 if prior and reserve and not prior.get("outcome") and not prior.get("invoked"): prior["superseded"] = sorted(set(prior.get("superseded", []) + [prior.get("replaces"), fields.get("replaces")]) - {None}); atomic_json(root / "pending-runs" / (prior["id"] + ".json"), prior); return prior
                 return task_usage.run_log(HOME, plan=ident, **fields) if reserve else None
-        return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(disabled)}"
+        return f"plan {ident}: allowed {plan['allowed']}; expires {expiry.isoformat()}; " + "; ".join(f"{v} used {used[v]} left {plan['points'][v] - used[v]}" for v in task_usage.VENDORS) + f"; disabled {sorted(f'{k} {r}/{t}' for k, r, t in disabled)}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise Stop(f"Missing or malformed plan/log {ident}: {error}") from error
 def budget_run(**fields):
@@ -1708,7 +1710,7 @@ def agent_environment():
     allowed = {'HOME', 'PATH', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR',
                'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
                'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'SECRETSPEC_REASON', 'TASK_HOLDER', 'TASK_PLAN',
-               'TASK_NO_PACE', 'TASK_GATE_DIR', 'TASK_LANE_TEMP_ROOT', 'TASK_REVIEW_TIMEOUT',
+               'TASK_NO_PACE', 'TASK_GATE_DIR', 'TASK_LANE_TEMP_ROOT', 'TASK_REVIEW_TIMEOUT', 'TASK_VENDOR_BACKOFF',
                'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
                'GIT_OPTIONAL_LOCKS', 'UV_CONSTRAINT', 'NPM_CONFIG_MIN_RELEASE_AGE'}
     return {name: value for name, value in os.environ.items()
@@ -1789,10 +1791,12 @@ def finalize_lane_record(path, run, state, **fields):
         print(f"Lane temporary cleanup failed: {error}", file=sys.stderr)
     finally:
         run.update(state=state, ended_at=utc_now(), **fields)
+        # T-71: a lane the seat stopped (`task lane --stop` or `task cancel` leave lane.stop) records `stopped`.
+        stopped = state in {"cancelled", "interrupted"} and (path.parent / "lane.stop").exists()
         usage_run = run.get("usage_run")
         if usage_run and usage_run.get("plan"): usage_run.update(read_json_object(HOME / ".local/state/task/pending-runs" / (usage_run["id"] + ".json")))
         if usage_run and (not usage_run.get("plan") or usage_run.get("invoked")):
-            task_usage.run_log(HOME, run["usage_run"], "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
+            task_usage.run_log(HOME, run["usage_run"], "stopped" if stopped else state if state == "vendor-unavailable" else "interrupted" if state in {"cancelled", "interrupted", "timed_out"} else "failed" if run.get("exit_code") else "finished", reason=lane_limit(run, path.parent) or state, exit_code=run.get("exit_code"))
         atomic_json(path, run)
 
 
@@ -2137,6 +2141,7 @@ def lane(args):
                 task_usage.record_override(HOME, task.repo.name, task.id, model, recorded, args.override)
                 print(f"override recorded: {model} on a {recorded} task ({args.override})")
             archive_lane_final(work)
+            (work / "lane.stop").unlink(missing_ok=True)
             worker = [sys.executable, str(Path(__file__).resolve()), "lane", str(task.repo), task.id,
                       "--builder", builder, "--model", model, "--tier", tier, "--effort", args.effort, "--no-boost", "--_worker"]
             if args.override:
@@ -2203,49 +2208,74 @@ def lane(args):
                 # Claude streams JSON events to lane.jsonl; final.md and the log keep the plain text.
                 stream = task_usage.ClaudeStream(HOME) if raw else None
                 if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], run["usage_run"], reserve=run["usage_run"])
-                child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
-                                         pass_fds=task_lock.descriptors(),
-                                         stdout=subprocess.PIPE if output else None, start_new_session=True)
-                try:
-                    run["child_pgid"] = child.pid
-                    atomic_json(lane_record, run)
-                    deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
-                    with selectors.DefaultSelector() as reader:
-                        if output:
-                            reader.register(child.stdout, selectors.EVENT_READ)
-                        while reader.get_map() or child.poll() is None:
-                            remaining = deadline - time.monotonic() if deadline is not None else None
-                            if remaining is not None and remaining <= 0:
-                                raise subprocess.TimeoutExpired(command, args.timeout * 60)
-                            for key, _ in reader.select(min(0.1, remaining) if remaining is not None else 0.1):
-                                chunk = os.read(key.fd, 65536)
-                                if not chunk:
-                                    reader.unregister(key.fileobj)
-                                    continue
-                                if stream:
-                                    raw.write(chunk)
-                                    raw.flush()
-                                    chunk = stream.feed(chunk).encode()
-                                output.write(chunk)
-                                output.flush()
-                                sys.stdout.buffer.write(chunk)
-                                sys.stdout.buffer.flush()
-                    if stream:
-                        rest = stream.finish().encode()
-                        output.write(rest)
-                        sys.stdout.buffer.write(rest)
-                        sys.stdout.buffer.flush()
-                    code = child.wait()
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    stop_child_group(child)
-                    end_round(task, run, work, "timed_out", None)
-                    finalize_lane_record(lane_record, run, "tampered" if tamper_reason(task) else "timed_out", exit_code=None)
-                    os.killpg(os.getpgrp(), signal.SIGKILL)
-                except (SystemExit, KeyboardInterrupt):
-                    interrupted = True
-                    stop_child_group(child)
-                    raise
+                deadline = time.monotonic() + args.timeout * 60 if args.timeout is not None else None
+                for attempt in range(3):
+                    child = subprocess.Popen(command, cwd=path, env=environment, stdin=source,
+                                             pass_fds=task_lock.descriptors(),
+                                             stdout=subprocess.PIPE if output else None, stderr=subprocess.PIPE, start_new_session=True)
+                    errors = b""
+                    try:
+                        run["child_pgid"] = child.pid
+                        atomic_json(lane_record, run)
+                        with selectors.DefaultSelector() as reader:
+                            reader.register(child.stderr, selectors.EVENT_READ)
+                            if output:
+                                reader.register(child.stdout, selectors.EVENT_READ)
+                            while reader.get_map() or child.poll() is None:
+                                remaining = deadline - time.monotonic() if deadline is not None else None
+                                if remaining is not None and remaining <= 0:
+                                    raise subprocess.TimeoutExpired(command, args.timeout * 60)
+                                for key, _ in reader.select(min(0.1, remaining) if remaining is not None else 0.1):
+                                    chunk = os.read(key.fd, 65536)
+                                    if not chunk:
+                                        reader.unregister(key.fileobj)
+                                        continue
+                                    if key.fileobj is child.stderr:  # the log keeps it; the tail shows a vendor error
+                                        errors = (errors + chunk)[-8192:]
+                                        sys.stdout.buffer.write(chunk)
+                                        sys.stdout.buffer.flush()
+                                        continue
+                                    if stream:
+                                        raw.write(chunk)
+                                        raw.flush()
+                                        chunk = stream.feed(chunk).encode()
+                                    output.write(chunk)
+                                    output.flush()
+                                    sys.stdout.buffer.write(chunk)
+                                    sys.stdout.buffer.flush()
+                        if stream:
+                            rest = stream.finish().encode()
+                            output.write(rest)
+                            sys.stdout.buffer.write(rest)
+                            sys.stdout.buffer.flush()
+                        code = child.wait()
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        stop_child_group(child)
+                        end_round(task, run, work, "timed_out", None)
+                        finalize_lane_record(lane_record, run, "tampered" if tamper_reason(task) else "timed_out", exit_code=None)
+                        os.killpg(os.getpgrp(), signal.SIGKILL)
+                    except (SystemExit, KeyboardInterrupt):
+                        interrupted = True
+                        stop_child_group(child)
+                        raise
+                    # T-71: a transient vendor error retries once after a backoff, then falls back to the route's next model.
+                    if not (vendor_unavailable(builder, code, errors.decode(errors="replace"))
+                            or vendor_unavailable(builder, code, task_usage._text(final))):
+                        break
+                    if attempt == 2:
+                        result = "vendor-unavailable"
+                        break
+                    if attempt:
+                        fallback = FALLBACK[builder] if model != FALLBACK[builder] else task_usage.CHEAPER[builder]
+                        command[command.index("--model") + 1] = cli_model = resolve_model(builder, fallback)
+                        run.update(model=fallback, cli_model=cli_model, fallback_from=model)
+                        model = fallback
+                    else:
+                        time.sleep(float(os.environ.get("TASK_VENDOR_BACKOFF", VENDOR_BACKOFF)))
+                    print(f"vendor-unavailable: retrying with {builder} {model}", flush=True)
+                    source.seek(0)
+                    stream = task_usage.ClaudeStream(HOME) if raw else None
     except (SystemExit, KeyboardInterrupt):
         interrupted = True
         raise
@@ -4998,9 +5028,11 @@ def cancel(args):
     lane_run = read_json_object(lane_path)
     if lane_run.get('state') == 'running' and lane_alive(lane_run):
         if not lane_run.get('unit'): raise Stop('Lane has no unit; ask the PM to inspect the legacy run.')
+        (lane_path.parent / 'lane.stop').touch()  # the worker's own exit then records `stopped` too
         stop_unit(lane_run['unit'])
         finalize_lane_record(lane_path, lane_run, 'cancelled')
         print(f"Cancelled lane unit {lane_run['unit']}; kept {task.path}."); return 0
+    if getattr(args, 'stop', False): raise Stop('No running lane to stop.')
     run_path = task_state(task) / 'run.json'
     run = read_json_object(run_path)
     lock = run_path.with_name('run.lock')
@@ -5237,6 +5269,7 @@ def main(argv=None):
             sub.add_argument("--no-boost", action="store_true")
             sub.add_argument("--no-pace", action="store_true", help="skip the usage-pacing check for this command (logged)")
             sub.add_argument("--timeout", type=float, help="stop the lane process group after this many minutes")
+            sub.add_argument("--stop", action="store_true", help="stop the running lane; it records `stopped`, which never trips a plan breaker")
             sub.add_argument("--builder", choices=("codex", "claude"))
             sub.add_argument("--override", metavar="REQUEST", default="",
                              help="Jacopo's request and date; permits gpt-6-astra or fable outside its tier (ledgered)")
@@ -5325,6 +5358,8 @@ def main(argv=None):
         return smoke(args)
     if args.command == "lane" and args.timeout is not None and not args.timeout > 0:
         parser.error("--timeout must be greater than zero minutes")
+    if args.command == "lane" and args.stop:
+        args.command = "cancel"
     global GATE_LOCK_WAIT
     GATE_LOCK_WAIT = getattr(args, "lock_wait", 45)
     if args.command == "check":

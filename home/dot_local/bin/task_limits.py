@@ -13,17 +13,34 @@ CLI_LIMIT = {
 }
 
 
+# T-71: transient vendor errors. A lane retries once with backoff, then falls back to FALLBACK's model;
+# still failing, it records `vendor-unavailable`, which never trips a plan's lane breaker.
+VENDOR_UNAVAILABLE = re.compile(r"Selected model is at capacity|model is (?:currently )?(?:at capacity|overloaded)"
+                                r"|overloaded_error|API Error: 5(?:00|02|03|29)|503 Service Unavailable", re.I)
+VENDOR_BACKOFF = 30  # seconds before the one retry; TASK_VENDOR_BACKOFF overrides it in tests
+FALLBACK = {"codex": "gpt-6.1-sol", "claude": "opus"}  # route's next model; a lane already on it uses the cheaper one
+
+
+def last_line(builder, output):
+    lines = [line for line in output.splitlines() if line.strip()]
+    # codex exec emits this after an error when --output-last-message is set.
+    if builder == "codex" and lines and lines[-1].startswith("Warning: no last agent message; wrote empty content to "):
+        lines.pop()
+    return lines[-1] if lines else ""
+
+
+def vendor_unavailable(builder, code, output):
+    last = last_line(builder, output) if code else ""
+    return last if VENDOR_UNAVAILABLE.search(last) else ""
+
+
 def cli_limit(record, output):
     """Only a failed, completed CLI run's terminal diagnostic can be a limit."""
     builder, code = record.get("builder"), record.get("exit_code")
     if record.get("state") != "finished" or type(code) is not int or code == 0:
         return ""
     pattern = CLI_LIMIT.get(builder)
-    lines = [line for line in output.splitlines() if line.strip()]
-    # codex exec emits this after an error when --output-last-message is set.
-    if builder == "codex" and lines and lines[-1].startswith("Warning: no last agent message; wrote empty content to "):
-        lines.pop()
-    last = lines[-1] if lines else ""
+    last = last_line(builder, output)
     if not pattern:
         return ""
     match = pattern.match(last) if builder == "claude" else pattern.fullmatch(last)
@@ -67,6 +84,8 @@ SETUP_CAUSES = {cause for cause, _ in ROUND_CAUSES}
 def round_cause(record, work):
     if record.get("state") in {"tampered", "timed_out"}:
         return "code-or-test"
+    if record.get("state") == "vendor-unavailable":
+        return "lane-infrastructure"
     if record.get("exit_code") == 127:
         return "missing-tool-or-cache"
     if lane_limit(record, work):

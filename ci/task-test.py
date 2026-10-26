@@ -172,6 +172,13 @@ prompt = sys.stdin.read()
 tamper = os.environ.get('LANE_STUB_TAMPER')
 if tamper:
     pathlib.Path(tamper).write_text(('gitdir: ' if tamper.endswith('.git') else '') + '/elsewhere' + chr(10))
+capacity = int(os.environ.get('LANE_STUB_CAPACITY', '0'))
+if capacity:
+    with (work / 'capacity-models').open('a') as models:
+        models.write(sys.argv[sys.argv.index('--model') + 1] + chr(10))
+    if len((work / 'capacity-models').read_text().split()) <= capacity:
+        print('ERROR: Selected model is at capacity. Please try a different model.', file=sys.stderr)
+        sys.exit(1)
 release = os.environ.get('LANE_STUB_RELEASE')
 if release:
     import subprocess
@@ -1100,7 +1107,7 @@ class TaskTool(unittest.TestCase):
             end('lane', 'interrupted', 'different text')
             with self.assertRaisesRegex(api.Stop, 'lane disabled'):
                 end('lane', 'finished', '')
-            self.assertIn("disabled ['lane']", self.raw_task('plan-budget', 'chain'))
+            self.assertIn("disabled ['lane proj/docs']", self.raw_task('plan-budget', 'chain'))
             before = len(self.run_rows())
             self.raw_task('plan-budget', 'chain', '--clear', 'lane')
             self.assertEqual(len(self.run_rows()), before + 1)
@@ -1111,7 +1118,7 @@ class TaskTool(unittest.TestCase):
             end('lane', 'failed', 'two')
             self.assertIn('disabled []', api.plan_budget('chain'))
             end('lane', 'failed', 'three')
-            self.assertIn("disabled ['lane']", api.plan_budget('chain'))
+            self.assertIn("disabled ['lane proj/docs']", api.plan_budget('chain'))
 
     def test_plan_budget_read_only_missing_malformed_and_status(self):
         state = self.home / '.local/state/task'
@@ -1432,6 +1439,25 @@ class TaskTool(unittest.TestCase):
         self.assertIn('claude used 0 left 1', self.raw_task('plan-budget', 'chain'))
         self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
 
+    def test_plan_budget_breaker_counts_real_failures_per_task(self):
+        self.budget_fixture(points=20)
+        with self.budget_environment() as api:
+            def end(task, outcome):
+                row = api.budget_run(repo='proj', task=task, kind='lane', vendor='codex', commit=str(len(self.run_rows())))
+                api.task_usage.run_log(self.home, row, outcome)
+            end('T-35', 'stopped')
+            end('T-36', 'failed')
+            end('T-36', 'vendor-unavailable')
+            end('T-36', 'vendor-unavailable')
+            self.assertIn('disabled []', api.plan_budget('chain'), 'stopped, vendor-unavailable and failures across tasks never count')
+            end('T-35', 'failed')
+            self.assertIn('disabled []', api.plan_budget('chain'))
+            end('T-36', 'failed')
+            self.assertIn("disabled ['lane proj/T-36']", api.plan_budget('chain'))
+            with self.assertRaisesRegex(api.Stop, r'lane disabled; clear required \(proj/T-36'):
+                end('T-36', 'finished')
+            end('T-35', 'finished')
+
     def test_plan_budget_same_commit_failures_are_separate_attempts_and_trip_breaker(self):
         wt, _ = self.started()
         self.budget_fixture(points=1)
@@ -1450,28 +1476,53 @@ class TaskTool(unittest.TestCase):
         self.assertEqual(self.run_rows(), rows)
         self.assertEqual(list((self.home / '.local/state/task/pending-runs').glob('*.json')), [])
 
-    def test_plan_budget_cancelled_attempts_keep_outcomes_and_trip_breaker(self):
+    def test_plan_budget_stopped_attempts_record_stopped_and_never_trip_breaker(self):
         wt, _ = self.started()
         self.budget_fixture(points=1)
         self.stub_models()
         (wt / '.work/prompt.md').write_text('task')
         release = self.home / 'release-cancelled-model'
         self.addCleanup(release.touch)
-        for _ in range(2):
+        for stop in (('lane', 'proj', '5', '--stop'), ('cancel', 'proj', '5')):
             (wt / '.work/model-call.json').unlink(missing_ok=True)
             self.raw_task('lane', 'proj', '5', '--plan', 'chain', env=dict(self.env, LANE_STUB_RELEASE=str(release)))
             self.wait_for_lane(wt, finished=False)
             run = json.loads((wt / '.work/lane.json').read_text())['usage_run']
             reservation = self.home / '.local/state/task/pending-runs' / (run['id'] + '.json')
             self.assertTrue(json.loads(reservation.read_text())['invoked'])
-            self.raw_task('cancel', 'proj', '5')
+            self.raw_task(*stop)
             self.wait_project_lock_free()
         rows = self.run_rows()
-        self.assertEqual([r['outcome'] for r in rows], ['interrupted', 'interrupted'])
+        self.assertEqual([r['outcome'] for r in rows], ['stopped', 'stopped'])
         self.assertEqual(len({r['id'] for r in rows}), 2)
-        self.assertIn('codex used 1 left 0', self.raw_task('plan-budget', 'chain'))
-        self.assertIn('lane disabled', self.raw_task('lane', 'proj', '5', '--plan', 'chain', code=1))
-        self.assertEqual(self.run_rows(), rows)
+        self.assertIn('codex used 1 left 0; disabled []', self.raw_task('plan-budget', 'chain'))
+        self.assertIn('No running lane to stop', self.raw_task('lane', 'proj', '5', '--stop', code=1))
+
+    def test_lane_vendor_capacity_retries_then_falls_back_and_never_trips_breaker(self):
+        wt, _ = self.started()
+        self.budget_fixture(points=1)
+        self.stub_models()
+        (wt / '.work/prompt.md').write_text('task')
+        models = wt / '.work/capacity-models'
+        env = dict(self.env, TASK_VENDOR_BACKOFF='0')
+        self.raw_task('lane', 'proj', '5', '--plan', 'chain', env=dict(env, LANE_STUB_CAPACITY='2'))
+        record = self.wait_for_lane(wt)
+        first, retry, fallback = models.read_text().split()
+        self.assertEqual(first, retry, 'one retry on the same model')
+        self.assertNotEqual(fallback, first, 'then the next model on the route')
+        self.assertEqual((record['model'], record['fallback_from'], record['exit_code']), (fallback, first, 0))
+        self.assertIn('Selected model is at capacity', (wt / '.work/lane.log').read_text())
+        self.assertEqual([r['outcome'] for r in self.run_rows()], ['finished'])
+        for _ in range(2):
+            models.unlink()
+            self.raw_task('lane', 'proj', '5', '--plan', 'chain', env=dict(env, LANE_STUB_CAPACITY='9'))
+            self.wait_for_lane(wt, state='vendor-unavailable')
+            self.wait_project_lock_free()
+            self.assertEqual(len(models.read_text().split()), 3)
+        self.assertEqual([r['outcome'] for r in self.run_rows()], ['finished', 'vendor-unavailable', 'vendor-unavailable'])
+        self.assertIn('disabled []', self.raw_task('plan-budget', 'chain'))
+        rounds = json.loads((self.state() / 'rounds.json').read_text())['rounds']
+        self.assertEqual([r['counted'] for r in rounds[-2:]], [False, False], 'a vendor outage costs no round')
 
     def test_plan_budget_vendor_change_requires_and_charges_executing_vendor(self):
         wt, _ = self.started()
@@ -1555,7 +1606,7 @@ class TaskTool(unittest.TestCase):
                     'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
                     'review disabled': "\n".join([
                         "for number in range(2):",
-                        "    row = api['task_usage'].run_log(api['HOME'], plan='chain', repo='proj', task='seed-' + str(number), kind='review', vendor='codex', commit=str(number))",
+                        "    row = api['task_usage'].run_log(api['HOME'], plan='chain', repo='proj', task='T-5', kind='review', vendor='codex', commit=str(number))",
                         "    api['task_usage'].run_log(api['HOME'], row, 'failed')",
                     ]),
                 }[rule]
@@ -1600,7 +1651,7 @@ class TaskTool(unittest.TestCase):
                 self.raw_task('review', 'proj', '5', '--run', '--plan', 'chain',
                               env=dict(self.env, REVIEW_STUB_FIRST_REPLY="You've hit your weekly limit",
                                        REVIEW_STUB_FIRST_EXIT='2', REVIEW_STUB_REPLY=reply))
-                attempts = [r for r in self.run_rows() if r.get('task') == 'T-5']
+                attempts = [r for r in self.run_rows() if r.get('task') == 'T-5' and r.get('commit') not in {'0', '1'}]  # not the seeds
                 self.assertEqual([(r['vendor'], r['outcome']) for r in attempts],
                                  [('claude', 'failed'), ('claude', 'failed'), ('codex', 'finished')])
                 self.assertEqual(attempts[-1]['id'], fallback['id'], 'reuse the refused reservation')
@@ -1640,7 +1691,7 @@ class TaskTool(unittest.TestCase):
                     'outside allowed': 'plan.write_text(plan.read_text().replace(\'["*"]\', \'["other"]\'))',
                     'lane disabled': "\n".join([
                         "for number in range(2):",
-                        "    run = api['budget_run'](repo='proj', task='seed-' + str(number), kind='lane', vendor='codex')",
+                        "    run = api['budget_run'](repo='proj', task='T-5', kind='lane', vendor='codex', commit=str(number))",
                         "    api['task_usage'].run_log(api['HOME'], run, 'failed')",
                     ]),
                 }[rule]
@@ -1977,7 +2028,7 @@ class TaskTool(unittest.TestCase):
         self.budget_fixture(points=5)
         with self.budget_environment() as api:
             for number in range(2):
-                run = api.budget_run(repo='proj', task=f'old-batch-{number}', kind='runner-start', vendor='codex')
+                run = api.budget_run(repo='proj', task='b1', kind='runner-start', vendor='codex', commit=str(number))
                 api.task_usage.run_log(self.home, run, 'failed')
         rows = self.run_rows()
         self.assertIn('runner-start disabled', self.raw_task('runner-start', 'proj', str(runner), '--plan', 'chain', code=1))
