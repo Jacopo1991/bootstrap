@@ -2873,34 +2873,150 @@ class TaskTool(unittest.TestCase):
             self.readings(**{vendor: (40, 84)}, five=10)
         self.assertEqual(path.read_bytes(), original)
 
-    def test_deeper_review_requires_boost_and_hard_tier_or_explicit_final(self):
+    def test_high_risk_review_never_defaults_to_opus_and_a_recorded_miss_is_ledgered(self):
         self.stub_reviewers()
         wt, _ = self.started()
         self.raw_task('risk', 'proj', '5', 'high', '--reason', 'exercise high review routing')
         self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00',
                   '--codex-until', '2099-01-01T00:00:00+00:00')
         self.assertIn('--final requires --run', self.task('review', 'proj', '5', '--final', code=1))
-        for builder, vendor, normal, deeper in (('codex', 'claude', 'haiku', 'opus'),
-                                                ('claude', 'codex', 'gpt-6-luna', 'gpt-6.1-sol')):
-            for tier, final, five, age, expected in (
-                    ('routine', False, 10, 0, normal), ('design', False, 10, 0, normal),
-                    ('hard', False, 10, 0, deeper), ('routine', True, 10, 0, deeper),
-                    ('hard', False, 50, 0, normal), ('routine', True, 62, 0, normal),
-                    ('hard', True, 10, 46, normal),
-                    *([('hard', False, None, 0, deeper), ('routine', True, None, 0, deeper)] if vendor == 'codex' else [])):
-                with self.subTest(builder=builder, tier=tier, final=final, five=five, age=age):
+        # Decision-32: another vendor than the author, never Opus by default, boost and --final change nothing.
+        for builder, vendor, model in (('codex', 'claude', 'sonnet'), ('claude', 'codex', 'gpt-6.1-sol')):
+            for tier, final in (('routine', False), ('hard', False), ('routine', True)):
+                with self.subTest(builder=builder, tier=tier, final=final):
                     self.task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', tier,
                               '--override', 'Jacopo 2026-10-23: test tiers')
                     self.raw_task('check', 'proj', '5')
-                    self.readings(**{vendor: (40, 84)}, five=five, age=timedelta(minutes=age))
-                    if age:
-                        TASK_MODULE.task_usage.claim(self.home, vendor, 'lane', 2 ** 22 + 7)
+                    self.readings(**{vendor: (40, 84)}, five=10)
                     head = self.git(wt, 'rev-parse', 'HEAD')
                     reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
                     self.raw_task('review', 'proj', '5', '--run', '--no-pace', *(['--final'] if final else []),
                                   env=dict(self.env, REVIEW_STUB_REPLY=reply))
                     metadata = json.loads((self.state() / 'review.json').read_text())
-                    self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, expected))
+                    self.assertEqual((metadata['reviewer'], metadata['model']), (vendor, model))
+        self.task('start', 'proj', '5', '--refresh', '--builder', 'codex')
+        self.raw_task('check', 'proj', '5')
+        head = self.git(wt, 'rev-parse', 'HEAD')
+        reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
+        self.raw_task('review', 'proj', '5', '--run', '--no-pace', '--miss', 'sonnet missed the T-39 hook regression',
+                      env=dict(self.env, REVIEW_STUB_REPLY=reply))
+        metadata = json.loads((self.state() / 'review.json').read_text())
+        self.assertEqual((metadata['reviewer'], metadata['model']), ('claude', 'opus'))
+        ledger = [json.loads(line) for line in (self.home / '.local/state/task/usage/overrides.jsonl').read_text().splitlines()]
+        self.assertEqual([(row['kind'], row['vendor']) for row in ledger if row.get('kind') == 'review_miss'], [('review_miss', 'claude')])
+        self.raw_task('risk', 'proj', '5', 'normal')
+        self.assertIn('--miss needs high risk', self.raw_task('review', 'proj', '5', '--miss', 'x', code=1))
+
+    def test_decision_32_review_chain_rows(self):
+        from task_routing import review_chain
+        luna, sol, haiku, sonnet = ('codex', 'gpt-6-luna'), ('codex', 'gpt-6.1-sol'), ('claude', 'haiku'), ('claude', 'sonnet')
+        gemini = ('gemini', 'gemini-x')
+        rows = {('codex', 'normal', None): [sol, haiku],  # Haiku only when Codex (and Gemini) are unavailable
+                ('codex', 'normal', 'gemini-x'): [gemini, sol, haiku],
+                ('claude', 'normal', None): [luna, haiku], ('claude', 'normal', 'gemini-x'): [luna, haiku],
+                ('codex', 'high', None): [sonnet], ('codex', 'high', 'gemini-x'): [sonnet, gemini],
+                ('claude', 'high', None): [sol], ('claude', 'high', 'gemini-x'): [sol, gemini]}
+        policy = {'normal': {'codex': 'gpt-6.1-sol', 'claude': 'gpt-6-luna'}, 'high': {'codex': 'sonnet', 'claude': 'gpt-6.1-sol'}}
+        for (builder, risk, agy), expected in rows.items():
+            with self.subTest(builder=builder, risk=risk, gemini=agy):
+                chain = review_chain(builder, risk, policy[risk][builder], agy)
+                self.assertEqual(chain, expected)
+                self.assertFalse(any('opus' in model or 'fable' in model for _, model in chain))
+        self.assertEqual(review_chain('claude', 'high', 'opus-free-claude-model', None), [])  # never the author's vendor
+
+    def stub_agy(self, usage='{"quotas": [{"window": "weekly", "remainingPercent": 55}]}', telemetry='off'):
+        """agy answers /usage and /config in print mode; any other prompt behaves like the reviewer stub."""
+        body = REVIEW_STUB.split('\n', 1)[1]
+        stub = self.home / 'bin/agy'
+        stub.write_text('#!/usr/bin/env python3\nimport os, sys\n'
+                        'if sys.argv[-1] in ("/usage", "/config"):\n'
+                        '    print(os.environ.get("AGY_STUB_" + sys.argv[-1][1:].upper(), ""))\n'
+                        '    sys.exit(0)\n' + body)
+        stub.chmod(0o755)
+        self.env.update(AGY_STUB_USAGE=usage, AGY_STUB_CONFIG=json.dumps({'Enable Telemetry': telemetry}))
+        record = self.home / '.local/state/task/usage/gemini.json'
+        record.parent.mkdir(parents=True, exist_ok=True)
+        return record
+
+    def test_review_routes_by_builder_and_risk_with_gemini_and_haiku_fallbacks(self):
+        self.stub_reviewers()
+        record = self.stub_agy()
+        wt, _ = self.started()
+
+        def review(builder, risk='normal', **env):
+            self.task('start', 'proj', '5', '--refresh', '--builder', builder)
+            if risk != (json.loads((self.state() / 'task.json').read_text()).get('risk') or 'normal'):
+                self.raw_task('risk', 'proj', '5', risk, *(['--reason', 'routing fixture'] if risk == 'high' else []))
+            self.raw_task('check', 'proj', '5')
+            head = self.git(wt, 'rev-parse', 'HEAD')
+            (wt / '.work/reviewer-count').unlink(missing_ok=True)
+            out = self.raw_task('review', 'proj', '5', '--run', '--no-pace', env=dict(
+                self.env, REVIEW_STUB_REPLY=f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n', **env))
+            meta = json.loads((self.state() / 'review.json').read_text())
+            return (meta['reviewer'], meta['model']), out
+
+        # Not qualified (no T-44 result): routing skips agy.
+        self.assertEqual(review('codex')[0], ('codex', 'gpt-6.1-sol'))
+        self.assertEqual(review('claude')[0], ('codex', 'gpt-6-luna'))
+        record.write_text(json.dumps(dict(result='fail', model='gemini-x', evidence='2 of 4', time='t')))
+        self.assertEqual(review('codex')[0], ('codex', 'gpt-6.1-sol'))
+        # Qualified: Gemini first for Codex-built normal risk, in print mode, plan mode, sandboxed.
+        record.write_text(json.dumps(dict(result='pass', model='gemini-x', evidence='4 of 4', time='t')))
+        self.assertEqual(review('codex')[0], ('gemini', 'gemini-x'))
+        args = json.loads((wt / '.work/reviewer-call.json').read_text())['args']
+        self.assertEqual(args[:9], ['--print', '--mode', 'plan', '--sandbox', '--output-format', 'text', '--model', 'gemini-x', '--add-dir'])
+        self.assertIn(str(self.state() / 'review-prompt.md'), args[-1])
+        self.assertEqual(review('claude')[0], ('codex', 'gpt-6-luna'))  # Claude-built: unchanged
+        self.assertEqual(review('claude', 'high')[0], ('codex', 'gpt-6.1-sol'))
+        self.assertEqual(review('codex', 'high')[0], ('claude', 'sonnet'))
+        # Gemini quota exhausted at runtime: the next reviewer runs and the review is still recorded.
+        route, out = review('codex', 'normal', REVIEW_STUB_FIRST_EXIT='3',
+                            REVIEW_STUB_STDERR='AGY_ERROR: {"status": "RESOURCE_EXHAUSTED", "code": 429}')
+        self.assertEqual(route, ('codex', 'gpt-6.1-sol'))
+        self.assertIn('gemini reviewer hit a usage limit; retrying once with codex gpt-6.1-sol', out)
+        # An exhausted or unknown quota, or telemetry not read as off, routes to Codex before agy runs.
+        for usage, telemetry in (('{"quotas": [{"window": "weekly", "remainingPercent": 0}]}', 'off'),
+                                 ('not json', 'off'), ('{"quotas": [{"remainingPercent": 50}]}', 'on')):
+            with self.subTest(usage=usage, telemetry=telemetry):
+                self.stub_agy(usage, telemetry)
+                route, out = review('codex')
+                self.assertEqual(route, ('codex', 'gpt-6.1-sol'))
+                self.assertIn('gemini reviewer skipped', out)
+                self.assertEqual(json.loads((wt / '.work/reviewer-call.json').read_text())['args'][0], 'exec')
+
+    def test_merge_accepts_same_vendor_pass_for_normal_codex_and_refuses_it_for_high(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+
+        def same_vendor_evidence():
+            self.prepare_merge_evidence('5')
+            review = json.loads((self.state() / 'review.json').read_text())
+            (self.state() / 'review.json').write_text(json.dumps(dict(review, reviewer='codex', model='gpt-6.1-sol')))
+            self.raw_task('check', 'proj', '5')
+
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'merge gate fixture')
+        same_vendor_evidence()
+        out = self.raw_task('merge', 'proj', '5', '--keep', '--no-redteam', 'fixture', code=1)
+        self.assertIn('by the other vendor', out)
+        self.raw_task('risk', 'proj', '5', 'normal')
+        same_vendor_evidence()
+        out = self.raw_task('merge', 'proj', '5', '--keep')
+        self.assertNotIn('exception', out)
+        self.assertEqual(self.git(self.repo, 'show', 'origin/main:b.txt'), 'x')
+
+    def test_merge_override_of_a_same_vendor_high_review_stays_ledgered(self):
+        wt, _ = self.started()
+        self.commit_in(wt, 'b.txt')
+        self.raw_task('risk', 'proj', '5', 'high', '--reason', 'merge gate fixture')
+        self.prepare_merge_evidence('5')
+        review = json.loads((self.state() / 'review.json').read_text())
+        (self.state() / 'review.json').write_text(json.dumps(dict(review, reviewer='codex', model='gpt-6.1-sol')))
+        self.raw_task('check', 'proj', '5')
+        out = self.raw_task('merge', 'proj', '5', '--keep', '--no-redteam', 'fixture', '--override', 'decision-32 fixture')
+        self.assertIn('waived: decision-32 fixture', out)
+        archive = next((self.home / '.local/state/task/archive/proj').glob('t5*/exception.json'), None) or \
+            next((self.home / '.local/state/task').rglob('exception.json'))
+        self.assertEqual(json.loads(archive.read_text())['reason'], 'decision-32 fixture')
 
     def test_codex_boost_without_a_five_hour_window_routes_and_starts_automatically(self):
         from task_routing import active, route, lane_limits
@@ -3181,7 +3297,7 @@ class TaskTool(unittest.TestCase):
         self.task('boost', '--codex-until', '2099-01-01T00:00:00+00:00', '--claude-until', '2099-01-01T00:00:00+00:00')
         head = self.git(wt, 'rev-parse', 'HEAD')
         reply = f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n'
-        for builder, vendor, model in [('codex', 'claude', 'haiku'), ('claude', 'codex', 'gpt-6-luna')]:
+        for builder, vendor, model in [('codex', 'codex', 'gpt-6.1-sol'), ('claude', 'codex', 'gpt-6-luna')]:
             self.task('start', 'proj', '5', '--refresh', '--builder', builder)
             self.raw_task("check", "proj", '5')
             self.raw_task('review', 'proj', '5', '--run', env=dict(self.env, REVIEW_STUB_REPLY=reply))
@@ -3205,9 +3321,9 @@ class TaskTool(unittest.TestCase):
                                              REVIEW_STUB_EXIT='2'))
                 self.assertIn('ended by usage limit', out)
                 calls = [json.loads(line) for line in (wt / '.work/reviewer-calls.jsonl').read_text().splitlines()]
-                self.assertEqual(len(calls), 2)
-                self.assertIn('haiku', calls[0])
-                self.assertIn('gpt-6-luna', calls[1])
+                self.assertEqual(len(calls), 2)  # decision-32: Codex sol, then Haiku only as the fallback
+                self.assertIn('gpt-6.1-sol', calls[0])
+                self.assertIn('haiku', calls[1])
                 self.assertFalse((self.state() / 'review.json').exists())
 
     def test_boosted_reviewer_other_errors_do_not_fall_back(self):
@@ -3220,7 +3336,7 @@ class TaskTool(unittest.TestCase):
                                      REVIEW_STUB_EXIT='1'))
         self.assertIn('exited with status 1', out)
         self.assertEqual((wt / '.work/reviewer-count').read_text(), '1')
-        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'haiku')
+        self.assertEqual(json.loads((self.state() / 'review-routing.json').read_text())['model'], 'gpt-6.1-sol')
 
     def test_boosted_codex_limit_retries_once(self):
         self.stub_reviewers()
@@ -3239,7 +3355,7 @@ class TaskTool(unittest.TestCase):
     def test_reviewer_fallback_records_actual_route_and_stops_without_verdict(self):
         self.stub_reviewers()
         wt, _ = self.started()
-        for builder, vendor, model in (('codex', 'codex', 'gpt-6-luna'), ('claude', 'claude', 'haiku')):
+        for builder, vendor, model in (('codex', 'claude', 'haiku'), ('claude', 'claude', 'haiku')):
             self.task('start', 'proj', '5', '--refresh', '--builder', builder)
             self.raw_task('check', 'proj', '5')
             head = self.git(wt, 'rev-parse', 'HEAD')
@@ -5113,7 +5229,7 @@ store.write_text(json.dumps(prs))
         wt, _ = self.started()
         self.readings(claude=(40, 84), codex=(40, 84), five=10)
         self.task('boost', '--claude-until', '2099-01-01T00:00:00+00:00', '--codex-until', '2099-01-01T00:00:00+00:00')
-        for builder, vendor, model in (('codex', 'claude', 'haiku'), ('claude', 'codex', 'gpt-6-luna')):
+        for builder, vendor, model in (('codex', 'codex', 'gpt-6.1-sol'), ('claude', 'codex', 'gpt-6-luna')):
             self.raw_task('start', 'proj', '5', '--refresh', '--builder', builder, '--tier', 'hard', '--override', 'Jacopo 2026-10-23: routing fixture')
             self.raw_task('check', 'proj', '5')
             head = self.git(wt, 'rev-parse', 'HEAD')
@@ -5126,7 +5242,7 @@ store.write_text(json.dumps(prs))
     def test_risk_normal_manual_deeper_review_refused_even_with_stored_route(self):
         wt, _ = self.started()
         self.raw_task('review', 'proj', '5')
-        for model in ('opus', 'claude-opus-5-5', 'fable', 'claude-fable-5-1', 'gpt-6.1-sol'):
+        for model in ('opus', 'claude-opus-5-5', 'fable', 'claude-fable-5-1'):  # gpt-6.1-sol is routine (decision-32)
             self.assertIn('risk normal', self.raw_task('review', 'proj', '5', '--record', 'missing', '--reviewer', 'claude', model, code=1))
 
     def test_risk_policy_selects_reviewers_and_unparseable_policy_fails_closed(self):
@@ -8389,6 +8505,7 @@ store.write_text(json.dumps(prs))
 
     def test_review_prints_claude_headless_command_and_persisted_prompt(self):
         wt, _ = self.started()
+        self.risk_policy_fixture('[review.normal]\ncodex = "haiku"\n')  # a Claude reviewer by policy
         out = self.raw_task("review", "proj", "5")
         prompt = self.state() / "review-prompt.md"
         reply = self.state() / "review-response.md"
@@ -8415,6 +8532,7 @@ store.write_text(json.dumps(prs))
         import json
         import shlex
         self.stub_reviewers()
+        self.risk_policy_fixture('[review.normal]\ncodex = "haiku"\n')  # keep the Claude reviewer path covered
         self.raw_task("start", "proj", "5", "--builder", builder)
         wt = self.repo / ".worktrees/t5"
         head = self.git(wt, "rev-parse", "HEAD")

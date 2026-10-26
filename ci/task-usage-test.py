@@ -153,7 +153,8 @@ class Usage(unittest.TestCase):
     def test_review_policy_company_path_defaults_and_partial_overrides(self):
         defaults = usage.policy(self.home)["review"]
         self.assertEqual(defaults["low"], dict(max_rounds=2, extra_rounds=1))
-        self.assertEqual(defaults["normal"], dict(codex="haiku", claude="gpt-6-luna", max_rounds=3, extra_rounds=1))
+        self.assertEqual(defaults["normal"], dict(codex="gpt-6.1-sol", claude="gpt-6-luna", max_rounds=3, extra_rounds=1))
+        self.assertEqual((defaults["high"]["codex"], defaults["high"]["claude"]), ("sonnet", "gpt-6.1-sol"))  # decision-32
         self.assertEqual(defaults["high"]["red_team_model"], "gpt-6.1-sol")
         self.assertEqual(defaults["high"]["red_team_model_claude"], "sonnet")
         self.assertIn("system/agent-policy/**", defaults["high_paths"]["bootstrap"])
@@ -560,6 +561,52 @@ class Usage(unittest.TestCase):
         reason, notes = usage.batch_gate(self.home, ["codex"], NOW)  # codex unknown: unchanged plus a warning
         self.assertEqual(reason, "")
         self.assertTrue(any("codex usage unknown" in note for note in notes))
+
+    AGY = """#!/usr/bin/env python3
+import os, sys
+assert sys.argv[1:4] == ["--print", "--output-format", "json"], sys.argv
+print(os.environ.get("AGY_STUB_" + sys.argv[4].strip("/").upper(), ""))
+sys.exit(int(os.environ.get("AGY_STUB_EXIT", "0")))
+"""
+    QUOTA = '{"quotas": [{"window": "5-hour", "remainingPercent": %s}, {"window": "weekly", "usedPercent": 30}]}'
+    CONFIG = '{"settings": [{"name": "Enable Telemetry", "value": "%s"}, {"name": "Theme", "value": "dark"}]}'
+
+    def gemini(self, quota="60", telemetry="off", **env):
+        stub = self.home / "bin/agy"
+        stub.parent.mkdir(exist_ok=True)
+        stub.write_text(self.AGY.replace("/usr/bin/env python3", sys.executable))
+        stub.chmod(0o755)
+        values = dict(PATH=str(stub.parent), AGY_STUB_USAGE=self.QUOTA % quota if quota else "not json",
+                      AGY_STUB_CONFIG=self.CONFIG % telemetry, **env)
+        with mock.patch.dict(os.environ, values):
+            return usage.gemini(self.home), "\n".join(usage.report(self.home, NOW))
+
+    def test_gemini_quota_telemetry_and_qualification_from_stubbed_agy(self):
+        with mock.patch.dict(os.environ, PATH=str(self.home / "none")):
+            state = usage.gemini(self.home)
+        self.assertEqual((state["quota"], state["quota_detail"], state["available"]), ("unknown", "agy not installed", False))
+        state, text = self.gemini()
+        self.assertEqual((state["quota"], state["telemetry"], state["qualified"], state["available"]), ("ok", "off", False, False))
+        self.assertIn("gemini (agy): quota ok (5-hour 60 % left; weekly 70 % left); telemetry off", text)
+        self.assertIn("not qualified: no T-44 backtest result recorded (task gemini --record); routing skips it", text)
+        record = self.home / ".local/state/task/usage/gemini.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps(dict(result="fail", model="gemini-x", evidence="2 of 4", time="t")))
+        self.assertFalse(self.gemini()[0]["available"])
+        record.write_text(json.dumps(dict(result="pass", model="gemini-x", evidence="4 of 4, controls clean", time="t")))
+        state, text = self.gemini()
+        self.assertEqual((state["available"], state["model"]), (True, "gemini-x"))
+        self.assertIn("qualified on the T-44 backtest (t, model gemini-x); reviews use it first", text)
+        for case, (quota, telemetry, env, expected) in {
+                "weekly lockout": ("0", "off", {}, ("exhausted", "off")),
+                "unreadable quota": ("", "off", {}, ("unknown", "off")),
+                "agy fails": ("60", "off", {"AGY_STUB_EXIT": "3"}, ("unknown", "unknown")),
+                "telemetry on": ("60", "on", {}, ("ok", "on")),
+                "telemetry unreadable": ("60", "maybe", {}, ("ok", "unknown"))}.items():
+            with self.subTest(case):
+                state, text = self.gemini(quota, telemetry, **env)
+                self.assertEqual((state["quota"], state["telemetry"], state["available"]), (*expected, False))
+                self.assertIn("routing skips it; reviews go to Codex", text)
 
     def test_report_lines_and_times(self):
         self.claude(50, 84)
