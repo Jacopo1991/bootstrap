@@ -1,0 +1,5 @@
+# PM wake map (T-77): one `pm=session_id` line per PM. `task` reads it to wake the owning PM's
+# Claude Code session on real events. chezmoi creates this file once and never overwrites it;
+# a PM session registers itself with `task pm-session <pm> <session_id>`.
+# Routing: company -> company; bootstrap and cortex-core -> workflow; any other repository -> the
+# PM named after it, only when listed here.
