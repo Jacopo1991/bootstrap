@@ -523,21 +523,6 @@ def usage(args):
     return 0
 
 
-def gemini(args):
-    """Decision-32 Gemini review route: state, the agy command for one backtest prompt, the T-44 result."""
-    if args.record:
-        if not args.model or not args.evidence or not args.evidence.strip():
-            raise Stop("--record needs --model <agy model slug> and --evidence \"<T-44 backtest result>\"")
-        atomic_json(HOME / ".local/state/task/usage/gemini.json", dict(
-            result=args.record, model=args.model, evidence=args.evidence.strip(), time=utc_now()))
-        task_usage.log(HOME, f"gemini T-44 backtest recorded: {args.record} with {args.model}")
-    if args.command_for:
-        print(agy_command(args.model or "<model>", prompt_file=Path(args.command_for).resolve()) + " < /dev/null")
-        return 0
-    print("\n".join(task_usage.gemini_lines(HOME)))
-    return 0
-
-
 def pace_check(args, kind, vendor, tier, task):
     """Usage-pacing gate for a PM lane or review: the decision, or None under --no-pace."""
     if args.no_pace or os.environ.get("TASK_NO_PACE"):
@@ -1113,20 +1098,6 @@ def redteam(args):
 def deeper_review(model):
     """Opus and the top-only models; gpt-6.1-sol is a routine reviewer under company decision-32."""
     return model in TOP_ONLY or any(name in model.lower() for name in ("opus", "fable"))
-
-
-AGY_PROMPT = "--print=@review-prompt"  # run_reviewer puts the prompt file's text here, as one argv element
-
-
-def agy_command(model, add_dir="", prompt_file=None):
-    """The Gemini review route: plan mode (no edits), terminal sandbox on, slash commands off. agy takes the
-    prompt as --print's value; with `prompt_file` the command reads it in a shell, for the PM's backtest."""
-    return (f"agy --mode plan --sandbox --output-format text --model {shlex.quote(model)} "
-            f"--disable-slash-commands {add_dir}{agy_prompt(prompt_file) if prompt_file else AGY_PROMPT}")
-
-
-def agy_prompt(prompt_file):
-    return f'--print="$(cat {shlex.quote(str(prompt_file))})"'
 
 
 def preserve_work(repo: Path, name: str, path: Path, reuse_head=None, *, strict=False):
@@ -3711,11 +3682,6 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
         raise Stop("TASK_REVIEW_TIMEOUT must be a positive number of seconds.")
     env = agent_environment()
     argv = shlex.split(command)
-    if AGY_PROMPT in argv:
-        text = prompt_file.read_text()
-        if len(text.encode()) > 120_000:  # one argv element may not exceed 128 KiB
-            raise Stop("Review prompt too long for agy's --print argument; no review recorded.")
-        argv[argv.index(AGY_PROMPT)] = "--print=" + text
     if argv[0] == "GIT_OPTIONAL_LOCKS=0":
         env["GIT_OPTIONAL_LOCKS"] = "0"
         argv.pop(0)
@@ -3758,7 +3724,7 @@ def run_reviewer(command, path, prompt_file, reply_file, replaces=None, lock_fd=
     try:
         with prompt_file.open() as prompt, raw.open("w") as reply, stderr_file.open("w") as errors:
             if os.environ.get("TASK_PLAN"): plan_budget(os.environ["TASK_PLAN"], usage_run, reserve=usage_run)
-            process = subprocess.Popen(argv, cwd=path, env=env, stdin=subprocess.DEVNULL if AGY_PROMPT in shlex.split(command) else prompt, stdout=reply, stderr=errors,
+            process = subprocess.Popen(argv, cwd=path, env=env, stdin=prompt, stdout=reply, stderr=errors,
                                        start_new_session=True, pass_fds=(*task_lock.descriptors(), *([lock_fd] if lock_fd is not None else [])))
             run.update(unit=unit, pid=os.getpid(), process_start=task_usage.process_start(os.getpid()))
             if not usage_run: usage_run = task_usage.run_log(HOME, repo=main_repo(path).name, task=read_json_object(reply_file.parent / "task.json").get("id", path.name), kind="review", vendor=argv[0], model=argv[argv.index("--model") + 1] if "--model" in argv else argv[argv.index("-m") + 1])
@@ -3880,13 +3846,7 @@ def review_locked(args):
     if not args.record:
         if args.miss is not None and (risk != "high" or not args.miss.strip()):
             raise Stop("--miss needs high risk and the recorded miss of a cheaper reviewer")
-        gemini = None
-        if (risk == "high" or record["builder"] == "codex") and task_usage.gemini_record(HOME).get("result") == "pass":
-            found = task_usage.gemini(HOME)
-            gemini = found["model"] if found["available"] else None
-            if not gemini:
-                print(f"gemini reviewer skipped: quota {found['quota']}, telemetry {found['telemetry']}; routing to the next reviewer.")
-        chain = review_chain(record["builder"], risk, review_policy[record["builder"]], gemini)
+        chain = review_chain(record["builder"], risk, review_policy[record["builder"]])
         if not chain:
             raise Stop(f"risk {risk}: the review policy names the builder's own vendor; high risk needs another vendor")
         if args.miss:  # decision-32: Opus only after a cheaper reviewer's recorded miss (ledgered)
@@ -3896,7 +3856,7 @@ def review_locked(args):
         if risk != "high" and deeper_review(reviewer_route[1]):
             raise Stop(f"risk {risk}: policy must select a cheap reviewer; deeper review requires high")
         if args.run:
-            decision = None if reviewer_route[0] == "gemini" else pace_check(args, "review", reviewer_route[0], "routine", task)
+            decision = pace_check(args, "review", reviewer_route[0], "routine", task)
             if decision and decision["hold"]:
                 return 4
             ledger_ramp_exempt(args, task, reviewer_route[0], reviewer_route[1], "routine", bool(decision and decision["ramp_exempt"]))
@@ -3981,8 +3941,6 @@ def review_locked(args):
         reply_file.unlink(missing_ok=True)
         add_dir = f"--add-dir {shlex.quote(str(task.kb))} " if task.file else ""
         def reviewer_command(vendor, model):
-            if vendor == "gemini":
-                return agy_command(model, add_dir)
             if vendor == "claude":
                 events = "--output-format stream-json --verbose " if args.run else ""
                 return (f"claude -p {events}{add_dir}--permission-mode dontAsk --model {shlex.quote(model)} --effort high "
@@ -3993,7 +3951,7 @@ def review_locked(args):
         if not args.run:
             print(prompt_text, end="")
             print("Headless reviewer command (run from the task worktree):")
-            print(f"  {command.replace(AGY_PROMPT, agy_prompt(prompt_file))} < "
+            print(f"  {command} < "
                   f"{shlex.quote(str(prompt_file))} > {shlex.quote(str(reply_file))}")
             print(f"Then record it: task review {shlex.quote(args.repo)} {shlex.quote(args.id)} --record {shlex.quote(str(reply_file))}")
             return 0
@@ -4005,9 +3963,9 @@ def review_locked(args):
                     run_reviewer(command, path, prompt_file, reply_file, replaces=read_json_object(state / "review-run.json")["usage_run"]["id"] if used_fallback and os.environ.get("TASK_PLAN") else None, lock_fd=args.review_lock_fd)
                     break
                 except Stop as error:
-                    # The next decision-32 reviewer on a usage limit; any agy failure also moves on, so reviews never stop on Gemini.
+                    # Try the next reviewer when the current one hits a usage limit.
                     limited = isinstance(error, UsageLimit)
-                    if len(chain) < 2 or not (limited or reviewer_route[0] == "gemini" and str(error) != "skipped: hold"):
+                    if len(chain) < 2 or not limited:
                         raise
                 previous_route, reviewer_route = reviewer_route, chain[1]
                 chain = chain[1:]
@@ -4055,8 +4013,8 @@ def review_locked(args):
         routed_reviewer = tuple(args.reviewer) if args.reviewer else None
         if not routed_reviewer:
             problems.append("no stored reviewer routing; provide --reviewer <vendor> <model>")
-        elif routed_reviewer[0].lower() not in {"claude", "codex", "gemini"} or not routed_reviewer[1].strip():
-            problems.append("--reviewer must be <claude|codex|gemini> <model>")
+        elif routed_reviewer[0].lower() not in {"claude", "codex"} or not routed_reviewer[1].strip():
+            problems.append("--reviewer must be <claude|codex> <model>")
         elif routed_reviewer[1] in TOP_ONLY:
             problems.append(f"reviews never use {routed_reviewer[1]}; no override applies")
         else:
@@ -5593,11 +5551,6 @@ def main(argv=None):
     sub.add_argument("pm")
     sub = commands.add_parser("usage", help="vendor usage, pace verdict and policy; spends no tokens")
     sub.add_argument("--weekly-line", action="store_true", help="one line per vendor for the company STATUS")
-    sub = commands.add_parser("gemini", help="Gemini (agy) review route: state, backtest command, T-44 result")
-    sub.add_argument("--record", choices=("pass", "fail"), help="record the T-44 backtest result (pass qualifies the route)")
-    sub.add_argument("--model", metavar="SLUG", help="the agy model the backtest ran")
-    sub.add_argument("--evidence", metavar="TEXT", help="the backtest result: defects found of 4, must-fix on controls")
-    sub.add_argument("--command-for", metavar="PROMPT_FILE", help="print the read-only agy review command for one prompt")
     sub = commands.add_parser("check", help="task check | task check <id> | task check <repo> <id>")
     sub.add_argument("--variant", metavar="NAME", help="run one variant in an advisory lane check")
     sub.add_argument("args", nargs="*")
@@ -5627,7 +5580,7 @@ def main(argv=None):
         if len(args.args) > 2:
             parser.error("usage: task check [[<repo>] <id>]")
         args.repo, args.id = ([None, None] + args.args)[-2:]
-    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start", "pm-session"} or task_lock.requires_pm(args) or args.command == "gemini" and args.record or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
+    if args.command in {"start", "lane", "review", "merge", "close", "cancel", "risk", "redteam", "note", "repair", "realign", "runner-start", "pm-session"} or task_lock.requires_pm(args) or args.command == "plan" and args.sign or args.command == "boost" and (args.action or args.claude_until or args.codex_until):
         try:
             require_pm(args)
         except Stop as stop:
@@ -5693,7 +5646,7 @@ def main(argv=None):
                 result = {"start": start, "lane": lane, "check": check, "merge": merge, "close": close,
                           "review": review, "risk": risk, "redteam": redteam, "cancel": cancel, "note": note, "status": status,
                           "denials": denials, "runner-check": runner_check, "runner-start": runner_start, "repair": repair,
-                          "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage, "gemini": gemini,
+                          "wait": wait_task, "plan": plan, "realign": realign, "boost": boost, "usage": usage,
                           "plan-budget": lambda a: print(plan_budget(a.id, clear=a.clear)) if not a.clear else plan_budget(a.id, clear=a.clear),
                           "hold": hold, "pm-session": pm_session, "pm-wake-digest": pm_wake_digest,
                           "lock": lambda command_args: task_lock.command(command_args, HOME, resolve_repo)}[args.command](args) or 0
