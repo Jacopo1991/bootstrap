@@ -57,18 +57,39 @@ def short(line):
     return line if len(line) <= MAX_LINE else line[:MAX_LINE - 3] + "..."
 
 
-def emit(home, repo, line, *, everyone=False):
-    """Queue one event line for the repository's PM (or every mapped PM); silent when unmapped."""
+def emit(home, repo, line, *, event_class="WAKE", everyone=False):
+    """Record a digest event or queue a wake for the repository's PM; silent when unmapped."""
     try:
+        if event_class not in {"WAKE", "DIGEST"}:
+            return
         mapped = sessions(home)
         targets = sorted(mapped) if everyone else [pm for pm in (pm_for(repo),) if pm in mapped]
         for pm in targets:
+            message = short(line)
             root = state_root(home)
             root.mkdir(parents=True, exist_ok=True)
             with open(root / f"{pm}.queue.lock", "a") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
+                count_path = root / f"{pm}.digest.count"
+                if event_class == "DIGEST":
+                    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    with open(root / f"{pm}.digest", "a") as digest:
+                        digest.write(f"{stamp} {short(line)}\n")
+                    try:
+                        count = int(count_path.read_text())
+                    except (OSError, ValueError):
+                        count = 0
+                    count_path.write_text(str(count + 1))
+                    continue
+                try:
+                    count = int(count_path.read_text())
+                except (OSError, ValueError):
+                    count = 0
+                if count:
+                    message = f"{message} (+{count} digest events since the last wake)"  # the suffix is never cut
+                    count_path.write_text("0")
                 with open(root / f"{pm}.spool", "a") as spool:
-                    spool.write(short(line) + "\n")
+                    spool.write(message + "\n")
             if not flusher_alive(home, pm):
                 start_flusher(home, pm)
     except Exception:  # delivery must never disturb the command that emitted the event
@@ -219,6 +240,25 @@ def set_session(home, pm, session):
         os.chmod(stream.name, 0o600)
         os.replace(stream.name, path)
     return path
+
+
+def digest(home, pm):
+    """Return this mapped PM's digest lines and current count; unmapped PMs are silent."""
+    if pm not in sessions(home):
+        return None
+    root = state_root(home)
+    root.mkdir(parents=True, exist_ok=True)
+    with open(root / f"{pm}.queue.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            lines = (root / f"{pm}.digest").read_text().splitlines()
+        except OSError:
+            lines = []
+        try:
+            count = int((root / f"{pm}.digest.count").read_text())
+        except (OSError, ValueError):
+            count = 0
+    return lines, count
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["flush"]:
