@@ -1873,13 +1873,26 @@ def user_uv_cache():
 
 
 UV_SEED_COPIED = ("simple-", "wheels-", "sdists-", "interpreter-", "git-")  # small registry metadata
+UV_SEED_ENTRY_LIMIT = 64 * 1024 ** 2  # an archive entry above this stays out of a lane's cache
+
+
+def tree_size(path):
+    total = 0
+    for root, _, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
 
 
 def seed_uv_cache(private):
-    """Let a nested `uv run --offline` in a lane resolve what the user's uv cache holds, without copying it:
-    the small metadata directories are copied, and each archive-v0 entry (the bulk, gigabytes) becomes a
-    symlink into the user's cache. New archives land in the lane's own directory. uv only reads existing
-    archive entries, and the lane never gets the user's cache as its UV_CACHE_DIR."""
+    """Let a nested `uv run --offline` in a lane resolve what the user's uv cache holds. The small metadata
+    directories and every archive-v0 entry below UV_SEED_ENTRY_LIMIT are copied as real directories. A
+    symlinked archive entry breaks uv's install ("Not a directory") and a hardlink would let the lane edit
+    the user's cached files, so neither is used. Larger entries stay out; new archives land in the lane's
+    own directory. The lane never gets the user's cache as its UV_CACHE_DIR."""
     marker, source = private / ".seeded", user_uv_cache()
     if marker.exists() or not source.is_dir() or source.resolve() == private.resolve():
         return
@@ -1889,10 +1902,13 @@ def seed_uv_cache(private):
             if entry.name.startswith("archive-v") and entry.is_dir():
                 (private / entry.name).mkdir(exist_ok=True)
                 for archive in entry.iterdir():
-                    link = private / entry.name / archive.name
-                    if not link.is_symlink() and not link.exists():
-                        os.symlink(archive, link)
-                        made.append(link)
+                    copy = private / entry.name / archive.name
+                    if copy.is_symlink() or copy.exists() or not archive.is_dir() or archive.is_symlink()                             or tree_size(archive) > UV_SEED_ENTRY_LIMIT:
+                        continue
+                    done = subprocess.run(["cp", "-a", "--reflink=auto", str(archive), str(copy)], capture_output=True)
+                    made.append(copy)
+                    if done.returncode:
+                        raise OSError(done.stderr)
             elif entry.name.startswith(UV_SEED_COPIED) and entry.is_dir():
                 copy = private / entry.name
                 fresh = not copy.exists()

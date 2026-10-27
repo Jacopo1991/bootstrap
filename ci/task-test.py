@@ -7224,30 +7224,33 @@ store.write_text(json.dumps(prs))
         for name in expected:
             self.assertNotIn(name, claude)
 
-    def test_codex_lane_uv_cache_resolves_user_cache_entries_without_copying_it(self):
+    def test_codex_lane_uv_cache_holds_real_copies_of_small_user_cache_entries(self):
         wt, _ = self.started()
         task = TASK_MODULE.Task(self.repo, "5")
         user = self.home / "user-uv"
         (user / "archive-v0/abc").mkdir(parents=True)
-        (user / "archive-v0/abc/big.whl").write_text("x" * 4096)
+        (user / "archive-v0/abc/small.whl").write_text("x" * 4096)
+        (user / "archive-v0/huge").mkdir()
+        (user / "archive-v0/huge/big.bin").write_text("y")
         (user / "simple-v25").mkdir()
         (user / "simple-v25/index").write_text("metadata")
         (user / "builds-v0").mkdir()
         (user / "builds-v0/scratch").write_text("not seeded")
-        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}),                 mock.patch.object(TASK_MODULE, "UV_SEED_ENTRY_LIMIT", 100),                 mock.patch.object(TASK_MODULE, "tree_size", side_effect=lambda p: 10 ** 6 if p.name == "huge" else 50):
             private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
             self.assertNotEqual(private, user)
-            self.assertEqual((private / "archive-v0/abc/big.whl").read_text(), "x" * 4096, "resolves through the seed")
+            self.assertEqual((private / "archive-v0/abc/small.whl").read_text(), "x" * 4096)
             self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
             (private / "archive-v0/new").mkdir()  # a lane's own fetches stay in its cache
             TASK_MODULE.lane_environment(task, "codex")  # seeded once
         self.assertFalse((user / "archive-v0/new").exists())
         self.assertFalse((private / "builds-v0").exists())
-        # Guard: the bulk is linked, never copied, and the metadata copy is independent of the user cache.
-        regular = [p for p in (private / "archive-v0").rglob("*") if p.is_file() and not p.is_symlink()
-                   and not any(parent.is_symlink() for parent in p.parents if parent != private)]
-        self.assertEqual(regular, [])
-        self.assertTrue((private / "archive-v0/abc").is_symlink())
+        # Guard: a symlinked archive entry breaks uv, a hardlink would let the lane edit the user's files.
+        self.assertFalse((private / "archive-v0/abc").is_symlink())
+        self.assertNotEqual((private / "archive-v0/abc/small.whl").stat().st_ino, (user / "archive-v0/abc/small.whl").stat().st_ino)
+        self.assertFalse((private / "archive-v0/huge").exists(), "entries above the limit stay out")
+        (private / "archive-v0/abc/small.whl").write_text("lane change")
+        self.assertEqual((user / "archive-v0/abc/small.whl").read_text(), "x" * 4096)
         (private / "simple-v25/index").write_text("lane change")
         self.assertEqual((user / "simple-v25/index").read_text(), "metadata")
 
@@ -7256,6 +7259,7 @@ store.write_text(json.dumps(prs))
         task = TASK_MODULE.Task(self.repo, "5")
         user = self.home / "user-uv"
         (user / "archive-v0/abc").mkdir(parents=True)
+        (user / "archive-v0/abc/small.whl").write_text("x")
         (user / "simple-v25").mkdir()
         (user / "simple-v25/index").write_text("metadata")
         real_run = subprocess.run
@@ -7265,11 +7269,11 @@ store.write_text(json.dumps(prs))
                                    side_effect=lambda cmd, *a, **k: failing if cmd[0] == "cp" else real_run(cmd, *a, **k)):
                 private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
             self.assertFalse((private / ".seeded").exists())
-            self.assertFalse((private / "archive-v0/abc").is_symlink(), "partial seeding is dropped")
+            self.assertFalse((private / "archive-v0/abc").exists(), "partial seeding is dropped")
             self.assertFalse((private / "simple-v25").exists())
             TASK_MODULE.lane_environment(task, "codex")
         self.assertTrue((private / ".seeded").exists())
-        self.assertTrue((private / "archive-v0/abc").is_symlink())
+        self.assertEqual((private / "archive-v0/abc/small.whl").read_text(), "x")
         self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
 
     def test_trusted_gate_nested_uv_uses_the_user_cache(self):
