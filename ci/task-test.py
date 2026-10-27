@@ -2967,99 +2967,12 @@ class TaskTool(unittest.TestCase):
         self.raw_task('risk', 'proj', '5', 'normal')
         self.assertIn('--miss needs high risk', self.raw_task('review', 'proj', '5', '--miss', 'x', code=1))
 
-    def test_decision_32_review_chain_rows(self):
+    def test_review_chain_and_retired_route(self):
         from task_routing import review_chain
-        luna, sol, haiku, sonnet = ('codex', 'gpt-6-luna'), ('codex', 'gpt-6.1-sol'), ('claude', 'haiku'), ('claude', 'sonnet')
-        gemini = ('gemini', 'gemini-x')
-        rows = {('codex', 'normal', None): [sol, haiku],  # Haiku only when Codex (and Gemini) are unavailable
-                ('codex', 'normal', 'gemini-x'): [gemini, sol, haiku],
-                ('claude', 'normal', None): [luna, haiku], ('claude', 'normal', 'gemini-x'): [luna, haiku],
-                ('codex', 'high', None): [sonnet], ('codex', 'high', 'gemini-x'): [sonnet, gemini],
-                ('claude', 'high', None): [sol], ('claude', 'high', 'gemini-x'): [sol, gemini]}
-        policy = {'normal': {'codex': 'gpt-6.1-sol', 'claude': 'gpt-6-luna'}, 'high': {'codex': 'sonnet', 'claude': 'gpt-6.1-sol'}}
-        for (builder, risk, agy), expected in rows.items():
-            with self.subTest(builder=builder, risk=risk, gemini=agy):
-                chain = review_chain(builder, risk, policy[risk][builder], agy)
-                self.assertEqual(chain, expected)
-                self.assertFalse(any('opus' in model or 'fable' in model for _, model in chain))
-        self.assertEqual(review_chain('claude', 'high', 'opus-free-claude-model', None), [])  # never the author's vendor
-
-    AGY_ROWS = ('Gemini Models\tWeekly Limit Remaining\t{weekly}%\t2026-11-02T08:19:35Z\n'
-                'Gemini Models\tFive Hour Limit Remaining\t100%\t2026-10-26T13:19:35Z\n')
-
-    def stub_agy(self, weekly='100'):
-        """agy answers --version and --print='/usage' (the real pinned release's shape); any other prompt behaves like the reviewer stub."""
-        body = REVIEW_STUB.split('\n', 1)[1]
-        stub = self.home / 'bin/agy'
-        stub.write_text('#!/usr/bin/env python3\nimport os, sys\n'
-                        'if sys.argv[1:] == ["--version"]:\n    print("agy 0.0.0-stub")\n    sys.exit(0)\n'
-                        'if sys.argv[-1] == "--print=/usage":\n'
-                        '    print(os.environ["AGY_STUB_USAGE"])\n'
-                        '    sys.exit(0)\n' + body)
-        stub.chmod(0o755)
-        self.env.update(AGY_STUB_USAGE=json.dumps(dict(status='SUCCESS', response=self.AGY_ROWS.format(weekly=weekly))))
-        record = self.home / '.local/state/task/usage/gemini.json'
-        record.parent.mkdir(parents=True, exist_ok=True)
-        return record
-
-    def test_review_routes_by_builder_and_risk_and_gemini_stays_closed_without_telemetry_control(self):
-        self.stub_reviewers()
-        record = self.stub_agy()
-        wt, _ = self.started()
-
-        def review(builder, risk='normal', **env):
-            self.task('start', 'proj', '5', '--refresh', '--builder', builder)
-            if risk != (json.loads((self.state() / 'task.json').read_text()).get('risk') or 'normal'):
-                self.raw_task('risk', 'proj', '5', risk, *(['--reason', 'routing fixture'] if risk == 'high' else []))
-            self.raw_task('check', 'proj', '5')
-            head = self.git(wt, 'rev-parse', 'HEAD')
-            (wt / '.work/reviewer-count').unlink(missing_ok=True)
-            out = self.raw_task('review', 'proj', '5', '--run', '--no-pace', env=dict(
-                self.env, REVIEW_STUB_REPLY=f'Verdict: PASS\nCommit: {head}\n#1 pass: checked\n#2 pass: checked\n', **env))
-            meta = json.loads((self.state() / 'review.json').read_text())
-            return (meta['reviewer'], meta['model']), out
-
-        # Not qualified (no T-44 result): routing skips agy without asking it.
-        self.assertEqual(review('codex')[0], ('codex', 'gpt-6.1-sol'))
-        self.assertEqual(review('claude')[0], ('codex', 'gpt-6-luna'))
-        # Even a recorded pass with quota left stays closed: agy has no telemetry control to verify.
-        record.write_text(json.dumps(dict(result='pass', model='gemini-x', evidence='4 of 4', time='t')))
-        for weekly in ('100', '0'):
-            with self.subTest(weekly=weekly):
-                self.stub_agy(weekly)
-                route, out = review('codex')
-                self.assertEqual(route, ('codex', 'gpt-6.1-sol'))
-                self.assertIn(f"gemini reviewer skipped: quota {'ok' if weekly == '100' else 'exhausted'}, "
-                              "telemetry no control in agy 0.0.0-stub (seat decision pending)", out)
-                self.assertEqual(json.loads((wt / '.work/reviewer-call.json').read_text())['args'][0], 'exec')
-        self.assertEqual(review('claude')[0], ('codex', 'gpt-6-luna'))  # Claude-built: unchanged
-        self.assertEqual(review('claude', 'high')[0], ('codex', 'gpt-6.1-sol'))
-        self.assertEqual(review('codex', 'high')[0], ('claude', 'sonnet'))
-
-    def test_agy_route_passes_the_prompt_as_the_print_value_in_plan_mode_and_sandbox(self):
-        self.stub_reviewers()
-        self.stub_agy()
-        wt, _ = self.started()
-        state = self.state()
-        state.mkdir(parents=True, exist_ok=True)
-        prompt, reply = state / 'review-prompt.md', state / 'review-response.md'
-        prompt.write_text("Review T-5.\nIt's a 'quoted' $(not run) prompt.\n")
-        command = TASK_MODULE.agy_command('gemini-x')
-        self.assertEqual(command, 'agy --mode plan --sandbox --output-format text --model gemini-x '
-                                  '--disable-slash-commands --print=@review-prompt')
-        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(TASK_MODULE, 'HOME', self.home), \
-                mock.patch.object(TASK_MODULE, 'main_repo', return_value=self.repo):
-            self.assertEqual(TASK_MODULE.run_reviewer(command, wt, prompt, reply, unit='task-review-proj-t5-test'), 0)
-            call = json.loads((wt / '.work/reviewer-call.json').read_text())
-            args = call['args']
-            self.assertEqual(call['prompt'], '')  # nothing on stdin: the prompt travels only as --print's value
-            self.assertEqual(args, ['--mode', 'plan', '--sandbox', '--output-format', 'text', '--model', 'gemini-x',
-                                    '--disable-slash-commands', '--print=' + prompt.read_text()])
-            prompt.write_text('x' * 130_000)
-            with self.assertRaisesRegex(TASK_MODULE.Stop, 'too long for agy'):
-                TASK_MODULE.run_reviewer(command, wt, prompt, reply, unit='task-review-proj-t5-test')
-        shell = TASK_MODULE.agy_command('gemini-x', prompt_file=prompt)
-        self.assertTrue(shell.endswith(f'--print="$(cat {prompt})"'), shell)
+        self.assertEqual(review_chain('codex', 'normal', 'gpt-6.1-sol'), [('codex', 'gpt-6.1-sol'), ('claude', 'haiku')])
+        self.assertEqual(review_chain('claude', 'high', 'gpt-6.1-sol'), [('codex', 'gpt-6.1-sol')])
+        self.assertFalse(hasattr(TASK_MODULE, 'agy_command'))
+        self.assertNotIn('gemini', self.raw_task('--help'))
 
     def test_merge_accepts_same_vendor_pass_for_normal_codex_and_refuses_it_for_high(self):
         wt, _ = self.started()

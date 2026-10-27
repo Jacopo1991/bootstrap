@@ -122,7 +122,7 @@ def pick(home, vendor, tier, explicit, boosted):
 
 
 def model_vendor(model):
-    return "codex" if model.startswith("gpt-") else "gemini" if model.startswith("gemini") else "claude"
+    return "codex" if model.startswith("gpt-") else "claude"
 
 
 def same_vendor_ok(builder, risk):
@@ -130,18 +130,17 @@ def same_vendor_ok(builder, risk):
     return builder == "codex" and risk == "normal"
 
 
-def review_chain(builder, risk, model, gemini=None):
+def review_chain(builder, risk, model):
     """Decision-32 reviewers in order: each next one runs only when the one before is unavailable.
 
-    `model` is the risk policy's reviewer for this builder; `gemini` is the qualified agy model, or None.
+    `model` is the risk policy's reviewer for this builder.
     High risk and planning never fall back to the author's vendor, and never default to Opus or Fable.
     """
     first = (model_vendor(model), model)
-    agy = [("gemini", gemini)] if gemini else []
     if risk == "high":
-        chain = [first, *agy]
+        chain = [first]
     elif builder == "codex":
-        chain = [*agy, first, ("claude", "haiku")]
+        chain = [first, ("claude", "haiku")]
     else:
         chain = [first, ("claude", "haiku")]
     return [route for index, route in enumerate(chain) if route not in chain[:index]

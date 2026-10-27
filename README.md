@@ -610,10 +610,10 @@ Claude allowance goes to building, not reviewing. `task review --run` picks, in 
 
 | Builder, risk | Reviewers, each used only when the ones before are unavailable |
 | --- | --- |
-| Codex, normal | Gemini via `agy` (once qualified), Codex gpt-6.1-sol in a fresh read-only session, Claude Haiku |
+| Codex, normal | Codex gpt-6.1-sol in a fresh read-only session, Claude Haiku |
 | Claude, normal | Codex gpt-6-luna (unchanged), Claude Haiku |
-| Claude, high | Codex gpt-6.1-sol at high effort, Gemini (once qualified) |
-| Codex, high | Claude Sonnet, Gemini (once qualified) |
+| Claude, high | Codex gpt-6.1-sol at high effort |
+| Codex, high | Claude Sonnet |
 
 Planning work (policy, skills, INTENT and decision records) is forced to high risk by
 `review.high_paths`, so it takes the high rows: never the author's vendor, never Opus by default.
@@ -624,27 +624,6 @@ company policy file that still names `codex = "haiku"` overrides them.
 
 `task merge` accepts a recorded PASS by Codex on a Codex-built normal-risk task; high risk still
 needs the other vendor, and `--override` stays recorded in the task's `exception.json`.
-
-Gemini runs as `agy --mode plan --sandbox --output-format text --model <slug> --disable-slash-commands
---print=<prompt>`: agy takes the prompt as `--print`'s value, so `task` reads the prompt file and passes
-it as one argument (nothing on stdin; a prompt over 120 kB moves the review to Codex). Routing reads the
-quota with `agy --output-format json --print='/usage'` (no agent turn, no quota): its `response` is a
-TAB-separated table of group, limit, percent remaining and reset time, and a `Gemini Models` row at 0 %
-is exhausted; a reading `task` cannot parse is unknown. Either routes to Codex, as does an agy run that
-fails or hits its quota; reviews never stop on Gemini. `task usage` shows the Gemini quota and route.
-
-**The route is closed.** The pinned agy release has no telemetry control: no `/config` key, no flag, no documented
-setting. Routing needs a verified control, so `task usage` reports `telemetry: no control in agy
-<version> (seat decision pending)` and routing skips Gemini even with a recorded backtest pass. Whether
-Gemini may review without a telemetry control is a decision for the seat.
-
-Qualifying Gemini (PM, after the T-61 install and the login in [docs/agy-probe.md](docs/agy-probe.md)):
-for each head of T-44's blind backtest set, print the read-only command for that head's prompt with
-`task gemini --model <slug> --command-for <prompt file>`, run it from the head's checkout in the PM's
-unsandboxed shell, and judge the replies against the sealed `set.md` (pass: the known defect on at
-least 3 of 4, no must-fix on either control). Then record it:
-`task gemini --record pass|fail --model <slug> --evidence "<n of 4, controls>"`. Until a pass is
-recorded, routing skips Gemini. `task gemini` alone shows the state.
 
 At check, review and merge, changed paths in `main...HEAD` matching `review.high_paths`
 force high risk; attempting to lower it names the matching path and refuses.
