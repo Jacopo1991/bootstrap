@@ -213,18 +213,9 @@ work = pathlib.Path.cwd() / '.work'
 }))
 with (work / 'reviewer-calls.jsonl').open('a') as calls:
     calls.write(json.dumps(sys.argv[1:]) + '\\n')
-if os.environ.get('REVIEW_STUB_POLICY'):
-    import importlib.util, subprocess
-    spec = importlib.util.spec_from_file_location('review_policy', os.environ['REVIEW_STUB_POLICY'])
-    policy = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(policy)
+if os.environ.get('REVIEW_STUB_DIFF'):
+    import subprocess
     command = ['git', '--no-optional-locks', 'diff', 'origin/main..HEAD']
-    denial = policy.evaluate({'tool_name': 'Bash', 'cwd': os.getcwd(),
-                              'tool_input': {'command': ' '.join(command)}},
-                             approved_roots=(pathlib.Path.cwd(),))
-    if denial:
-        print(denial, file=sys.stderr)
-        sys.exit(1)
     diff = subprocess.run(command, check=True, capture_output=True, text=True).stdout
     (work / 'reviewer-diff.txt').write_text(diff)
 counter = work / 'reviewer-count'
@@ -8387,14 +8378,6 @@ store.write_text(json.dumps(prs))
             self.assertEqual(holder.parent, lock.parent)
             mkdir.assert_called_once_with(exist_ok=True)
 
-    def test_lane_git_override_set_matches_the_hook(self):
-        import ast
-        tree = ast.parse((ROOT / "system/agent-policy/pre_tool_use.py").read_text())
-        assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
-                          and any(isinstance(target, ast.Name) and target.id == "GIT_OVERRIDE_ENV"
-                                  for target in node.targets))
-        self.assertEqual(TASK_MODULE.GIT_OVERRIDE_ENV, ast.literal_eval(assignment.value))
-
     def test_exclude_failure_and_flock_error_degrade_without_traceback(self):
         wt, _ = self.started()
         self.commit_in(wt, "b.txt")
@@ -8856,7 +8839,7 @@ store.write_text(json.dumps(prs))
                            GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.pager",
                            GIT_CONFIG_VALUE_0="cat", GIT_CONFIG_FUTURE="blocked",
                            GIT_OPTIONAL_LOCKS="1", TASK_RUN_ID="runner",
-                           REVIEW_STUB_POLICY=str(ROOT / "system/agent-policy/pre_tool_use.py"),
+                           REVIEW_STUB_DIFF="1",
                            REVIEW_STUB_REPLY=reply)
                 self.raw_task("check", "proj", name)
                 self.raw_task("review", "proj", name, "--run", env=env)

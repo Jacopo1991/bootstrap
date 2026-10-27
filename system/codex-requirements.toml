@@ -33,22 +33,6 @@ hooks = true
 [hooks]
 managed_dir = "/usr/local/lib/agent-policy"
 
-[[hooks.PreToolUse]]
-matcher = "^Bash$"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py --vendor codex"
-timeout = 30
-
-[[hooks.PreToolUse]]
-matcher = "^(apply_patch|Edit|Write)$"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py --vendor codex"
-timeout = 30
-
 [[hooks.UserPromptSubmit]]
 
 [[hooks.UserPromptSubmit.hooks]]
@@ -56,18 +40,11 @@ type = "command"
 command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/context_reminder.py"
 timeout = 10
 
-[[hooks.PermissionRequest]]
-matcher = "^Bash$"
-
-[[hooks.PermissionRequest.hooks]]
-type = "command"
-command = "/usr/bin/env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/python3 -I /usr/local/lib/agent-policy/pre_tool_use.py --vendor codex"
-timeout = 30
-
+# The hand-written command-parsing PreToolUse/PermissionRequest policy hook was removed
+# by founder ruling 2026-10-27 (decision-38). Enforcement is the vendor's own: the sandbox
+# permission profiles below, the [rules] prefix rules, and managed approval policy.
 # Requirements rules merge with ~/.codex/rules/*.rules and the most restrictive decision wins,
-# so the user-level allow rules for routine Git/gh cannot lift these. Shared PreToolUse enforces
-# workspace, secrets and forbidden operations at all argv positions; literal prefixes cannot
-# cover global selectors or flags after arbitrary operands.
+# so the user-level allow rules for routine Git/gh cannot lift these.
 [rules]
 prefix_rules = [
   { pattern = [{ any_of = ["git", "/usr/bin/git"] }, { any_of = ["reset", "rebase", "cherry-pick", "revert"] }], decision = "prompt", justification = "Approve this destructive local history/index operation." },

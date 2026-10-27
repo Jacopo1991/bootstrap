@@ -45,19 +45,10 @@ assert 'install -o root -g root -m 0644 "$source" "$temp" && mv -f -- "$temp" "$
 assert "claude-managed.sh" in (ROOT / "install.sh").read_text(encoding="utf-8")
 
 
-def hook(event: dict, cwd: Path) -> dict:
-    with tempfile.TemporaryDirectory(prefix="agent-policy-test-") as state:
-        result = subprocess.run([sys.executable, str(HOOK)], input=json.dumps(event),
-                                capture_output=True, text=True, cwd=cwd, check=True,
-                                env=dict(os.environ, AGENT_POLICY_STATE_DIR=state))
-    return json.loads(result.stdout) if result.stdout.strip() else {}
-
-
-with tempfile.TemporaryDirectory() as temp:
-    cwd = Path(temp)
-    for command in ("wsl.exe -d AgentDev", "sudo true"):
-        out = hook({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd)}, cwd)
-        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", command
-    out = hook({"tool_name": "PowerShell", "tool_input": {}, "cwd": str(cwd)}, cwd)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-print("claude managed-mods drop-in and hook denial checks passed")
+# The command-parsing hook was removed (decision-38). Windows escapes stay denied by the
+# vendor's own managed deny rules; the agent account has no sudo.
+assert not HOOK.exists()
+deny = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text(encoding="utf-8"))["permissions"]["deny"]
+for rule in ("Bash(wsl.exe *)", "Bash(powershell.exe *)", "Bash(pwsh *)", "Bash(cmd.exe *)"):
+    assert rule in deny, rule
+print("claude managed-mods drop-in and managed deny-rule checks passed")

@@ -21,8 +21,7 @@ require_root_owned_policy() {
   [[ $BOOTSTRAP_ROOT == /opt/machine-bootstrap/current ]] || {
     echo 'Run the managed-policy installers from /opt/machine-bootstrap/current.' >&2; exit 1;
   }
-  for file in /usr/local/lib/agent-policy/pre_tool_use.py \
-    /usr/local/lib/agent-policy/context_reminder.py \
+  for file in /usr/local/lib/agent-policy/context_reminder.py \
     /usr/local/lib/agent-policy/package-caps.toml \
     /usr/bin/env /usr/bin/python3 /usr/bin/git /usr/local/bin/gitleaks; do
     path=$(readlink -e -- "$file") || { echo "Missing managed-policy file: $file" >&2; exit 1; }

@@ -2702,7 +2702,7 @@ def runner_check(args):
             if re.match(r"^\s*```\s*$", line):
                 in_text_rules = False
             continue
-        # Keep this small denylist aligned with system/agent-policy/pre_tool_use.py.
+        # Small denylist kept here; the command-parsing hook it once mirrored was removed (decision-38).
         if re.search(r"<<|\b(?:nohup|setsid|xargs|sudo)\b|\bcp\s+(?:--recursive|--archive|-[A-Za-z]*[arR])", line):
             problems.append(f"line {number}: construct blocked by the policy hook")
         override_match = override_field.search(line)
