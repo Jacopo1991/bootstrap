@@ -1863,6 +1863,69 @@ def new_lane_temporary():
     return temporary
 
 
+def user_uv_cache():
+    """Where uv keeps the cache for this user; the same lookup uv itself does."""
+    env = os.environ
+    if env.get("UV_CACHE_DIR"):
+        return Path(env["UV_CACHE_DIR"])
+    base = Path(env["XDG_CACHE_HOME"]) if env.get("XDG_CACHE_HOME") else Path.home() / ".cache"
+    return base / "uv"
+
+
+UV_SEED_COPIED = ("simple-", "wheels-", "sdists-", "interpreter-", "git-")  # small registry metadata
+UV_SEED_ENTRY_LIMIT = 64 * 1024 ** 2  # an archive entry above this stays out of a lane's cache
+
+
+def tree_size(path):
+    total = 0
+    for root, _, names in os.walk(path):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def seed_uv_cache(private):
+    """Let a nested `uv run --offline` in a lane resolve what the user's uv cache holds. The small metadata
+    directories and every archive-v0 entry below UV_SEED_ENTRY_LIMIT are copied as real directories. A
+    symlinked archive entry breaks uv's install ("Not a directory") and a hardlink would let the lane edit
+    the user's cached files, so neither is used. Larger entries stay out; new archives land in the lane's
+    own directory. The lane never gets the user's cache as its UV_CACHE_DIR."""
+    marker, source = private / ".seeded", user_uv_cache()
+    if marker.exists() or not source.is_dir() or source.resolve() == private.resolve():
+        return
+    made = []  # what this call created, dropped again if any step fails so the next lane start retries
+    try:
+        for entry in source.iterdir():
+            if entry.name.startswith("archive-v") and entry.is_dir():
+                (private / entry.name).mkdir(exist_ok=True)
+                for archive in entry.iterdir():
+                    copy = private / entry.name / archive.name
+                    if copy.is_symlink() or copy.exists() or not archive.is_dir() or archive.is_symlink()                             or tree_size(archive) > UV_SEED_ENTRY_LIMIT:
+                        continue
+                    done = subprocess.run(["cp", "-a", "--reflink=auto", str(archive), str(copy)], capture_output=True)
+                    made.append(copy)
+                    if done.returncode:
+                        raise OSError(done.stderr)
+            elif entry.name.startswith(UV_SEED_COPIED) and entry.is_dir():
+                copy = private / entry.name
+                fresh = not copy.exists()
+                done = subprocess.run(["cp", "-a", "--reflink=auto", str(entry), str(private)], capture_output=True)
+                if fresh:
+                    made.append(copy)
+                if done.returncode:
+                    raise OSError(done.stderr)
+        marker.touch()
+    except OSError:
+        for path in made:
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(path, ignore_errors=True)
+
+
 def lane_environment(task, builder="codex"):
     env = agent_environment()
     env.update(configured_environment(task.path, task.repo))
@@ -1883,6 +1946,8 @@ def lane_environment(task, builder="codex"):
             cache = temporary / directory
             cache.mkdir(parents=True, exist_ok=True)
             env[name] = str(cache.resolve())
+            if name == "UV_CACHE_DIR":
+                seed_uv_cache(cache)
     env["TASK_WORKTREE"] = str(task.path.resolve())
     if not env.get("SECRETSPEC_REASON", "").strip():
         env["SECRETSPEC_REASON"] = f"lane {task.repo.name}/{task.id}"
@@ -2540,6 +2605,7 @@ def trusted_check_environment(path, run_id, gate_environment):
     allowed = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "TERM", "SHELL", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}
     environment = {key: value for key, value in os.environ.items()
                    if key in allowed or key.startswith("LC_")}
+    environment["UV_CACHE_DIR"] = str(user_uv_cache())  # every nested uv call sees the outer step's cache
     environment.update(configured_environment(path))
     environment.update(gate_environment)
     environment["TASK_GATE_RUN_ID"] = run_id

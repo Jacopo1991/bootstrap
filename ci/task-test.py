@@ -111,6 +111,7 @@ case "$1 $2" in
     if [ -f smoke_check.py ]; then
       grep -Fq 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' justfile || exit 1
       uv run --no-project --with colorama==0.4.6 python smoke_check.py || exit $?
+      [ -f smoke_nested.py ] && { uv run --no-project --with colorama==0.4.6 python smoke_nested.py || exit $?; }
     fi
     [ -e FAIL ] && { echo "FAILED (failures=1)"; exit 1; }
     echo "Ran 3 tests in 0.01s"; echo OK ;;
@@ -7223,6 +7224,69 @@ store.write_text(json.dumps(prs))
         for name in expected:
             self.assertNotIn(name, claude)
 
+    def test_codex_lane_uv_cache_holds_real_copies_of_small_user_cache_entries(self):
+        wt, _ = self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        user = self.home / "user-uv"
+        (user / "archive-v0/abc").mkdir(parents=True)
+        (user / "archive-v0/abc/small.whl").write_text("x" * 4096)
+        (user / "archive-v0/huge").mkdir()
+        (user / "archive-v0/huge/big.bin").write_text("y")
+        (user / "simple-v25").mkdir()
+        (user / "simple-v25/index").write_text("metadata")
+        (user / "builds-v0").mkdir()
+        (user / "builds-v0/scratch").write_text("not seeded")
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}),                 mock.patch.object(TASK_MODULE, "UV_SEED_ENTRY_LIMIT", 100),                 mock.patch.object(TASK_MODULE, "tree_size", side_effect=lambda p: 10 ** 6 if p.name == "huge" else 50):
+            private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
+            self.assertNotEqual(private, user)
+            self.assertEqual((private / "archive-v0/abc/small.whl").read_text(), "x" * 4096)
+            self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
+            (private / "archive-v0/new").mkdir()  # a lane's own fetches stay in its cache
+            TASK_MODULE.lane_environment(task, "codex")  # seeded once
+        self.assertFalse((user / "archive-v0/new").exists())
+        self.assertFalse((private / "builds-v0").exists())
+        # Guard: a symlinked archive entry breaks uv, a hardlink would let the lane edit the user's files.
+        self.assertFalse((private / "archive-v0/abc").is_symlink())
+        self.assertNotEqual((private / "archive-v0/abc/small.whl").stat().st_ino, (user / "archive-v0/abc/small.whl").stat().st_ino)
+        self.assertFalse((private / "archive-v0/huge").exists(), "entries above the limit stay out")
+        (private / "archive-v0/abc/small.whl").write_text("lane change")
+        self.assertEqual((user / "archive-v0/abc/small.whl").read_text(), "x" * 4096)
+        (private / "simple-v25/index").write_text("lane change")
+        self.assertEqual((user / "simple-v25/index").read_text(), "metadata")
+
+    def test_failed_uv_cache_seeding_leaves_no_marker_and_the_next_start_retries(self):
+        wt, _ = self.started()
+        task = TASK_MODULE.Task(self.repo, "5")
+        user = self.home / "user-uv"
+        (user / "archive-v0/abc").mkdir(parents=True)
+        (user / "archive-v0/abc/small.whl").write_text("x")
+        (user / "simple-v25").mkdir()
+        (user / "simple-v25/index").write_text("metadata")
+        real_run = subprocess.run
+        failing = subprocess.CompletedProcess([], 1, b"", b"cp: boom")
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
+            with mock.patch.object(TASK_MODULE.subprocess, "run",
+                                   side_effect=lambda cmd, *a, **k: failing if cmd[0] == "cp" else real_run(cmd, *a, **k)):
+                private = Path(TASK_MODULE.lane_environment(task, "codex")["UV_CACHE_DIR"])
+            self.assertFalse((private / ".seeded").exists())
+            self.assertFalse((private / "archive-v0/abc").exists(), "partial seeding is dropped")
+            self.assertFalse((private / "simple-v25").exists())
+            TASK_MODULE.lane_environment(task, "codex")
+        self.assertTrue((private / ".seeded").exists())
+        self.assertEqual((private / "archive-v0/abc/small.whl").read_text(), "x")
+        self.assertEqual((private / "simple-v25/index").read_text(), "metadata")
+
+    def test_trusted_gate_nested_uv_uses_the_user_cache(self):
+        wt, _ = self.started()
+        user = self.home / "user-uv"
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(user)}):
+            self.assertEqual(TASK_MODULE.trusted_check_environment(wt, "run", {})["UV_CACHE_DIR"], str(user))
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.home / "xdg")}), \
+                mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("UV_CACHE_DIR", None)
+            self.assertEqual(TASK_MODULE.trusted_check_environment(wt, "run", {})["UV_CACHE_DIR"],
+                             str(self.home / "xdg/uv"))
+
     def assert_claude_temporary_path(self, temporary, call=None):
         root = Path("/tmp") / f"claude-{os.getuid()}"
         # Locate the outer grant from the fixture's actual location, independently
@@ -11137,11 +11201,12 @@ if commands:  # the real-repository lane (T-62): run each command and stop
         pathlib.Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')
     sys.exit(0)
 if 'uv run --no-project --with colorama==0.4.6 python smoke_check.py' in prompt:
-    checked = subprocess.run(['uv', 'run', '--no-project', '--with', 'colorama==0.4.6',
-                              'python', 'smoke_check.py'], capture_output=True, text=True)
-    if checked.returncode:
-        print(checked.stderr or checked.stdout, file=sys.stderr)
-        sys.exit(1)
+    for script in ('smoke_check.py', 'smoke_nested.py'):
+        checked = subprocess.run(['uv', 'run', '--no-project', '--with', 'colorama==0.4.6',
+                                  'python', script], capture_output=True, text=True)
+        if checked.returncode:
+            print(checked.stderr or checked.stdout, file=sys.stderr)
+            sys.exit(1)
 pathlib.Path('smoke.txt').write_text('ok\\n')
 if os.environ.get('SMOKE_STUB_RO') == '1':
     # T-53's defect: the agent's commit is refused, and the agent stops under its stop rule.
@@ -11178,11 +11243,17 @@ class SmokeTests(unittest.TestCase):
         for name, body in stubs.items():
             (bin_dir / name).write_text(textwrap.dedent(body))
             (bin_dir / name).chmod(0o755)
+        (self.home / '.cache/uv').mkdir(parents=True)
+        (self.home / '.cache/uv/archive-v0/colorama').mkdir(parents=True)  # only in the user cache (T-68)
+        (self.home / '.cache/uv/archive-v0/colorama/seeded').write_text('')
         uv = bin_dir / 'uv'
         uv.write_text("#!/bin/sh\n[ \"$SMOKE_UV_FAIL\" = 1 ] && { echo 'error: uv cache is read-only' >&2; exit 1; }\n"
                       "[ -n \"$UV_CACHE_DIR\" ] && { [ -e \"$UV_CACHE_DIR/.read-only\" ] || ! touch \"$UV_CACHE_DIR/.probe\"; } 2>/dev/null && { echo \"error: Failed to initialize cache at "
                       "$UV_CACHE_DIR: Read-only file system (os error 30)\" >&2; exit 2; }\n"
+                      "case \" $* \" in *\" --offline \"*) cache=\"${UV_CACHE_DIR:-$HOME/.cache/uv}\"; [ -e \"$cache/archive-v0/colorama/seeded\" ] || { echo \"error: Because colorama was not found in the cache and you require colorama==0.4.6, "
+                      "we can conclude that your requirements are unsatisfiable. Packages were unavailable because the network was disabled\" >&2; exit 1; }; exit 0 ;; esac\n"
                       "[ \"$1 $2\" = 'run --no-project' ] || exit 2\n"
+                      "case \"$*\" in *smoke_nested.py) exec python3 smoke_nested.py ;; esac\n"
                       "echo \"$PWD\" >> \"$HOME/uv-runs\"\nexit 0\n")
         uv.chmod(0o755)
         shutil.copy(SMOKE_HELPER, bin_dir / 'task-smoke')
