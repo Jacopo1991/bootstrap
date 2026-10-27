@@ -48,11 +48,13 @@ sudo chmod -R go-w "$public_source"
 policy_dir=/usr/local/lib/agent-policy
 [[ ! -L $policy_dir ]] || { echo "Refusing symlinked $policy_dir." >&2; exit 1; }
 sudo install -d -o root -g root -m 0755 "$policy_dir"
-for script in pre_tool_use.py context_reminder.py package_caps.py package-caps.toml; do
+for script in context_reminder.py package_caps.py package-caps.toml; do
   policy_temp=$(sudo mktemp "$policy_dir/.agent-policy.XXXXXX")
   sudo install -o root -g root -m 0644 "$public_source/system/agent-policy/$script" "$policy_temp"
   sudo mv -f -- "$policy_temp" "$policy_dir/$script"
 done
+# The command-parsing hook was removed by founder ruling 2026-10-27 (decision-38).
+sudo rm -f -- "$policy_dir/pre_tool_use.py"
 # Generate resolver constraints once from the validated, root-owned policy.
 # The installed policy/module are world-readable; generate the user-owned temporary output.
 /usr/bin/python3 -I "$policy_dir/package_caps.py" --emit-constraints > "$tmp/constraints.txt"

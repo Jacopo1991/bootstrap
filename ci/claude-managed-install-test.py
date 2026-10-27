@@ -93,17 +93,7 @@ for stale in (home / ".codex/hooks.json", home / ".local/share/bootstrap/agent-p
 user = json.loads((home / ".claude/settings.json").read_text(encoding="utf-8"))
 assert "deny" not in user["permissions"] and "hooks" not in user
 
-# The deployed managed hook, run exactly as configured, still denies blocked commands.
-pre_tool_use = next(argv for argv in argvs if argv[8].endswith("/pre_tool_use.py"))
-# The deployed hook fixture owns its temporary root, not the enclosing lane.
-env = {"PATH": os.environ["PATH"], "HOME": str(Path.home())}
-with tempfile.TemporaryDirectory() as cwd:
-    env["TMPDIR"] = cwd
-    env["XDG_STATE_HOME"] = str(Path(cwd) / "state")
-    env["AGENT_POLICY_STATE_DIR"] = str(Path(cwd) / "audit-state")
-    for command in ("wsl.exe -d AgentDev", "sudo true"):
-        event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}
-        result = subprocess.run(pre_tool_use, input=json.dumps(event), capture_output=True,
-                                text=True, cwd=cwd, env=env, check=True, timeout=30)
-        assert json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny", command
-print("managed guardrails are root-owned and agent-immutable, and the managed hook still denies")
+# The command-parsing hook was removed (decision-38): no managed hook runs it and no copy is deployed.
+assert not any(argv[8].endswith("/pre_tool_use.py") for argv in argvs), argvs
+assert not Path("/usr/local/lib/agent-policy/pre_tool_use.py").exists()
+print("managed guardrails are root-owned and agent-immutable; no command-parsing hook is deployed")

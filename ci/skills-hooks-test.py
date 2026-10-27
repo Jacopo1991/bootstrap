@@ -316,8 +316,8 @@ class Reminder(unittest.TestCase):
         codex_prompt = [h["command"] for e in codex["UserPromptSubmit"] for h in e["hooks"]]
         self.assertEqual(codex_prompt, [prompt[0]])
         self.assertFalse((ROOT / "home/dot_codex/hooks.json").exists())
-        for events in (claude, codex):  # the policy hook is still wired for every tool event it was
-            self.assertTrue(any("pre_tool_use.py" in line(h) for e in events["PreToolUse"] for h in e["hooks"]))
+        for events in (claude, codex):  # the command-parsing policy hook is gone (decision-38)
+            self.assertFalse(any("pre_tool_use.py" in line(h) for e in events.get("PreToolUse", []) for h in e["hooks"]))
 
 
 class Windows(unittest.TestCase):

@@ -124,34 +124,8 @@ for config in (claude, managed, codex_config, codex_required):
     assert "docker" not in json.dumps(config).lower().replace("~/.docker/config.json", "")
 print("PASS: no Claude or Codex sandbox setting allows Unix sockets or mentions Docker")
 
-# Hook: lane sessions (TASK_WORKTREE) may not run container CLIs or set a daemon; others are unchanged.
-spec = importlib.util.spec_from_file_location("policy", ROOT / "system/agent-policy/pre_tool_use.py")
-policy = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(policy)
-with tempfile.TemporaryDirectory() as temp:
-    base = Path(temp)
-    task = base / "task"
-    task.mkdir()
-    subprocess.run(["git", "init", "-q", str(task)], check=True)
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-
-    def judge(command, lane):
-        environment = dict(env, **({"TASK_WORKTREE": str(task)} if lane else {}))
-        with patch.dict(os.environ, environment, clear=True):
-            return policy.evaluate({"tool_name": "Bash", "cwd": str(task), "tool_input": {"command": command}}, (base,))
-
-    for command in ("docker ps", "/usr/bin/docker run --rm alpine true", "podman ps", "nerdctl ps",
-                    "docker-compose up", "timeout 5 docker ps", "env docker ps",
-                    "DOCKER_HOST=unix:///run/user/1001/docker.sock ls",
-                    "env DOCKER_HOST=unix:///run/user/1001/docker.sock ls", "DOCKER_CONTEXT=x ls",
-                    "CONTAINER_HOST=unix:///x ls"):
-        reason = judge(command, lane=True)
-        assert reason and getattr(reason, "rule_id", "") in {"container.lane_boundary", "command.unsafe_environment"}, (command, reason)
-    for command in ("docker ps", "DOCKER_HOST=unix:///x ls"):
-        reason = judge(command, lane=False)
-        assert getattr(reason, "rule_id", "") not in {"container.lane_boundary", "command.unsafe_environment"}, (command, reason)
-    assert judge("ls", lane=True) is None
-print("PASS: hook denies docker, podman, nerdctl and DOCKER_HOST settings in lane sessions only")
+# The command-parsing hook that denied container CLIs in lanes was removed (decision-38).
+assert not (ROOT / "system/agent-policy/pre_tool_use.py").exists()
 
 # The example task: no network, no mounts, nothing privileged. Flat YAML subset, parsed by hand.
 compose = read("docs/inspect/compose.yaml")
