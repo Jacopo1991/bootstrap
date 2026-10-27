@@ -965,6 +965,11 @@ mapped PM), `task smoke` finished (`smoke (both): PASS (exit 0)`), and an ask th
 note ... setup`, and a batch line that parks a task or stops the batch). Lines are short and carry
 no file contents. Jacopo's own `sudo agent-hold` sends nothing.
 
+Only stops, asks and failures wake a PM (T-88): a lane that did not finish OK, a failed check, merge gate,
+review or smoke, an ask, and the hold. Informational events (lane finished OK, review PASS, main moved,
+smoke PASS) are appended to `~/.local/state/task/pm-wake/<pm>.digest` and counted; the next wake ends with
+`(+N digest events since the last wake)`, and `task pm-wake-digest <pm>` prints the lines and the count.
+
 The map is `~/.config/pm-wake/sessions`, one `pm=session_id` line per PM; chezmoi creates it once
 (comments only) and never overwrites it. A fresh PM session registers itself with
 `task pm-session <pm> <session_id>`: the id must be `session_` followed by letters and digits, and the

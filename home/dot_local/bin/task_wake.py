@@ -65,7 +65,7 @@ def emit(home, repo, line, *, event_class="WAKE", everyone=False):
         mapped = sessions(home)
         targets = sorted(mapped) if everyone else [pm for pm in (pm_for(repo),) if pm in mapped]
         for pm in targets:
-            message = line
+            message = short(line)
             root = state_root(home)
             root.mkdir(parents=True, exist_ok=True)
             with open(root / f"{pm}.queue.lock", "a") as lock:
@@ -86,10 +86,10 @@ def emit(home, repo, line, *, event_class="WAKE", everyone=False):
                 except (OSError, ValueError):
                     count = 0
                 if count:
-                    message = f"{line} (+{count} digest events since the last wake)"
+                    message = f"{message} (+{count} digest events since the last wake)"  # the suffix is never cut
                     count_path.write_text("0")
                 with open(root / f"{pm}.spool", "a") as spool:
-                    spool.write(short(message) + "\n")
+                    spool.write(message + "\n")
             if not flusher_alive(home, pm):
                 start_flusher(home, pm)
     except Exception:  # delivery must never disturb the command that emitted the event

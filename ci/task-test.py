@@ -10591,6 +10591,16 @@ class PmWakeTests(unittest.TestCase):
         self.assertIn('review T-5: PASS (abcdef0)', lines[1])
         self.assertEqual(lines[2], '0 digest event(s)')
 
+    def test_long_wake_line_keeps_the_digest_count_suffix(self):
+        self.wake()
+        wake = TASK_MODULE.task_wake
+        wake.emit(self.home, 'proj', 'review T-5: PASS (abcdef0)', event_class='DIGEST')
+        wake.emit(self.home, 'proj', 'hold pulled by workflow-pm: ' + 'x' * 300)
+        spool = self.home / '.local/state/task/pm-wake/proj.spool'
+        sent = spool.read_text()
+        self.assertTrue(sent.rstrip().endswith('(+1 digest events since the last wake)'), sent)
+        self.assertIn('...', sent)
+
     def test_lane_and_smoke_outcomes_choose_wake_or_digest(self):
         self.wake()
         task = SimpleNamespace(repo=SimpleNamespace(name='proj'), id='T-5')
