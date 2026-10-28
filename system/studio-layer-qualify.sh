@@ -125,6 +125,31 @@ def interrupted(signum, frame):
     raise RuntimeError('interrupted')
 
 
+def check_qualified():
+    target = '/etc/studio-layer/qualified'
+    if not os.path.lexists(target):
+        return
+    s = os.lstat(target)
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != 0:
+        return
+    release = os.path.basename(os.path.realpath('/usr/local/lib/studio-layer/current'))
+    if len(release) != 40 or any(c not in '0123456789abcdef' for c in release):
+        return
+    try:
+        lines = Path(target).read_text().splitlines()
+    except (OSError, UnicodeError):
+        return
+    releases = [line[8:] for line in lines if line.startswith('release=')]
+    if releases == [release]:
+        print('ALREADY QUALIFIED for release %s; nothing to do.' % release, flush=True)
+        sys.exit(0)
+    if len(releases) == 1 and releases[0] != release:
+        print('FAIL marker is for another release; reinstall clears it', flush=True)
+        sys.exit(1)
+
+
+check_qualified()
+
 for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(sig, interrupted)
 

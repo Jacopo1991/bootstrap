@@ -6,6 +6,7 @@ import io
 import os
 from pathlib import Path
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -14,6 +15,42 @@ from unittest.mock import patch
 script = (Path(__file__).resolve().parents[1] / 'system/studio-layer-qualify.sh').read_text()
 source = script.split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
 tree = ast.parse(source)
+check_qualified = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'check_qualified')
+early_call = next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Expr)
+                  and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                  and node.value.func.id == 'check_qualified')
+assert early_call < next(i for i, node in enumerate(tree.body) if isinstance(node, ast.Try))
+with tempfile.TemporaryDirectory() as tmp:
+    marker = Path(tmp) / 'qualified'
+    current = Path(tmp) / 'current'
+    current.symlink_to('a' * 40)
+    class MapEarlyPaths(ast.NodeTransformer):
+        def visit_Constant(self, node):
+            paths = {'/etc/studio-layer/qualified': str(marker),
+                     '/usr/local/lib/studio-layer/current': str(current)}
+            return ast.copy_location(ast.Constant(paths[node.value]), node) if isinstance(node.value, str) and node.value in paths else node
+    program = ast.fix_missing_locations(MapEarlyPaths().visit(ast.Module(body=[check_qualified], type_ignores=[])))
+    namespace = dict(os=os, stat=stat, Path=Path, sys=sys)
+    exec(compile(program, '<early qualification>', 'exec'), namespace)
+    real_lstat = os.lstat
+    def root_lstat(path):
+        result = real_lstat(path)
+        return type('Stat', (), {'st_mode': result.st_mode, 'st_uid': 0})()
+    for release, expected, message in (
+        ('a' * 40, 0, 'ALREADY QUALIFIED for release ' + 'a' * 40 + '; nothing to do.\n'),
+        ('b' * 40, 1, 'FAIL marker is for another release; reinstall clears it\n'),
+    ):
+        marker.write_text('release=' + release + '\n')
+        output = io.StringIO()
+        with patch.object(os, 'lstat', root_lstat), contextlib.redirect_stdout(output):
+            try:
+                namespace['check_qualified']()
+            except SystemExit as error:
+                assert error.code == expected
+            else:
+                raise AssertionError('qualification did not exit early')
+        assert output.getvalue() == message
+
 cleanup = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'cleanup')
 with tempfile.TemporaryDirectory() as tmp:
     marker = Path(tmp) / 'agent-hold'
