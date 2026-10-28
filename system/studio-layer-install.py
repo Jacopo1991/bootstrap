@@ -25,7 +25,10 @@ def install(pin, checkout, root=Path('/')):
     revision = Path(pin).read_text().strip()
     if not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('release pin must be a 40-hex commit; PENDING cannot be installed')
-    archive = subprocess.run(['/usr/bin/git', '-c', 'safe.directory=' + str(checkout), '-C', str(checkout), 'archive', '--format=tar', revision], check=True, stdout=subprocess.PIPE).stdout
+    git_env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent',
+               'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_CONFIG_NOSYSTEM': '1',
+               'GIT_CONFIG_GLOBAL': '/dev/null'}
+    archive = subprocess.run(['/usr/bin/git', '-c', 'safe.directory=' + str(checkout), '-C', str(checkout), 'archive', '--format=tar', revision], check=True, stdout=subprocess.PIPE, env=git_env).stdout
     lib = root / 'usr/local/lib/studio-layer'
     protected_dir(lib)
     with tempfile.TemporaryDirectory(prefix='.release-', dir=lib) as temp:
@@ -100,8 +103,15 @@ def install(pin, checkout, root=Path('/')):
             name = f.name
         os.replace(name, wrapper)
     link = lib / ('.current-' + str(os.getpid()))
+    current = lib / 'current'
+    if not current.is_symlink() or os.readlink(current) != revision:
+        qualified = etc / 'qualified'
+        if qualified.is_symlink():
+            raise ValueError('unsafe qualification marker')
+        if qualified.exists():
+            qualified.unlink()
     os.symlink(revision, link)
-    os.replace(link, lib / 'current')
+    os.replace(link, current)
 
 
 if __name__ == '__main__':
