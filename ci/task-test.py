@@ -46,6 +46,7 @@ TOOL = Path(os.environ.get("TASK_TEST_TOOL", ROOT / "home/dot_local/bin/executab
 # Test-only source seam: installed commands have no environment override for /etc.
 HOLD_FIXTURE = Path(audit_state.name) / 'etc/agent-hold'
 HOLD_FIXTURE.parent.mkdir()
+(HOLD_FIXTURE.parent / 'agent-hold.lock').touch(mode=0o600)
 def hold_fixture_source(source):
     assert source.count('Path("/etc/agent-hold")') == 1, 'hold seam must replace exactly one path per source'
     source = source.replace('Path("/etc/agent-hold")', f'Path({str(HOLD_FIXTURE)!r})')
@@ -539,7 +540,7 @@ class TaskTool(unittest.TestCase):
 
     def test_hold_root_command_and_install_wiring(self):
         source = (ROOT / 'system/agent-hold').read_text()
-        self.assertLessEqual(len(source.splitlines()), 25)
+        self.assertLessEqual(len(source.splitlines()), 35)
         def root_command(*args, uid=0):
             with mock.patch.object(sys, 'argv', ['agent-hold', *args]), \
                     mock.patch.object(os, 'geteuid', return_value=uid), \

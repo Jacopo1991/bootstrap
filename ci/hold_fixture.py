@@ -8,6 +8,7 @@ def install_checker(home):
     home = Path(home)
     target = home / '.local/bin/task'
     target.parent.mkdir(parents=True, exist_ok=True)
+    (home / 'etc-agent-hold.lock').touch(mode=0o600)
     source_dir = ROOT / 'home/dot_local/bin'
     source = (source_dir / 'executable_task').read_text()
     source = source.replace("name.startswith('LC_')", "name.startswith(('LC_', 'TASK_TEST_', 'GATE_BROWSER_FIXTURE_')) or name in {'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'}")
