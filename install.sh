@@ -12,6 +12,7 @@ sudo "$bash_cmd" "$ROOT/system/base.sh"
 sudo "$bash_cmd" "$ROOT/system/users.sh" "$(id -un)"
 sudo "$bash_cmd" "$ROOT/system/inventory-mirror.sh"
 sudo "$bash_cmd" "$ROOT/system/agent-hold.sh"
+sudo "$bash_cmd" "$ROOT/system/studio-layer.sh"
 # shellcheck source=system/common.sh
 source "$ROOT/system/common.sh"
 tmp=$(mktemp -d)
