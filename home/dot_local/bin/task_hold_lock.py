@@ -44,11 +44,13 @@ def marker_lock(marker, exclusive=False):
                     raise OSError('hold lock unavailable')
                 time.sleep(0.05)
         current = os.stat(name + '.lock', dir_fd=directory, follow_symlinks=False)
-        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
-            raise OSError('hold lock replaced')
+        acquired = os.fstat(lock)
+        metadata = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid, s.st_nlink)
+        if metadata(info) != metadata(current) or metadata(info) != metadata(acquired):
+            raise OSError('hold lock metadata changed')
         yield
         current = os.stat(name + '.lock', dir_fd=directory, follow_symlinks=False)
-        if (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink) != (current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_nlink):
+        if metadata(info) != metadata(current) or metadata(info) != metadata(os.fstat(lock)):
             raise OSError('hold lock replaced')
     finally:
         if lock is not None:
