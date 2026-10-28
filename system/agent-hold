@@ -13,7 +13,7 @@ def locked(exclusive):
     from task_hold_lock import marker_lock
     return marker_lock(marker, exclusive=exclusive)
 try:
-    args = sys.argv[1:]
+    args = [] if sys.argv[1:] == ['status'] else sys.argv[1:]  # 'status' = read-only
     if args and os.geteuid() != 0: raise OSError('Use sudo agent-hold to pull or release Jacopo\'s hold')
     if args[:1] == ['pull'] and len(args) == 2 and args[1].strip():
         try:
