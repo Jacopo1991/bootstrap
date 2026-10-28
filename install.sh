@@ -3,6 +3,9 @@ set -euo pipefail
 umask 022
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [[ $EUID != 0 && $(id -un) != agent ]] || { echo 'Run as the non-root admin user.' >&2; exit 1; }
+entry=${BASH_SOURCE[0]}
+[[ $entry = /* ]] || entry="$PWD/$entry"
+/usr/bin/python3 -I "$ROOT/system/studio-layer-install.py" --check-custody "$entry"
 [[ -z $(git -C "$ROOT" status --porcelain) ]] || {
   echo 'Commit bootstrap changes before running install.sh.' >&2; exit 1;
 }

@@ -30,31 +30,68 @@ def runtime_paths():
     return paths
 
 
-def install(pin, checkout, root=Path('/')):
-    pin = Path(pin)
-    custody_root = pin.parent.parent
+def check_custody(fd, path, agent, agent_groups):
+    info = os.fstat(fd)
+    if (info.st_uid == agent.pw_uid or info.st_mode & 0o002
+            or (info.st_mode & 0o020 and info.st_gid in agent_groups)):
+        raise ValueError('unsafe pin custody: ' + str(path))
+    try:
+        os.getxattr(fd, 'system.posix_acl_access')
+    except OSError as exc:
+        if exc.errno not in (errno.ENODATA, errno.ENOTSUP):
+            raise
+    else:
+        raise ValueError('pin custody ACL requires review: ' + str(path))
+
+
+def open_custodied(path, directory=False):
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('custody path must be absolute and normalized')
     agent = pwd.getpwnam('agent')
     agent_groups = set(os.getgrouplist('agent', agent.pw_gid))
-    def custody(path):
-        for item in (path, *path.parents):
-            info = item.lstat()
-            if (stat.S_ISLNK(info.st_mode) or info.st_uid == agent.pw_uid
-                    or info.st_mode & 0o002 or (info.st_mode & 0o020 and info.st_gid in agent_groups)):
-                raise ValueError('unsafe pin custody: ' + str(item))
-            try:
-                os.getxattr(item, 'system.posix_acl_access', follow_symlinks=False)
-            except OSError as exc:
-                if exc.errno not in (errno.ENODATA, errno.ENOTSUP):
-                    raise
-            else:
-                raise ValueError('pin custody ACL requires review: ' + str(item))
-            if item == custody_root:
-                return
-        raise ValueError('pin outside checkout')
-    digest_pin = pin.parent / 'studio-layer-archon.sha256'
-    custody(pin)
-    custody(digest_pin)
-    fields = digest_pin.read_text().strip().split(maxsplit=1)
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        current = Path('/')
+        check_custody(fd, current, agent, agent_groups)
+        for i, part in enumerate(path.parts[1:]):
+            is_dir = i < len(path.parts[1:]) - 1 or directory
+            flags = os.O_RDONLY | os.O_NOFOLLOW | (os.O_DIRECTORY if is_dir else os.O_NONBLOCK)
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            current /= part
+            check_custody(fd, current, agent, agent_groups)
+            if not is_dir and not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError('custody file is not regular: ' + str(current))
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_pins(pin):
+    pin = Path(pin)
+    agent = pwd.getpwnam('agent')
+    groups = set(os.getgrouplist('agent', agent.pw_gid))
+    directory = open_custodied(pin.parent, directory=True)
+    try:
+        values = []
+        for name in (pin.name, 'studio-layer-archon.sha256'):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            with os.fdopen(fd, 'r') as source:
+                check_custody(source.fileno(), pin.parent / name, agent, groups)
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise ValueError('pin is not a regular file')
+                values.append(source.read())
+        return values
+    finally:
+        os.close(directory)
+
+
+def install(pin, checkout, root=Path('/')):
+    revision, digest = read_pins(pin)
+    fields = digest.strip().split(maxsplit=1)
     if len(fields) != 2 or not re.fullmatch(r'[0-9a-f]{64}', fields[0]) or not Path(fields[1]).is_absolute():
         raise ValueError('invalid Archon pin')
     archon_bytes = Path(fields[1]).read_bytes()
@@ -68,7 +105,7 @@ def install(pin, checkout, root=Path('/')):
             info = current.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022 or (root == Path('/') and info.st_uid != 0):
                 raise ValueError('unsafe installation directory: ' + str(current))
-    revision = Path(pin).read_text().strip()
+    revision = revision.strip()
     if not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('release pin must be a 40-hex commit; PENDING cannot be installed')
     git_env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent',
@@ -191,7 +228,13 @@ def install(pin, checkout, root=Path('/')):
 
 if __name__ == '__main__':
     try:
-        install(sys.argv[1], sys.argv[2])
+        script = Path(__file__).absolute()
+        entry = Path(sys.argv[2]) if len(sys.argv) == 3 and sys.argv[1] == '--check-custody' else script.parent.parent / 'install.sh'
+        for path in (script, entry):
+            fd = open_custodied(path)
+            os.close(fd)
+        if sys.argv[1] != '--check-custody':
+            install(sys.argv[1], sys.argv[2])
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print('studio-layer install refused:', exc, file=sys.stderr)
         sys.exit(1)

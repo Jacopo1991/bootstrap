@@ -43,12 +43,49 @@ with tempfile.TemporaryDirectory() as tmp:
     root = base / 'root'
     root.mkdir()
     refused(lambda: mod.install(pin, checkout, root))
-    with patch.object(mod.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=987654, pw_gid=987654)), patch.object(mod.os, 'getgrouplist', return_value=[987654]), patch.object(mod, 'runtime_paths', return_value={'codex': '/fixture/codex', 'node': '/fixture/node', 'uv': '/fixture/uv'}):
+    real_check = mod.check_custody
+    def fixture_check(fd, path, agent, groups):
+        # /tmp is necessarily world-writable; model only its ancestors as trusted.
+        if path == base or base in path.parents:
+            real_check(fd, path, agent, groups)
+    with patch.object(mod.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=987654, pw_gid=987654)), patch.object(mod.os, 'getgrouplist', return_value=[987654]), patch.object(mod, 'check_custody', side_effect=fixture_check), patch.object(mod, 'runtime_paths', return_value={'codex': '/fixture/codex', 'node': '/fixture/node', 'uv': '/fixture/uv'}):
+        (base / 'bootstrap').chmod(0o777)
+        refused(lambda: mod.install(pin, checkout, root))
+        (base / 'bootstrap').chmod(0o755)
+        entry = base / 'bootstrap/install.sh'
+        entry.write_text('fixture\n')
+        script = pins / 'studio-layer-install.py'
+        script.write_text('fixture\n')
+        (base / 'bootstrap').chmod(0o777)
+        refused(lambda: mod.open_custodied(entry))
+        refused(lambda: mod.open_custodied(script))
+        (base / 'bootstrap').chmod(0o755)
+        entry.unlink()
+        entry.symlink_to(script)
+        refused(lambda: mod.open_custodied(entry))
+        entry.unlink()
         pin.unlink()
         pin.symlink_to(pins / 'other')
         refused(lambda: mod.install(pin, checkout, root))
         pin.unlink()
         pin.write_text(revision + '\n')
+        # Replace the checkout after opening its pin directory; descriptor reads
+        # must retain the original pins even when the path now names a symlink.
+        replacement = base / 'replacement/system'
+        replacement.mkdir(parents=True)
+        (replacement / pin.name).write_text('0' * 40 + '\n')
+        (replacement / 'studio-layer-archon.sha256').write_text('bad pin\n')
+        original_open = mod.open_custodied
+        def swap_after_open(path, directory=False):
+            fd = original_open(path, directory)
+            (base / 'bootstrap').rename(base / 'preserved')
+            (base / 'bootstrap').symlink_to(base / 'replacement', target_is_directory=True)
+            return fd
+        with patch.object(mod, 'open_custodied', side_effect=swap_after_open):
+            release, digest = mod.read_pins(pin)
+        assert release.strip() == revision and digest.startswith(hashlib.sha256(binary.read_bytes()).hexdigest())
+        (base / 'bootstrap').unlink()
+        (base / 'preserved').rename(base / 'bootstrap')
         original = mod.subprocess.run
         def wrong_tree(argv, **kwargs):
             result = original(argv, **kwargs)
