@@ -149,19 +149,15 @@ def install(pin, checkout, root=Path('/')):
         f.write(runtimes)
         os.fchmod(f.fileno(), 0o644)
         runtime_tmp = f.name
-    os.replace(runtime_tmp, runtime_target)
     target = etc / 'hold-config.json'
     data = (json.dumps(config, separators=(',', ':')) + '\n').encode()
     if target.is_symlink() or (target.exists() and target.read_bytes() != data):
         raise ValueError('existing hold config differs')
     if target.exists() and (not target.is_file() or target.stat().st_mode & 0o777 != 0o644 or (root == Path('/') and target.stat().st_uid != 0)):
         raise ValueError('existing hold config has unsafe metadata')
-    if not target.exists():
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-        with os.fdopen(fd, 'wb') as f:
-            f.write(data)
     bindir = root / 'usr/local/bin'
     protected_dir(bindir)
+    wrappers = []
     for entry in (dest / 'bin').iterdir():
         if not entry.name.startswith('layer-'):
             continue
@@ -171,16 +167,25 @@ def install(pin, checkout, root=Path('/')):
             f.write(content)
             os.fchmod(f.fileno(), 0o755)
             name = f.name
-        os.replace(name, wrapper)
+        wrappers.append((name, wrapper))
     link = lib / ('.current-' + str(os.getpid()))
     current = lib / 'current'
-    if not current.is_symlink() or os.readlink(current) != revision:
+    runtime_changed = not runtime_target.exists() or runtime_target.read_bytes() != runtimes
+    if runtime_changed or not current.is_symlink() or os.readlink(current) != revision:
         qualified = etc / 'qualified'
         if qualified.is_symlink():
             raise ValueError('unsafe qualification marker')
         if qualified.exists():
             qualified.unlink()
+    # All inputs and destinations have been validated and staged before publishing.
     os.symlink(revision, link)
+    if not target.exists():
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+    for name, wrapper in wrappers:
+        os.replace(name, wrapper)
+    os.replace(runtime_tmp, runtime_target)
     os.replace(link, current)
 
 

@@ -137,6 +137,7 @@ try:
     with marker_lock(MARKER, exclusive=True):
         s = os.lstat(LOCK)
         initial_identity = (s.st_dev, s.st_ino)
+        initial_metadata = (s.st_uid, s.st_gid, stat.S_IMODE(s.st_mode), s.st_nlink)
         require(not os.path.lexists(MARKER),
                 'pre-existing hold: preserved; owner must choose when to retry')
     for path in (OWNER, '/usr/local/bin/task_hold_lock.py',
@@ -205,6 +206,10 @@ try:
     require(owner('release') != 0 and os.path.lexists(MARKER),
             'release did not preserve hold under contention')
     passed('a-break-glass')
+    final = os.lstat(LOCK)
+    require((final.st_dev, final.st_ino) == initial_identity and
+            (final.st_uid, final.st_gid, stat.S_IMODE(final.st_mode), final.st_nlink) == initial_metadata,
+            'lock identity or metadata changed')
 except BaseException as error:
     # Exception text may originate in runtime code: report type, never contents.
     print('FAIL probe (' + type(error).__name__ + ')', flush=True)

@@ -63,6 +63,17 @@ with tempfile.TemporaryDirectory() as tmp:
         assert (root / 'usr/local/lib/studio-layer/current/archon').read_bytes() == binary.read_bytes()
         qualified = root / 'etc/studio-layer/qualified'
         qualified.write_text('release=' + revision + '\n')
+        with patch.object(mod, 'runtime_paths', return_value={'codex': '/fixture/changed', 'node': '/fixture/node', 'uv': '/fixture/uv'}):
+            mod.install(pin, checkout, root)
+        assert not qualified.exists()
+        qualified.write_text('release=' + revision + '\n')
+        hold_config = root / 'etc/studio-layer/hold-config.json'
+        hold_config.write_text('invalid')
+        before = (root / 'etc/studio-layer/runtime-paths.json').read_bytes()
+        with patch.object(mod, 'runtime_paths', return_value={'codex': '/fixture/another', 'node': '/fixture/node', 'uv': '/fixture/uv'}):
+            refused(lambda: mod.install(pin, checkout, root))
+        assert (root / 'etc/studio-layer/runtime-paths.json').read_bytes() == before
+        hold_config.unlink()
         (checkout / 'bin/layer-core').write_text('new release\n')
         git(checkout, 'add', '.')
         git(checkout, 'commit', '-qm', 'upgrade')
