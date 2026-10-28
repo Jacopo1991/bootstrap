@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Install a pinned, self-contained studio layer. Root entry point has no overrides."""
 import io
+import hashlib
+import errno
 import json
 import os
+import pwd
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -14,6 +17,35 @@ import tempfile
 
 
 def install(pin, checkout, root=Path('/')):
+    pin = Path(pin)
+    custody_root = pin.parent.parent
+    agent = pwd.getpwnam('agent')
+    agent_groups = set(os.getgrouplist('agent', agent.pw_gid))
+    def custody(path):
+        for item in (path, *path.parents):
+            info = item.lstat()
+            if (stat.S_ISLNK(info.st_mode) or info.st_uid == agent.pw_uid
+                    or info.st_mode & 0o002 or (info.st_mode & 0o020 and info.st_gid in agent_groups)):
+                raise ValueError('unsafe pin custody: ' + str(item))
+            try:
+                os.getxattr(item, 'system.posix_acl_access', follow_symlinks=False)
+            except OSError as exc:
+                if exc.errno not in (errno.ENODATA, errno.ENOTSUP):
+                    raise
+            else:
+                raise ValueError('pin custody ACL requires review: ' + str(item))
+            if item == custody_root:
+                return
+        raise ValueError('pin outside checkout')
+    digest_pin = pin.parent / 'studio-layer-archon.sha256'
+    custody(pin)
+    custody(digest_pin)
+    fields = digest_pin.read_text().strip().split(maxsplit=1)
+    if len(fields) != 2 or not re.fullmatch(r'[0-9a-f]{64}', fields[0]) or not Path(fields[1]).is_absolute():
+        raise ValueError('invalid Archon pin')
+    archon_bytes = Path(fields[1]).read_bytes()
+    if hashlib.sha256(archon_bytes).hexdigest() != fields[0]:
+        raise ValueError('Archon digest mismatch')
     def protected_dir(path):
         path.mkdir(parents=True, exist_ok=True)
         current = root
@@ -29,6 +61,7 @@ def install(pin, checkout, root=Path('/')):
                'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_CONFIG_NOSYSTEM': '1',
                'GIT_CONFIG_GLOBAL': '/dev/null'}
     archive = subprocess.run(['/usr/bin/git', '-c', 'safe.directory=' + str(checkout), '-C', str(checkout), 'archive', '--format=tar', revision], check=True, stdout=subprocess.PIPE, env=git_env).stdout
+    expected_tree = subprocess.run(['/usr/bin/git', '-c', 'safe.directory=' + str(checkout), '-C', str(checkout), 'rev-parse', revision + '^{tree}'], check=True, stdout=subprocess.PIPE, env=git_env).stdout.decode().strip()
     lib = root / 'usr/local/lib/studio-layer'
     protected_dir(lib)
     with tempfile.TemporaryDirectory(prefix='.release-', dir=lib) as temp:
@@ -56,6 +89,20 @@ def install(pin, checkout, root=Path('/')):
                 if any(parent.name and parent.as_posix() in {x.name.rstrip('/') for x in members if x.issym()} for parent in p.parents):
                     raise ValueError('archive member beneath symlink')
             tar.extractall(stage, members=members, filter='data')
+        index = Path(temp) / 'index'
+        git_dir = Path(temp) / 'verify.git'
+        subprocess.run(['/usr/bin/git', 'init', '--bare', '--quiet', str(git_dir)], check=True, env=git_env)
+        index_env = dict(git_env, GIT_INDEX_FILE=str(index), GIT_WORK_TREE=str(stage), GIT_DIR=str(git_dir))
+        git_cmd = ['/usr/bin/git']
+        subprocess.run(git_cmd + ['read-tree', '--empty'], check=True, env=index_env)
+        subprocess.run(git_cmd + ['-c', 'core.autocrlf=false', 'add', '-f', '--all', '--', '.'], check=True, env=index_env)
+        actual_tree = subprocess.run(git_cmd + ['write-tree'], check=True, stdout=subprocess.PIPE, env=index_env).stdout.decode().strip()
+        if actual_tree != expected_tree:
+            raise ValueError('archived tree mismatch')
+        if (stage / 'archon').exists() or (stage / 'archon').is_symlink():
+            raise ValueError('archive collides with installed Archon')
+        (stage / 'archon').write_bytes(archon_bytes)
+        (stage / 'archon').chmod(0o755)
         for p in stage.rglob('*'):
             if not p.is_symlink():
                 p.chmod((0o555 if p.is_dir() or p.stat().st_mode & 0o111 else 0o444))
