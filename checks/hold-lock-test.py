@@ -40,7 +40,28 @@ with tempfile.TemporaryDirectory() as temporary:
         assert reader.returncode == 0 and 'synthetic' in out, (out, err)
     subprocess.run([sys.executable, str(command), 'release'], env=env, check=True, capture_output=True)
     assert not marker.exists() and lock.exists()
+    run = lambda *a, e=env: subprocess.run([sys.executable, str(command), *a], env=e, capture_output=True, text=True)
+    # Jacopo's pull never depends on agents: lock held by someone else beyond the bound -> pull anyway (break-glass).
+    with lock.open('r') as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = run('pull', 'blocked')
+        assert result.returncode == 0 and marker.exists() and 'break-glass' in result.stderr, result
+        # Release under a blocked lock keeps the hold (fails safe); --force is Jacopo's override.
+        result = run('release')
+        assert result.returncode != 0 and marker.exists(), result
+        result = run('release', '--force')
+        assert result.returncode == 0 and not marker.exists(), result
+    # Lock tampered with (agent-owned file chmod 0644) -> pull still works.
+    lock.chmod(0o644)
+    result = run('pull', 'tampered')
+    assert result.returncode == 0 and marker.exists() and 'break-glass' in result.stderr, result
+    run('release', '--force'); lock.chmod(0o600)
+    # Lock file missing and lock helper not importable -> pull still works; the reader fails closed.
     lock.unlink()
-    result = subprocess.run([sys.executable, str(command), 'pull', 'synthetic'], env=env, capture_output=True)
-    assert result.returncode != 0 and not marker.exists() and not lock.exists()
+    result = run('pull', 'no-lock', e={'PATH': '/usr/bin:/bin'})
+    assert result.returncode == 0 and marker.exists() and 'break-glass' in result.stderr, result
+    result = run(e={'PATH': '/usr/bin:/bin'})
+    assert result.returncode != 0 and 'held / cannot inspect' in result.stderr, result
+    run('release', '--force')
+    assert not marker.exists() and not lock.exists()
 print('hold lock: PASS')

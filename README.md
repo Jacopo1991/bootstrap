@@ -884,6 +884,9 @@ read the log recorded by the latest check, including trusted PM checks.
 
 `task hold` shows the two holds. Jacopo uses `sudo agent-hold pull "reason"` and
 `sudo agent-hold release`; `agent-hold` shows his marker at `/etc/agent-hold`.
+`pull` always works: if the shared lock `/etc/agent-hold.lock` is blocked, missing or
+tampered with, it pulls anyway and says "break-glass". `release` waits for the lock and
+keeps the hold if it cannot get it; `sudo agent-hold release --force` releases regardless.
 Everyone else uses `task hold pull "reason"` with `TASK_HOLDER` set or `--holder <name>`.
 `task hold release` also requires `TASK_HOLDER` or `--holder <name>` and removes only
 `~/.local/state/task/hold`, never Jacopo's marker. Names provide attribution, not authentication;
