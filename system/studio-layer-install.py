@@ -16,6 +16,20 @@ import tarfile
 import tempfile
 
 
+def runtime_paths():
+    # Resolve in the agent's login environment, never the invoking admin's PATH.
+    script = 'command -v codex; mise which node; mise which uv'
+    result = subprocess.run(['/usr/sbin/runuser', '-u', 'agent', '--', '/bin/bash', '-lc', script],
+                            check=True, capture_output=True, text=True, timeout=30)
+    lines = result.stdout.splitlines()
+    if len(lines) != 3:
+        raise ValueError('runtime resolution failed')
+    paths = {name: str(Path(value).resolve(strict=True)) for name, value in zip(('codex', 'node', 'uv'), lines)}
+    if any(not Path(value).is_absolute() or not Path(value).is_file() or not os.access(value, os.X_OK) for value in paths.values()):
+        raise ValueError('runtime path unavailable')
+    return paths
+
+
 def install(pin, checkout, root=Path('/')):
     pin = Path(pin)
     custody_root = pin.parent.parent
@@ -127,6 +141,15 @@ def install(pin, checkout, root=Path('/')):
               'runner': {'argv': ['/usr/local/bin/layer-agent-runners'], 'state': '/home/agent/.local/state/studio-layer/state'}}
     etc = root / 'etc/studio-layer'
     protected_dir(etc)
+    runtimes = (json.dumps(runtime_paths(), separators=(',', ':')) + '\n').encode()
+    runtime_target = etc / 'runtime-paths.json'
+    if runtime_target.is_symlink() or (runtime_target.exists() and (not runtime_target.is_file() or runtime_target.stat().st_mode & 0o777 != 0o644 or (root == Path('/') and runtime_target.stat().st_uid != 0))):
+        raise ValueError('unsafe runtime configuration')
+    with tempfile.NamedTemporaryFile(dir=etc, delete=False) as f:
+        f.write(runtimes)
+        os.fchmod(f.fileno(), 0o644)
+        runtime_tmp = f.name
+    os.replace(runtime_tmp, runtime_target)
     target = etc / 'hold-config.json'
     data = (json.dumps(config, separators=(',', ':')) + '\n').encode()
     if target.is_symlink() or (target.exists() and target.read_bytes() != data):

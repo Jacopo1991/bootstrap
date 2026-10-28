@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory() as tmp:
     root = base / 'root'
     root.mkdir()
     refused(lambda: mod.install(pin, checkout, root))
-    with patch.object(mod.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=987654, pw_gid=987654)), patch.object(mod.os, 'getgrouplist', return_value=[987654]):
+    with patch.object(mod.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=987654, pw_gid=987654)), patch.object(mod.os, 'getgrouplist', return_value=[987654]), patch.object(mod, 'runtime_paths', return_value={'codex': '/fixture/codex', 'node': '/fixture/node', 'uv': '/fixture/uv'}):
         pin.unlink()
         pin.symlink_to(pins / 'other')
         refused(lambda: mod.install(pin, checkout, root))
@@ -59,6 +59,7 @@ with tempfile.TemporaryDirectory() as tmp:
             refused(lambda: mod.install(pin, checkout, root))
         mod.install(pin, checkout, root)
         mod.install(pin, checkout, root)
+        assert '"node":"/fixture/node"' in (root / 'etc/studio-layer/runtime-paths.json').read_text()
         assert (root / 'usr/local/lib/studio-layer/current/archon').read_bytes() == binary.read_bytes()
         qualified = root / 'etc/studio-layer/qualified'
         qualified.write_text('release=' + revision + '\n')

@@ -31,10 +31,9 @@ LOCK = MARKER + '.lock'
 OWNER = '/usr/local/bin/agent-hold'
 CORE = '/usr/local/lib/studio-layer/current/core'
 children = set()
-armed = False
 initial_identity = None
 held_fd = None
-checks = {name: False for name in ('a-break-glass', 'b-reader-wait', 'c-cleanup')}
+checks = {name: False for name in ('a-break-glass', 'b-reader-wait')}
 
 
 def passed(name):
@@ -118,17 +117,6 @@ def cleanup():
     if held_fd is not None:
         os.close(held_fd)
         held_fd = None
-    if not armed:
-        return
-    # Never unlink the marker ourselves; the real owner release must take flock.
-    code = owner('release')
-    s = os.lstat(LOCK)
-    require(code == 0 and not os.path.lexists(MARKER),
-            'owner release failed: Jacopo must run sudo agent-hold release')
-    require((s.st_dev, s.st_ino) == initial_identity, 'lock identity changed')
-    require(stat.S_ISREG(s.st_mode) and s.st_nlink == 1
-            and stat.S_IMODE(s.st_mode) == 0o600, 'lock metadata changed')
-    passed('c-cleanup')
 
 
 def interrupted(signum, frame):
@@ -155,27 +143,6 @@ try:
                  CORE + '/safe_core.py', CORE + '/layer_core.py'):
         print('SOURCE ' + path + ' sha256=' + hashlib.sha256(Path(path).read_bytes()).hexdigest(), flush=True)
     print('LOCK dev=%s inode=%s; reader uid=%s' % (*initial_identity, agent.pw_uid), flush=True)
-    armed = True
-
-    # Break-glass must pull even after a five-second lock timeout.
-    held_fd = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    require((os.fstat(held_fd).st_dev, os.fstat(held_fd).st_ino) == initial_identity,
-            'lock changed before probe')
-    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    started = time.monotonic()
-    result = subprocess.run([OWNER, 'pull', 'qualification'], capture_output=True, timeout=8)
-    require(result.returncode == 0 and b'break-glass' in result.stderr
-            and time.monotonic() - started < 7 and os.path.isfile(MARKER),
-            'break-glass pull failed')
-    require(owner('release') != 0 and os.path.lexists(MARKER),
-            'release did not preserve hold under contention')
-    result = subprocess.run([OWNER, 'release', '--force'], capture_output=True, timeout=8)
-    require(result.returncode == 0 and not os.path.lexists(MARKER),
-            'forced release failed')
-    os.close(held_fd)
-    held_fd = None
-    passed('a-break-glass')
-
     # (b) Audit hooks pause immediately BEFORE the actual os.replace syscall.
     # The unchanged installed command body has already acquired its own flock.
     ready_r, ready_w = os.pipe()
@@ -224,6 +191,20 @@ try:
     signal_byte(reader_r, b'D')
     require(wait(reader) == 0, 'core reader failed after mutation')
     passed('b-reader-wait')
+
+    # The hold stays pulled, including on failure or interrupt.
+    held_fd = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    require((os.fstat(held_fd).st_dev, os.fstat(held_fd).st_ino) == initial_identity,
+            'lock changed before probe')
+    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    started = time.monotonic()
+    result = subprocess.run([OWNER, 'pull', 'qualification'], capture_output=True, timeout=8)
+    require(result.returncode == 0 and b'break-glass' in result.stderr
+            and time.monotonic() - started < 7 and os.path.isfile(MARKER),
+            'break-glass pull failed')
+    require(owner('release') != 0 and os.path.lexists(MARKER),
+            'release did not preserve hold under contention')
+    passed('a-break-glass')
 except BaseException as error:
     # Exception text may originate in runtime code: report type, never contents.
     print('FAIL probe (' + type(error).__name__ + ')', flush=True)
@@ -234,7 +215,7 @@ finally:
     try:
         cleanup()
     except BaseException:
-        print('FAIL c-cleanup: run sudo agent-hold release and investigate lock identity.', flush=True)
+        print('FAIL cleanup: investigate owned probe processes.', flush=True)
     for name, ok in checks.items():
         if not ok:
             print('FAIL ' + name, flush=True)
@@ -262,6 +243,8 @@ if all(checks.values()):
         print('PASS qualified', flush=True)
     except BaseException:
         print('FAIL qualified marker', flush=True)
+        print('Hold left in place; after reading the result, run sudo agent-hold release.', flush=True)
         sys.exit(1)
+print('Hold left in place if pulled; after reading the result, run sudo agent-hold release.', flush=True)
 sys.exit(0 if all(checks.values()) else 1)
 PY
