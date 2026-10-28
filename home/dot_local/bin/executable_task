@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_usage
 import task_lock
+from task_hold_lock import marker_lock
 import task_wake
 from task_limits import bwrap_denial, cli_limit, lane_limit, round_cause, SETUP_CAUSES
 from task_routing import TIERS, TOP_ONLY, route, guards, tier_guard,lane_limits, active, override_problem, RoutingParseError
@@ -5368,16 +5369,19 @@ def hold_status():
     held = []
     for path, release in ((JACOPO_HOLD, 'Jacopo: sudo agent-hold release'),
                           (HOME / '.local/state/task/hold', 'task hold release')):
-        try: mode = path.lstat().st_mode
-        except FileNotFoundError: continue
+        try:
+            with marker_lock(path) if path == JACOPO_HOLD else contextlib.nullcontext():
+                try: mode = path.lstat().st_mode
+                except FileNotFoundError: continue
+                except OSError as error: detail = f'cannot inspect: {error}'
+                else:
+                    try:
+                        if not stat.S_ISREG(mode): raise OSError('not a regular file')
+                        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
+                            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise OSError('not a regular file')
+                            detail = stream.read().strip()
+                    except (OSError, UnicodeError) as error: detail = f'cannot read: {error}'
         except OSError as error: detail = f'cannot inspect: {error}'
-        else:
-            try:
-                if not stat.S_ISREG(mode): raise OSError('not a regular file')
-                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
-                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise OSError('not a regular file')
-                    detail = stream.read().strip()
-            except (OSError, UnicodeError) as error: detail = f'cannot read: {error}'
         held.append(f'{path}: held (drain) {detail}\nRelease: {release}')
     return '\n'.join(held)
 

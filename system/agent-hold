@@ -2,11 +2,13 @@
 import os, stat, sys, tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from task_hold_lock import marker_lock
 marker = Path("/etc/agent-hold")
 try:
     action = sys.argv[1] if len(sys.argv) > 1 else ''
-    if action:
-        if os.geteuid() != 0: raise OSError('Use sudo agent-hold to pull or release Jacopo\'s hold')
+    if action and os.geteuid() != 0: raise OSError('Use sudo agent-hold to pull or release Jacopo\'s hold')
+    with marker_lock(marker, exclusive=bool(action)):
+      if action:
         if action == 'pull' and len(sys.argv) == 3 and sys.argv[2].strip():
             with tempfile.NamedTemporaryFile(mode='w', dir=marker.parent, delete=False) as stream:
                 stream.write(f'drain jacopo {datetime.now(timezone.utc).isoformat()}: {sys.argv[2]}\n')
@@ -14,12 +16,12 @@ try:
             os.replace(stream.name, marker)
         elif action == 'release' and len(sys.argv) == 2: marker.unlink(missing_ok=True)
         else: raise OSError('Usage: agent-hold [pull "reason" | release]')
-    try: mode = marker.lstat().st_mode
-    except FileNotFoundError: print(f'{marker}: no hold'); sys.exit(0)
-    if not stat.S_ISREG(mode): raise OSError('not a regular file')
-    with os.fdopen(os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise OSError('not a regular file')
-        print(f'{marker}: held (drain) {stream.read().strip()}')
+      try: mode = marker.lstat().st_mode
+      except FileNotFoundError: print(f'{marker}: no hold'); sys.exit(0)
+      if not stat.S_ISREG(mode): raise OSError('not a regular file')
+      with os.fdopen(os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
+          if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise OSError('not a regular file')
+          print(f'{marker}: held (drain) {stream.read().strip()}')
 except (OSError, UnicodeError) as error:
     print(f'{marker}: held / cannot inspect or change hold: {error}', file=sys.stderr)
     sys.exit(1)

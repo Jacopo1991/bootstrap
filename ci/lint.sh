@@ -72,6 +72,7 @@ run python3 ci/gate-browser-test.py
 run python3 ci/skills-hooks-test.py
 run python3 ci/workspace-tidy-test.py
 run python3 ci/task-test.py
+run python3 checks/hold-lock-test.py
 run python3 ci/task-usage-test.py
 run python3 ci/task-batch-test.py
 run python3 ci/task-line-budget-test.py
