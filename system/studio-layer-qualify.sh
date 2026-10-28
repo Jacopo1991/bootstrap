@@ -34,6 +34,8 @@ children = set()
 initial_identity = None
 held_fd = None
 checks = {name: False for name in ('a-break-glass', 'b-reader-wait')}
+experiment_ok = False
+cleanup_ok = False
 
 
 def passed(name):
@@ -191,7 +193,6 @@ try:
     require(wait(writer) == 0, 'instrumented installed writer failed')
     signal_byte(reader_r, b'D')
     require(wait(reader) == 0, 'core reader failed after mutation')
-    passed('b-reader-wait')
 
     # The hold stays pulled, including on failure or interrupt.
     held_fd = os.open(LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -205,12 +206,15 @@ try:
             'break-glass pull failed')
     require(owner('release') != 0 and os.path.lexists(MARKER),
             'release did not preserve hold under contention')
-    passed('a-break-glass')
     final = os.lstat(LOCK)
     require((final.st_dev, final.st_ino) == initial_identity and
             (final.st_uid, final.st_gid, stat.S_IMODE(final.st_mode), final.st_nlink) == initial_metadata,
             'lock identity or metadata changed')
+    passed('b-reader-wait')
+    passed('a-break-glass')
+    experiment_ok = True
 except BaseException as error:
+    experiment_ok = False
     # Exception text may originate in runtime code: report type, never contents.
     print('FAIL probe (' + type(error).__name__ + ')', flush=True)
 finally:
@@ -219,12 +223,13 @@ finally:
         signal.signal(sig, signal.SIG_IGN)
     try:
         cleanup()
+        cleanup_ok = True
     except BaseException:
         print('FAIL cleanup: investigate owned probe processes.', flush=True)
     for name, ok in checks.items():
         if not ok:
             print('FAIL ' + name, flush=True)
-if all(checks.values()):
+if experiment_ok and cleanup_ok and all(checks.values()):
     try:
         release = os.path.realpath('/usr/local/lib/studio-layer/current')
         commit = os.path.basename(release)
@@ -251,5 +256,5 @@ if all(checks.values()):
         print('Hold left in place; after reading the result, run sudo agent-hold release.', flush=True)
         sys.exit(1)
 print('Hold left in place if pulled; after reading the result, run sudo agent-hold release.', flush=True)
-sys.exit(0 if all(checks.values()) else 1)
+sys.exit(0 if experiment_ok and cleanup_ok and all(checks.values()) else 1)
 PY
