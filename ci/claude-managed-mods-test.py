@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hosted checks: managed-mods drop-in content and the policy hook's denials.
+"""Hosted checks: managed-mods drop-in content (the policy hook was removed in decision-38).
 
 The pinned Claude Code release may predate mods, so these checks assert the
 deployed policy and the hook's verdicts, not mod loading itself.

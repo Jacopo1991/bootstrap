@@ -2,8 +2,8 @@
 """Hosted checks: agent guardrails live in root-owned managed config, and only guardrails.
 
 Claude Code: system/claude-managed-guardrails.json -> /etc/claude-code/managed-settings.d/
-10-agent-guardrails.json (deny rules, policy hooks). Codex: system/codex-requirements.toml ->
-/etc/codex/requirements.toml (hooks feature, policy hooks, forbidden/prompt rules). Nothing in
+10-agent-guardrails.json (deny rules, context reminder hook). Codex: system/codex-requirements.toml ->
+/etc/codex/requirements.toml (hooks feature, context reminder hook, forbidden/prompt rules). Nothing in
 either may limit bypass/auto mode, approval policy, sandbox choice or the user's own hooks.
 """
 import ast

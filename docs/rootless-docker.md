@@ -4,11 +4,11 @@ Evaluations that run model-written code (Inspect AI) use a Docker daemon that ru
 
 ## Why lanes cannot use it
 
-A Docker socket gives the full power of the `agent` user: a container can bind-mount any path the agent can read and write anywhere the agent can. That would bypass the Claude and Codex lane sandboxes and the policy hook. So only unsandboxed agent processes reach the socket (the PM shell, a user unit, `task`). Lane sessions do not:
+A Docker socket gives the full power of the `agent` user: a container can bind-mount any path the agent can read and write anywhere the agent can. That would bypass the Claude and Codex lane sandboxes and the managed deny rules. So only unsandboxed agent processes reach the socket (the PM shell, a user unit, `task`). Lane sessions do not:
 
 - The Claude sandbox blocks creating Unix sockets, and its settings have no `allowUnixSockets` entry.
 - The Codex `workspace-write` sandbox refuses AF_UNIX sockets in its built-in seccomp filter, with network access on or off (measured 2026-10-22: `socket() EPERM`, zero connections counted at the listener). No Codex setting exists to add; the live containment check below is what keeps this true.
-- The policy hook denies `docker`, `podman`, `nerdctl` and any `DOCKER_HOST`/`DOCKER_*` setting in lane sessions.
+- The policy hook that denied `docker`, `podman`, `nerdctl` and `DOCKER_*` settings was removed in decision-38. Native rules only deny reading `~/.docker/config.json`; the two sandbox facts above are what keep lanes off the socket.
 - `checks/docker-containment.py` proves it from inside each sandbox; run it after install (see below).
 
 ## Start an evaluation

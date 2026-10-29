@@ -42,7 +42,7 @@ cmp -s "$tmp/just" "$HOME/.local/bin/just" || install -m 0755 "$tmp/just" "$HOME
 just_expected=${JUST_URL##*/download/}
 [[ $("$HOME/.local/bin/just" --version) == "just ${just_expected%%/*}" ]]
 # Antigravity CLI (agy): the release tarball is SHA-checked before restore.
-# The vendor's install script is never run. Lanes cannot run agy (policy hook, T-48).
+# The vendor's install script is never run. Agents do not run agy (the T-48 policy hook refusal was removed in decision-38).
 install_agy
 pre_commit_root="$HOME/.local/share/bootstrap/pre-commit"
 mise exec -- uv venv --quiet --allow-existing --python "$(mise which python)" "$pre_commit_root/venv"
