@@ -2,7 +2,7 @@
 
 For the PM, after bootstrap has installed the pinned `agy` release (T-61). Agents do not run these steps:
 the login is Jacopo's, and the probe runs from an unsandboxed PM shell, because lane sessions
-are refused `agy` by the policy hook.
+cannot reach the login and the probe is not an agent step (the policy hook that refused `agy` in lanes was removed in decision-38).
 
 Public material only until Google's data terms are checked. Never paste the login URL, the
 login code, a token, or any part of `~/.gemini` into a prompt, a repository, a log or a report.

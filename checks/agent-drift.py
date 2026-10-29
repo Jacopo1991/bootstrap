@@ -140,7 +140,7 @@ def configured_mcp_names(home: Path) -> set[str]:
 
 
 # The AgentDev shell connector is for PM seats in the Claude app only; it bypasses the
-# policy hook, so no Claude Code or Codex configuration may start it.
+# sandbox and managed deny rules, so no Claude Code or Codex configuration may start it.
 SHELL_CONNECTOR_MARKERS = ("agentdev-shell", "desktop-commander", "desktopcommander",
                            "wonderwhy-er", "claude-server-commander")
 

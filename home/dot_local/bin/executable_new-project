@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Create a new project the standard way (slim workflow, 2026-10-04).
 # Run by the founder or the PM from a normal shell as the agent user, never from inside an agent session
-# (the agent policy hook blocks git init there on purpose).
+# (agent sessions do not run it; the policy hook that blocked git init there was removed in decision-38).
 #   new-project create <name> [--local-only]   code repo + cortex-kb repo, each on main with the pre-commit gate and a first commit
 #   new-project publish <name>                 after the PM created both GitHub repos: add origin and push
 set -euo pipefail

@@ -15,8 +15,8 @@ deny = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text(
     encoding="utf-8"))["permissions"]["deny"]
 
 # Rules with a colon after a wildcard (for example 'git push * :* *') or a trailing ':*'
-# after a space print a warning in every session; the policy hook enforces refspec
-# colons instead (ci/agent-config-test.py).
+# after a space print a warning in every session, so no such rule is used (the policy hook
+# that once enforced refspec colons was removed in decision-38).
 for entry in deny:
     assert not re.search(r"\*\s+:|\s:\*|:\*\)$", entry), f"warning-prone deny rule: {entry}"
 for entry in ("Bash(git push * :* *)", "Bash(/usr/bin/git push * :* *)"):
@@ -26,7 +26,7 @@ for entry in ("Bash(git push * :* *)", "Bash(/usr/bin/git push * :* *)"):
 assert settings["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
 
 # Plugins a coding lane never needs are off. desktop-commander runs commands and edits
-# files outside the policy hook, so it must never load in an agent session.
+# files outside the sandbox and deny rules, so it must never load in an agent session.
 plugins = settings["enabledPlugins"]
 for name in ("desktop-commander", "design", "product-management", "cowork-plugin-management"):
     assert plugins.get(name + "@synced") is False, name
