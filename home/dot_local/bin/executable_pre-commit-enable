@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Add the standard local quality gate to an existing checkout (slim workflow, 2026-10-05).
 # Run by the founder or the PM from a normal shell as the agent user, never from inside an agent session
-# (the agent policy hook blocks writes to .git/hooks there on purpose).
+# (agent sessions do not run it; the policy hook that blocked .git/hooks writes was removed in decision-38).
 #   pre-commit-enable <checkout>   write .pre-commit-config.yaml if absent and install the pre-commit hook
 set -euo pipefail
 

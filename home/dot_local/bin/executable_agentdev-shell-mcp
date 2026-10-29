@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Starts the pinned Desktop Commander MCP server over stdio as the agent user, one per Claude
 # app session of a PM seat (wsl.exe -d AgentDev -u agent -- /home/agent/.local/bin/agentdev-shell-mcp).
-# Never for Claude Code or Codex sessions: it bypasses the policy hook. It opens no network
+# Never for Claude Code or Codex sessions: it bypasses the sandbox and managed deny rules. It opens no network
 # port; AgentDev itself is the boundary. stdout belongs to MCP, so this script writes only to
 # stderr before the exec.
 set -euo pipefail

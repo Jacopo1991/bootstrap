@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hosted tests for native settings and policy-hook negative controls."""
+"""Hosted tests for native settings and negative controls (the policy hook was removed in decision-38)."""
 import importlib.util
 import hashlib
 import json

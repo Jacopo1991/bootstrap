@@ -302,7 +302,7 @@ model files; no model service or credentials are used.
 ### Design step 10 — minimal agent configuration and drift report
 
 The existing chezmoi apply manages Codex and Claude Code's global instructions,
-native permissions, and one shared pre-tool policy hook. Codex uses the supported `on-request` approval policy, routes approvals to
+native permissions, and a nonblocking context reminder hook. The command-parsing policy hook was removed in decision-38. Codex uses the supported `on-request` approval policy, routes approvals to
 the user, and uses the managed `lane` profile, which extends `:workspace` and enables
 network access through a host allowlist proxy. The `review` profile extends
 `:read-only` and has no network access. The retired
@@ -313,15 +313,14 @@ unavailable. The base image pins the sandbox's `bubblewrap` and `socat`
 dependencies. Claude's optional seccomp add-on is not installed; Windows interop
 and drive automount remain disabled by the distro baseline.
 
-The policy hook blocks Windows/host commands, file-tool writes outside the
-current repository, shell writes outside that repository, and commits whose
-staged diff cannot pass the pinned Gitleaks scan. The one writable place outside
-a repository is the review scratch `/tmp/claude-<uid>/scratch/`, and only while
-`/tmp/claude-<uid>` (Claude Code's `$TMPDIR`) is a real directory owned by the
-agent and closed to others; symlinks out of it are refused. The Codex hooks are
+The command-parsing policy hook (Windows/host command refusal, write-location checks,
+the staged-diff Gitleaks scan) was removed in decision-38 and no longer enforces anything.
+What remains is native: the managed deny rules (Windows/host launchers such as
+`powershell.exe`, `cmd.exe` and `wsl.exe`), the Claude native sandbox and Codex
+workspace sandbox, which enforce subprocess and write boundaries, and the approval
+rules. The one remaining hook is the nonblocking context reminder. The Codex hooks are
 managed (below), so Codex trusts them by policy and `/hooks` cannot disable them;
-no hook-trust review or bypass is involved. Hooks are additional guardrails; the
-Codex workspace sandbox and Claude native sandbox enforce subprocess boundaries.
+no hook-trust review or bypass is involved.
 
 #### Managed guardrails
 
@@ -489,8 +488,8 @@ load; built-in mods and the agent's own settings hooks are unaffected. The
 directory and file are `root:root` and not writable by the agent, and CI checks
 that. The option is read from managed settings only, so it is deliberately not
 in the agent's `~/.claude/settings.json`. `disableSideloadFlags` is not set
-because it would also reject `--agents` and `--mcp-config`. The policy hook
-itself is a managed hook (above), which a mod cannot override either. The pinned
+because it would also reject `--agents` and `--mcp-config`. The remaining reminder
+hook is a managed hook (above), which a mod cannot override either. The pinned
 Claude Code release is 2.1.287 or later, so
 the distro job's last step (`ci/claude-mods-load-test.sh`) runs a fixture mod both
 with `--plugin-dir` and installed into the agent's plugin scope: neither answers
@@ -653,7 +652,7 @@ force high risk; attempting to lower it names the matching path and refuses.
 Patterns apply to the whole repository-relative path, with `*` matching any part;
 the `"*"` repository entry applies everywhere. Defaults cover every repo's `policy/**`,
 skill rules and references, agent instructions, `INTENT.md` and decision records,
-and bootstrap's agent-policy hook/rule tables, managed settings, Codex sandbox/rules,
+and bootstrap's agent-policy tables, managed settings, Codex sandbox/rules,
 hold script/markers, boundary checks, Git credential settings and gitleaks config.
 The task executable itself is excluded. The complete paths are in the example policy.
 
@@ -809,7 +808,7 @@ is normal.
 
 The app-side PM plans the batch, talks to Jacopo and gets his go. It may then
 launch one headless Codex batch runner with `--model gpt-6.1-sol` and
-`--dangerously-bypass-approvals-and-sandbox`; the managed policy hook stays active.
+`--dangerously-bypass-approvals-and-sandbox`; the managed requirements and rules stay active.
 The runner handles only that approved batch: dispatch, trusted checks, cheap
 other-vendor reviews, recording, merge and close on green. A FAIL gets one fix
 round; a second FAIL or a decision needing Jacopo stops the batch.
@@ -949,10 +948,10 @@ The builder defaults to the pinned builder; an explicit builder must match it.
 Codex defaults to `gpt-6-luna` and always uses `codex exec --sandbox workspace-write`.
 Claude uses `claude -p --model sonnet --effort high --permission-mode acceptEdits
 --allowedTools "Bash Read Write Edit Glob Grep"`; its sandbox, configured in
-`settings.json`, and the policy hook remain active. Builders use no bypass flag.
+`settings.json`, and the managed deny rules remain active. Builders use no bypass flag.
 
-The launcher removes hook-blocked Git overrides (`GIT_PAGER`, `GIT_CONFIG*` and
-the hook's `GIT_OVERRIDE_ENV` set) and gate-run ownership variables, preserving
+The launcher removes Git overrides (`GIT_PAGER`, `GIT_CONFIG*` and
+the launcher's `GIT_OVERRIDE_ENV` set, once blocked by the removed policy hook) and gate-run ownership variables, preserving
 other Git variables such as author/committer identity and `GIT_OPTIONAL_LOCKS`.
 It runs from the task worktree, detaches and prints its pid. The final response is
 `.work/final.md`, logs are `.work/lane.log`, and `task status` shows the lane as
@@ -1102,7 +1101,7 @@ Desktop Commander, which started a new `wsl.exe` launcher per command and left g
 behind when a call hung. Long-lived processes go through `start_process` and
 `read_process_output`.
 
-- **Never in agent sessions.** It bypasses the policy hook, so no Claude Code or Codex
+- **Never in agent sessions.** It bypasses the sandbox and managed deny rules, so no Claude Code or Codex
   configuration may start it. `ci/shell-connector-test.py` fails if a tracked agent-session config
   references it, and `checks/agent-drift.py` reports `shell-connector-in-agent-session` for a live
   registration in `~/.claude.json`, `~/.claude/settings.json` or `~/.codex/config.toml`.
@@ -1580,7 +1579,7 @@ and `ci/package-cap-resolver-test.py`.
   it is also a `PreToolUse` hook that adds a "read the github-ci skill first" note before a
   Write/Edit/Bash that touches `.github/workflows` or changes repository settings (`gh repo edit`,
   `gh secret set`, `gh workflow run`, `gh api` with a write method on a settings endpoint). It
-  only adds context; it never blocks, and `pre_tool_use.py` stays the policy gate. Codex has the
+  only adds context; it never blocks and is not a policy gate (`pre_tool_use.py` was removed in decision-38). Codex has the
   same per-prompt reminder; only Claude Code gets the tool-call note.
   Missing files, wrong paths and hook denials are resolved within authority or reported;
   they do not count as repeated failing checks and guardrails must never be bypassed.
@@ -1929,25 +1928,24 @@ any Actions execution policy. A manual run defaults to a read-only candidate
 preview; select the non-preview option only when a pull request is intended.
 
 The uv cooldown applies only where versions are chosen: this monthly bump and a
-hand-run lock upgrade. Outside agent sessions (the policy hook refuses inline
-`--exclude-newer`), upgrade a `uv.lock` with the cutoff passed explicitly:
+hand-run lock upgrade. Outside agent sessions (the removed policy hook used to refuse inline
+`--exclude-newer`; nothing native refuses it now), upgrade a `uv.lock` with the cutoff passed explicitly:
 
 ```bash
 uv lock --upgrade --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
 It never goes in the user uv config, `uv.toml` or `[tool.uv]`: there it refuses young
-exact pins and breaks existing locks (T-37). The policy hook refuses uv commands
-when a `uv.toml` or `pyproject.toml [tool.uv]` between the working directory and
-the repository root sets `exclude-newer` or `exclude-newer-package`, as it
-refuses the inline `--exclude-newer` and `UV_EXCLUDE_NEWER` forms.
+exact pins and breaks existing locks (T-37). The policy hook that refused uv commands
+under such a config, and the inline `--exclude-newer` and `UV_EXCLUDE_NEWER` forms,
+was removed in decision-38; nothing native refuses them now.
 
 
 ### Repository commands and approved network access
 
 Founder decision 2026-10-02: Claude Code uses `acceptEdits`, with explicit
 allow rules for `git *`, `gh *`, `/usr/bin/git *` and `/usr/bin/gh *`, and no
-Git/gh ask rules. The deny list and PreToolUse hook remain active as managed settings.
+Git/gh ask rules. The managed deny list remains active (the command-parsing PreToolUse hook was removed in decision-38).
 The sandbox remains enabled, with `allowUnsandboxedCommands: false`.
 Its exclusions are exactly `git`, `gh`, `git *`, `gh *`, `/usr/bin/git *`
 and `/usr/bin/gh *`: bare names alone only match argument-less calls.

@@ -31,7 +31,7 @@ for entry in ("Bash(git push * :* *)", "Bash(/usr/bin/git push * :* *)", "Bash(g
 assert settings["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
 
 # Plugins a coding lane never needs are off. desktop-commander runs commands and edits
-# files outside the policy hook, so it must never load in an agent session.
+# files outside the sandbox and deny rules, so it must never load in an agent session.
 plugins = settings["enabledPlugins"]
 for name in ("desktop-commander", "design", "product-management", "cowork-plugin-management"):
     assert plugins.get(name + "@synced") is False, name
