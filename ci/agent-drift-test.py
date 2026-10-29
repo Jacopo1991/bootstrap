@@ -23,7 +23,7 @@ expected = {"claude", "codex", "bws", "secretspec", "gitleaks", "ccusage",
             "new-project", "qmd-refresh", "gh-skill-update", "workspace-tidy", "task", "task-batch", "job-ping",
             "task-watch", "task-smoke", "agentdev-shell-mcp", "agentdev-backlog-mcp"}
 assert drift.EXPECTED_BINARIES == expected
-allowed_helpers = {"task_limits.py", "task_routing.py", "task_usage.py", "task_lock.py", "task_wake.py"}
+allowed_helpers = {"task_limits.py", "task_routing.py", "task_usage.py", "task_lock.py", "task_hold_lock.py", "task_wake.py"}
 # Every command the bootstrap installs into ~/.local/bin is expected, not drift.
 for script in (ROOT / "home/dot_local/bin").iterdir():
     if script.is_file():
