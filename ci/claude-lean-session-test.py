@@ -15,12 +15,17 @@ deny = json.loads((ROOT / "system/claude-managed-guardrails.json").read_text(
     encoding="utf-8"))["permissions"]["deny"]
 
 # Rules with a colon after a wildcard (for example 'git push * :* *') or a trailing ':*'
-# after a space print a warning in every session; the policy hook enforces refspec
-# colons instead (ci/agent-config-test.py).
+# after a space print a warning in every session. The only colon rules are the six remote-deletion
+# refspec denials that replaced the removed policy hook (decision-38); Claude Code warns once for
+# each (a `:*` that is not at the end is a plain wildcard) and they are verified to match.
+REFSPEC_DENIES = {f"Bash({exe} push * {quote}:**)" for exe in ("git", "/usr/bin/git")
+                  for quote in ("", "'", '"')}
+assert REFSPEC_DENIES <= set(deny)
 for entry in deny:
-    assert not re.search(r"\*\s+:|\s:\*|:\*\)$", entry), f"warning-prone deny rule: {entry}"
-for entry in ("Bash(git push * :* *)", "Bash(/usr/bin/git push * :* *)"):
-    assert entry not in deny, entry
+    if entry not in REFSPEC_DENIES:
+        assert not re.search(r"\*\s+:|\s:\*|:\*\)$", entry), f"warning-prone deny rule: {entry}"
+for entry in ("Bash(git push * :* *)", "Bash(/usr/bin/git push * :* *)", "Bash(git push * :*)"):
+    assert entry not in deny, entry  # a trailing :* would be a prefix rule that denies every push
 
 # claude.ai connectors (Gmail, Calendar, Drive, ...) stay out of coding sessions.
 assert settings["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
@@ -52,5 +57,5 @@ for name, (script, command) in registered.items():
 install = (ROOT / "install.sh").read_text(encoding="utf-8")
 assert install.index("chezmoi --source") < install.index("context7-setup.sh")
 assert not settings.get("mcpServers")
-print("PASS: lean Claude Code session settings (no warning-prone rules, connectors off, "
+print("PASS: lean Claude Code session settings (no warning-prone rules beyond the refspec denials, connectors off, "
       "plugins and MCP servers as approved)")

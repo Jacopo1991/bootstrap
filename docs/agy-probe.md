@@ -2,7 +2,7 @@
 
 For the PM, after bootstrap has installed the pinned `agy` release (T-61). Agents do not run these steps:
 the login is Jacopo's, and the probe runs from an unsandboxed PM shell, because lane sessions
-are refused `agy` by the policy hook.
+are denied `agy` by the managed Claude and Codex rules (T-48).
 
 Public material only until Google's data terms are checked. Never paste the login URL, the
 login code, a token, or any part of `~/.gemini` into a prompt, a repository, a log or a report.
@@ -37,7 +37,7 @@ CLI, not from this document), send one public-material prompt:
 
 Use a prompt with nothing private in it, for example a question about a public library's
 documentation. Record the model name and whether the reply came back. Do not use
-`--dangerously-skip-permissions` (refused in every session).
+`--dangerously-skip-permissions` (denied in agent shell commands by the managed Claude rule).
 
 ## 3. Quota
 

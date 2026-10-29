@@ -89,9 +89,11 @@ for forbidden in ("~/.local/state", "~/.codex", "~/.agents", "~/.ssh", "**/.git"
 tools_template = (ROOT / "home/.chezmoitemplates/tools.sh").read_text(encoding="utf-8")
 assert 'mkdir -p "$HOME/.cache/uv" "$HOME/.cache/pre-commit" "$HOME/.cache/pip" "$HOME/.npm"' in tools_template
 assert "Read(~/.config/gh/**)" in claude["permissions"]["deny"]
-# T-48: the Antigravity sign-in folder is unreadable to Claude; Codex has no native deny here, so its
-# guard is the policy hook on Bash and apply_patch (checked above), tested in ci/managed-policy-test.py.
+# T-48: the Antigravity sign-in folder is unreadable and unwritable to Claude (file tools and, merged
+# into the sandbox, shell commands) and denied in both Codex profiles (shell and apply_patch alike).
 assert "Read(~/.gemini/**)" in claude["permissions"]["deny"]
+assert "Edit(~/.gemini/**)" in claude["permissions"]["deny"]
+assert all(profile["filesystem"]["~/.gemini"] == "deny" for profile in requirements["permissions"].values())
 assert "Bash(git merge *)" not in claude["permissions"]["deny"]
 assert "Bash(gh pr merge *)" in claude["permissions"]["deny"]
 assert not any("*" in d for d in claude["sandbox"]["network"]["allowedDomains"])
@@ -106,12 +108,20 @@ for executable in ("git", "/usr/bin/git"):
                  "push origin HEAD -f", "push origin -fextra",
                  "push --delete origin branch", "push origin branch --delete"):
         assert claude_denies(executable + " " + tail), tail
-    # The native grammar cannot express "an argument starting with a colon", and a rule
-    # such as 'git push * :* *' prints a warning in every session. The hook denies every
-    # ':refspec' position instead (tested below), so no such native rule may exist.
-    assert not claude_denies(executable + " push origin HEAD:refs/heads/task")
-assert not any(entry.endswith(":*)") or " :" in entry for entry in claude["permissions"]["deny"]), \
-    "refspec colon rules are enforced by the hook; native colon rules print warnings"
+    # Remote deletion by refspec (the removed hook refused an argument starting with a colon, quoted
+    # or not; `HEAD:refs/heads/x` stayed allowed). Claude Code reads a trailing `:*` as a prefix
+    # rule (it would deny every push) and warns about any `:*` elsewhere, so the rules end in `:**`.
+    for tail in ("push origin :task", "push -u origin :task", "push origin HEAD :task",
+                 "push origin ':task'", 'push origin ":task"', "push origin :refs/heads/task"):
+        assert claude_denies(executable + " " + tail), tail
+    for tail in ("push origin HEAD:refs/heads/task", "push -u origin HEAD", "push origin task"):
+        assert not claude_denies(executable + " " + tail), tail
+    assert claude_denies(executable + " update-ref refs/heads/x HEAD")
+    assert not claude_denies(executable + " status")
+assert not any(entry.endswith(":*)") for entry in claude["permissions"]["deny"]), \
+    "a trailing :* is a prefix rule in Claude Code and would deny every push"
+for command in ("agy -p hi", "antigravity --version", "claude --dangerously-skip-permissions -p x"):
+    assert claude_denies(command), command
 for executable in ("gh", "/usr/bin/gh"):
     for tail in ("repo delete fixture", "repo edit fixture", "release delete fixture",
                  "secret list", "ruleset list", "api -X DELETE repos/fixture",
@@ -127,7 +137,7 @@ assert rules.count('decision = "prompt"') == 0
 assert rules.count('decision = "forbidden"') == 0
 # Each requirements rule covers git and /usr/bin/git (or gh and /usr/bin/gh) at once.
 decisions = [rule["decision"] for rule in requirements["rules"]["prefix_rules"]]
-assert decisions.count("prompt") == 2 and decisions.count("forbidden") == 6, decisions
+assert decisions.count("prompt") == 2 and decisions.count("forbidden") == 8, decisions
 # Read-deny: Codex runs with an admin permissions profile (not --sandbox, which cannot combine
 # with one) that keeps the write scope of its built-in base and denies the Claude Read list plus
 # credentials, private data and the excluded private repos. Only these profiles may be selected.

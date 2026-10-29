@@ -72,9 +72,11 @@ assert set(managed["permissions"]) == {"deny"}
 for path in keys(managed):  # "permissions" only as the container of the deny list
     assert path == ("permissions",) or path[-1] not in RESTRICTING, path
 deny = managed["permissions"]["deny"]
-assert len(deny) == 89 and len(set(deny)) == 89, len(deny)
+assert len(deny) == 101 and len(set(deny)) == 101, len(deny)
 for rule in ("Bash(gh pr merge *)", "Bash(wsl.exe *)", "Read(~/.ssh/**)", "Read(~/.claude.json)",
-             "Read(~/.gemini/**)", "Edit(//etc/**)", "Bash(git push --force*)",
+             "Read(~/.gemini/**)", "Edit(~/.gemini/**)", "Edit(//etc/**)", "Bash(git push --force*)",
+             "Bash(agy *)", "Bash(antigravity *)", "Bash(* --dangerously-skip-permissions*)",
+             "Bash(git update-ref *)", "Bash(/usr/bin/git update-ref *)", "Bash(git push * :**)",
              "Bash(/usr/bin/gh api * --method=DELETE*)"):
     assert rule in deny, rule
 # One source of truth: the user file keeps preferences only.
@@ -172,8 +174,14 @@ for executable in ("git", "/usr/bin/git"):
                  "stash pop", "stash drop", "stash clear"):
         assert decide([executable, *args.split()]) == "prompt", args
     for args in ("push --force origin HEAD", "push --force-with-lease origin HEAD", "push -f origin HEAD",
-                 "push --delete origin task", "push --mirror origin", "push --prune origin"):
+                 "push --delete origin task", "push --mirror origin", "push --prune origin",
+                 "update-ref refs/heads/x HEAD", "update-ref -d refs/heads/x"):
         assert decide([executable, *args.split()]) == "forbidden", args
+# Antigravity CLI (T-48): refused by name; a refspec starting with a colon cannot be matched by a
+# prefix rule at all (documented residual in the README), so it stays allowed here.
+for command in (["agy", "-p", "hi"], ["antigravity", "--version"]):
+    assert decide(command) == "forbidden", command
+assert decide(["git", "push", "origin", ":task"]) == "allow"
 for executable in ("gh", "/usr/bin/gh"):
     for args in ("issue list", "pr create", "auth status", "api repos/fixture", "repo view", "release list"):
         assert decide([executable, *args.split()]) == "allow", args

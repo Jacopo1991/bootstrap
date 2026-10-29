@@ -376,7 +376,7 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
 `install.sh` publishes the revision to `/opt/machine-bootstrap/current`, then runs, from there:
 
 - `system/claude-managed.sh`: `/etc/claude-code/managed-settings.d/10-agent-guardrails.json`
-  (from `system/claude-managed-guardrails.json`) holds the 88 `permissions.deny` rules and the
+  (from `system/claude-managed-guardrails.json`) holds the 101 `permissions.deny` rules and the
   `PreToolUse`/`UserPromptSubmit` hooks. Managed settings rank above user, project, local and
   `--settings` values, deny rules from any level win over allow rules, managed hooks run
   alongside the user's own hooks, and only a managed `disableAllHooks` can turn them off
@@ -419,8 +419,10 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   after every lane, and before check, review and merge; a mismatch marks the lane `tampered`, stops
   the batch runner and is never repaired automatically. With the shared `refs`
   writable, a lane can also move other local branches (`git branch -f`, `-D`, `-m`), as it could
-  before T-52. The policy hook does not refuse those yet (`git update-ref` is refused; `branch`
-  is not checked), so this is an accepted risk until cortex-core T-42 #5 adds that refusal.
+  before T-52. `git update-ref` is denied natively (Claude `Bash(git update-ref *)` deny, Codex
+  forbidden prefix rule; both match only the plain `git update-ref` form, not `git -C <dir> update-ref`).
+  `branch` is not checked, so moving other local branches stays an accepted risk until
+  cortex-core T-42 #5 adds that refusal.
   Codex builder lanes get private uv, pip, pre-commit and npm caches under their worktree's
   .work/tmp; Claude lanes keep their existing environment. The shared ~/.cache/uv,
   ~/.cache/pip, ~/.cache/pre-commit and ~/.npm stay read-only to lanes because the PM's
@@ -431,6 +433,27 @@ policy, the sandbox choice or the agent's own extra hooks; those stay preference
   (T-56); the change counts as installed only when it passes. Also confirm `codex exec` with
   `-c default_permissions` starts under the requirements (no "overrides cannot both be set" error)
   and that `~/.codex/config.toml` `sandbox_mode` does not conflict.
+
+No native rule can replace these protections of the removed hook (decision-38):
+
+- **Remote-branch deletion by refspec** (`git push origin :task`). Claude denies it (the
+  `Bash(git push * :**)` family, which Claude Code reports once per rule at startup because it
+  contains `:*`; it still matches as a plain wildcard). Codex prefix rules match exact leading
+  tokens only, so they cannot see a refspec that starts with a colon. Residual risk: a Codex
+  session with a push credential can delete a remote branch. The hook never refused
+  `HEAD:refs/heads/other` either (`src:dst` stayed allowed), so that was never a protection.
+  Proposal: a GitHub ruleset on the repository that blocks deletion of, and updates to, every
+  branch except the session's own task branches, which also covers `git -C` and every other
+  spelling that Claude's command-text rules miss.
+- **Environment, option and path variants.** Both vendors' command rules match the command as
+  typed. `git -C <dir> push --force`, a `bash -c` wrapper, an absolute path other than
+  `/usr/bin/git` and `/usr/bin/gh`, or `git push origin HEAD --force` in Codex (the Codex
+  patterns are leading prefixes only) are not matched. The hook's token-level checks of
+  `GIT_*`, `GH_*`, `LD_*` and `PATH` assignments had no native equivalent either.
+- **Lane-only rules** (`git branch -f/-D/-m`, `git tag -f/-d`, `git checkout -B`, `git remote add`,
+  container CLIs). Managed settings apply to every agent session, including the PM's, so a
+  deny there would also stop the PM. A lane-only rule would have to come from the lane launch
+  (for example Claude `--settings`), which is not done here.
 
 Both installers refuse to run unless the policy scripts, `/usr/bin/env`, `/usr/bin/python3`,
 `/usr/bin/git` and the root-owned `/usr/local/bin/gitleaks` (installed by `install.sh`), and
@@ -1423,8 +1446,13 @@ use; 1.4.6 also closed sandbox access to `~/.docker` and `~/.kube`, and 1.4.4 fi
 settings reverting while settings load. The cooldown rule itself is unchanged.
 
 - **Who runs it:** the PM, from an unsandboxed shell (`agy -p "<prompt>"`, `--add-dir <path>`).
-  The policy hook refuses `agy` and `antigravity` in every lane session (T-48). It refuses
-  `--dangerously-skip-permissions` in every session.
+  Agent sessions are denied `agy` and `antigravity` (T-48): Claude `Bash(agy *)` and
+  `Bash(antigravity *)` deny rules, and one Codex forbidden prefix rule. Both match the command
+  name as typed, so an absolute path or a `bash -c` wrapper is not covered by Claude's rule; the
+  `~/.gemini` denies below are what keep the login out of reach. The denial is session-wide: the
+  removed hook allowed it outside lane sessions, and managed settings cannot tell a lane from the
+  PM's agent session. Claude `Bash(* --dangerously-skip-permissions*)` denies that flag in an
+  agent's shell commands; Claude's `disableBypassPermissionsMode` is deliberately not set (above).
 - **Data:** public material only until Google's data terms are checked. According to Google's
   forum reply of 2026-10-09, prompts are not collected for training when `Enable Telemetry` is
   off; public material only until the probe confirms that. The CLI's README says
@@ -1436,10 +1464,10 @@ settings reverting while settings load. The cooldown rule itself is unchanged.
   `~/.gemini/antigravity-cli/`). Both vendors' sandboxes deny reads of `~/.gemini`: Claude's
   `Read(~/.gemini/**)` deny and sandbox read-deny in the managed guardrails, and Codex's
   `~/.gemini` filesystem deny in `system/codex-requirements.toml` (T-52, the `lane` and `review`
-  profiles). The policy hook adds token-level refusals of any Bash, Write, Edit or `apply_patch`
-  access to `~/.gemini` in both vendors. The hook matches command tokens, so it does not catch a
-  recursive search from the home folder (for example `grep -r ... ~`); the sandbox read-deny is
-  the control for those reads.
+  profiles; Codex checks `apply_patch` targets against the same filesystem policy). Claude's
+  `Edit(~/.gemini/**)` deny covers writes by the file tools and, merged into the sandbox, by shell
+  commands. These sandbox denies replace the removed hook's token-level refusals and also cover
+  searches the hook never saw (for example `grep -r ... ~`).
 - **Login and probe:** the one-time login and the probe are in [docs/agy-probe.md](docs/agy-probe.md).
 
 ### Package caps (the litellm lock rule)
