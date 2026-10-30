@@ -101,8 +101,9 @@ assert claude_hooks == {
 requirements = tomllib.loads((ROOT / "system/codex-requirements.toml").read_text(encoding="utf-8"))
 assert set(requirements) == {"features", "hooks", "rules", "permissions", "allowed_permission_profiles",
                              "default_permissions"}, set(requirements)
-# Read-deny profiles: only lane (writable, default) and review (read-only) may be selected.
-assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True}
+# Read-deny profiles lane (writable, default) and review (read-only); the built-in :danger-full-access is the unsandboxed PM seat
+# (decision-37, 2026-10-30), selected only by the PM launcher.
+assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True, ":danger-full-access": True}
 assert requirements["default_permissions"] == "lane"
 profiles = requirements["permissions"]
 assert set(profiles) == {"lane", "review"}, set(profiles)
