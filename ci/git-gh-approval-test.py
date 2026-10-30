@@ -48,8 +48,11 @@ for executable in ("git", "/usr/bin/git"):
         check([executable, *arguments], "prompt")
     for arguments in (["push", "--force", "origin", "HEAD"],
                       ["push", "--force-with-lease", "origin", "HEAD"],
-                      ["push", "-f", "origin", "HEAD"], ["push", "--delete", "origin", "task"]):
+                      ["push", "-f", "origin", "HEAD"], ["push", "--delete", "origin", "task"],
+                      ["update-ref", "refs/heads/fixture", "HEAD"]):
         check([executable, *arguments], "forbidden")
+for command in (["agy", "-p", "hi"], ["antigravity", "--version"]):
+    check(command, "forbidden")
 for executable in ("gh", "/usr/bin/gh"):
     for arguments in (["issue", "list"], ["pr", "create"], ["auth", "status"],
                       ["api", "repos/fixture"], ["repo", "view"], ["release", "list"]):

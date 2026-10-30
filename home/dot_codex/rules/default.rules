@@ -2,7 +2,7 @@
 # The forbidden and prompt rules are guardrails: they live in the root-owned
 # /etc/codex/requirements.toml (system/codex-requirements.toml), which Codex merges with these
 # rules using the most restrictive decision, so an allow here never lifts them.
-prefix_rule(pattern = ["git"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
-prefix_rule(pattern = ["gh"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
-prefix_rule(pattern = ["/usr/bin/git"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
-prefix_rule(pattern = ["/usr/bin/gh"], decision = "allow", justification = "Founder-approved routine Git/gh operations; shared policy guard remains active.")
+prefix_rule(pattern = ["git"], decision = "allow", justification = "Founder-approved routine Git/gh operations; native forbidden rules in the managed requirements still apply.")
+prefix_rule(pattern = ["gh"], decision = "allow", justification = "Founder-approved routine Git/gh operations; native forbidden rules in the managed requirements still apply.")
+prefix_rule(pattern = ["/usr/bin/git"], decision = "allow", justification = "Founder-approved routine Git/gh operations; native forbidden rules in the managed requirements still apply.")
+prefix_rule(pattern = ["/usr/bin/gh"], decision = "allow", justification = "Founder-approved routine Git/gh operations; native forbidden rules in the managed requirements still apply.")
