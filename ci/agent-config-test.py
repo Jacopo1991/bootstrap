@@ -132,7 +132,8 @@ assert decisions.count("prompt") == 2 and decisions.count("forbidden") == 6, dec
 # with one) that keeps the write scope of its built-in base and denies the Claude Read list plus
 # credentials, private data and the excluded private repos. Only these profiles may be selected.
 assert requirements["default_permissions"] == "lane"
-assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True}
+# :danger-full-access: the unsandboxed PM seat (decision-37, 2026-10-30), selected only by the PM launcher.
+assert requirements["allowed_permission_profiles"] == {"lane": True, "review": True, ":danger-full-access": True}
 assert {n: p["extends"] for n, p in requirements["permissions"].items()} == {"lane": ":workspace", "review": ":read-only"}
 claude_reads = {x[len("Read("):-1].removesuffix("/**") for x in claude["permissions"]["deny"]
                 if x.startswith("Read(~/")}

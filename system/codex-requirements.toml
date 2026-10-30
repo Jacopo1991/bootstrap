@@ -23,6 +23,10 @@ default_permissions = "lane"
 [allowed_permission_profiles]
 lane = true
 review = true
+# PM seats (Workflow PM, project PMs) are trusted and run unsandboxed (founder ruling 2026-10-30,
+# decision-37). The PM launcher selects it with -c 'default_permissions=":danger-full-access"'.
+# A nested codex inside a lane sandbox still inherits that sandbox (built-ins cannot be extended).
+":danger-full-access" = true
 
 # Hooks run even if a user config turns the hooks feature off.
 [features]
